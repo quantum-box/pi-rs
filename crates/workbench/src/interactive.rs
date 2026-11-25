@@ -58,14 +58,6 @@ fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
         }
         output.push_str(&status);
     }
-    if execution.truncated
-        && let Some(path) = &execution.full_output_path
-    {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str(&format!("Output truncated. Full output: {path}"));
-    }
     output
 }
 
@@ -3284,7 +3276,7 @@ impl View {
                         render_call_id: None,
                         rendered: None,
                     });
-                    self.finish_tool(&id, &outcome);
+                    self.finish_tool(&id, &outcome, None);
                 }
                 pi_rs::Event::BashExecution { execution } => {
                     self.lines.push(Entry::Tool {
@@ -3301,7 +3293,11 @@ impl View {
                         failed: execution.cancelled
                             || execution.exit_code.is_some_and(|code| code != 0),
                         finished: true,
-                        parts: Vec::new(),
+                        parts: execution
+                            .truncation_note()
+                            .map(ToolPart::TruncationNotice)
+                            .into_iter()
+                            .collect(),
                         numbered_diff: false,
                         render_records: None,
                         render_call_id: None,
@@ -3377,7 +3373,7 @@ impl View {
                     outcome,
                 } => {
                     self.track_tool_render(&operation_id.to_string(), record.id, false);
-                    self.finish_tool(&operation_id.to_string(), outcome);
+                    self.finish_tool(&operation_id.to_string(), outcome, None);
                 }
                 _ => {}
             }
@@ -3444,7 +3440,12 @@ impl View {
             rendered: None,
         });
     }
-    fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
+    fn finish_tool(
+        &mut self,
+        operation: &str,
+        outcome: &pi_rs::Outcome,
+        truncation_notice: Option<String>,
+    ) {
         if self.model_operations.remove(operation) {
             if let Some(usage) = pi_rs_extensions::codemode::ModelUsage::from_outcome(outcome) {
                 self.tokens = self.tokens.saturating_add(usage.total_tokens);
@@ -3480,6 +3481,7 @@ impl View {
                     "[{model} does not support images; it saw a placeholder instead]"
                 )));
             }
+            rendered_parts.extend(truncation_notice.map(ToolPart::TruncationNotice));
             *parts = rendered_parts;
             let diff = match outcome {
                 pi_rs::Outcome::SucceededWithDetails { details, .. }
@@ -3595,12 +3597,21 @@ render_call_id: None,
             }
             Some("bash_execution_end") => {
                 self.shell_running = false;
-                let outcome = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
-                    Ok(execution) if !execution.cancelled && execution.exit_code.is_none_or(|code| code == 0) => pi_rs::Outcome::Succeeded(shell_display_output(&execution)),
-                    Ok(execution) => pi_rs::Outcome::TextResult { output: shell_display_output(&execution), details: None, is_error: true },
-                    Err(_) => pi_rs::Outcome::Failed(value["error"].as_str().unwrap_or("Shell execution failed").into()),
+                let (outcome, note) = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
+                    Ok(execution) => (
+                        pi_rs::Outcome::TextResult {
+                            output: shell_display_output(&execution),
+                            details: None,
+                            is_error: execution.cancelled || execution.exit_code.is_some_and(|code| code != 0),
+                        },
+                        execution.truncation_note(),
+                    ),
+                    Err(_) => (
+                        pi_rs::Outcome::Failed(value["error"].as_str().unwrap_or("Shell execution failed").into()),
+                        None,
+                    ),
                 };
-                self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome);
+                self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome, note);
             }
             Some("auto_retry_start") => {
                 self.phase = Some("再試行待ち");
@@ -3787,6 +3798,7 @@ render_call_id: None,
                             self.finish_tool(
                                 event["operation_id"].as_str().unwrap_or_default(),
                                 &outcome,
+                                None,
                             );
                         }
                     }
@@ -12110,6 +12122,7 @@ mod tests {
                 data: json!({"content":[{"type":"text", "text":"Read image file [image/png]"}]}),
                 details: json!({"imageUnsupportedByModel":"text-only"}),
             },
+            None,
         );
         let theme = Theme::system();
         let entry = view.lines.last().unwrap();
@@ -13757,11 +13770,7 @@ exit {exit}
             shells,
             [
                 ("bash", "hi\n", false),
-                (
-                    "bash (excluded)",
-                    "bad\n(exit 1)\nOutput truncated. Full output: /tmp/output",
-                    true
-                ),
+                ("bash (excluded)", "bad\n(exit 1)", true),
                 ("bash", "(cancelled)", true)
             ]
         );
@@ -13780,6 +13789,7 @@ exit {exit}
             .flat_map(|line| line.spans.into_iter().map(|span| span.text))
             .collect::<String>();
         assert!(rendered.contains("echo hi") && rendered.contains("hi"));
+        assert!(rendered.contains("Output truncated. Full output: /tmp/output"));
         assert!(!rendered.contains("Ran `") && !rendered.contains("```"));
         let original = imported
             .records()
@@ -13806,6 +13816,30 @@ exit {exit}
         assert!(
             matches!(view.lines.last(), Some(Entry::Tool { output, failed: true, finished: true, .. }) if output == "bad\n(exit 1)")
         );
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"truncated","command":"echo long"}),
+        );
+        let output = format!("{}final shell line", "preview line\n".repeat(12));
+        view.receive(&json!({"type":"bash_execution_end","executionId":"truncated","data":{"command":"echo long","output":output,"exitCode":0,"cancelled":false,"truncated":true}}));
+        for expanded in [false, true] {
+            let rendered = view
+                .lines
+                .last()
+                .unwrap()
+                .render(
+                    &Theme::system(),
+                    100,
+                    expanded,
+                    true,
+                    TranscriptOptions::default(),
+                )
+                .into_iter()
+                .flat_map(|row| row.spans.into_iter().map(|span| span.text))
+                .collect::<String>();
+            assert!(rendered.contains("Output truncated"));
+            assert!(rendered.contains("preview line"));
+            assert_eq!(rendered.contains("final shell line"), expanded);
+        }
     }
 
     #[test]
@@ -14626,7 +14660,11 @@ exit {exit}
         );
 
         view.track_tool_render(&operation, 3, false);
-        view.finish_tool(&operation, &pi_rs::Outcome::Succeeded("completed".into()));
+        view.finish_tool(
+            &operation,
+            &pi_rs::Outcome::Succeeded("completed".into()),
+            None,
+        );
         view.receive(&update("late"));
         assert!(view.partial_tool_results.is_empty());
         assert!(matches!(&view.lines[0], super::Entry::Tool {
