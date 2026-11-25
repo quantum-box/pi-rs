@@ -2475,6 +2475,40 @@ async fn fork_inherits_policies_for_absent_documents_at_the_cut() {
 }
 
 #[tokio::test]
+async fn paused_scheduler_resumes_only_explicitly_scheduled_conversations() {
+    use pi_rs_durable::runtime::{Scheduler, Status};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let mut queued = Vec::new();
+    for prompt in ["selected", "unrelated"] {
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit(id, None, prompt.into()).unwrap();
+        queued.push(id);
+    }
+    drop(h);
+
+    let mut scheduler = Scheduler::open_paused(&path, opts()).unwrap();
+    scheduler.schedule(queued[0]);
+    scheduler.wait(queued[0]).await.unwrap();
+    assert!(matches!(
+        scheduler.conversation(queued[0]).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    assert!(matches!(
+        scheduler.conversation(queued[1]).unwrap().submissions[0].status,
+        Status::Queued
+    ));
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn unified_history_pages_survive_reopen_and_show_fork_snapshots() {
     use pi_rs_durable::{
         document::TaskDocuments,

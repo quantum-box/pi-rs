@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Sha256::digest(args.endpoint.as_bytes())
     );
     let model = Arc::new(RoutedModel { client, suffix });
-    let mut scheduler = Scheduler::open(
+    let mut scheduler = Scheduler::open_paused(
         &args.db,
         Options {
             model: model.clone(),

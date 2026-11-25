@@ -23291,6 +23291,16 @@ impl Scheduler {
         Self::open_with_extensions(path, options, crate::extension::Registry::default())
     }
     /// Install the initial registry before recovered conversations are scheduled.
+    /// Recover persisted phases and wait for explicit conversation admission
+    /// or scheduling before starting their workers.
+    pub fn open_paused(path: impl AsRef<Path>, options: Options) -> Result<Self, Error> {
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
+        let mut scheduler =
+            Self::with_harness(Harness::open_paused(path, options)?, None, Vec::new());
+        scheduler.start_reporter();
+        Ok(scheduler)
+    }
     pub fn open_with_extensions(
         path: impl AsRef<Path>,
         options: Options,
@@ -23618,19 +23628,7 @@ impl Scheduler {
         } else {
             (Vec::new(), Vec::new())
         };
-        let mut scheduler = Self {
-            cancel: harness.owner.conversation_controls().root(),
-            worker_errors: harness.owner.conversation_controls().worker_errors(),
-            harness,
-            tasks: HashMap::new(),
-            summary_tasks: HashMap::new(),
-            summary_provider,
-            summary_blocked,
-            reporter_cancel: CancellationToken::new(),
-            reporter: None,
-            foreground_worker: None,
-            reporter_error: Arc::new(std::sync::Mutex::new(None)),
-        };
+        let mut scheduler = Self::with_harness(harness, summary_provider, summary_blocked);
         // Attach and publish the task driver before any recovered worker is spawned.
         let driver = tasks
             .map(|registry| scheduler.start_tasks(registry))
@@ -23656,6 +23654,25 @@ impl Scheduler {
         }
         scheduler.start_reporter();
         Ok((scheduler, driver))
+    }
+    fn with_harness(
+        harness: Harness,
+        summary_provider: Option<SummaryProviderIdentity>,
+        summary_blocked: Vec<Uuid>,
+    ) -> Self {
+        Self {
+            cancel: harness.owner.conversation_controls().root(),
+            worker_errors: harness.owner.conversation_controls().worker_errors(),
+            harness,
+            tasks: HashMap::new(),
+            summary_tasks: HashMap::new(),
+            summary_provider,
+            summary_blocked,
+            reporter_cancel: CancellationToken::new(),
+            reporter: None,
+            foreground_worker: None,
+            reporter_error: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
     /// Read the same durable extension error log exposed by the harness.
     pub fn extension_reports(&self) -> Result<Vec<ExtensionReportBatch>, Error> {
