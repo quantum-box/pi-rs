@@ -2104,6 +2104,8 @@ script line numbers. Compatible OpenAI Responses providers use Pi's raw
 JavaScript grammar, with the same code field used internally and by providers
 that use JSON function arguments. The parser trims JavaScript whitespace and
 uses the same Pi-compatible JSON syntax diagnostics as settings and RPC.
+Unknown fields are diagnosed in JavaScript object key order, with numeric
+array indices first.
 Non-chat model APIs and remaining execution-limit differences remain open.
 
 Classifier results include their API and invocation timestamp even if the
