@@ -596,6 +596,8 @@ struct HookCheckpoint {
     outcome: Option<Outcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<crate::runtime::ToolDiagnostic>,
 }
 pub(crate) fn invalid_raw_checkpoint() -> Result<Checkpoint, String> {
     let data = serde_json::to_value(HookCheckpoint {
@@ -605,6 +607,7 @@ pub(crate) fn invalid_raw_checkpoint() -> Result<Checkpoint, String> {
             "Invalid tool arguments: invalid checkpointable arguments".into(),
         )),
         host_error: Some("invalid_arguments".into()),
+        diagnostics: Vec::new(),
     })
     .map_err(|error| error.to_string())?;
     Ok(Checkpoint {
@@ -813,16 +816,23 @@ fn validate_content_result(result: &crate::extension::ToolBlockResult) -> Result
     validate_content_result_with_limit(result, 60 * 1024)
 }
 
+fn valid_reported_diagnostics(diagnostics: &[crate::runtime::ToolDiagnostic]) -> bool {
+    diagnostics.len() <= 30
+        && diagnostics.iter().all(|diagnostic| {
+            diagnostic.message.len() <= 4096
+                && diagnostic
+                    .code
+                    .as_ref()
+                    .is_none_or(|code| code.len() <= 256)
+        })
+}
+
 fn validate_durable_progress(progress: &DurableToolProgress, size: usize) -> Result<(), String> {
     if size > super::MAX_CHECKPOINTABLE_PROGRESS_BYTES {
         return Err("checkpointable progress exceeds 32 KiB".into());
     }
     // Leave room for the required interruption and truncation diagnostics.
-    if progress.diagnostics.len() > 30
-        || progress
-            .diagnostics
-            .iter()
-            .any(|d| d.message.len() > 4096 || d.code.as_ref().is_some_and(|code| code.len() > 256))
+    if !valid_reported_diagnostics(&progress.diagnostics)
         || (progress.dropped_bytes == 0 && progress.dropped_lines != 0)
     {
         return Err("invalid checkpointable progress metadata".into());
@@ -1552,6 +1562,7 @@ impl Executor {
             arguments: args,
             outcome: Some(Outcome::Failed(message)),
             host_error: Some(code.into()),
+            diagnostics: Vec::new(),
         })
         .map_err(|e| e.to_string())?;
         if serde_json::to_vec(&data).map_err(|e| e.to_string())?.len() > 65536 {
@@ -1728,6 +1739,7 @@ impl Executor {
             arguments: call.arguments,
             outcome: None,
             host_error: None,
+            diagnostics: Vec::new(),
         })
         .map_err(|e| e.to_string())?;
         if serde_json::to_vec(&data).map_err(|e| e.to_string())?.len() > 65536 {
@@ -1738,17 +1750,22 @@ impl Executor {
             data,
         }))
     }
-    #[allow(clippy::too_many_arguments)] // Fenced hook context and the stored result channels are independent.
     fn after_blocks(
         &self,
         task: &Task,
         docs: &mut crate::document::TaskDocuments<'_>,
         admission: &AdmissionHandle<'_>,
         cancel: &pi_rs_core::CancellationToken,
-        args: serde_json::Value,
-        outcome: Outcome,
-        host_error: Option<String>,
+        stored: HookCheckpoint,
     ) -> Result<Step, HookFenceError> {
+        let HookCheckpoint {
+            arguments: args,
+            outcome,
+            host_error,
+            mut diagnostics,
+            ..
+        } = stored;
+        let outcome = outcome.ok_or("missing completed outcome")?;
         let mut extra = std::collections::BTreeMap::new();
         extra.insert(
             "isError".into(),
@@ -1779,8 +1796,7 @@ impl Executor {
         } else {
             None
         };
-        let mut diagnostics: Vec<crate::runtime::ToolDiagnostic> =
-            required.clone().into_iter().collect();
+        diagnostics.extend(required.clone());
         if required.is_none() {
             match &outcome {
                 Outcome::Failed(reason) | Outcome::Skipped(reason) => {
@@ -1918,21 +1934,27 @@ impl Executor {
         }) {
             return Err("invalid host result code".into());
         }
-        let outcome = stored.outcome.ok_or("missing completed outcome")?;
+        let outcome = stored.outcome.as_ref().ok_or("missing completed outcome")?;
         if stored.host_error.is_some() && !matches!(outcome, Outcome::Failed(_)) {
             return Err("invalid host result outcome".into());
         }
-        if self.block_results {
-            return self.after_blocks(
-                task,
-                docs,
-                admission,
-                cancel,
-                stored.arguments,
-                outcome,
-                stored.host_error,
-            );
+        if !stored.diagnostics.is_empty()
+            && (!self.block_results
+                || stored.host_error.is_some()
+                || !valid_reported_diagnostics(&stored.diagnostics)
+                || !matches!(
+                    outcome,
+                    Outcome::Succeeded(_)
+                        | Outcome::SucceededWithDetails { .. }
+                        | Outcome::Structured { .. }
+                ))
+        {
+            return Err("invalid after checkpoint diagnostics".into());
         }
+        if self.block_results {
+            return self.after_blocks(task, docs, admission, cancel, stored);
+        }
+        let outcome = stored.outcome.ok_or("missing completed outcome")?;
         let diagnostic_message = match &outcome {
             Outcome::Failed(reason) => reason.clone(),
             _ => String::new(),
@@ -3640,6 +3662,24 @@ impl Handler for Executor {
         {
             return Err("durable result too large".into());
         }
+        let mut successful_diagnostics = if admission.is_conversation_checkpointable()
+            && matches!(
+                &result,
+                DurableToolStep::Complete(
+                    Outcome::Succeeded(_)
+                        | Outcome::SucceededWithDetails { .. }
+                        | Outcome::Structured { .. }
+                )
+            ) {
+            host.progress
+                .lock()
+                .map_err(|error| error.to_string())?
+                .replacement
+                .diagnostics
+                .clone()
+        } else {
+            Vec::new()
+        };
         let step = match &result {
             DurableToolStep::Complete(Outcome::Pending { .. } | Outcome::Unknown(_)) => {
                 return Err("uncertain tool outcome requires reconciliation".into());
@@ -3650,6 +3690,11 @@ impl Handler for Executor {
                     arguments: args.clone(),
                     outcome: Some(outcome.clone()),
                     host_error: None,
+                    diagnostics: if self.block_results {
+                        std::mem::take(&mut successful_diagnostics)
+                    } else {
+                        Vec::new()
+                    },
                 })
                 .map_err(|e| e.to_string())?;
                 if serde_json::to_vec(&data).map_err(|e| e.to_string())?.len() > 65536 {
@@ -3702,22 +3747,8 @@ impl Handler for Executor {
             }
         };
         let docs = host.docs.into_inner().map_err(|e| e.to_string())?;
-        if admission.is_conversation_checkpointable()
-            && self.hook.is_none()
-            && matches!(
-                &result,
-                DurableToolStep::Complete(
-                    Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. }
-                )
-            )
-        {
-            let diagnostics = host
-                .progress
-                .into_inner()
-                .map_err(|error| error.to_string())?
-                .replacement
-                .diagnostics;
-            docs.stage_checkpointable_result_diagnostics(diagnostics)?;
+        if self.hook.is_none() {
+            docs.stage_checkpointable_result_diagnostics(successful_diagnostics)?;
         }
         if no_dispatch {
             let DurableToolStep::Complete(outcome) = &result else {
@@ -3752,6 +3783,7 @@ mod evidence_tests {
                 arguments: serde_json::json!({}),
                 outcome: Some(outcome),
                 host_error: host_error.map(str::to_owned),
+                diagnostics: Vec::new(),
             })
             .unwrap()
         };

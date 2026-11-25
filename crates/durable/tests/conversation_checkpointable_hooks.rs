@@ -2802,6 +2802,9 @@ impl Hook for RichHook {
         );
         self.after.fetch_add(1, Ordering::SeqCst);
         let mut result = result.clone();
+        if self.mode == "progress-diagnostics" {
+            assert_eq!(result.diagnostics[0].code.as_deref(), Some("progress_note"));
+        }
         result.output = vec![
             json!({"type":"text","text":"first"}),
             json!({"type":"text","text":"second"}),
@@ -2868,9 +2871,20 @@ impl DurableAsyncTool for ErrorJob {
         _: Value,
         _: ToolContext,
         _: DurableToolResume,
-        _: &dyn DurableTaskHost,
+        host: &dyn DurableTaskHost,
     ) -> Result<DurableToolStep, String> {
         self.executions.fetch_add(1, Ordering::SeqCst);
+        if self.mode == "progress-diagnostics" {
+            host.report_progress(pi_rs_durable::async_task_tool::DurableToolProgress {
+                diagnostics: vec![pi_rs_durable::runtime::ToolDiagnostic {
+                    severity: pi_rs_durable::runtime::DiagnosticSeverity::Warn,
+                    code: Some("progress_note".into()),
+                    message: "from checkpointable progress".into(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        }
         Ok(DurableToolStep::Complete(
             if self.mode.starts_with("invalid-structured") {
                 Outcome::Structured {
@@ -3310,7 +3324,13 @@ fn setup_rich_unsafe(
 }
 #[tokio::test]
 async fn selected_after_rich_and_error_results_resume_conversation() {
-    for mode in ["success", "failure", "block", "schema"] {
+    for mode in [
+        "progress-diagnostics",
+        "success",
+        "failure",
+        "block",
+        "schema",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let after = Arc::new(AtomicUsize::new(0));
@@ -3342,7 +3362,8 @@ async fn selected_after_rich_and_error_results_resume_conversation() {
             .unwrap();
         let c = scheduler.conversation(id).unwrap();
         let meta = &c.tool_results[0];
-        assert_eq!(meta.is_error, mode != "success", "{mode}");
+        let succeeded = matches!(mode, "success" | "progress-diagnostics");
+        assert_eq!(meta.is_error, !succeeded, "{mode}");
         assert_eq!(meta.details, Some(json!({"kept":true})), "{mode}");
         assert_eq!(meta.structured_output, Some(json!({"value":7})), "{mode}");
         assert_eq!(meta.attachments.len(), 1, "{mode}");
@@ -3367,11 +3388,19 @@ async fn selected_after_rich_and_error_results_resume_conversation() {
             .unwrap();
         assert_eq!(blocks.blocks[0]["text"], "first");
         assert_eq!(blocks.blocks[1]["text"], "second");
+        if mode == "progress-diagnostics" {
+            assert_eq!(meta.diagnostics[0].code.as_deref(), Some("progress_note"));
+            assert!(
+                serde_json::to_string(&blocks.blocks)
+                    .unwrap()
+                    .contains("from checkpointable progress")
+            );
+        }
         assert_eq!(
             serde_json::to_string(&blocks.blocks)
                 .unwrap()
                 .contains("[tool error]"),
-            mode != "success"
+            !succeeded
         );
         assert!(
             c.messages
@@ -3381,7 +3410,7 @@ async fn selected_after_rich_and_error_results_resume_conversation() {
         assert_eq!(after.load(Ordering::SeqCst), 1, "{mode}");
         assert_eq!(
             executions.load(Ordering::SeqCst),
-            usize::from(mode == "success" || mode == "failure"),
+            usize::from(succeeded || mode == "failure"),
             "{mode}"
         );
         let store = durable_store::Store::open(&path).unwrap();
@@ -3403,7 +3432,14 @@ async fn selected_after_rich_and_error_results_resume_conversation() {
 
 #[tokio::test]
 async fn unsafe_selected_after_rich_and_error_results_resume_conversation() {
-    for mode in ["success", "failure", "block", "schema", "prepare"] {
+    for mode in [
+        "progress-diagnostics",
+        "success",
+        "failure",
+        "block",
+        "schema",
+        "prepare",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let after = Arc::new(AtomicUsize::new(0));
@@ -3436,7 +3472,8 @@ async fn unsafe_selected_after_rich_and_error_results_resume_conversation() {
             .unwrap();
         let c = scheduler.conversation(id).unwrap();
         let meta = &c.tool_results[0];
-        assert_eq!(meta.is_error, mode != "success", "{mode}");
+        let succeeded = matches!(mode, "success" | "progress-diagnostics");
+        assert_eq!(meta.is_error, !succeeded, "{mode}");
         assert_eq!(meta.details, Some(json!({"kept":true})), "{mode}");
         assert_eq!(meta.structured_output, Some(json!({"value":7})), "{mode}");
         assert_eq!(meta.attachments.len(), 1, "{mode}");
@@ -3461,11 +3498,19 @@ async fn unsafe_selected_after_rich_and_error_results_resume_conversation() {
             .unwrap();
         assert_eq!(blocks.blocks[0]["text"], "first");
         assert_eq!(blocks.blocks[1]["text"], "second");
+        if mode == "progress-diagnostics" {
+            assert_eq!(meta.diagnostics[0].code.as_deref(), Some("progress_note"));
+            assert!(
+                serde_json::to_string(&blocks.blocks)
+                    .unwrap()
+                    .contains("from checkpointable progress")
+            );
+        }
         assert_eq!(
             serde_json::to_string(&blocks.blocks)
                 .unwrap()
                 .contains("[tool error]"),
-            mode != "success"
+            !succeeded
         );
         assert!(
             c.messages
@@ -3475,7 +3520,7 @@ async fn unsafe_selected_after_rich_and_error_results_resume_conversation() {
         assert_eq!(after.load(Ordering::SeqCst), 1, "{mode}");
         assert_eq!(
             executions.load(Ordering::SeqCst),
-            usize::from(mode == "success" || mode == "failure"),
+            usize::from(succeeded || mode == "failure"),
             "{mode}"
         );
         let store = durable_store::Store::open(&path).unwrap();
