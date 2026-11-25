@@ -964,14 +964,62 @@ pub trait DurableAsyncTool: Tool {
 
 /// Wrap a tool's ordinary invocation as a durable leaf. Register the returned
 /// tool with the real replay policy for its effects before exposing it to a
-/// parent. The leaf forwards argument preparation and invocation. Use a
-/// native `DurableAsyncTool` when the tool needs the durable child or progress
-/// host, or when it must persist a park.
+/// parent. The leaf forwards argument preparation and invokes the tool with
+/// a host that can persist textual partial results and their details. Use a
+/// native `DurableAsyncTool` for durable nested calls or parks.
 pub fn checkpointable_leaf(tool: Arc<dyn Tool>) -> Arc<dyn DurableAsyncTool> {
     Arc::new(CheckpointableLeaf(tool))
 }
 
 struct CheckpointableLeaf(Arc<dyn Tool>);
+
+type LeafProgressUpdate = (
+    DurableToolProgress,
+    tokio::sync::oneshot::Sender<pi_rs_core::ExtensionResult<()>>,
+);
+
+struct LeafProgressHost(tokio::sync::mpsc::Sender<LeafProgressUpdate>);
+
+#[async_trait::async_trait]
+impl pi_rs_core::ToolHost for LeafProgressHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    fn supports_progress(&self) -> bool {
+        !self.0.is_closed()
+    }
+
+    async fn report_progress(
+        &self,
+        partial_result: serde_json::Value,
+    ) -> pi_rs_core::ExtensionResult<()> {
+        let content = partial_result["content"]
+            .as_array()
+            .ok_or("tool progress must include a content array")?;
+        let text = content
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let progress = DurableToolProgress {
+            text,
+            details: partial_result.get("details").cloned(),
+            ..Default::default()
+        };
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.0
+            .send((progress, reply))
+            .await
+            .map_err(|_| "durable tool invocation ended")?;
+        result.await.map_err(|_| "durable tool invocation ended")?
+    }
+
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        Outcome::Skipped("nested calls are unavailable for a durable leaf".into())
+    }
+}
 
 #[async_trait::async_trait]
 impl Tool for CheckpointableLeaf {
@@ -1002,11 +1050,29 @@ impl DurableAsyncTool for CheckpointableLeaf {
         arguments: serde_json::Value,
         context: pi_rs_core::ToolContext,
         _resume: DurableToolResume,
-        _host: &dyn DurableTaskHost,
+        host: &dyn DurableTaskHost,
     ) -> Result<DurableToolStep, String> {
-        Ok(DurableToolStep::Complete(
-            self.invoke(arguments, context).await,
-        ))
+        let (updates, mut progress) = tokio::sync::mpsc::channel(1);
+        let invocation = self.0.invoke_with_host(
+            arguments,
+            context,
+            None,
+            Arc::new(LeafProgressHost(updates)),
+        );
+        tokio::pin!(invocation);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                outcome = &mut invocation => break outcome,
+                update = progress.recv() => match update {
+                    Some((partial, reply)) => {
+                        let _ = reply.send(host.report_progress(partial).await);
+                    }
+                    None => break invocation.await,
+                },
+            }
+        };
+        Ok(DurableToolStep::Complete(outcome))
     }
 }
 

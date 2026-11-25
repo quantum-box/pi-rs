@@ -236,6 +236,7 @@ async fn replay_safe_checkpointable_parent_awaits_live_generic_task_tools() {
             payload("failed").to_string(),
             payload("unknown").to_string(),
         ],
+        false,
     )
     .await;
 }
@@ -265,6 +266,23 @@ async fn replay_safe_checkpointable_parent_calls_an_ordinary_registered_leaf() {
             assert_eq!(arguments["normalized"], true);
             Outcome::Succeeded(arguments["value"].as_str().unwrap().to_owned())
         }
+
+        async fn invoke_with_host(
+            &self,
+            arguments: Value,
+            context: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: Arc<dyn pi_rs_core::ToolHost>,
+        ) -> Outcome {
+            assert!(host.supports_progress());
+            host.report_progress(json!({
+                "content":[{"type":"text","text":"starting"},{"type":"text","text":"processing"}],
+                "details":{"input":arguments["value"]},
+            }))
+            .await
+            .unwrap();
+            self.invoke(arguments, context).await
+        }
     }
 
     let mut registry = Registry::default();
@@ -277,13 +295,14 @@ async fn replay_safe_checkpointable_parent_calls_an_ordinary_registered_leaf() {
         UnsafeDurableAuthorization::interruption_requires_reconciliation(),
     )
     .unwrap();
-    exercise_registered_leaf(registry, leaf, ["left".into(), "right".into()]).await;
+    exercise_registered_leaf(registry, leaf, ["left".into(), "right".into()], true).await;
 }
 
 async fn exercise_registered_leaf(
     mut registry: Registry,
     leaf: Arc<pi_rs_durable::task_tool::TaskTool>,
     expected_outputs: [String; 2],
+    reports_progress: bool,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let leaf_registration = leaf.register();
@@ -325,6 +344,7 @@ async fn exercise_registered_leaf(
             max_output_tokens: 100,
         })
         .unwrap();
+    let progress_cursor = scheduler.progress_history_from_now(conversation).unwrap();
     scheduler.submit(conversation, None, "work".into()).unwrap();
     tokio::time::timeout(Duration::from_secs(15), scheduler.wait(conversation))
         .await
@@ -340,6 +360,31 @@ async fn exercise_registered_leaf(
                 matches!(message, Message::Tool { content, .. } if content == "left+right")
             })
     );
+    if reports_progress {
+        let mut reported: Vec<_> = scheduler
+            .progress_history(&progress_cursor, NonZeroUsize::new(256).unwrap())
+            .unwrap()
+            .records
+            .into_iter()
+            .flat_map(|record| record.changes)
+            .filter_map(|change| match change {
+                pi_rs_durable::runtime::ProgressHistoryChange::CheckpointableTool {
+                    progress,
+                    ..
+                } => Some(progress),
+                _ => None,
+            })
+            .map(|progress| {
+                assert_eq!(progress.text, "starting\nprocessing");
+                progress.details.unwrap()["input"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        reported.sort();
+        assert_eq!(reported, ["left", "right"]);
+    }
     driver.shutdown().unwrap();
     scheduler.shutdown().await.unwrap();
 }
