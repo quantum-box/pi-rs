@@ -86,6 +86,22 @@ impl Turn {
             "willRetry":false
         }))
     }
+
+    fn settle(&mut self, state: &Conversation, failure: Option<String>) -> io::Result<()> {
+        let status = state
+            .submissions
+            .iter()
+            .find(|input| input.id == self.submission)
+            .map(|input| &input.status);
+        match status {
+            Some(Status::Done { answer }) => self.end(answer, None),
+            Some(Status::Unanswered { reason }) => self.end(&self.partial.clone(), Some(reason)),
+            _ => self.end(
+                &self.partial.clone(),
+                Some(failure.as_deref().unwrap_or("submission is still pending")),
+            ),
+        }
+    }
 }
 
 pub(super) async fn run(
@@ -120,7 +136,7 @@ pub(super) async fn run(
             received = input.recv(), if input_open => {
                 match received {
                     Some(request) => {
-                        respond(scheduler, id, &provider_model, &mut active, request)?;
+                        respond(scheduler, id, &provider_model, &mut active, request).await?;
                     }
                     None => input_open = false,
                 }
@@ -167,7 +183,7 @@ fn input_reader() -> tokio::sync::mpsc::Receiver<Result<Value, String>> {
     receiver
 }
 
-fn respond(
+async fn respond(
     scheduler: &mut Scheduler,
     id: Uuid,
     model: &str,
@@ -200,7 +216,17 @@ fn respond(
                 Err("prompt message must be text".into())
             }
         }
-        "abort" => scheduler.abort(id).map(|_| None).map_err(|error| error.to_string()),
+        "abort" => match scheduler.abort(id) {
+            Ok(()) => {
+                let settled = scheduler.wait(id).await;
+                if let Some(mut turn) = active.take() {
+                    let state = scheduler.conversation(id).map_err(io::Error::other)?;
+                    turn.settle(&state, settled.as_ref().err().map(ToString::to_string))?;
+                }
+                settled.map(|_| None).map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        },
         "get_state" => scheduler.conversation(id).map(|state| {
             Some(json!({
                 "sessionId": id,
@@ -273,20 +299,7 @@ async fn advance(
         .await
         .err()
         .map(|error| error.to_string());
-    let state = scheduler.conversation(id)?;
-    match state
-        .submissions
-        .iter()
-        .find(|input| input.id == turn.submission)
-        .map(|input| &input.status)
-    {
-        Some(Status::Done { answer }) => turn.end(answer, None)?,
-        Some(Status::Unanswered { reason }) => turn.end(&turn.partial.clone(), Some(reason))?,
-        _ => turn.end(
-            &turn.partial.clone(),
-            Some(failure.as_deref().unwrap_or("submission is still pending")),
-        )?,
-    }
+    turn.settle(&scheduler.conversation(id)?, failure)?;
     Ok(true)
 }
 

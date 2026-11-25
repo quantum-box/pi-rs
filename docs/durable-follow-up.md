@@ -27,7 +27,7 @@ cargo run -p pi-rs-durable --features text-cli --bin pi-rs-durable -- \
 
 続けるには、同じデータベースと送信先を指定し、`--model MODEL` を最初に表示された `--conversation UUID` に置き換える。同じ入力を再送する場合は同じ `--request-id` を使う。`--json` は会話 ID、保存済みのテキスト進捗、確定結果を1行ずつ出力する。
 
-テキスト RPC は `--json` とコマンド末尾のメッセージを `--rpc` に置き換えて起動する。標準入力から1行ごとに `prompt`、`abort`、`get_state`、`get_messages` を受け取る。入力は一度に1件で、確定した途中出力を `message_update` イベントで返す。
+テキスト RPC は `--json` とコマンド末尾のメッセージを `--rpc` に置き換えて起動する。標準入力から1行ごとに `prompt`、`abort`、`get_state`、`get_messages` を受け取る。入力は一度に1件で、確定した途中出力を `message_update` イベントで返す。`abort` は実行中のターンが終了してから応答する。
 
 ## 運用・検証
 

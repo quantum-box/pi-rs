@@ -220,6 +220,7 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     let stdout = BufReader::new(rpc.stdout.take().unwrap());
     let mut sent_abort = false;
     let mut ended = false;
+    let mut acknowledged = false;
     for line in stdout.lines() {
         let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
         if frame["assistantMessageEvent"]["type"] == "text_delta" && !sent_abort {
@@ -230,12 +231,14 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             sent_abort = true;
             writeln!(stdin, r#"{{"type":"abort","id":"cancel"}}"#).unwrap();
         } else if frame["id"] == "cancel" {
+            assert!(ended, "abort must respond after the active turn ends");
             assert_eq!(frame["success"], true);
             finish_first_tx.send(()).unwrap();
+            acknowledged = true;
+            break;
         } else if frame["type"] == "agent_end" {
             assert_eq!(frame["success"], false);
             ended = true;
-            break;
         }
     }
     drop(stdin);
@@ -245,7 +248,7 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(sent_abort && ended);
+    assert!(sent_abort && ended && acknowledged);
 
     let bodies = worker.join().unwrap();
     assert_eq!(bodies[0]["model"], "fixture");
