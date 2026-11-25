@@ -1965,12 +1965,13 @@ async fn registry_wake_writer_race(lock_past_busy_timeout: bool) {
     at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let writer_path = path.clone();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let connection = rusqlite::Connection::open(writer_path).unwrap();
         connection.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
         if lock_past_busy_timeout {
-            std::thread::sleep(Duration::from_millis(7000));
+            let _ = unlock_rx.recv_timeout(Duration::from_secs(35));
         } else {
             while now_ms() <= deadline + 50 {
                 std::thread::sleep(Duration::from_millis(2));
@@ -1980,12 +1981,13 @@ async fn registry_wake_writer_race(lock_past_busy_timeout: bool) {
     });
     locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     release_tx.send(()).unwrap();
-    writer.join().unwrap();
     if lock_past_busy_timeout {
         busy_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(20))
             .expect("target wake did not reach the SQLite busy timeout");
+        unlock_tx.send(()).unwrap();
     }
+    writer.join().unwrap();
     let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
     if lock_past_busy_timeout {
         // The first transaction could not start. Its retry must remain live and
@@ -2094,18 +2096,20 @@ async fn memo_busy_after_signal_read_defers_and_rechecks_lease() {
     at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let writer_path = path.clone();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let conn = rusqlite::Connection::open(writer_path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(6500));
+        let _ = unlock_rx.recv_timeout(Duration::from_secs(35));
         conn.execute_batch("COMMIT").unwrap();
     });
     locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     resume_tx.send(()).unwrap();
     busy_rx
-        .recv_timeout(Duration::from_secs(7))
+        .recv_timeout(Duration::from_secs(20))
         .expect("memo commit never reached busy timeout");
+    unlock_tx.send(()).unwrap();
     writer.join().unwrap();
     let task = wait_signal_sleep(&path, "first").await;
     assert!(
@@ -2176,24 +2180,35 @@ async fn busy_park_settlement_rechecks_abort_before_retry() {
     hook_fence_test_hook::install(task.id(), "settlement-busy", move || {
         busy_tx.send(()).unwrap();
     });
+    let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+    hook_fence_test_hook::install(task.id(), "settlement-deferred", move || {
+        retry_tx.send(()).unwrap();
+        continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
     gate.store(2, Ordering::SeqCst);
     at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let writer_path = path.clone();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let conn = rusqlite::Connection::open(writer_path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(7000));
+        let _ = unlock_rx.recv_timeout(Duration::from_secs(35));
         conn.execute_batch("COMMIT").unwrap();
     });
     locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     resume_tx.send(()).unwrap();
     busy_rx
-        .recv_timeout(Duration::from_secs(7))
+        .recv_timeout(Duration::from_secs(20))
         .expect("settlement did not hit busy timeout");
-    driver.request_abort(task.id()).unwrap();
+    unlock_tx.send(()).unwrap();
     writer.join().unwrap();
+    retry_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let aborted = driver.request_abort(task.id());
+    continue_tx.send(()).unwrap();
+    aborted.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let task = driver.get(task.id()).unwrap().unwrap();
@@ -2256,18 +2271,20 @@ async fn busy_park_settlement_revalidates_and_resumes() {
     at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let writer_path = path.clone();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let conn = rusqlite::Connection::open(writer_path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(7000));
+        let _ = unlock_rx.recv_timeout(Duration::from_secs(35));
         conn.execute_batch("COMMIT").unwrap();
     });
     locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     resume_tx.send(()).unwrap();
     busy_rx
-        .recv_timeout(Duration::from_secs(7))
+        .recv_timeout(Duration::from_secs(20))
         .expect("settlement did not hit busy timeout");
+    unlock_tx.send(()).unwrap();
     writer.join().unwrap();
     let task = wait_signal_sleep(&path, "first").await;
     let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
@@ -2337,18 +2354,20 @@ async fn signal_read_busy_defers_and_rechecks_lease() {
     at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let writer_path = path.clone();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let conn = rusqlite::Connection::open(writer_path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(6500));
+        let _ = unlock_rx.recv_timeout(Duration::from_secs(35));
         conn.execute_batch("COMMIT").unwrap();
     });
     locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     resume_tx.send(()).unwrap();
     busy_rx
-        .recv_timeout(Duration::from_secs(7))
+        .recv_timeout(Duration::from_secs(20))
         .expect("signal read never reached busy timeout");
+    unlock_tx.send(()).unwrap();
     writer.join().unwrap();
     let task = wait_signal_sleep(&path, "first").await;
     let token = pi_rs_durable::extension::checkpointable_hook_signal_token();

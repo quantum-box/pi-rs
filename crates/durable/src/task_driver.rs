@@ -1884,14 +1884,18 @@ impl Shared {
             #[cfg(test)]
             Err(SettlementError::Yielded { pending }) => (*pending, None),
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let pending_task = pending.task_id();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let is_prepared = matches!(pending, PendingSettlement::Prepared { .. });
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(pending);
+        #[cfg(feature = "test-hooks")]
+        if is_prepared && failure.is_none() {
+            crate::task_scheduler::hook_fence_test_hook::run(pending_task, "settlement-deferred");
+        }
         #[cfg(test)]
         if is_prepared {
             let hook = prepared_enqueue_hooks()
