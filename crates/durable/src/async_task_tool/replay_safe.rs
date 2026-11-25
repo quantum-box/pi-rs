@@ -1289,29 +1289,26 @@ impl DurableTaskHost for Host<'_, '_> {
         }
         Ok(match child.0.result(&self.task, &mut docs)? {
             None => None,
+            Some(NestedTaskResult::Succeeded(value))
+                if immediate
+                    && task.kind().is_some_and(|kind| {
+                        self.children.values().any(|child| {
+                            child
+                                .identity()
+                                .is_some_and(|id| id.kind == kind && !id.is_checkpointable())
+                        })
+                    }) =>
+            {
+                Some(AsyncTaskResult::Outcome(Outcome::Succeeded(
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string()),
+                )))
+            }
             Some(NestedTaskResult::Succeeded(value)) => {
-                let result: Result<DurableTaskResult, _> = serde::Deserialize::deserialize(&value);
-                let result = match result {
-                    Ok(result) => result,
-                    Err(_)
-                        if immediate
-                            && task.kind().is_some_and(|kind| {
-                                self.children.values().any(|child| {
-                                    child.identity().is_some_and(|id| {
-                                        id.kind == kind && !id.is_checkpointable()
-                                    })
-                                })
-                            }) =>
-                    {
-                        return Ok(Some(AsyncTaskResult::Outcome(Outcome::Succeeded(
-                            value
-                                .as_str()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| value.to_string()),
-                        ))));
-                    }
-                    Err(_) => return Err("child result is not a Tool outcome".into()),
-                };
+                let result: DurableTaskResult = serde::Deserialize::deserialize(&value)
+                    .map_err(|_| "child result is not a Tool outcome")?;
                 Some(match result {
                     DurableTaskResult::Rich { task_content_v1 } => {
                         validate_content_result(&task_content_v1)?;

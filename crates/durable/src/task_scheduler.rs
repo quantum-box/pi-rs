@@ -21347,7 +21347,15 @@ mod tests {
                 assert!(std::time::Instant::now() < until);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            assert!(gate.try_start().is_some(), "commit retained its gate");
+            // A reader may observe the SQLite commit before the driver's
+            // settlement scope drops the start gate.
+            while gate.try_start().is_none() {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "commit retained its gate"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             driver.shutdown().unwrap();
         }
     }
