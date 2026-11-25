@@ -475,7 +475,7 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
             max_turns: 4,
             uncertain_policy: UncertainPolicy::RequireReconciliation,
         };
-        let mut scheduler = Scheduler::open(&path, options).unwrap();
+        let mut scheduler = Scheduler::open(&path, options.clone()).unwrap();
         let driver = scheduler.start_tasks(registry).unwrap();
         let id = scheduler
             .create_conversation(Config {
@@ -501,6 +501,11 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
         assert_eq!(
             driver.checkpointable_tool_progress(task).unwrap(),
             Some(first)
+        );
+        assert!(
+            scheduler
+                .prune_finished_checkpointable_progress(task, NonZeroUsize::MIN)
+                .is_err()
         );
         if mode == "abort" {
             tokio::time::timeout(Duration::from_secs(15), scheduler.abort_and_wait(id))
@@ -607,9 +612,33 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
                 .tool_progress
                 .is_none()
         );
+        let published = scheduler.conversation(id).unwrap().messages;
+        let fork = (mode == "bounded").then(|| {
+            let id = scheduler.fork(id).unwrap();
+            (id, scheduler.conversation(id).unwrap().messages)
+        });
+        let mut deleted = 0;
+        loop {
+            let count = scheduler
+                .prune_finished_checkpointable_progress(task, NonZeroUsize::MIN)
+                .unwrap();
+            if count == 0 {
+                break;
+            }
+            assert_eq!(count, 1);
+            deleted += count;
+        }
+        assert_eq!(deleted, if mode == "wake" { 2 } else { 1 });
+        assert_eq!(scheduler.conversation(id).unwrap().messages, published);
         watch.close();
         driver.shutdown().unwrap();
         scheduler.shutdown().await.unwrap();
+        if let Some((child, history)) = fork {
+            let reopened = Scheduler::open(&path, options).unwrap();
+            assert_eq!(reopened.conversation(child).unwrap().messages, history);
+            assert_eq!(reopened.conversation(id).unwrap().messages, published);
+            reopened.shutdown().await.unwrap();
+        }
     }
 }
 

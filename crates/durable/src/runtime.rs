@@ -13999,6 +13999,58 @@ impl Harness {
         }
     }
 
+    /// Reclaim at most `limit` attempt-local progress snapshots for a settled
+    /// task. The caller chooses which terminal tasks to retain for inspection.
+    /// Repeat while a full batch is returned. Published transcript, results,
+    /// progress history, and fork records are outside this collection.
+    pub fn prune_finished_checkpointable_progress(
+        &self,
+        task: Uuid,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<usize, Error> {
+        let store = self.owner.store();
+        let stored = crate::task_store::TaskStore::new(store)
+            .load(task)
+            .map_err(crate::task_scheduler::Error::from)?
+            .ok_or_else(|| Error::Invalid("task not found".into()))?;
+        if !stored.task.is_task_tool() || !stored.task.is_terminal() {
+            return Err(Error::Invalid(
+                "progress cleanup requires a terminal task tool".into(),
+            ));
+        }
+        let prefix = crate::async_task_tool::durable_progress_prefix(task);
+        let rows = store.prefix_page_bounded(
+            prefix.as_bytes(),
+            prefix.as_bytes(),
+            limit.get(),
+            prefix.len() + 36,
+            crate::async_task_tool::MAX_CHECKPOINTABLE_PROGRESS_BYTES,
+        )?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let count = rows.len();
+        let mut checks = vec![Check {
+            key: crate::task_store::key(task),
+            expected: Expected::Version(stored.version),
+        }];
+        let mut mutations = Vec::with_capacity(count);
+        for (key, entry) in rows {
+            std::str::from_utf8(&key[prefix.len()..])
+                .ok()
+                .and_then(|suffix| Uuid::parse_str(suffix).ok())
+                .filter(|id| crate::async_task_tool::durable_progress_key(task, *id) == key)
+                .ok_or_else(|| Error::Invalid("invalid checkpointable progress key".into()))?;
+            checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            });
+            mutations.push(Mutation::Delete { key });
+        }
+        store.commit(&checks, &mutations)?;
+        Ok(count)
+    }
+
     /// Capture an explicit forward-only boundary. Earlier overwritten progress
     /// cannot be reconstructed, even when this cursor's position is zero.
     pub fn progress_history_from_now(
@@ -23840,6 +23892,13 @@ impl Scheduler {
         self.harness
             .watch_unified_history(cursor, limit, interval)
             .await
+    pub fn prune_finished_checkpointable_progress(
+        &self,
+        task: Uuid,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<usize, Error> {
+        self.harness
+            .prune_finished_checkpointable_progress(task, limit)
     }
     pub fn progress_history_from_now(
         &self,

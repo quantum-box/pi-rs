@@ -859,8 +859,14 @@ pub struct DurableToolProgress {
     pub dropped_lines: u64,
 }
 
+pub(crate) const MAX_CHECKPOINTABLE_PROGRESS_BYTES: usize = 32 * 1024;
+
+pub(crate) fn durable_progress_prefix(task: uuid::Uuid) -> String {
+    format!("durable/checkpointable-progress/{task}/")
+}
+
 pub(crate) fn durable_progress_key(task: uuid::Uuid, attempt: uuid::Uuid) -> Vec<u8> {
-    format!("durable/checkpointable-progress/{task}/{attempt}").into_bytes()
+    format!("{}{attempt}", durable_progress_prefix(task)).into_bytes()
 }
 
 pub(crate) use replay_safe::live_checkpointable_progress;

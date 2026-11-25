@@ -813,10 +813,8 @@ fn validate_content_result(result: &crate::extension::ToolBlockResult) -> Result
     validate_content_result_with_limit(result, 60 * 1024)
 }
 
-const MAX_PROGRESS_BYTES: usize = 32 * 1024;
-
 fn validate_durable_progress(progress: &DurableToolProgress, size: usize) -> Result<(), String> {
-    if size > MAX_PROGRESS_BYTES {
+    if size > super::MAX_CHECKPOINTABLE_PROGRESS_BYTES {
         return Err("checkpointable progress exceeds 32 KiB".into());
     }
     // Leave room for the required interruption and truncation diagnostics.
@@ -833,7 +831,7 @@ fn validate_durable_progress(progress: &DurableToolProgress, size: usize) -> Res
 }
 
 fn decode_durable_progress(value: &[u8]) -> Result<DurableToolProgress, String> {
-    if value.len() > MAX_PROGRESS_BYTES {
+    if value.len() > super::MAX_CHECKPOINTABLE_PROGRESS_BYTES {
         return Err("stored checkpointable progress exceeds 32 KiB".into());
     }
     let progress = serde_json::from_slice(value).map_err(|error| error.to_string())?;
