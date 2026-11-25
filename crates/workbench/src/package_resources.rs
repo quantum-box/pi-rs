@@ -29,6 +29,8 @@ impl PackageResourcePaths {
     /// manifest precedence. Reads are synchronous. Grants follow symlinks in
     /// exact paths, including the roots and manifests. Recursive scans skip
     /// hidden entries, dependency/build directories, and symlinked directories.
+    /// A scan can discover a file symlink whose target is outside the package.
+    /// File reads through the resulting paths follow those links.
     /// This operation performs filesystem discovery only.
     pub fn discover(directories: &[PathBuf]) -> Result<Self> {
         if directories.len() > MAX_PATHS {
@@ -168,14 +170,17 @@ fn discover_kind(
         match prefix {
             b'+' => force_includes.push(root.join(path)),
             b'-' => force_excludes.push(root.join(path)),
-            b'!' => excludes.push(compile_glob(&value)?),
+            b'!' => {
+                let matcher = compile_glob(&value)?;
+                excludes.push((value, matcher));
+            }
             _ if value.contains(['*', '?', '[', '{']) => includes.push(compile_glob(&value)?),
             _ => sources.push(root.join(path)),
         }
     }
 
     let mut candidates = Vec::new();
-    if !includes.is_empty() || sources.is_empty() && force_includes.is_empty() {
+    if !includes.is_empty() || sources.is_empty() {
         scan(root, kind, examined, |path| {
             let relative = path
                 .strip_prefix(root)
@@ -203,7 +208,12 @@ fn discover_kind(
         let relative = path
             .strip_prefix(root)
             .expect("package path is root-relative");
-        !excludes.iter().any(|glob| glob.is_match(relative))
+        !excludes.iter().any(|(pattern, glob)| {
+            glob.is_match(relative)
+                || path.file_name().is_some_and(|name| glob.is_match(name))
+                || (!pattern.contains(['*', '?', '[', '{'])
+                    && relative.starts_with(pattern.trim_start_matches("./")))
+        })
     });
     for path in force_includes {
         if metadata(&path)?.is_some_and(|metadata| kind.accepts(&path, &metadata)) {

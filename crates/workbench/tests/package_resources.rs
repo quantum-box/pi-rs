@@ -72,6 +72,33 @@ fn snapshots_merge_grants_and_honor_native_manifest_filters() {
 }
 
 #[test]
+fn override_only_lists_keep_default_candidates_and_exclude_basenames_and_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let manifest = write(root, "pi-package.json", "{}");
+    let kept = write(root, "prompts/kept.md", "kept");
+    let excluded = write(root, "prompts/nested/draft.md", "excluded by basename");
+    let other = write(root, "prompts/nested/other.md", "excluded by directory");
+    let rescued = write(root, ".saved/rescued.md", "forced");
+    let discover = |patterns: &[&str]| {
+        fs::write(&manifest, json!({"pi": {"prompts": patterns}}).to_string()).unwrap();
+        PackageResourcePaths::discover(&[root.to_owned()])
+            .unwrap()
+            .prompts
+    };
+
+    assert_eq!(
+        discover(&["+.saved/rescued.md"]),
+        [rescued.clone(), kept.clone(), excluded, other.clone()]
+    );
+    assert_eq!(discover(&["prompts", "!draft.md"]), [kept.clone(), other]);
+    assert_eq!(
+        discover(&["!prompts/nested", "+.saved/rescued.md"]),
+        [rescued, kept]
+    );
+}
+
+#[test]
 fn validates_package_grants_and_manifest_paths() {
     let temp = tempfile::tempdir().unwrap();
     let package = temp.path().join("package");

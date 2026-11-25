@@ -7299,13 +7299,17 @@ load individual resource kinds. Discovery shares the native CLI's manifest
 precedence of `pi-package.json`, Cargo metadata and Pi `package.json`. Explicit
 Pi `package.json` resource lists contribute themes only, as in the native CLI.
 Without an explicit resource list, discovery uses the conventional resource
-directories. The SDK supports package-relative paths and globs, `!` glob
-exclusions and exact `+` and `-` file overrides. A package is evaluated in
+directories. The SDK supports package-relative paths and globs. `!` exclusions
+can match a basename or a literal directory subtree. Lists with only `!`,
+`+` or `-` overrides first gather the package's eligible resources. The
+`+` and `-` overrides apply to exact files. A package is evaluated in
 grant order, with paths sorted within each resource kind. Recursive scans
 have entry and depth limits and skip hidden entries, linked directories,
 `target` and `node_modules`. Exact manifest paths can include hidden entries
-and follow symlinks, as can granted package roots. SDK package scans use the
-manifest patterns for filtering. Pi also applies its local ignore rules.
+and follow symlinks, as can granted package roots. Scans can also discover
+file symlinks, so grants allow reading those targets even outside the directory.
+SDK package scans use the manifest patterns for filtering. Pi also applies
+its local ignore rules.
 
 Package discovery reads manifests and file metadata. Extensions appear as
 candidate paths, and the host authorizes each executable separately with
