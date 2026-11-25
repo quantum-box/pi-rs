@@ -490,9 +490,10 @@ A replay-unsafe conversation checkpointable parent can also start a registered
 checkpointable child immediately. A live parent lease authorizes only the
 explicitly admitted child tree until the parent parks or settles. After a
 process loss, children of the interrupted parent cannot resume under that
-lease, even if the children themselves are replay-safe. Standalone immediate
-checkpointable admission still requires replay-safe tools. An interrupted
-unsafe parent without a receipt remains subject to reconciliation.
+lease, even if the children themselves are replay-safe. Standalone
+checkpointable tools use the same lease check and require standalone
+registrations for both tools. An interrupted unsafe parent without a receipt
+remains subject to reconciliation.
 
 A top-level opt-in [`TaskTool`](../crates/durable/src/task_tool.rs) maps a tool call to a conversation-owned generic task. The operation ID is its task ID. The runtime validates the handler against the attached driver and commits the task and a task-backed pending phase together; polling reads the durable terminal task state, including after reopen. A missing driver or registration fails before admission; an interrupted marker invocation is replay-safe because it performs no task effects. Conversation abort marks the owned task and waits for its cleanup before settling the pending tool. A synchronous handler must return before its abort handler can run. Install the same task definition when reopening; to attach the driver before resuming interrupted marker dispatch, use `Harness::open_paused`. Task output is the task's JSON result (a JSON string becomes text). Because generic task failures do not distinguish a reported error from uncertain effects, any failed task blocks the conversation for reconciliation. This is a single top-level task-backed tool, not upstream nested `wait: false`: nested dispatch, tool checkpoints, parallel child handles and a wake payload are not supplied by this adapter. The adapter fails closed outside its registered top-level runtime dispatch.
 

@@ -8655,8 +8655,6 @@ impl AdmissionHandle<'_> {
                         .checkpointable_conversation_checks(&parent.task, registry)
                         .map_err(|error| Error::Handler(error.to_string()))?;
                 } else if !self.standalone
-                    || !parent.task.replay_safe()
-                    || !tool_identity.replay_safe
                     || ![parent_kind, tool_identity.kind.as_str()]
                         .into_iter()
                         .all(|kind| {
