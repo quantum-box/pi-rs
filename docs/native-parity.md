@@ -6965,6 +6965,15 @@ Tree search also matches the first 200 UTF-16 units of tool-result text.
 Focused selector tests cover linear chains, branches, hidden records, search,
 and fold/unfold behavior. Other tree layout and navigation differences remain.
 
+### Shell output without a retained file
+
+A truncated user shell result shows `Output truncated` in terminal history and
+in the model context when no full output path is available. Stored paths still
+appear in the notice, and shell output marked excluded stays outside model
+context. This matches
+[Pi's default shell truncation notice](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/messages.ts#L94-L107).
+Pi's distinct `fullOutputError` detail remains outside this checkpoint.
+
 ### Sparse custom-message import checkpoint
 
 Pi custom-message entries with missing or null content now import as empty

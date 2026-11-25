@@ -58,13 +58,11 @@ fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
         }
         output.push_str(&status);
     }
-    if execution.truncated
-        && let Some(path) = &execution.full_output_path
-    {
+    if let Some(note) = execution.truncation_note() {
         if !output.is_empty() && !output.ends_with('\n') {
             output.push('\n');
         }
-        output.push_str(&format!("Output truncated. Full output: {path}"));
+        output.push_str(&note);
     }
     output
 }
@@ -13792,6 +13790,13 @@ exit {exit}
         view.receive(&json!({"type":"bash_execution_end","executionId":"failed","data":{"command":"false","output":"bad","exitCode":1,"cancelled":false,"truncated":false}}));
         assert!(
             matches!(view.lines.last(), Some(Entry::Tool { output, failed: true, finished: true, .. }) if output == "bad\n(exit 1)")
+        );
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"truncated","command":"echo long"}),
+        );
+        view.receive(&json!({"type":"bash_execution_end","executionId":"truncated","data":{"command":"echo long","output":"tail","exitCode":0,"cancelled":false,"truncated":true}}));
+        assert!(
+            matches!(view.lines.last(), Some(Entry::Tool { output, failed: false, finished: true, .. }) if output == "tail\nOutput truncated")
         );
     }
 
