@@ -9624,7 +9624,7 @@ pub mod hook_fence_test_hook {
             .unwrap()
             .insert((task, phase), Box::new(hook));
     }
-    pub(super) fn run(task: Uuid, phase: &'static str) {
+    pub(crate) fn run(task: Uuid, phase: &'static str) {
         let hook = HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
