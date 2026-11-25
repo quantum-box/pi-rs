@@ -3,7 +3,7 @@
 //! Changes are provisional until the enclosing `Harness::session_transaction`
 //! commits. The callback is never replayed after a conflict.
 use crate::{
-    document::{Address, Documents, Error},
+    document::{Address, Documents, Error, ForkPolicy},
     runtime::{ApplicationWrite, Conversation, Submission},
     task_store::OwnedBatch,
 };
@@ -65,6 +65,8 @@ pub struct SessionTransaction<'a> {
     reads: HashMap<Address, Option<Map<String, Value>>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
     drafts: HashSet<Address>,
+    policy_reads: HashSet<Address>,
+    policies: HashMap<Address, ForkPolicy>,
     task_reads: HashMap<Uuid, (Expected, Option<crate::task_store::StoredTask>)>,
     tasks: Vec<crate::task::Task>,
     signals: crate::document::HostTransaction<'a>,
@@ -95,6 +97,8 @@ impl<'a> SessionTransaction<'a> {
             reads: HashMap::new(),
             writes: HashMap::new(),
             drafts: HashSet::new(),
+            policy_reads: HashSet::new(),
+            policies: HashMap::new(),
             task_reads: HashMap::new(),
             tasks: Vec::new(),
             signals: crate::document::HostTransaction::new(store),
@@ -282,6 +286,35 @@ impl<'a> SessionTransaction<'a> {
         self.document(address)?;
         self.drafts.remove(address);
         self.writes.insert(address.clone(), None);
+        Ok(())
+    }
+
+    /// Read the fork policy at the transaction's snapshot or its staged replacement.
+    /// An address without an explicit policy uses `ForkPolicy::Copy`.
+    pub fn document_fork_policy(&mut self, address: &Address) -> Result<ForkPolicy, Error> {
+        if let Some(policy) = self.policies.get(address) {
+            return Ok(policy.clone());
+        }
+        let policy = match self
+            .store
+            .document_at(&address.policy_key()?, self.revision)?
+        {
+            Some(entry) => serde_json::from_slice(&entry.value)?,
+            None => ForkPolicy::Copy,
+        };
+        self.policy_reads.insert(address.clone());
+        Ok(policy)
+    }
+
+    /// Stage the address's policy with the same commit as its draft or other
+    /// session changes. The policy can be set before the document exists.
+    pub fn set_document_fork_policy(
+        &mut self,
+        address: &Address,
+        policy: ForkPolicy,
+    ) -> Result<(), Error> {
+        self.document_fork_policy(address)?;
+        self.policies.insert(address.clone(), policy);
         Ok(())
     }
 
@@ -637,7 +670,7 @@ impl<'a> SessionTransaction<'a> {
                 ));
             }
         }
-        let changed = self.table_written || !self.writes.is_empty();
+        let changed = self.table_written || !self.writes.is_empty() || !self.policies.is_empty();
         let mut batch = OwnedBatch {
             checks: Vec::new(),
             mutations: Vec::new(),
@@ -685,6 +718,19 @@ impl<'a> SessionTransaction<'a> {
                         value: serde_json::to_vec(value)?,
                     },
                     None => Mutation::Delete { key },
+                });
+            }
+        }
+        for address in self.policy_reads {
+            let key = address.policy_key()?;
+            batch.checks.push(Check {
+                key: key.clone(),
+                expected: Expected::DocumentUnchangedSince(self.revision),
+            });
+            if let Some(policy) = self.policies.get(&address) {
+                batch.mutations.push(Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(policy)?,
                 });
             }
         }

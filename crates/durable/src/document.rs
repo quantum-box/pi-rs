@@ -67,7 +67,7 @@ impl Address {
         result.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
         Ok(result)
     }
-    fn policy_key(&self) -> Result<Vec<u8>, Error> {
+    pub(crate) fn policy_key(&self) -> Result<Vec<u8>, Error> {
         let mut key = POLICY_PREFIX.to_vec();
         key.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
         Ok(key)

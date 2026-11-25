@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use durable_store::{Check, Expected, Mutation, Store};
 use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
 use pi_rs_durable::{
-    document::{Address, Documents, Error as DocumentError, Transaction},
+    document::{Address, Documents, Error as DocumentError, ForkPolicy, Transaction},
     recovery::UncertainPolicy,
     runtime::{Config, Error, Harness, Options},
 };
@@ -62,6 +62,9 @@ fn mutable_drafts_share_staged_edits_and_commit_with_entries() {
             assert_eq!(draft["n"], 1);
             draft.insert("n".into(), json!(2));
             assert_eq!(tx.document(&address)?.unwrap()["n"], 2);
+            assert_eq!(tx.document_fork_policy(&address)?, ForkPolicy::Copy);
+            tx.set_document_fork_policy(&address, ForkPolicy::Current)?;
+            assert_eq!(tx.document_fork_policy(&address)?, ForkPolicy::Current);
             Ok(entry)
         })
         .unwrap();
@@ -69,6 +72,14 @@ fn mutable_drafts_share_staged_edits_and_commit_with_entries() {
     let committed = Documents::new(&store).get(&address).unwrap().unwrap();
     assert_eq!(committed.value["n"], 2);
     assert_eq!(committed.value["first"], true);
+    assert_eq!(
+        Documents::new(&store)
+            .fork_policy(&address)
+            .unwrap()
+            .unwrap()
+            .policy,
+        ForkPolicy::Current
+    );
     assert_eq!(
         h.conversation(conversation).unwrap().application_writes[0].id,
         entry
@@ -236,6 +247,41 @@ fn document_conflict_rolls_back_entry_without_replaying_callback() {
             .value,
         object(9)
     );
+}
+
+#[test]
+fn document_policy_conflict_rolls_back_entry_and_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    let store = Store::open(path).unwrap();
+    let address = address();
+    let result = h.session_transaction(id, |tx| {
+        tx.set_document_fork_policy(&address, ForkPolicy::Current)?;
+        tx.document_draft(&address, object(1))?;
+        tx.append_entry("note", None)?;
+        let mut concurrent = Transaction::new();
+        concurrent.set_fork_policy(
+            &address,
+            Expected::Missing,
+            &ForkPolicy::Initial { value: object(9) },
+        )?;
+        concurrent.commit(&store)?;
+        assert_eq!(tx.document_fork_policy(&address)?, ForkPolicy::Current);
+        Ok(())
+    });
+    assert!(matches!(
+        result,
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    let documents = Documents::new(&store);
+    assert!(documents.get(&address).unwrap().is_none());
+    assert_eq!(
+        documents.fork_policy(&address).unwrap().unwrap().policy,
+        ForkPolicy::Initial { value: object(9) }
+    );
+    assert!(h.conversation(id).unwrap().application_writes.is_empty());
 }
 
 #[test]

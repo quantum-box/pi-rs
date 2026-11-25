@@ -2721,7 +2721,9 @@ impl Store {
                     version == Some(v) && Instant::now() < deadline
                 }
                 Expected::DocumentUnchangedSince(revision) => {
-                    if !check.key.starts_with(b"durable/document/") {
+                    if !check.key.starts_with(b"durable/document/")
+                        && !check.key.starts_with(b"durable/document-policy/")
+                    {
                         return Err(Error::InvalidSnapshot);
                     }
                     let current: u64 = tx.query_row(
