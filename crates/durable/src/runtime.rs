@@ -9718,8 +9718,9 @@ impl Harness {
                     .filter(|w| w.placed && !w.withdrawn)
                     .cloned()
                     .collect();
-                if prior.is_none() && !placed.is_empty() {
-                    // A copied prefix has no authenticated display-entry lineage.
+                if prior.is_none() && writes.iter().any(|write| write.id == entry_id) {
+                    // A copied prefix is evidence of the local baseline, not
+                    // of the original placement of any entry inside that prefix.
                     return Err(crate::fork::Error::InvalidSnapshot.into());
                 }
                 snapshot
