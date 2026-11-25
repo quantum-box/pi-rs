@@ -832,6 +832,84 @@ fn validate_durable_progress(progress: &DurableToolProgress, size: usize) -> Res
     Ok(())
 }
 
+fn decode_durable_progress(value: &[u8]) -> Result<DurableToolProgress, String> {
+    if value.len() > MAX_PROGRESS_BYTES {
+        return Err("stored checkpointable progress exceeds 32 KiB".into());
+    }
+    let progress = serde_json::from_slice(value).map_err(|error| error.to_string())?;
+    validate_durable_progress(&progress, value.len())?;
+    Ok(progress)
+}
+
+pub(crate) fn live_checkpointable_progress(
+    store: &durable_store::Store,
+    task: uuid::Uuid,
+) -> Result<Option<DurableToolProgress>, String> {
+    let tasks = crate::task_store::TaskStore::new(store);
+    loop {
+        let Some(current) = tasks.load(task).map_err(|error| error.to_string())? else {
+            return Ok(None);
+        };
+        if current.task.state() != &crate::task::TaskState::Running
+            || current.task.abort_requested()
+            || !current.task.is_task_tool()
+        {
+            return Ok(None);
+        }
+        let Some(attempt) = current.task.attempt_id() else {
+            return Ok(None);
+        };
+        let entry = store
+            .get(&super::durable_progress_key(task, attempt))
+            .map_err(|error| error.to_string())?;
+        if tasks
+            .load(task)
+            .map_err(|error| error.to_string())?
+            .is_some_and(|latest| latest.version == current.version)
+        {
+            return entry
+                .map(|entry| decode_durable_progress(&entry.value))
+                .transpose();
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ReportedProgress {
+    replacement: DurableToolProgress,
+    output: Option<crate::output::OutputBuffer>,
+}
+
+impl ReportedProgress {
+    fn append(&mut self, chunk: &str) {
+        let output = self.output.get_or_insert_with(|| {
+            let mut output = crate::output::OutputBuffer::new(crate::output::OutputLimits {
+                max_bytes: 4 * 1024,
+                max_lines: 2_000,
+                retain: crate::output::Retain::Head,
+            });
+            output.push_str(&self.replacement.text);
+            output
+        });
+        output.push_str(chunk);
+    }
+
+    fn snapshot(&mut self) -> DurableToolProgress {
+        let mut result = self.replacement.clone();
+        if let Some(output) = &mut self.output {
+            let window = output.snapshot();
+            result.text = window.text;
+            result.dropped_bytes = result
+                .dropped_bytes
+                .saturating_add(window.dropped_bytes as u64);
+            result.dropped_lines = result
+                .dropped_lines
+                .saturating_add(window.dropped_lines as u64);
+        }
+        result
+    }
+}
+
 fn cancelled_tool_content(
     task: &Task,
     admission: &AdmissionHandle<'_>,
@@ -857,12 +935,7 @@ fn cancelled_tool_content(
         .flatten()
     {
         if let Some(entry) = admission.read_checkpointable_progress(attempt)? {
-            if entry.value.len() > MAX_PROGRESS_BYTES {
-                return Err("stored checkpointable progress exceeds 32 KiB".into());
-            }
-            let snapshot = serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
-            validate_durable_progress(&snapshot, entry.value.len())?;
-            progress = Some(snapshot);
+            progress = Some(decode_durable_progress(&entry.value)?);
             break;
         }
     }
@@ -1056,21 +1129,52 @@ struct Host<'a, 'b> {
     started: Mutex<HashSet<uuid::Uuid>>,
     cancellation: &'a pi_rs_core::CancellationToken,
     admission: &'a AdmissionHandle<'a>,
-    reports_for_cancel: bool,
+    progress: Mutex<ReportedProgress>,
+}
+
+impl Host<'_, '_> {
+    fn commit_progress(&self, progress: &DurableToolProgress) -> Result<(), String> {
+        let encoded = serde_json::to_vec(progress).map_err(|error| error.to_string())?;
+        validate_durable_progress(progress, encoded.len())?;
+        self.admission
+            .report_checkpointable_progress(self.cancellation, encoded)
+    }
 }
 
 #[async_trait::async_trait]
 impl DurableTaskHost for Host<'_, '_> {
     async fn report_progress(&self, progress: DurableToolProgress) -> Result<(), String> {
-        if !self.reports_for_cancel {
-            return Err(
-                "checkpointable progress requires selected conversation cancellation".into(),
-            );
-        }
-        let encoded = serde_json::to_vec(&progress).map_err(|e| e.to_string())?;
-        validate_durable_progress(&progress, encoded.len())?;
-        self.admission
-            .report_checkpointable_progress(self.cancellation, encoded)
+        let mut current = self.progress.lock().map_err(|error| error.to_string())?;
+        self.commit_progress(&progress)?;
+        *current = ReportedProgress {
+            replacement: progress,
+            output: None,
+        };
+        Ok(())
+    }
+
+    async fn append_output(&self, chunk: &str) -> Result<(), String> {
+        let mut current = self.progress.lock().map_err(|error| error.to_string())?;
+        let mut next = current.clone();
+        next.append(chunk);
+        self.commit_progress(&next.snapshot())?;
+        *current = next;
+        Ok(())
+    }
+
+    async fn complete_from_progress(&self) -> Result<DurableToolStep, String> {
+        let progress = self
+            .progress
+            .lock()
+            .map_err(|error| error.to_string())?
+            .snapshot();
+        Ok(DurableToolStep::Complete(match progress.details {
+            Some(details) => Outcome::SucceededWithDetails {
+                output: progress.text,
+                details,
+            },
+            None => Outcome::Succeeded(progress.text),
+        }))
     }
 
     async fn start_child(
@@ -3386,7 +3490,7 @@ impl Handler for Executor {
             started: Mutex::new(HashSet::new()),
             cancellation,
             admission,
-            reports_for_cancel: self.block_results && self.conversation_cancel_dispatch_enabled(),
+            progress: Mutex::new(ReportedProgress::default()),
         };
         let (result, args, no_dispatch) = runtime.block_on(async {
             let args = match saved_args {

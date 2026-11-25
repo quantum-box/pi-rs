@@ -8017,15 +8017,19 @@ impl AdmissionHandle<'_> {
             key: crate::async_task_tool::durable_progress_key(task.id(), attempt),
             value,
         };
-        self.replay_safe_durable_fence(
-            false,
-            task.replay_safe(),
-            Some(cancellation),
-            CheckpointableFence::Progress,
-            (&[], std::slice::from_ref(&mutation)),
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        for _ in 0..8 {
+            match self.replay_safe_durable_fence(
+                false,
+                task.replay_safe(),
+                Some(cancellation),
+                CheckpointableFence::Progress,
+                (&[], std::slice::from_ref(&mutation)),
+            ) {
+                Err(HookFenceError::Conflict) => continue,
+                result => return result.map(|_| ()).map_err(|error| error.to_string()),
+            }
+        }
+        Err("checkpointable progress conflicted with concurrent changes".into())
     }
 
     pub(crate) fn read_checkpointable_progress(

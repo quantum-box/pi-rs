@@ -749,6 +749,18 @@ impl Driver {
             .map_err(task_scheduler::Error::from)?
             .map(|snapshot| snapshot.task))
     }
+
+    /// Poll the current checkpointable execution attempt's committed output.
+    /// This also supports nested tasks. Waiting, aborted, and finished
+    /// attempts have no live output.
+    pub fn checkpointable_tool_progress(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::async_task_tool::DurableToolProgress>, Error> {
+        crate::async_task_tool::live_checkpointable_progress(self.shared.owner.store(), id)
+            .map_err(task_scheduler::Error::Handler)
+            .map_err(Error::from)
+    }
     /// Wait for a persisted terminal task. Cancelling or dropping this future
     /// stops only the wait, not the task. The driver must remain running.
     /// Live records are polled at most every 100 ms, including after reopen.

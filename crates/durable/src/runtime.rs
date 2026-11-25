@@ -10340,11 +10340,34 @@ impl Harness {
                 .map(|request| crate::progress::Snapshot::load(store, request))
                 .transpose()?
                 .and_then(|snapshot| snapshot.is_persisted().then(|| snapshot.state().clone()));
-            let tool_progress = state
-                .tool_attempt()
-                .map(|attempt| crate::tool_progress::Snapshot::load(store, attempt.attempt_id))
-                .transpose()?
-                .and_then(|snapshot| snapshot.is_persisted().then(|| snapshot.state().clone()));
+            let tool_progress = if let Phase::TaskPending { task, .. } = &state.phase
+                && let Some(attempt) = state.tool_attempt()
+                && attempt.operation_id == *task
+                && !state.abort_requested
+                && let Some(binding) = store.get(&checkpointable_root_binding_key(*task))?
+            {
+                let binding: CheckpointableRootBinding = serde_json::from_slice(&binding.value)?;
+                if binding.version != 1
+                    || binding.conversation != id
+                    || binding.task != *task
+                    || binding.tool_attempt != attempt
+                {
+                    return Err(Error::Invalid(
+                        "checkpointable progress binding changed".into(),
+                    ));
+                }
+                crate::async_task_tool::live_checkpointable_progress(store, *task)
+                    .map_err(Error::Invalid)?
+                    .map(serde_json::to_value)
+                    .transpose()?
+                    .map(|progress| crate::tool_progress::State::Running(Some(progress)))
+            } else {
+                state
+                    .tool_attempt()
+                    .map(|attempt| crate::tool_progress::Snapshot::load(store, attempt.attempt_id))
+                    .transpose()?
+                    .and_then(|snapshot| snapshot.is_persisted().then(|| snapshot.state().clone()))
+            };
             if store
                 .get(&Self::key(id))?
                 .is_some_and(|current| current.version == entry.version)

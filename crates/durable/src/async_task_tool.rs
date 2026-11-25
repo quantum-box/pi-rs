@@ -848,7 +848,7 @@ pub struct DurableToolResume {
 
 /// Replacement snapshot of the text and metadata a checkpointable tool has
 /// reported. These bytes are supplemental output, never an execution receipt.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableToolProgress {
     pub text: String,
@@ -863,15 +863,29 @@ pub(crate) fn durable_progress_key(task: uuid::Uuid, attempt: uuid::Uuid) -> Vec
     format!("durable/checkpointable-progress/{task}/{attempt}").into_bytes()
 }
 
+pub(crate) use replay_safe::live_checkpointable_progress;
+
 /// Task-owned nested admission and result access. Implementations must fence
 /// every operation against the current parent reservation and abort state.
 #[async_trait::async_trait]
 pub trait DurableTaskHost: Send + Sync {
-    /// Save a replacement for this execution attempt. Available to selected
-    /// conversation tools with cancellation enabled. The snapshot is limited
-    /// to 32 KiB encoded and 30 diagnostics. A resumed tool may replace it; if
-    /// it has not reported, cancellation can use the last committed park.
+    /// Save a replacement for this execution attempt. The snapshot is limited
+    /// to 32 KiB encoded and 30 diagnostics. An eligible cancellation can use
+    /// the last committed park when a resumed attempt has not reported.
     async fn report_progress(&self, _progress: DurableToolProgress) -> Result<(), String> {
+        Err("checkpointable tool progress is unavailable".into())
+    }
+
+    /// Append a text chunk and commit the current bounded output for observers.
+    /// Each execution attempt starts a new stream. The head is retained, up to
+    /// 4 KiB and 2,000 lines. The complete snapshot must fit the reporting limit.
+    async fn append_output(&self, _chunk: &str) -> Result<(), String> {
+        Err("checkpointable tool progress is unavailable".into())
+    }
+
+    /// Finish successfully with this attempt's committed text and details.
+    /// Use `Complete` to return explicit final output, including empty text.
+    async fn complete_from_progress(&self) -> Result<DurableToolStep, String> {
         Err("checkpointable tool progress is unavailable".into())
     }
 
