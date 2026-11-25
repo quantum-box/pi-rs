@@ -1605,6 +1605,22 @@ The SDK defaults to SSE and uses a host-supplied OAuth access token on the
 exact `openai-codex` route. The typed client lets hosts select another Codex
 transport. ChatGPT plan clients use the separate `openai-responses` API.
 
+The native SDK supports `NativeModelApi::PiMessages` and `api: "pi-messages"`
+model declarations, including a host-authorized `radius` route. The SDK grant
+contains the complete Messages request URL, which upstream derives by
+appending `/messages` to the model base URL. The model file's declared base URL
+selects the grant. Both host credential kinds and explicitly granted file keys
+use the bearer scheme. SDK clients share the CLI's transcript encoding,
+SSE decoding and endpoint-scoped replay. SDK construction and preparation are
+offline and do not use the CLI's on-disk context fingerprint key. Inference
+uses the granted endpoint directly with redirects and
+implicit proxies disabled. The host supplies any refreshed credential and
+catalog metadata. Radius account discovery, OAuth refresh and environment
+defaults belong to the CLI. Loopback coverage exercises both credential
+kinds, ambient configuration isolation and redirect rejection.
+[Pinned Pi Messages API](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/ai/src/api/pi-messages.ts)
+[Pinned Radius provider](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/ai/src/providers/radius.ts)
+
 Hosts may resolve saved key variables with
 `AuthFileReadGrants::load_with_variables`. The resolver receives the exact
 route and variable name after checking saved inline values, and the loader
