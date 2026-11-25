@@ -46,6 +46,16 @@ impl ResourceFactory {
     /// A read or validation error returns no snapshot. Skill diagnostics are
     /// retained by the skill loader.
     pub fn load(&self, grants: &ResourceReadGrants) -> Result<ResourceSnapshot> {
+        self.load_with_theme_directories(grants, &[])
+    }
+
+    /// Load a combined snapshot, also reading direct `.json` files from the
+    /// explicitly granted theme directories. See [`ThemeReadGrants::load_with_directories`].
+    pub fn load_with_theme_directories(
+        &self,
+        grants: &ResourceReadGrants,
+        theme_directories: &[PathBuf],
+    ) -> Result<ResourceSnapshot> {
         if grants.context.directories.len() > 128 || grants.prompt_files.len() > 128 {
             return Err(Error::Config(
                 "too many context directories or prompt files".into(),
@@ -65,6 +75,7 @@ impl ResourceFactory {
             .chain(&grants.templates.files)
             .chain(&grants.template_directories)
             .chain(&grants.themes.files)
+            .chain(theme_directories)
         {
             if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
                 return Err(Error::Config(format!(
@@ -82,7 +93,7 @@ impl ResourceFactory {
             templates: grants
                 .templates
                 .load_with_directories(&grants.template_directories)?,
-            themes: grants.themes.load()?,
+            themes: grants.themes.load_with_directories(theme_directories)?,
         })
     }
 }

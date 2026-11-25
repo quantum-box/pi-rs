@@ -7094,14 +7094,25 @@ so a GUI can report the failure and keep the user's original input.
 `pi_rs_workbench::theme_resources::ThemeReadGrants` loads an ordered snapshot
 from explicitly granted absolute files without parent components. It shares schema validation and color
 resolution with the interactive frontend and exposes each name, source path and
-resolved color roles without selecting a theme or probing the terminal. Reads
-are synchronous, bounded, follow symlinks, and are not a filesystem sandbox.
-A grant includes the symlink target. Reloading creates an independent snapshot.
-Missing, invalid, duplicate-name, oversized or excessive inputs fail atomically;
-variable chains have a depth limit. Unlike Pi's resource loader, this API does
-not discover directories, packages, settings or built-in themes, detect terminal
-capabilities, or return per-file warnings and deduplicate collisions. Hosts choose
-when to apply a snapshot, and revoking a grant does not erase an existing one.
+resolved color roles without selecting a theme or probing the terminal.
+`ThemeReadGrants::load_with_directories` also accepts explicitly granted absolute
+directories without parent components. As in Pi's
+[explicit theme directory loader](https://github.com/earendil-works/pi/blob/c11a73bfba1310dc4075ad836254ea87003f409b/packages/coding-agent/src/core/resource-loader.ts#L1126),
+it reads direct children with a case-sensitive `.json` suffix, including hidden
+files and symlinks to regular files. It skips nested directories, dangling
+links and non-regular entries. The SDK puts exact file grants first, follows
+the host's directory order, and sorts entries within each directory by path.
+This explicit-directory mode is independent of Pi's automatic discovery and
+its ignore rules.
+
+Reads are synchronous and bounded. A grant includes symlink targets and is not
+a filesystem sandbox. A load supports up to 64 directories, 4,096 examined
+directory entries and 64 theme files in total. Missing explicitly granted
+paths, invalid contents, duplicate names and exceeded limits fail atomically.
+The SDK returns an error where Pi can keep valid themes and report
+warnings or collisions. Hosts choose when to apply a snapshot or to rebuild it
+after changing grants. Package discovery, built-in themes, and terminal
+capability detection remain the host's responsibility.
 
 ### Native SDK prompt resource factory
 
@@ -7240,6 +7251,9 @@ paths exposed by the individual loaders, including skill diagnostics, and
 a failed load leaves the previous snapshot and session usable. Grants require
 absolute paths without parent components and include symlink targets. Hosts
 should run the synchronous load off the UI thread.
+`ResourceFactory::load_with_theme_directories` accepts explicit theme directory
+grants for the same snapshot. `ResourceFactory::load` reads themes from exact
+file grants.
 
 `ResourceSnapshot::apply` sets the system prompt on a host-owned
 `SessionBuilder`. With a custom preamble, it follows Pi v1.5.0's order and
