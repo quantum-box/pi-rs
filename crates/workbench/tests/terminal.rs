@@ -825,6 +825,37 @@ fn settings_picker_can_be_operated_with_the_mouse() {
         serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
     assert_eq!(settings["warnings"]["anthropicExtraUsage"], false);
     assert_eq!(settings["compaction"]["enabled"], false);
+
+    master.write_all(b"\x15Notices\r").unwrap();
+    output_until(&mut master, |text| {
+        [
+            "Cache misses",
+            "Cache warming",
+            "Compaction costs",
+            "Reasoning drops",
+        ]
+        .into_iter()
+        .all(|label| settings_row_shows(text, label, "false"))
+    });
+    master.write_all(b" ").unwrap();
+    output_until(&mut master, |text| {
+        settings_row_shows(text, "Cache misses", "true")
+    });
+    master.write_all(b"\x1b[B\x1b[B\x1b[B\r").unwrap();
+    output_until(&mut master, |text| {
+        settings_row_shows(text, "Reasoning drops", "true")
+    });
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| {
+        settings_row_shows(text, "Notices", "configure")
+    });
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        settings["notices"],
+        serde_json::json!({"cacheMisses":true,"reasoningDrops":true})
+    );
+    assert_eq!(settings["warnings"]["anthropicExtraUsage"], false);
 }
 
 #[test]
