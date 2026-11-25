@@ -168,6 +168,9 @@ impl Conversation {
     }
 
     fn submit(&mut self, worker: &mut Companion, view: &mut View, follow_up: bool) -> Result<()> {
+        if view.clipboard.is_some() {
+            return Ok(());
+        }
         let text = view.editor.take();
         if text.trim().is_empty() && view.draft_images.is_empty() {
             return Ok(());
@@ -188,7 +191,7 @@ impl Conversation {
             view.editor.replace(text);
             return Err(error);
         }
-        view.remember_prompt(&text);
+        view.history_index = None;
         view.draft_images.clear();
         self.submissions.insert(id, input);
         Ok(())
@@ -210,6 +213,7 @@ fn append_message(view: &mut View, message: &Value) {
     let text = message_text(message);
     match message["role"].as_str() {
         Some("user") => {
+            view.remember_prompt(&text);
             view.append_entry(Entry::User(text.into()));
             let attachments = message_images(message);
             if !attachments.is_empty() {
@@ -351,7 +355,10 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                         view.editor.text.is_empty() && view.draft_images.is_empty(),
                     )
                     .unwrap_or("");
-                if view.editor.jump_key(action, key) || view.editor.action(action) {
+                if view.editor.jump_key(action, key)
+                    || view.editor.action(action)
+                    || view.editor_vertical_action(action)
+                {
                     continue;
                 }
                 match action {
@@ -457,6 +464,19 @@ mod tests {
             }),
         );
         assert!(matches!(&view.lines[..], [Entry::User(_)]));
+        view.editor_width = 80;
+        assert!(view.editor_vertical_action("tui.editor.cursorUp"));
+        assert_eq!(view.editor.text, "first");
+        assert!(view.editor_vertical_action("tui.editor.cursorDown"));
+        assert!(view.editor.text.is_empty());
+
+        view.editor.replace("first line\nsecond line".into());
+        let last_row_cursor = view.editor.cursor;
+        assert!(view.editor_vertical_action("tui.editor.cursorUp"));
+        assert!(view.editor.cursor < "first line\n".len());
+        assert!(view.editor_vertical_action("tui.editor.cursorDown"));
+        assert_eq!(view.editor.cursor, last_row_cursor);
+        view.editor.take();
         conversation.event(
             &mut view,
             &mut args,

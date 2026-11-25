@@ -1394,6 +1394,47 @@ fn append_indexed(
 }
 
 impl View {
+    fn editor_vertical_action(&mut self, action: &str) -> bool {
+        match action {
+            "tui.editor.pageUp" | "tui.editor.pageDown" => {
+                let step = self.editor_page as isize;
+                let delta = if action == "tui.editor.pageUp" {
+                    -step
+                } else {
+                    step
+                };
+                self.editor.visual_move(self.editor_width, delta);
+            }
+            "tui.editor.cursorUp" if self.editor.visual_move(self.editor_width, -1) => {}
+            "tui.editor.cursorDown" if self.editor.visual_move(self.editor_width, 1) => {}
+            "tui.editor.cursorUp"
+                if self.history_index.is_none()
+                    && self.editor.cursor != self.editor.line_start() =>
+            {
+                self.editor.action("tui.editor.cursorLineStart");
+            }
+            "tui.editor.cursorUp" | "tui.editor.historyPrevious" if !self.history.is_empty() => {
+                let index = self
+                    .history_index
+                    .unwrap_or(self.history.len())
+                    .saturating_sub(1);
+                self.editor.replace(self.history[index].clone());
+                self.history_index = Some(index);
+            }
+            "tui.editor.cursorDown" | "tui.editor.historyNext" if self.history_index.is_some() => {
+                let index = self.history_index.unwrap() + 1;
+                self.editor
+                    .replace(self.history.get(index).cloned().unwrap_or_default());
+                self.history_index = (index < self.history.len()).then_some(index);
+            }
+            "tui.editor.cursorDown" => {
+                self.editor.action("tui.editor.cursorLineEnd");
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn invalidate_model_catalog(&mut self) {
         self.available_models.clear();
         self.model_list = None;
@@ -8124,44 +8165,7 @@ pub(super) async fn run(
                             }
                         }
                     }
-                    "tui.editor.pageUp" | "tui.editor.pageDown" => {
-                        let step = view.editor_page as isize;
-                        let delta = if action == "tui.editor.pageUp" {
-                            -step
-                        } else {
-                            step
-                        };
-                        view.editor.visual_move(view.editor_width, delta);
-                    }
-                    "tui.editor.cursorUp" if view.editor.visual_move(view.editor_width, -1) => {}
-                    "tui.editor.cursorDown" if view.editor.visual_move(view.editor_width, 1) => {}
-                    "tui.editor.cursorUp"
-                        if view.history_index.is_none()
-                            && view.editor.cursor != view.editor.line_start() =>
-                    {
-                        view.editor.action("tui.editor.cursorLineStart");
-                    }
-                    "tui.editor.cursorUp" | "tui.editor.historyPrevious"
-                        if !view.history.is_empty() =>
-                    {
-                        let index = view
-                            .history_index
-                            .unwrap_or(view.history.len())
-                            .saturating_sub(1);
-                        view.editor.replace(view.history[index].clone());
-                        view.history_index = Some(index);
-                    }
-                    "tui.editor.cursorDown" | "tui.editor.historyNext"
-                        if view.history_index.is_some() =>
-                    {
-                        let index = view.history_index.unwrap() + 1;
-                        view.editor
-                            .replace(view.history.get(index).cloned().unwrap_or_default());
-                        view.history_index = (index < view.history.len()).then_some(index);
-                    }
-                    "tui.editor.cursorDown" => {
-                        view.editor.action("tui.editor.cursorLineEnd");
-                    }
+                    action if view.editor_vertical_action(action) => {}
                     "" => {
                         if let KeyCode::Char(character) = key.code
                             && !key.modifiers.intersects(
