@@ -3821,6 +3821,17 @@ Regressions cover chunked multibyte output, trailing whitespace, and both
 progress snapshots and completed results, using upstream
 `780bf31fcaeb252fa9b68df3964c735eae75bde3` as the reference.
 
+### Shell full-output save failures
+
+When Bash or PowerShell cannot save a full-output file, the native shell
+runner continues draining and preserves the command outcome. Model-facing
+text retains its bounded preview and reports the save error. The tool's
+truncation details use `fullOutputError` instead of a file path, and a
+truncated structured result uses `full_output_error`. User-initiated shell
+execution also retains its bounded output and exit status. Its journal and
+RPC result do not yet expose the separate save error.
+[Pi shell output accumulator](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/tools/output-accumulator.ts)
+
 ### Grep context and line-limit checkpoint
 
 Invalid regular expressions in unrestricted local `grep` include the `rg:`
