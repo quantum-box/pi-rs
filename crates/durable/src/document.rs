@@ -67,7 +67,7 @@ impl Address {
         result.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
         Ok(result)
     }
-    fn policy_key(&self) -> Result<Vec<u8>, Error> {
+    pub(crate) fn policy_key(&self) -> Result<Vec<u8>, Error> {
         let mut key = POLICY_PREFIX.to_vec();
         key.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
         Ok(key)
@@ -2681,6 +2681,25 @@ impl<'a> TaskDocuments<'a> {
         self.signals.batch.mutations.push(mutation);
         Ok(())
     }
+    pub(crate) fn stage_checkpointable_result_diagnostics(
+        &mut self,
+        diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+    ) -> Result<(), String> {
+        if let crate::task::TaskOwner::Conversation(conversation) = self.task.owner()
+            && !diagnostics.is_empty()
+        {
+            let mut batch = crate::runtime::prepare_checkpointable_result_diagnostics(
+                *conversation,
+                self.task.id(),
+                diagnostics,
+            )
+            .map_err(|error| error.to_string())?;
+            self.signals.batch.checks.append(&mut batch.checks);
+            self.signals.batch.mutations.append(&mut batch.mutations);
+        }
+        Ok(())
+    }
+
     pub(crate) fn stage_checkpointable_durable_result(
         &mut self,
         intent_key: Vec<u8>,
@@ -3573,6 +3592,19 @@ impl<'a> TaskDocuments<'a> {
             return Err("task is not a direct child".into());
         }
         Ok(child.task.clone())
+    }
+
+    /// Probe an immediately admitted child while it can still change. The
+    /// caller must pin a terminal result with `get_owned_child` before using it.
+    pub(crate) fn owned_child_has_settled(&self, id: uuid::Uuid) -> Result<bool, String> {
+        let child = crate::task_store::TaskStore::new(self.store)
+            .load(id)
+            .map_err(|error| error.to_string())?
+            .ok_or("owned child missing")?;
+        if child.task.owner() != &crate::task::TaskOwner::Task(self.task.id()) {
+            return Err("task is not a direct child".into());
+        }
+        Ok(child.task.is_terminal())
     }
 
     /// Read a task-owned document, acquiring an absent address for this task.

@@ -3,13 +3,13 @@
 //! Changes are provisional until the enclosing `Harness::session_transaction`
 //! commits. The callback is never replayed after a conflict.
 use crate::{
-    document::{Address, Documents, Error},
+    document::{Address, Documents, Error, ForkPolicy},
     runtime::{ApplicationWrite, Conversation, Submission},
     task_store::OwnedBatch,
 };
 use durable_store::{Check, Expected, Mutation, Store};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 pub(crate) struct SessionChild {
@@ -64,6 +64,9 @@ pub struct SessionTransaction<'a> {
     pub(crate) entries_allowed: bool,
     reads: HashMap<Address, Option<Map<String, Value>>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
+    drafts: HashSet<Address>,
+    policy_reads: HashSet<Address>,
+    policies: HashMap<Address, ForkPolicy>,
     task_reads: HashMap<Uuid, (Expected, Option<crate::task_store::StoredTask>)>,
     tasks: Vec<crate::task::Task>,
     signals: crate::document::HostTransaction<'a>,
@@ -93,6 +96,9 @@ impl<'a> SessionTransaction<'a> {
             entries_allowed,
             reads: HashMap::new(),
             writes: HashMap::new(),
+            drafts: HashSet::new(),
+            policy_reads: HashSet::new(),
+            policies: HashMap::new(),
             task_reads: HashMap::new(),
             tasks: Vec::new(),
             signals: crate::document::HostTransaction::new(store),
@@ -246,14 +252,103 @@ impl<'a> SessionTransaction<'a> {
         value: Map<String, Value>,
     ) -> Result<(), Error> {
         self.document(address)?;
+        self.drafts.remove(address);
         self.writes.insert(address.clone(), Some(value));
         Ok(())
+    }
+
+    /// Borrow a mutable JSON document draft for this transaction. Repeated
+    /// acquisitions return the staged value. A missing or staged-deleted
+    /// document is initialized from `seed`.
+    ///
+    /// Changes are visible inside this transaction and commit with the other
+    /// session changes. An unchanged existing draft creates no new document
+    /// version, but its original read is still fenced.
+    pub fn document_draft(
+        &mut self,
+        address: &Address,
+        seed: Map<String, Value>,
+    ) -> Result<&mut Map<String, Value>, Error> {
+        if !self.writes.contains_key(address) {
+            let current = self.document(address)?;
+            self.writes.insert(address.clone(), current);
+            self.drafts.insert(address.clone());
+        }
+        Ok(self
+            .writes
+            .get_mut(address)
+            .expect("draft or explicit write staged")
+            .get_or_insert(seed))
+    }
+
+    /// Edit a typed JSON-object document inside this transaction. The
+    /// initializer runs only for a missing document. Existing values must
+    /// round-trip through the type without losing stored fields.
+    pub fn edit_document<T, R>(
+        &mut self,
+        address: &Address,
+        initialize: impl FnOnce() -> T,
+        edit: impl FnOnce(&mut T) -> Result<R, Error>,
+    ) -> Result<R, Error>
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize,
+    {
+        let original = self.document(address)?.map(Value::Object);
+        let mut draft = match &original {
+            Some(value) => {
+                let draft: T = serde::Deserialize::deserialize(value)?;
+                if serde_json::to_value(&draft)? != *value {
+                    return Err(Error::InvalidDocument);
+                }
+                draft
+            }
+            None => initialize(),
+        };
+        let result = edit(&mut draft)?;
+        let candidate = serde_json::to_value(draft)?;
+        if original.as_ref() != Some(&candidate) {
+            let Value::Object(value) = candidate else {
+                return Err(Error::InvalidDocument);
+            };
+            self.put_document(address, value)?;
+        }
+        Ok(result)
     }
 
     /// Delete a document, retaining the original snapshot as a dependency.
     pub fn delete_document(&mut self, address: &Address) -> Result<(), Error> {
         self.document(address)?;
+        self.drafts.remove(address);
         self.writes.insert(address.clone(), None);
+        Ok(())
+    }
+
+    /// Read the fork policy at the transaction's snapshot or its staged replacement.
+    /// An address without an explicit policy uses `ForkPolicy::Copy`.
+    pub fn document_fork_policy(&mut self, address: &Address) -> Result<ForkPolicy, Error> {
+        if let Some(policy) = self.policies.get(address) {
+            return Ok(policy.clone());
+        }
+        let policy = match self
+            .store
+            .document_at(&address.policy_key()?, self.revision)?
+        {
+            Some(entry) => serde_json::from_slice(&entry.value)?,
+            None => ForkPolicy::Copy,
+        };
+        self.policy_reads.insert(address.clone());
+        Ok(policy)
+    }
+
+    /// Stage the address's policy with the same commit as its draft or other
+    /// session changes. The policy can be set before the document exists.
+    pub fn set_document_fork_policy(
+        &mut self,
+        address: &Address,
+        policy: ForkPolicy,
+    ) -> Result<(), Error> {
+        self.document_fork_policy(address)?;
+        self.policies.insert(address.clone(), policy);
         Ok(())
     }
 
@@ -587,6 +682,9 @@ impl<'a> SessionTransaction<'a> {
     }
 
     pub(crate) fn into_parts(mut self) -> Result<SessionParts, Error> {
+        self.writes.retain(|address, candidate| {
+            !self.drafts.contains(address) || self.reads.get(address) != Some(candidate)
+        });
         if let Some(profile) = self.image_profile_guard {
             let adapter = self
                 .adapter
@@ -606,7 +704,7 @@ impl<'a> SessionTransaction<'a> {
                 ));
             }
         }
-        let changed = self.table_written || !self.writes.is_empty();
+        let changed = self.table_written || !self.writes.is_empty() || !self.policies.is_empty();
         let mut batch = OwnedBatch {
             checks: Vec::new(),
             mutations: Vec::new(),
@@ -654,6 +752,19 @@ impl<'a> SessionTransaction<'a> {
                         value: serde_json::to_vec(value)?,
                     },
                     None => Mutation::Delete { key },
+                });
+            }
+        }
+        for address in self.policy_reads {
+            let key = address.policy_key()?;
+            batch.checks.push(Check {
+                key: key.clone(),
+                expected: Expected::DocumentUnchangedSince(self.revision),
+            });
+            if let Some(policy) = self.policies.get(&address) {
+                batch.mutations.push(Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(policy)?,
                 });
             }
         }

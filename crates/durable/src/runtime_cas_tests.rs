@@ -149,12 +149,40 @@ fn display_entry_forks_use_original_commit_and_reopen() {
         2
     );
     assert!(h.fork_by_display_entry_id(child, first).is_err());
+    let local = h
+        .submit_write(
+            child,
+            None,
+            "display.local".into(),
+            Some(serde_json::json!(3)),
+        )
+        .unwrap();
+    h.submit_write(child, None, "display.after".into(), None)
+        .unwrap();
     drop(h);
-    let h = Harness::open_paused(&path, options()).unwrap();
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let descendant = h.fork_by_display_entry_id(child, local).unwrap();
+    let state = h.conversation(descendant).unwrap();
     assert_eq!(
-        h.conversation(child).unwrap().application_writes[0].id,
-        first
+        state
+            .application_writes
+            .iter()
+            .map(|write| write.id)
+            .collect::<Vec<_>>(),
+        vec![first, local]
     );
+    assert_eq!(state.config.model, "old");
+    assert_eq!(
+        h.document(&Address {
+            scope: descendant.to_string(),
+            ..child_address
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        1
+    );
+    assert!(h.fork_by_display_entry_id(child, first).is_err());
 }
 
 #[test]

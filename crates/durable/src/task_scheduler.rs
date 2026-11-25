@@ -170,11 +170,11 @@ pub(crate) enum HookFenceError {
     #[error("{0}")]
     Other(String),
 }
-enum CheckpointableFence {
+enum CheckpointableFence<'a> {
     CreateIntent,
     Undispatched,
     Hook,
-    Progress,
+    Progress(&'a crate::async_task_tool::DurableToolProgress),
 }
 
 impl From<String> for HookFenceError {
@@ -8010,6 +8010,7 @@ impl AdmissionHandle<'_> {
         &self,
         cancellation: &pi_rs_core::CancellationToken,
         value: Vec<u8>,
+        progress: &crate::async_task_tool::DurableToolProgress,
     ) -> Result<(), String> {
         let task = &self.running.task;
         let attempt = task.attempt_id().ok_or("missing progress attempt")?;
@@ -8022,7 +8023,7 @@ impl AdmissionHandle<'_> {
                 false,
                 task.replay_safe(),
                 Some(cancellation),
-                CheckpointableFence::Progress,
+                CheckpointableFence::Progress(progress),
                 (&[], std::slice::from_ref(&mutation)),
             ) {
                 Err(HookFenceError::Conflict) => continue,
@@ -8050,12 +8051,17 @@ impl AdmissionHandle<'_> {
         test_namespace: bool,
         expected_replay_safe: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
-        phase: CheckpointableFence,
+        phase: CheckpointableFence<'_>,
         extra: (&[durable_store::Check], &[durable_store::Mutation]),
     ) -> Result<Vec<u8>, HookFenceError> {
         let write_intent = matches!(phase, CheckpointableFence::CreateIntent);
         let hook_phase = matches!(phase, CheckpointableFence::Hook);
-        let progress = matches!(phase, CheckpointableFence::Progress);
+        let reported = if let CheckpointableFence::Progress(reported) = phase {
+            Some(reported)
+        } else {
+            None
+        };
+        let progress = reported.is_some();
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         if (!self.standalone && (test_namespace || self.validator.is_none()))
             || self.abort
@@ -8160,6 +8166,7 @@ impl AdmissionHandle<'_> {
             }
         }
         let tasks = TaskStore::new(owner.store());
+        let mut history = None;
         let mut ancestor = current.task.clone();
         let mut seen = std::collections::HashSet::new();
         loop {
@@ -8224,6 +8231,18 @@ impl AdmissionHandle<'_> {
                                 checks.push(check);
                             }
                         }
+                        if let Some(reported) = reported {
+                            history = Some(
+                                crate::runtime::prepare_checkpointable_progress_history(
+                                    owner.store(),
+                                    *id,
+                                    current.task.id(),
+                                    attempt,
+                                    reported,
+                                )
+                                .map_err(|error| error.to_string())?,
+                            );
+                        }
                         break;
                     }
                     let conversation = format!("runtime/conversation/{id}").into_bytes();
@@ -8274,6 +8293,10 @@ impl AdmissionHandle<'_> {
             vec![]
         };
         mutations.extend_from_slice(extra.1);
+        if let Some(history) = history {
+            checks.extend(history.checks);
+            mutations.extend(history.mutations);
+        }
         #[cfg(test)]
         if !progress {
             let hook = INTENT_COMMIT_HOOK
@@ -8479,7 +8502,16 @@ impl AdmissionHandle<'_> {
         key: &str,
         input: Value,
     ) -> Result<Uuid, Error> {
-        self.admit_child(tool, None, key, input)
+        self.admit_child(tool, ChildAdmission::Ordinary, key, input)
+    }
+
+    pub(crate) fn admit_checkpointable_child(
+        &self,
+        tool: &crate::task_tool::TaskTool,
+        key: &str,
+        input: Value,
+    ) -> Result<Uuid, Error> {
+        self.admit_child(tool, ChildAdmission::Checkpointable, key, input)
     }
 
     pub(crate) fn admit_sealed_child(
@@ -8493,14 +8525,14 @@ impl AdmissionHandle<'_> {
             return Err(Error::Registration);
         }
         let parent = self.running.task.id();
-        self.admit_child(tool, Some(sealed), key, input)
+        self.admit_child(tool, ChildAdmission::Sealed(sealed), key, input)
             .map(|child| (parent, child))
     }
 
     fn admit_child(
         &self,
         tool: &crate::task_tool::TaskTool,
-        sealed: Option<&crate::async_task_tool::ToolIdentity>,
+        mode: ChildAdmission<'_>,
         key: &str,
         input: Value,
     ) -> Result<Uuid, Error> {
@@ -8510,7 +8542,7 @@ impl AdmissionHandle<'_> {
         if self.abort || self.lease.retired || !self.running.task.is_task_tool() {
             return Err(Error::Ownership);
         }
-        let (identity, child) = if sealed.is_some() {
+        let (identity, child) = if matches!(mode, ChildAdmission::Sealed(_)) {
             tool.sealed_child_candidate(&self.running.task, input)
         } else {
             tool.child_candidate(&self.running.task, input)
@@ -8518,6 +8550,17 @@ impl AdmissionHandle<'_> {
         .map_err(Error::Handler)?;
         let owner = &self.lease.attachment.owner;
         let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        let selection_gate = match mode {
+            ChildAdmission::Checkpointable => self
+                .validator
+                .map(|harness| harness.checkpointable_extension_gate()),
+            _ => None,
+        };
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|_| Error::Poisoned)?;
         let state = self.lease.state.lock().map_err(|_| Error::Poisoned)?;
         if state.poisoned
             || self
@@ -8550,24 +8593,63 @@ impl AdmissionHandle<'_> {
         {
             return Err(Error::Registration);
         }
-        if let Some(identity) = sealed {
-            let registration = definitions
-                .registry
-                .entries
-                .get(&tool_identity.kind)
-                .ok_or(Error::Registration)?;
-            if registration
-                .receipt_capture
-                .as_ref()
-                .is_none_or(|capture| &capture.identity != identity)
-            {
-                return Err(Error::Registration);
+        let mut checkpointable_checks = Vec::new();
+        match mode {
+            ChildAdmission::Sealed(identity) => {
+                let registration = definitions
+                    .registry
+                    .entries
+                    .get(&tool_identity.kind)
+                    .ok_or(Error::Registration)?;
+                if registration
+                    .receipt_capture
+                    .as_ref()
+                    .is_none_or(|capture| &capture.identity != identity)
+                {
+                    return Err(Error::Registration);
+                }
             }
+            ChildAdmission::Checkpointable => {
+                let registry = &definitions.registry;
+                let parent_kind = parent.task.kind().ok_or(Error::Registration)?;
+                if !parent.task.replay_safe() {
+                    return Err(Error::Registration);
+                }
+                if let Some(harness) = self.validator {
+                    let checkpointable = registry
+                        .matches_conversation_checkpointable(&tool_identity, &tool.handler());
+                    let generic_safe =
+                        tool_identity.replay_safe && !tool_identity.is_checkpointable();
+                    if !(checkpointable || generic_safe)
+                        || !registry.is_conversation_checkpointable_task(&parent.task)
+                        || registry.checkpointable_selection_for_kind(parent_kind)
+                            != registry.checkpointable_selection_for_kind(&tool_identity.kind)
+                    {
+                        return Err(Error::Registration);
+                    }
+                    checkpointable_checks = harness
+                        .checkpointable_conversation_checks(&parent.task, registry)
+                        .map_err(|error| Error::Handler(error.to_string()))?;
+                } else if !self.standalone
+                    || !tool_identity.replay_safe
+                    || ![parent_kind, tool_identity.kind.as_str()]
+                        .into_iter()
+                        .all(|kind| {
+                            registry.entries.get(kind).is_some_and(|entry| {
+                                entry.cancellable_durable_async
+                                    && entry.conversation_checkpointable.is_none()
+                            })
+                        })
+                {
+                    return Err(Error::Registration);
+                }
+            }
+            ChildAdmission::Ordinary => {}
         }
         if pending_abort_root_for_running(&tasks, parent.task.id(), false)?.is_some() {
             return Err(Error::Ownership);
         }
-        let prepared = crate::keyed_child::prepare(
+        let mut prepared = crate::keyed_child::prepare(
             owner.store(),
             &parent,
             key,
@@ -8576,12 +8658,48 @@ impl AdmissionHandle<'_> {
             &child,
         )
         .map_err(|e| Error::Handler(e.to_string()))?;
+        let mut checks = crate::ownership_edge::owner_chain_admission_checks(
+            owner.store(),
+            parent.task.id(),
+            child.id(),
+        )
+        .map_err(|_| Error::Ownership)?;
+        if matches!(mode, ChildAdmission::Checkpointable) {
+            // These checks describe the same child admission, so compose them
+            // before appending the graph mutation as one transaction component.
+            for check in checks.drain(..).chain(checkpointable_checks) {
+                if let Some(existing) = prepared
+                    .checks
+                    .iter_mut()
+                    .find(|item| item.key == check.key)
+                {
+                    if existing.expected == durable_store::Expected::Missing
+                        && matches!(
+                            check.expected,
+                            durable_store::Expected::MissingUnchangedSince(_)
+                        )
+                    {
+                        existing.expected = check.expected;
+                    } else if existing.expected != check.expected
+                        && !(check.expected == durable_store::Expected::Missing
+                            && matches!(
+                                existing.expected,
+                                durable_store::Expected::MissingUnchangedSince(_)
+                            ))
+                    {
+                        return Err(Error::Ownership);
+                    }
+                } else {
+                    prepared.checks.push(check);
+                }
+            }
+        }
         let mut transaction = crate::document::Transaction::new();
         transaction.append(crate::task_store::OwnedBatch {
             checks: prepared.checks,
             mutations: prepared.mutations,
         })?;
-        if let Some(identity) = sealed {
+        if let ChildAdmission::Sealed(identity) = mode {
             let identity_batch = crate::async_task_protocol::prepare_child_identity(
                 owner.store(),
                 prepared.child,
@@ -8590,17 +8708,22 @@ impl AdmissionHandle<'_> {
             .map_err(|error| Error::Handler(error.to_string()))?;
             transaction.append(identity_batch)?;
         }
-        let checks = crate::ownership_edge::owner_chain_admission_checks(
-            owner.store(),
-            parent.task.id(),
-            child.id(),
-        )
-        .map_err(|_| Error::Ownership)?;
         transaction.append(crate::task_store::OwnedBatch {
             checks,
             mutations: vec![],
         })?;
         if let Err(error) = transaction.commit(owner.store()) {
+            if matches!(mode, ChildAdmission::Checkpointable)
+                && matches!(
+                    &error,
+                    crate::document::Error::Store(
+                        durable_store::Error::Conflict { .. }
+                            | durable_store::Error::WriteLockBusy(_)
+                    )
+                )
+            {
+                return Err(error.into());
+            }
             self.lease
                 .scheduler_poison
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -8609,6 +8732,13 @@ impl AdmissionHandle<'_> {
         self.activity.notify();
         Ok(prepared.child)
     }
+}
+
+#[derive(Clone, Copy)]
+enum ChildAdmission<'a> {
+    Ordinary,
+    Sealed(&'a crate::async_task_tool::ToolIdentity),
+    Checkpointable,
 }
 
 /// Memo writes are committed under the same attempt, lease, ancestor and
@@ -21217,7 +21347,15 @@ mod tests {
                 assert!(std::time::Instant::now() < until);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            assert!(gate.try_start().is_some(), "commit retained its gate");
+            // A reader may observe the SQLite commit before the driver's
+            // settlement scope drops the start gate.
+            while gate.try_start().is_none() {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "commit retained its gate"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             driver.shutdown().unwrap();
         }
     }

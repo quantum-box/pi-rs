@@ -82,7 +82,7 @@ type RpcModelImages = std::sync::Arc<std::sync::Mutex<rpc::ModelImageCache>>;
     version,
     about,
     args_override_self = true,
-    after_help = "Pi aliases: -v (--version), -nt (--no-tools), -nbt (--no-builtin-tools), -xt (--exclude-tools), -ne (--no-extensions), -ns (--no-skills), -np (--no-prompt-templates), -nc (--no-context-files), -na (--no-approve)."
+    after_help = "Pi aliases: -v (--version), -nt (--no-tools), -nbt (--no-builtin-tools), -xt (--exclude-tools), -ne (--no-extensions), -ns (--no-skills), -np (--no-prompt-templates), -nc (--no-context-files), -na (--no-approve).\nUse pi-rs --durable --help for the experimental durable text CLI."
 )]
 struct Cli {
     #[arg(skip)]
@@ -1401,7 +1401,43 @@ fn startup_ready(ready: &mut Option<tokio::sync::oneshot::Sender<()>>) {
     }
 }
 
+fn run_durable_cli() -> Option<i32> {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--durable")) {
+        return None;
+    }
+    let result = std::env::current_exe().and_then(|executable| {
+        let companion =
+            executable.with_file_name(format!("pi-rs-durable{}", std::env::consts::EXE_SUFFIX));
+        let mut command = std::process::Command::new(companion);
+        command.args(arguments);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            Err::<i32, _>(command.exec())
+        }
+        #[cfg(not(unix))]
+        {
+            command.status().map(|status| status.code().unwrap_or(1))
+        }
+    });
+    Some(match result {
+        Ok(code) => code,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("Error: install pi-rs-durable with the text-cli feature beside pi-rs");
+            1
+        }
+        Err(error) => {
+            eprintln!("Error: could not start pi-rs-durable: {error}");
+            1
+        }
+    })
+}
+
 fn main() {
+    if let Some(code) = run_durable_cli() {
+        std::process::exit(code);
+    }
     #[cfg(windows)]
     let code = {
         // Windows executables start with a smaller stack than Unix binaries.

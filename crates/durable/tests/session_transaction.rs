@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use durable_store::{Check, Expected, Mutation, Store};
 use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
 use pi_rs_durable::{
-    document::{Address, Documents, Error as DocumentError, Transaction},
+    document::{Address, Documents, Error as DocumentError, ForkPolicy, Transaction},
     recovery::UncertainPolicy,
     runtime::{Config, Error, Harness, Options},
 };
@@ -42,6 +42,121 @@ fn address() -> Address {
 }
 fn object(n: i64) -> Map<String, Value> {
     json!({"n":n}).as_object().unwrap().clone()
+}
+
+#[test]
+fn mutable_drafts_share_staged_edits_and_commit_with_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let conversation = h.create_conversation(config()).unwrap();
+    let address = address();
+    let entry = h
+        .session_transaction(conversation, |tx| {
+            let draft = tx.document_draft(&address, object(1))?;
+            assert_eq!(*draft, object(1));
+            draft.insert("first".into(), json!(true));
+            let entry = tx.append_entry("note", Some(json!("atomic")))?;
+            let draft = tx.document_draft(&address, object(99))?;
+            assert_eq!(draft["first"], true);
+            assert_eq!(draft["n"], 1);
+            draft.insert("n".into(), json!(2));
+            assert_eq!(tx.document(&address)?.unwrap()["n"], 2);
+            assert_eq!(tx.document_fork_policy(&address)?, ForkPolicy::Copy);
+            tx.set_document_fork_policy(&address, ForkPolicy::Current)?;
+            assert_eq!(tx.document_fork_policy(&address)?, ForkPolicy::Current);
+            Ok(entry)
+        })
+        .unwrap();
+    let store = Store::open(&path).unwrap();
+    let committed = Documents::new(&store).get(&address).unwrap().unwrap();
+    assert_eq!(committed.value["n"], 2);
+    assert_eq!(committed.value["first"], true);
+    assert_eq!(
+        Documents::new(&store)
+            .fork_policy(&address)
+            .unwrap()
+            .unwrap()
+            .policy,
+        ForkPolicy::Current
+    );
+    assert_eq!(
+        h.conversation(conversation).unwrap().application_writes[0].id,
+        entry
+    );
+
+    h.session_transaction(conversation, |tx| {
+        assert_eq!(*tx.document_draft(&address, object(99))?, committed.value);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        Documents::new(&store)
+            .get(&address)
+            .unwrap()
+            .unwrap()
+            .version,
+        committed.version
+    );
+}
+
+#[test]
+fn typed_document_edits_keep_fields_and_commit_with_entries() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Settings {
+        n: i64,
+        #[serde(flatten)]
+        extra: Map<String, Value>,
+    }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct PartialSettings {
+        n: i64,
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    let address = address();
+    let entry = h
+        .session_transaction(id, |tx| {
+            tx.edit_document(
+                &address,
+                || Settings {
+                    n: 1,
+                    extra: Map::new(),
+                },
+                |draft| {
+                    draft.extra.insert("olderField".into(), json!("retained"));
+                    Ok(())
+                },
+            )?;
+            assert!(matches!(
+                tx.edit_document(
+                    &address,
+                    || PartialSettings { n: 9 },
+                    |_| -> Result<(), DocumentError> { panic!("losing fields must be rejected") }
+                ),
+                Err(DocumentError::InvalidDocument)
+            ));
+            let n = tx.edit_document(
+                &address,
+                || panic!("the draft already exists"),
+                |draft: &mut Settings| {
+                    draft.n += 1;
+                    Ok(draft.n)
+                },
+            )?;
+            let entry = tx.append_entry("note", Some(json!(n)))?;
+            Ok(entry)
+        })
+        .unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let document = h.document(&address).unwrap().unwrap();
+    assert_eq!(document.value["n"], 2);
+    assert_eq!(document.value["olderField"], "retained");
+    assert_eq!(h.conversation(id).unwrap().application_writes[0].id, entry);
 }
 
 #[test]
@@ -110,7 +225,8 @@ fn callback_error_discards_entries_and_documents() {
     let mut h = Harness::open_paused(&path, options()).unwrap();
     let conversation = h.create_conversation(config()).unwrap();
     let result: Result<(), Error> = h.session_transaction(conversation, |tx| {
-        tx.put_document(&address(), object(1))?;
+        tx.document_draft(&address(), object(1))?
+            .insert("discard".into(), json!(true));
         tx.append_entry("note", Some(json!(1)))?;
         Err(DocumentError::InvalidApplicationEntry)
     });
@@ -161,7 +277,8 @@ fn document_conflict_rolls_back_entry_without_replaying_callback() {
         calls += 1;
         assert!(tx.document(&address())?.is_none());
         tx.append_entry("note", Some(json!(1)))?;
-        tx.put_document(&address(), object(1))?;
+        tx.document_draft(&address(), object(1))?
+            .insert("stale".into(), json!(true));
         let mut writer = Transaction::new();
         writer.put(&address(), Expected::Missing, &object(9))?;
         writer.commit(&other)?;
@@ -189,6 +306,41 @@ fn document_conflict_rolls_back_entry_without_replaying_callback() {
             .value,
         object(9)
     );
+}
+
+#[test]
+fn document_policy_conflict_rolls_back_entry_and_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    let store = Store::open(path).unwrap();
+    let address = address();
+    let result = h.session_transaction(id, |tx| {
+        tx.set_document_fork_policy(&address, ForkPolicy::Current)?;
+        tx.document_draft(&address, object(1))?;
+        tx.append_entry("note", None)?;
+        let mut concurrent = Transaction::new();
+        concurrent.set_fork_policy(
+            &address,
+            Expected::Missing,
+            &ForkPolicy::Initial { value: object(9) },
+        )?;
+        concurrent.commit(&store)?;
+        assert_eq!(tx.document_fork_policy(&address)?, ForkPolicy::Current);
+        Ok(())
+    });
+    assert!(matches!(
+        result,
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    let documents = Documents::new(&store);
+    assert!(documents.get(&address).unwrap().is_none());
+    assert_eq!(
+        documents.fork_policy(&address).unwrap().unwrap().policy,
+        ForkPolicy::Initial { value: object(9) }
+    );
+    assert!(h.conversation(id).unwrap().application_writes.is_empty());
 }
 
 #[test]

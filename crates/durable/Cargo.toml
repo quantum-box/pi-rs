@@ -14,10 +14,17 @@ experimental-graph-revision = ["durable-store/experimental-graph-revision"]
 test-hooks = []
 coding-tools = ["dep:pi-rs-workbench"]
 builtin-images = ["dep:image"]
+text-cli = ["dep:clap", "dep:pi-rs-workbench", "tokio/signal"]
+
+[[bin]]
+name = "pi-rs-durable"
+path = "src/bin/pi-rs-durable.rs"
+required-features = ["text-cli"]
 
 [dependencies]
 durable-task-schema = { path = "../durable-task-schema" }
 base64 = "0.22"
+clap = { version = "4", optional = true, features = ["derive"] }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

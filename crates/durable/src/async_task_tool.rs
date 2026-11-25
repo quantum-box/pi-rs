@@ -859,8 +859,14 @@ pub struct DurableToolProgress {
     pub dropped_lines: u64,
 }
 
+pub(crate) const MAX_CHECKPOINTABLE_PROGRESS_BYTES: usize = 32 * 1024;
+
+pub(crate) fn durable_progress_prefix(task: uuid::Uuid) -> String {
+    format!("durable/checkpointable-progress/{task}/")
+}
+
 pub(crate) fn durable_progress_key(task: uuid::Uuid, attempt: uuid::Uuid) -> Vec<u8> {
-    format!("durable/checkpointable-progress/{task}/{attempt}").into_bytes()
+    format!("{}{attempt}", durable_progress_prefix(task)).into_bytes()
 }
 
 pub(crate) use replay_safe::live_checkpointable_progress;
@@ -877,8 +883,8 @@ pub trait DurableTaskHost: Send + Sync {
     }
 
     /// Append a text chunk and commit the current bounded output for observers.
-    /// Each execution attempt starts a new stream. The head is retained, up to
-    /// 4 KiB and 2,000 lines. The complete snapshot must fit the reporting limit.
+    /// Each execution attempt starts a new stream with the tool's output limits.
+    /// The complete snapshot must fit the reporting limit.
     async fn append_output(&self, _chunk: &str) -> Result<(), String> {
         Err("checkpointable tool progress is unavailable".into())
     }
@@ -895,7 +901,33 @@ pub trait DurableTaskHost: Send + Sync {
         tool: &str,
         input: serde_json::Value,
     ) -> Result<AsyncTaskCall, String>;
+
+    /// Commit a keyed child immediately so it can run while its parent is
+    /// active. The parent must be replay-safe. An explicitly registered unsafe
+    /// conversation child keeps its normal receipt and reconciliation policy.
+    /// The ordinary `start_child` stages admission for the parent transition.
+    async fn start_child_now(
+        &self,
+        _key: &str,
+        _tool: &str,
+        _input: serde_json::Value,
+    ) -> Result<AsyncTaskCall, String> {
+        Err("immediate checkpointable child admission is unavailable".into())
+    }
+
     async fn child_result(&self, child: &AsyncTaskCall) -> Result<Option<AsyncTaskResult>, String>;
+
+    /// Wait for an immediately admitted child while keeping this attempt
+    /// active. A timeout returns `None`; use a park to release the worker
+    /// while waiting for capacity or a long-running child.
+    async fn wait_child_result(
+        &self,
+        _child: &AsyncTaskCall,
+        _timeout: std::time::Duration,
+    ) -> Result<Option<AsyncTaskResult>, String> {
+        Err("live checkpointable child waits are unavailable".into())
+    }
+
     /// Read the ordinary result and any authenticated supplemental after output.
     async fn child_result_with_after(
         &self,
@@ -910,6 +942,17 @@ pub trait DurableTaskHost: Send + Sync {
 /// registration is available only with an explicit replay-safe attestation.
 #[async_trait::async_trait]
 pub trait DurableAsyncTool: Tool {
+    /// Retention for this tool's `DurableTaskHost::append_output` stream.
+    /// Values over 4 KiB are clamped to fit the encoded progress envelope.
+    /// Explicit results and replacement progress retain their own limits.
+    fn output_limits(&self) -> crate::output::OutputLimits {
+        crate::output::OutputLimits {
+            max_bytes: 4 * 1024,
+            max_lines: 2_000,
+            retain: crate::output::Retain::Head,
+        }
+    }
+
     async fn execute_durable(
         &self,
         arguments: serde_json::Value,
@@ -917,6 +960,54 @@ pub trait DurableAsyncTool: Tool {
         resume: DurableToolResume,
         host: &dyn DurableTaskHost,
     ) -> Result<DurableToolStep, String>;
+}
+
+/// Wrap a tool's ordinary invocation as a durable leaf. Register the returned
+/// tool with the real replay policy for its effects before exposing it to a
+/// parent. The leaf forwards argument preparation and invocation. Use a
+/// native `DurableAsyncTool` when the tool needs the durable child or progress
+/// host, or when it must persist a park.
+pub fn checkpointable_leaf(tool: Arc<dyn Tool>) -> Arc<dyn DurableAsyncTool> {
+    Arc::new(CheckpointableLeaf(tool))
+}
+
+struct CheckpointableLeaf(Arc<dyn Tool>);
+
+#[async_trait::async_trait]
+impl Tool for CheckpointableLeaf {
+    fn spec(&self) -> ToolSpec {
+        self.0.spec()
+    }
+
+    async fn prepare_arguments(
+        &self,
+        arguments: serde_json::Value,
+    ) -> pi_rs_core::ExtensionResult<serde_json::Value> {
+        self.0.prepare_arguments(arguments).await
+    }
+
+    async fn invoke(
+        &self,
+        arguments: serde_json::Value,
+        context: pi_rs_core::ToolContext,
+    ) -> Outcome {
+        self.0.invoke(arguments, context).await
+    }
+}
+
+#[async_trait::async_trait]
+impl DurableAsyncTool for CheckpointableLeaf {
+    async fn execute_durable(
+        &self,
+        arguments: serde_json::Value,
+        context: pi_rs_core::ToolContext,
+        _resume: DurableToolResume,
+        _host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        Ok(DurableToolStep::Complete(
+            self.invoke(arguments, context).await,
+        ))
+    }
 }
 
 /// Persisted callback replay policy. The initial protocol only permits a

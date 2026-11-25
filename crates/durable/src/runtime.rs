@@ -2903,6 +2903,27 @@ enum DiagnosticCheckpoint {
     Legacy(Vec<ToolDiagnostic>),
     Journal(DiagnosticJournal),
 }
+pub(crate) fn prepare_checkpointable_result_diagnostics(
+    conversation: Uuid,
+    operation: Uuid,
+    diagnostics: Vec<ToolDiagnostic>,
+) -> Result<crate::task_store::OwnedBatch, serde_json::Error> {
+    let key = diagnostic_key(conversation, operation);
+    Ok(crate::task_store::OwnedBatch {
+        checks: vec![Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        }],
+        mutations: vec![Mutation::Put {
+            key,
+            value: serde_json::to_vec(&DiagnosticJournal {
+                diagnostics,
+                keys: Default::default(),
+            })?,
+        }],
+    })
+}
+
 impl DiagnosticCheckpoint {
     fn journal(self) -> DiagnosticJournal {
         match self {
@@ -3200,6 +3221,13 @@ pub enum ProgressHistoryChange {
         attempt: ToolAttempt,
         state: crate::tool_progress::State,
         partial_is_null: bool,
+    },
+    /// A committed checkpointable tool report. A park or wake may end the
+    /// live attempt without producing another report.
+    CheckpointableTool {
+        task: Uuid,
+        attempt: Uuid,
+        progress: Box<crate::async_task_tool::DurableToolProgress>,
     },
 }
 fn same_progress_identity(a: &ProgressHistoryChange, b: &ProgressHistoryChange) -> bool {
@@ -3644,6 +3672,25 @@ fn prepare_progress_history(
         ));
     }
     Ok(crate::observer::Observer::progress_history(store, conversation).prepare_append(&value)?)
+}
+
+/// Stage a report in the same commit as its attempt-local snapshot.
+pub(crate) fn prepare_checkpointable_progress_history(
+    store: &durable_store::Store,
+    conversation: Uuid,
+    task: Uuid,
+    attempt: Uuid,
+    progress: &crate::async_task_tool::DurableToolProgress,
+) -> Result<crate::observer::Append, Error> {
+    prepare_progress_history(
+        store,
+        conversation,
+        vec![ProgressHistoryChange::CheckpointableTool {
+            task,
+            attempt,
+            progress: Box::new(progress.clone()),
+        }],
+    )
 }
 
 /// Trusted cursor for a finite database-local unified history capture.
@@ -9671,8 +9718,9 @@ impl Harness {
                     .filter(|w| w.placed && !w.withdrawn)
                     .cloned()
                     .collect();
-                if prior.is_none() && !placed.is_empty() {
-                    // A copied prefix has no authenticated display-entry lineage.
+                if prior.is_none() && writes.iter().any(|write| write.id == entry_id) {
+                    // A copied prefix is evidence of the local baseline, not
+                    // of the original placement of any entry inside that prefix.
                     return Err(crate::fork::Error::InvalidSnapshot.into());
                 }
                 snapshot
@@ -13353,6 +13401,18 @@ impl Harness {
         })
     }
 
+    /// Start watching after the current store commit. A live cursor reads only
+    /// tracked commits published after this boundary, including on migrated stores.
+    pub fn unified_history_from_now(&self, id: Uuid) -> Result<UnifiedHistoryCursor, Error> {
+        self.load(id)?;
+        let sequence = self.owner.store().commit_sequence()?;
+        Ok(UnifiedHistoryCursor {
+            conversation: id,
+            after: sequence,
+            through: sequence,
+        })
+    }
+
     /// Read at most `limit` complete commits in the captured range. Each model
     /// record is an expanded observation snapshot; application records are full
     /// log snapshots, not individually ordered transcript events.
@@ -13420,6 +13480,36 @@ impl Harness {
             next,
             has_more,
         })
+    }
+
+    /// Wait for the next nonempty page of complete commits. Drain any finite
+    /// capture first, then continue past its boundary. Persist the returned
+    /// cursor after processing the page to resume the watch after reopening.
+    pub async fn watch_unified_history(
+        &self,
+        cursor: &UnifiedHistoryCursor,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<UnifiedHistoryPage, Error> {
+        if interval.is_zero() {
+            return Err(Error::Invalid(
+                "unified history watch interval must be nonzero".into(),
+            ));
+        }
+        let mut cursor = cursor.clone();
+        loop {
+            let page = self.unified_history(&cursor, limit)?;
+            if !page.commits.is_empty() {
+                return Ok(page);
+            }
+            let through = self.owner.store().commit_sequence()?;
+            if through == cursor.through {
+                tokio::time::sleep(interval).await;
+            } else {
+                cursor.after = cursor.through;
+                cursor.through = through;
+            }
+        }
     }
 
     fn merged_observation(
@@ -13791,7 +13881,10 @@ impl Harness {
                             ProgressHistoryChange::Tool {
                                 state: crate::tool_progress::State::Running(_),
                                 ..
-                            } => Some(matching[0].clone()),
+                            }
+                            | ProgressHistoryChange::CheckpointableTool { .. } => {
+                                Some(matching[0].clone())
+                            }
                             _ => None,
                         }
                     } else {
@@ -13955,6 +14048,58 @@ impl Harness {
             }
             tokio::time::sleep(interval).await;
         }
+    }
+
+    /// Reclaim at most `limit` attempt-local progress snapshots for a settled
+    /// task. The caller chooses which terminal tasks to retain for inspection.
+    /// Repeat while a full batch is returned. Published transcript, results,
+    /// progress history, and fork records are outside this collection.
+    pub fn prune_finished_checkpointable_progress(
+        &self,
+        task: Uuid,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<usize, Error> {
+        let store = self.owner.store();
+        let stored = crate::task_store::TaskStore::new(store)
+            .load(task)
+            .map_err(crate::task_scheduler::Error::from)?
+            .ok_or_else(|| Error::Invalid("task not found".into()))?;
+        if !stored.task.is_task_tool() || !stored.task.is_terminal() {
+            return Err(Error::Invalid(
+                "progress cleanup requires a terminal task tool".into(),
+            ));
+        }
+        let prefix = crate::async_task_tool::durable_progress_prefix(task);
+        let rows = store.prefix_page_bounded(
+            prefix.as_bytes(),
+            prefix.as_bytes(),
+            limit.get(),
+            prefix.len() + 36,
+            crate::async_task_tool::MAX_CHECKPOINTABLE_PROGRESS_BYTES,
+        )?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let count = rows.len();
+        let mut checks = vec![Check {
+            key: crate::task_store::key(task),
+            expected: Expected::Version(stored.version),
+        }];
+        let mut mutations = Vec::with_capacity(count);
+        for (key, entry) in rows {
+            std::str::from_utf8(&key[prefix.len()..])
+                .ok()
+                .and_then(|suffix| Uuid::parse_str(suffix).ok())
+                .filter(|id| crate::async_task_tool::durable_progress_key(task, *id) == key)
+                .ok_or_else(|| Error::Invalid("invalid checkpointable progress key".into()))?;
+            checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            });
+            mutations.push(Mutation::Delete { key });
+        }
+        store.commit(&checks, &mutations)?;
+        Ok(count)
     }
 
     /// Capture an explicit forward-only boundary. Earlier overwritten progress
@@ -23147,6 +23292,16 @@ impl Scheduler {
         Self::open_with_extensions(path, options, crate::extension::Registry::default())
     }
     /// Install the initial registry before recovered conversations are scheduled.
+    /// Recover persisted phases and wait for explicit conversation admission
+    /// or scheduling before starting their workers.
+    pub fn open_paused(path: impl AsRef<Path>, options: Options) -> Result<Self, Error> {
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
+        let mut scheduler =
+            Self::with_harness(Harness::open_paused(path, options)?, None, Vec::new());
+        scheduler.start_reporter();
+        Ok(scheduler)
+    }
     pub fn open_with_extensions(
         path: impl AsRef<Path>,
         options: Options,
@@ -23474,19 +23629,7 @@ impl Scheduler {
         } else {
             (Vec::new(), Vec::new())
         };
-        let mut scheduler = Self {
-            cancel: harness.owner.conversation_controls().root(),
-            worker_errors: harness.owner.conversation_controls().worker_errors(),
-            harness,
-            tasks: HashMap::new(),
-            summary_tasks: HashMap::new(),
-            summary_provider,
-            summary_blocked,
-            reporter_cancel: CancellationToken::new(),
-            reporter: None,
-            foreground_worker: None,
-            reporter_error: Arc::new(std::sync::Mutex::new(None)),
-        };
+        let mut scheduler = Self::with_harness(harness, summary_provider, summary_blocked);
         // Attach and publish the task driver before any recovered worker is spawned.
         let driver = tasks
             .map(|registry| scheduler.start_tasks(registry))
@@ -23512,6 +23655,25 @@ impl Scheduler {
         }
         scheduler.start_reporter();
         Ok((scheduler, driver))
+    }
+    fn with_harness(
+        harness: Harness,
+        summary_provider: Option<SummaryProviderIdentity>,
+        summary_blocked: Vec<Uuid>,
+    ) -> Self {
+        Self {
+            cancel: harness.owner.conversation_controls().root(),
+            worker_errors: harness.owner.conversation_controls().worker_errors(),
+            harness,
+            tasks: HashMap::new(),
+            summary_tasks: HashMap::new(),
+            summary_provider,
+            summary_blocked,
+            reporter_cancel: CancellationToken::new(),
+            reporter: None,
+            foreground_worker: None,
+            reporter_error: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
     /// Read the same durable extension error log exposed by the harness.
     pub fn extension_reports(&self) -> Result<Vec<ExtensionReportBatch>, Error> {
@@ -23770,6 +23932,42 @@ impl Scheduler {
         self.harness
             .watch_merged_progress(cursor, limit, interval)
             .await
+    }
+    pub fn unified_history_start(
+        &self,
+        id: Uuid,
+        allow_legacy_boundary: bool,
+    ) -> Result<UnifiedHistoryCursor, Error> {
+        self.harness
+            .unified_history_start(id, allow_legacy_boundary)
+    }
+    pub fn unified_history_from_now(&self, id: Uuid) -> Result<UnifiedHistoryCursor, Error> {
+        self.harness.unified_history_from_now(id)
+    }
+    pub fn unified_history(
+        &self,
+        cursor: &UnifiedHistoryCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<UnifiedHistoryPage, Error> {
+        self.harness.unified_history(cursor, limit)
+    }
+    pub async fn watch_unified_history(
+        &self,
+        cursor: &UnifiedHistoryCursor,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<UnifiedHistoryPage, Error> {
+        self.harness
+            .watch_unified_history(cursor, limit, interval)
+            .await
+    }
+    pub fn prune_finished_checkpointable_progress(
+        &self,
+        task: Uuid,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<usize, Error> {
+        self.harness
+            .prune_finished_checkpointable_progress(task, limit)
     }
     pub fn progress_history_from_now(
         &self,

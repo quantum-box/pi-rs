@@ -19,6 +19,537 @@ use pi_rs_durable::{
 use serde_json::{Value, json};
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
+struct LiveChildrenTool {
+    name: &'static str,
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    journal: Option<std::path::PathBuf>,
+    hold_after_results: bool,
+    expect_uncertain_child: bool,
+    expected_outputs: [String; 2],
+}
+
+#[async_trait]
+impl Tool for LiveChildrenTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        panic!("ordinary invoke")
+    }
+}
+
+#[async_trait]
+impl DurableAsyncTool for LiveChildrenTool {
+    async fn execute_durable(
+        &self,
+        args: Value,
+        context: ToolContext,
+        _: DurableToolResume,
+        host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        if self.name == "leaf" {
+            if let Some(dir) = &self.journal {
+                use std::io::Write;
+                let value = args["value"].as_str().unwrap();
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join(value))
+                    .unwrap()
+                    .write_all(b"x")
+                    .unwrap();
+            }
+            self.entered.add_permits(1);
+            tokio::select! {
+                _ = context.cancellation.cancelled() => return Err("aborted child".into()),
+                permit = self.release.acquire() => permit.unwrap().forget(),
+            }
+            return Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                args["value"].as_str().unwrap().into(),
+            )));
+        }
+        let (left, right) = tokio::try_join!(
+            host.start_child_now("left", "leaf", json!({"value":"left"})),
+            host.start_child_now("right", "leaf", json!({"value":"right"})),
+        )?;
+        let duplicate = host
+            .start_child_now("left", "leaf", json!({"value":"left"}))
+            .await?;
+        assert_eq!(duplicate.task_id(), left.task_id());
+        assert!(
+            host.start_child_now("left", "leaf", json!({"value":"changed"}))
+                .await
+                .is_err()
+        );
+        for (child, expected) in [&left, &right].into_iter().zip(&self.expected_outputs) {
+            let result = host
+                .wait_child_result(child, Duration::from_secs(15))
+                .await?
+                .ok_or("child did not settle")?;
+            if self.expect_uncertain_child {
+                assert!(matches!(
+                    result,
+                    AsyncTaskResult::Uncertain(Outcome::Unknown(_))
+                ));
+            } else {
+                assert_eq!(
+                    result,
+                    AsyncTaskResult::Outcome(Outcome::Succeeded(expected.clone()))
+                );
+            }
+        }
+        if self.hold_after_results {
+            let marker = self.journal.as_ref().unwrap().join("results-observed");
+            std::fs::write(marker, b"ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        let summary = if self.expect_uncertain_child {
+            "children need reconciliation"
+        } else {
+            "left+right"
+        };
+        Ok(DurableToolStep::Complete(Outcome::Succeeded(
+            summary.into(),
+        )))
+    }
+}
+
+fn live_children_setup(
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    journal: Option<std::path::PathBuf>,
+    hold_after_results: bool,
+    unsafe_children: bool,
+    expect_uncertain_child: bool,
+) -> (Options, Registry) {
+    let mut registry = Registry::default();
+    let mut adapters = Vec::new();
+    let mut children = Vec::new();
+    for name in ["leaf", "root"] {
+        let tool = Arc::new(LiveChildrenTool {
+            name,
+            entered: entered.clone(),
+            release: release.clone(),
+            journal: journal.clone(),
+            hold_after_results,
+            expect_uncertain_child,
+            expected_outputs: ["left".into(), "right".into()],
+        });
+        let adapter = if name == "leaf" && unsafe_children {
+            register_conversation_unsafe_durable_tool(
+                &mut registry,
+                tool,
+                name,
+                1,
+                children,
+                UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+            )
+        } else {
+            register_conversation_replay_safe_durable_tool(
+                &mut registry,
+                tool,
+                name,
+                1,
+                children,
+                ReplaySafeAuthorization::host_attests_replay_safe(),
+            )
+        }
+        .unwrap();
+        adapters.push(adapter.register());
+        children = vec![adapter];
+    }
+    (
+        Options {
+            model: Arc::new(ModelStub {
+                arguments: "{}".into(),
+            }),
+            tools: adapters,
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+        registry,
+    )
+}
+
+#[tokio::test]
+async fn immediately_admitted_siblings_run_and_settle_while_parent_is_running() {
+    exercise_immediately_admitted_siblings(false, false).await;
+}
+
+#[tokio::test]
+async fn immediately_admitted_siblings_are_cancelled_with_their_parent() {
+    exercise_immediately_admitted_siblings(true, false).await;
+}
+
+#[tokio::test]
+async fn immediately_admitted_unsafe_siblings_publish_committed_results() {
+    exercise_immediately_admitted_siblings(false, true).await;
+}
+
+#[tokio::test]
+async fn replay_safe_checkpointable_parent_awaits_live_generic_task_tools() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Step},
+        task_tool::TaskTool,
+    };
+    struct Generic;
+    fn payload(status: &str) -> Value {
+        json!({"status":status,"detail":"application data"})
+    }
+    impl Handler for Generic {
+        fn run(&self, task: &Task) -> Result<Step, String> {
+            let status = if task.input()["value"] == "left" {
+                "failed"
+            } else {
+                "unknown"
+            };
+            Ok(Step::Succeed(payload(status)))
+        }
+    }
+
+    let mut registry = Registry::default();
+    let generic = Arc::new(Generic);
+    assert!(registry.register_shared("test.generic", true, generic.clone()));
+    let leaf = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "leaf".into(),
+            description: String::new(),
+            parameters: json!({"type": "object"}),
+        },
+        "test.generic",
+        true,
+        1,
+        generic,
+    ));
+    exercise_registered_leaf(
+        registry,
+        leaf,
+        [
+            payload("failed").to_string(),
+            payload("unknown").to_string(),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn replay_safe_checkpointable_parent_calls_an_ordinary_registered_leaf() {
+    struct Plain;
+    #[async_trait]
+    impl Tool for Plain {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "leaf".into(),
+                description: String::new(),
+                parameters: json!({"type":"object","required":["value","normalized"]}),
+            }
+        }
+
+        async fn prepare_arguments(
+            &self,
+            mut arguments: Value,
+        ) -> pi_rs_core::ExtensionResult<Value> {
+            arguments["normalized"] = json!(true);
+            Ok(arguments)
+        }
+
+        async fn invoke(&self, arguments: Value, _: ToolContext) -> Outcome {
+            assert_eq!(arguments["normalized"], true);
+            Outcome::Succeeded(arguments["value"].as_str().unwrap().to_owned())
+        }
+    }
+
+    let mut registry = Registry::default();
+    let leaf = register_conversation_unsafe_durable_tool(
+        &mut registry,
+        pi_rs_durable::async_task_tool::checkpointable_leaf(Arc::new(Plain)),
+        "live-ordinary-leaf",
+        1,
+        Vec::new(),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    exercise_registered_leaf(registry, leaf, ["left".into(), "right".into()]).await;
+}
+
+async fn exercise_registered_leaf(
+    mut registry: Registry,
+    leaf: Arc<pi_rs_durable::task_tool::TaskTool>,
+    expected_outputs: [String; 2],
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let leaf_registration = leaf.register();
+    let parent = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(LiveChildrenTool {
+            name: "root",
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            journal: None,
+            hold_after_results: false,
+            expect_uncertain_child: false,
+            expected_outputs,
+        }),
+        "live-generic-parent",
+        1,
+        vec![leaf],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let mut scheduler = Scheduler::open(
+        dir.path().join("db"),
+        Options {
+            model: Arc::new(ModelStub {
+                arguments: "{}".into(),
+            }),
+            tools: vec![parent.register(), leaf_registration],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+    )
+    .unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(conversation, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(conversation))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        scheduler
+            .conversation(conversation)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| {
+                matches!(message, Message::Tool { content, .. } if content == "left+right")
+            })
+    );
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+async fn exercise_immediately_admitted_siblings(abort: bool, unsafe_children: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (options, registry) = live_children_setup(
+        entered.clone(),
+        release.clone(),
+        None,
+        false,
+        unsafe_children,
+        false,
+    );
+    let mut scheduler = Scheduler::open(&path, options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(conversation, None, "work".into()).unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    match tokio::time::timeout(Duration::from_secs(6), entered.acquire_many(2)).await {
+        Ok(permit) => permit.unwrap().forget(),
+        Err(error) => panic!(
+            "children did not enter: {error}; tasks: {:?}; conversation: {:?}",
+            pi_rs_durable::task_store::TaskStore::new(&store).list(),
+            scheduler.conversation(conversation)
+        ),
+    }
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    let root = tasks
+        .iter()
+        .find(|entry| {
+            entry.task.owner() == &pi_rs_durable::task::TaskOwner::Conversation(conversation)
+        })
+        .unwrap();
+    assert_eq!(root.task.state(), &TaskState::Running);
+    assert_eq!(
+        tasks
+            .iter()
+            .filter(|entry| {
+                entry.task.owner() == &pi_rs_durable::task::TaskOwner::Task(root.task.id())
+                    && entry.task.state() == &TaskState::Running
+            })
+            .count(),
+        2
+    );
+    if abort {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            scheduler.abort_and_wait(conversation),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let store = pi_rs_durable::task_store::TaskStore::new(&store);
+        for child in tasks.iter().filter(|entry| {
+            entry.task.owner() == &pi_rs_durable::task::TaskOwner::Task(root.task.id())
+        }) {
+            let cancelled = store.load(child.task.id()).unwrap().unwrap();
+            assert_eq!(cancelled.task.state(), &TaskState::Cancelled);
+        }
+    } else {
+        release.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(15), scheduler.wait(conversation))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(scheduler.conversation(conversation).unwrap().messages.iter().any(
+            |message| matches!(message, Message::Tool { content, .. } if content == "left+right")
+        ));
+    }
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn immediately_admitted_siblings_crash_worker() {
+    let Some(dir) = std::env::var_os("PI_IMMEDIATE_CHILD_CRASH_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let unsafe_children = std::env::var_os("PI_IMMEDIATE_CHILD_UNSAFE").is_some();
+    let (options, registry) = live_children_setup(
+        Arc::new(tokio::sync::Semaphore::new(0)),
+        Arc::new(tokio::sync::Semaphore::new(if unsafe_children {
+            0
+        } else {
+            2
+        })),
+        Some(dir.clone()),
+        true,
+        unsafe_children,
+        false,
+    );
+    let mut scheduler = Scheduler::open(dir.join("db"), options).unwrap();
+    let _driver = scheduler.start_tasks(registry).unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    std::fs::write(dir.join("conversation"), conversation.to_string()).unwrap();
+    scheduler.submit(conversation, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn immediately_admitted_siblings_reuse_results_after_process_loss() {
+    exercise_live_children_recovery(false).await;
+}
+
+#[tokio::test]
+async fn interrupted_unsafe_live_children_are_never_replayed() {
+    exercise_live_children_recovery(true).await;
+}
+
+async fn exercise_live_children_recovery(unsafe_children: bool) {
+    use std::process::{Child, Command};
+    struct Kill(Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "immediately_admitted_siblings_crash_worker"])
+        .env("PI_IMMEDIATE_CHILD_CRASH_DIR", dir.path());
+    if unsafe_children {
+        command.env("PI_IMMEDIATE_CHILD_UNSAFE", "1");
+    }
+    let mut worker = Kill(command.spawn().unwrap());
+    let reached_boundary = || {
+        if unsafe_children {
+            ["left", "right"].iter().all(|key| {
+                std::fs::metadata(dir.path().join(key)).is_ok_and(|file| file.len() == 1)
+            })
+        } else {
+            dir.path().join("results-observed").exists()
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !reached_boundary() {
+            assert!(worker.0.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("children did not reach the expected crash boundary");
+    worker.0.kill().unwrap();
+    worker.0.wait().unwrap();
+    let conversation = std::fs::read_to_string(dir.path().join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (options, registry) = live_children_setup(
+        Arc::new(tokio::sync::Semaphore::new(0)),
+        Arc::new(tokio::sync::Semaphore::new(2)),
+        Some(dir.path().to_owned()),
+        false,
+        unsafe_children,
+        unsafe_children,
+    );
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    scheduler.schedule(conversation);
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(conversation))
+        .await
+        .unwrap()
+        .unwrap();
+    let state = scheduler.conversation(conversation).unwrap();
+    if unsafe_children {
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks.iter().all(|stored| matches!(
+            stored.task.state(), TaskState::Failed(reason) if reason.contains("requires reconciliation")
+        )));
+        assert!(
+            state.tool_results.is_empty(),
+            "published success without a receipt"
+        );
+    } else {
+        assert!(state.messages.iter().any(|message| {
+            matches!(message, Message::Tool { content, .. } if content == "left+right")
+        }));
+    }
+    for key in ["left", "right"] {
+        assert_eq!(std::fs::read(dir.path().join(key)).unwrap(), b"x");
+    }
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
 struct StreamingTool {
     name: &'static str,
     advance: Arc<tokio::sync::Semaphore>,
@@ -42,6 +573,23 @@ impl Tool for StreamingTool {
 
 #[async_trait]
 impl DurableAsyncTool for StreamingTool {
+    fn output_limits(&self) -> pi_rs_durable::output::OutputLimits {
+        use pi_rs_durable::output::{OutputLimits, Retain};
+        if self.name == "leaf" {
+            OutputLimits {
+                max_bytes: 1024,
+                max_lines: 1,
+                retain: Retain::Tail,
+            }
+        } else {
+            OutputLimits {
+                max_bytes: 4096,
+                max_lines: 2000,
+                retain: Retain::Head,
+            }
+        }
+    }
+
     async fn execute_durable(
         &self,
         args: Value,
@@ -50,7 +598,7 @@ impl DurableAsyncTool for StreamingTool {
         host: &dyn DurableTaskHost,
     ) -> Result<DurableToolStep, String> {
         if args["mode"] == "nested" {
-            host.append_output("nested output").await?;
+            host.append_output("old line\nnested output").await?;
             self.advance.acquire().await.unwrap().forget();
             return host.complete_from_progress().await;
         }
@@ -65,6 +613,15 @@ impl DurableAsyncTool for StreamingTool {
         }
         host.report_progress(DurableToolProgress {
             details: Some(json!({"source":"stream"})),
+            diagnostics: if args["mode"] == "diagnostics" {
+                vec![pi_rs_durable::runtime::ToolDiagnostic {
+                    severity: pi_rs_durable::runtime::DiagnosticSeverity::Warn,
+                    code: Some("fixture".into()),
+                    message: "checkpointable warning".into(),
+                }]
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         })
         .await?;
@@ -123,7 +680,14 @@ async fn wait_for_stream_text(
 
 #[tokio::test]
 async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
-    for mode in ["inherited", "explicit", "bounded", "abort", "wake"] {
+    for mode in [
+        "inherited",
+        "explicit",
+        "bounded",
+        "abort",
+        "wake",
+        "diagnostics",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let advance = Arc::new(tokio::sync::Semaphore::new(0));
@@ -164,7 +728,7 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
             max_turns: 4,
             uncertain_policy: UncertainPolicy::RequireReconciliation,
         };
-        let mut scheduler = Scheduler::open(&path, options).unwrap();
+        let mut scheduler = Scheduler::open(&path, options.clone()).unwrap();
         let driver = scheduler.start_tasks(registry).unwrap();
         let id = scheduler
             .create_conversation(Config {
@@ -176,6 +740,7 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
         let mut watch = scheduler
             .watch_view(id, NonZeroUsize::MIN, Duration::from_millis(5))
             .unwrap();
+        let progress_cursor = scheduler.progress_history_from_now(id).unwrap();
         scheduler.submit(id, None, "work".into()).unwrap();
         let first = wait_for_stream_text(&mut watch, |p| p.text == "first").await;
         let store = durable_store::Store::open(&path).unwrap();
@@ -190,6 +755,11 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
         assert_eq!(
             driver.checkpointable_tool_progress(task).unwrap(),
             Some(first)
+        );
+        assert!(
+            scheduler
+                .prune_finished_checkpointable_progress(task, NonZeroUsize::MIN)
+                .is_err()
         );
         if mode == "abort" {
             tokio::time::timeout(Duration::from_secs(15), scheduler.abort_and_wait(id))
@@ -212,6 +782,8 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
                                 .unwrap()
                         {
                             assert_eq!(progress.text, "nested output");
+                            assert_eq!(progress.dropped_bytes, 9);
+                            assert_eq!(progress.dropped_lines, 1);
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -281,6 +853,11 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
                 .unwrap();
             if mode == "explicit" {
                 assert_eq!(content, "");
+            } else if mode == "diagnostics" {
+                assert!(content.starts_with(&second.text));
+                assert!(content.contains("[warn] checkpointable warning"));
+                assert_eq!(conversation.tool_results[0].diagnostics, second.diagnostics);
+                assert!(!conversation.tool_results[0].is_error);
             } else {
                 assert_eq!(content, second.text);
                 assert_eq!(conversation.tool_results[0].details, second.details);
@@ -294,9 +871,64 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
                 .tool_progress
                 .is_none()
         );
+        let published = scheduler.conversation(id).unwrap().messages;
+        let fork = (mode == "bounded").then(|| {
+            let id = scheduler.fork(id).unwrap();
+            (id, scheduler.conversation(id).unwrap().messages)
+        });
+        let mut deleted = 0;
+        loop {
+            let count = scheduler
+                .prune_finished_checkpointable_progress(task, NonZeroUsize::MIN)
+                .unwrap();
+            if count == 0 {
+                break;
+            }
+            assert_eq!(count, 1);
+            deleted += count;
+        }
+        assert_eq!(deleted, if mode == "wake" { 2 } else { 1 });
+        let recorded: Vec<_> = scheduler
+            .progress_history(&progress_cursor, NonZeroUsize::new(100).unwrap())
+            .unwrap()
+            .records
+            .into_iter()
+            .flat_map(|record| record.changes)
+            .filter_map(|change| {
+                if let pi_rs_durable::runtime::ProgressHistoryChange::CheckpointableTool {
+                    task: reported,
+                    attempt,
+                    progress,
+                } = change
+                {
+                    Some((reported, attempt, progress))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            recorded
+                .iter()
+                .any(|(reported, _, progress)| *reported == task && progress.text == "first")
+        );
+        if mode == "wake" {
+            assert!(recorded.iter().any(|(reported, _, progress)| {
+                *reported != task && progress.text == "nested output"
+            }));
+            assert_ne!(recorded.first().unwrap().1, recorded.last().unwrap().1);
+            assert_eq!(recorded.last().unwrap().2.text, "second attempt");
+        }
+        assert_eq!(scheduler.conversation(id).unwrap().messages, published);
         watch.close();
         driver.shutdown().unwrap();
         scheduler.shutdown().await.unwrap();
+        if let Some((child, history)) = fork {
+            let reopened = Scheduler::open(&path, options).unwrap();
+            assert_eq!(reopened.conversation(child).unwrap().messages, history);
+            assert_eq!(reopened.conversation(id).unwrap().messages, published);
+            reopened.shutdown().await.unwrap();
+        }
     }
 }
 
