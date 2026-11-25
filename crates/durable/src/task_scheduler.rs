@@ -18411,6 +18411,8 @@ impl Scheduler {
         // Both use the captured version, so aborts and competing graph writers
         // fence the whole transaction, without a self-conflict.
         let mut graph = self.ts().prepare_save(&batch)?;
+        #[cfg(feature = "test-hooks")]
+        hook_fence_test_hook::run(running.task.id(), "checkpointable-settlement");
         let selection_gate = if self
             .registered(&running.task)?
             .conversation_checkpointable
@@ -18433,9 +18435,26 @@ impl Scheduler {
                 .conversation_checkpointable
                 .is_some()
         {
-            let checks = harness
+            let checks = match harness
                 .checkpointable_conversation_checks(&running.task, &self.registry)
-                .map_err(|_| Error::Ownership)?;
+            {
+                Ok(checks) => checks,
+                Err(crate::runtime::Error::CheckpointableSelectionChanged) => {
+                    // A host can replace a selection after a hook returns.
+                    // Discard this attempt's staged effects and settle the
+                    // task through the checked owned-failure path.
+                    drop(_selection);
+                    return self.finish_running_conflict(
+                        &running,
+                        "checkpointable extension selection changed before task settlement".into(),
+                        &owner,
+                        _gate,
+                        nonblocking_abort,
+                        deferred,
+                    );
+                }
+                Err(_) => return Err(Error::Ownership),
+            };
             for check in checks {
                 if let Some(existing) = graph
                     .checks
