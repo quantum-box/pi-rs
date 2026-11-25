@@ -1123,6 +1123,7 @@ struct Host<'a, 'b> {
     docs: Mutex<&'a mut crate::document::TaskDocuments<'b>>,
     children: &'a HashMap<String, Arc<TaskTool>>,
     started: Mutex<HashSet<uuid::Uuid>>,
+    immediate: Mutex<HashSet<uuid::Uuid>>,
     cancellation: &'a pi_rs_core::CancellationToken,
     admission: &'a AdmissionHandle<'a>,
     progress: Mutex<ReportedProgress>,
@@ -1189,10 +1190,50 @@ impl DurableTaskHost for Host<'_, '_> {
             .insert(call.task_id());
         Ok(AsyncTaskCall(call))
     }
+
+    async fn start_child_now(
+        &self,
+        key: &str,
+        tool: &str,
+        input: serde_json::Value,
+    ) -> Result<AsyncTaskCall, String> {
+        let child = self.children.get(tool).ok_or("child is not registered")?;
+        let docs = self.docs.lock().map_err(|error| error.to_string())?;
+        if self.cancellation.is_cancelled()
+            || docs
+                .keyed_children
+                .iter()
+                .any(|(staged, _, _)| staged == key)
+        {
+            return Err("cannot immediately admit a cancelled or already staged child".into());
+        }
+        let id = self
+            .admission
+            .admit_checkpointable_child(child, key, input)
+            .map_err(|error| error.to_string())?;
+        self.immediate
+            .lock()
+            .map_err(|error| error.to_string())?
+            .insert(id);
+        Ok(AsyncTaskCall(crate::task_tool::NestedTaskCall::new(
+            self.task.id(),
+            id,
+        )))
+    }
+
     async fn child_result(&self, child: &AsyncTaskCall) -> Result<Option<AsyncTaskResult>, String> {
         let mut docs = self.docs.lock().map_err(|e| e.to_string())?;
         if !child.0.belongs_to(self.task.id()) {
             return Err("child belongs to another parent".into());
+        }
+        if self
+            .immediate
+            .lock()
+            .map_err(|error| error.to_string())?
+            .contains(&child.task_id())
+            && !docs.owned_child_has_settled(child.task_id())?
+        {
+            return Ok(None);
         }
         let task = docs.get_owned_child(child.task_id())?;
         if !task.replay_safe()
@@ -1258,6 +1299,34 @@ impl DurableTaskHost for Host<'_, '_> {
             Some(NestedTaskResult::Failed(reason)) => Some(AsyncTaskResult::Failed(reason)),
             Some(NestedTaskResult::Cancelled) => Some(AsyncTaskResult::Cancelled),
         })
+    }
+
+    async fn wait_child_result(
+        &self,
+        child: &AsyncTaskCall,
+        timeout: std::time::Duration,
+    ) -> Result<Option<AsyncTaskResult>, String> {
+        if !child.0.belongs_to(self.task.id())
+            || !self
+                .immediate
+                .lock()
+                .map_err(|error| error.to_string())?
+                .contains(&child.task_id())
+        {
+            return Err("live wait requires an immediately admitted child of this attempt".into());
+        }
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => Err("child wait cancelled".into()),
+            result = tokio::time::timeout(timeout, async {
+                loop {
+                    if let Some(outcome) = self.child_result(child).await? {
+                        return Ok(Some(outcome));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }) => result.unwrap_or(Ok(None)),
+        }
     }
     async fn child_result_with_after(
         &self,
@@ -3487,6 +3556,7 @@ impl Handler for Executor {
             docs: Mutex::new(docs),
             children: &self.children,
             started: Mutex::new(HashSet::new()),
+            immediate: Mutex::new(HashSet::new()),
             cancellation,
             admission,
             progress: Mutex::new(ReportedProgress::default()),

@@ -895,7 +895,32 @@ pub trait DurableTaskHost: Send + Sync {
         tool: &str,
         input: serde_json::Value,
     ) -> Result<AsyncTaskCall, String>;
+
+    /// Commit a keyed child immediately so it can run while its parent is
+    /// active. Both tools must be registered as replay-safe. The ordinary
+    /// `start_child` method instead stages admission for the parent transition.
+    async fn start_child_now(
+        &self,
+        _key: &str,
+        _tool: &str,
+        _input: serde_json::Value,
+    ) -> Result<AsyncTaskCall, String> {
+        Err("immediate checkpointable child admission is unavailable".into())
+    }
+
     async fn child_result(&self, child: &AsyncTaskCall) -> Result<Option<AsyncTaskResult>, String>;
+
+    /// Wait for an immediately admitted child while keeping this attempt
+    /// active. A timeout returns `None`; use a park to release the worker
+    /// while waiting for capacity or a long-running child.
+    async fn wait_child_result(
+        &self,
+        _child: &AsyncTaskCall,
+        _timeout: std::time::Duration,
+    ) -> Result<Option<AsyncTaskResult>, String> {
+        Err("live checkpointable child waits are unavailable".into())
+    }
+
     /// Read the ordinary result and any authenticated supplemental after output.
     async fn child_result_with_after(
         &self,

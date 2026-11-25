@@ -3575,6 +3575,19 @@ impl<'a> TaskDocuments<'a> {
         Ok(child.task.clone())
     }
 
+    /// Probe an immediately admitted child while it can still change. The
+    /// caller must pin a terminal result with `get_owned_child` before using it.
+    pub(crate) fn owned_child_has_settled(&self, id: uuid::Uuid) -> Result<bool, String> {
+        let child = crate::task_store::TaskStore::new(self.store)
+            .load(id)
+            .map_err(|error| error.to_string())?
+            .ok_or("owned child missing")?;
+        if child.task.owner() != &crate::task::TaskOwner::Task(self.task.id()) {
+            return Err("task is not a direct child".into());
+        }
+        Ok(child.task.is_terminal())
+    }
+
     /// Read a task-owned document, acquiring an absent address for this task.
     /// Existing owned addresses may be reacquired by the same task; an
     /// unowned existing document is never implicitly taken over.
