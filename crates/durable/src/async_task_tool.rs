@@ -903,8 +903,9 @@ pub trait DurableTaskHost: Send + Sync {
     ) -> Result<AsyncTaskCall, String>;
 
     /// Commit a keyed child immediately so it can run while its parent is
-    /// active. Both tools must be registered as replay-safe. The ordinary
-    /// `start_child` method instead stages admission for the parent transition.
+    /// active. The parent must be replay-safe. An explicitly registered unsafe
+    /// conversation child keeps its normal receipt and reconciliation policy.
+    /// The ordinary `start_child` stages admission for the parent transition.
     async fn start_child_now(
         &self,
         _key: &str,

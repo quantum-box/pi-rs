@@ -8605,7 +8605,7 @@ impl AdmissionHandle<'_> {
             ChildAdmission::Checkpointable => {
                 let registry = &definitions.registry;
                 let parent_kind = parent.task.kind().ok_or(Error::Registration)?;
-                if !parent.task.replay_safe() || !tool_identity.replay_safe {
+                if !parent.task.replay_safe() {
                     return Err(Error::Registration);
                 }
                 if let Some(harness) = self.validator {
@@ -8621,6 +8621,7 @@ impl AdmissionHandle<'_> {
                         .checkpointable_conversation_checks(&parent.task, registry)
                         .map_err(|error| Error::Handler(error.to_string()))?;
                 } else if !self.standalone
+                    || !tool_identity.replay_safe
                     || ![parent_kind, tool_identity.kind.as_str()]
                         .into_iter()
                         .all(|kind| {

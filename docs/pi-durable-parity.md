@@ -462,15 +462,17 @@ closed; external job cancellation is not provided.
 
 An internal [storage-only keyed child admission](../crates/durable/src/keyed_child.rs) now atomically creates a registered child task and a parent-scoped key record with its task ID, tool identity, arguments, replay policy, registration identity, initial checkpoint and restart limit. A duplicate with the same identity returns the original ID; a conflicting identity fails. Older experimental records without the initial checkpoint and restart limit fail closed; there is no automatic migration. Admission requires a current running, non-aborting task parent and a ready child owned by it. Creation advances the parent version to fence abort and settlement traversals, and checks the ownership ancestry; duplicate lookup also checks the recorded child exists and is still owned by that parent. Concurrent admissions, including different keys, can conflict and require a fresh snapshot and retry; an uncertain storage commit requires inspection before retry. The internal preparation must not be composed with separately prepared ownership changes: their ancestry checks see only pre-commit state. This primitive does not acquire an executor lease or validate a registration against a live registry: its eventual caller must do both. It is private and not connected to nested tool execution or exposed as `wait: false`.
 
-For registered replay-safe checkpointable tools, `DurableTaskHost::start_child_now`
-commits a keyed direct child while the parent attempt remains active.
-Sibling calls can run concurrently when workers are available. Identical keys
-reattach after process loss. `wait_child_result` waits with a deadline and
-cancellation, and the terminal read is fenced with the parent's settlement.
-Tools can park when the worker pool is full or a child needs a longer wait.
-This explicit path checks the current registration, ownership and selected
-hooks. The existing `start_child` method stages the child with the parent's
-transition, including for unsafe checkpointable tools.
+For a registered replay-safe checkpointable parent,
+`DurableTaskHost::start_child_now` commits a keyed direct child while the parent
+attempt remains active. Siblings can run concurrently when workers are
+available. Identical keys reattach after process loss. `wait_child_result`
+waits with a deadline and cancellation, and the terminal read is fenced with
+the parent's settlement. Tools can park to release a worker during a longer
+wait. The admission checks the registration, ownership and selected hooks. An
+explicitly registered unsafe conversation child retains its usual receipt and
+reconciliation rules. A process loss without a receipt blocks publication of
+the parent's success. The existing `start_child` method stages the child with
+the parent's transition, including for unsafe checkpointable parents.
 
 A top-level opt-in [`TaskTool`](../crates/durable/src/task_tool.rs) maps a tool call to a conversation-owned generic task. The operation ID is its task ID. The runtime validates the handler against the attached driver and commits the task and a task-backed pending phase together; polling reads the durable terminal task state, including after reopen. A missing driver or registration fails before admission; an interrupted marker invocation is replay-safe because it performs no task effects. Conversation abort marks the owned task and waits for its cleanup before settling the pending tool. A synchronous handler must return before its abort handler can run. Install the same task definition when reopening; to attach the driver before resuming interrupted marker dispatch, use `Harness::open_paused`. Task output is the task's JSON result (a JSON string becomes text). Because generic task failures do not distinguish a reported error from uncertain effects, any failed task blocks the conversation for reconciliation. This is a single top-level task-backed tool, not upstream nested `wait: false`: nested dispatch, tool checkpoints, parallel child handles and a wake payload are not supplied by this adapter. The adapter fails closed outside its registered top-level runtime dispatch.
 
