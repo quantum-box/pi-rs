@@ -4036,6 +4036,15 @@ stored name, as Pi does, including names imported from external JSONL. A
 whitespace-only name clears the title without falling back to an older name;
 reading preserves internal line breaks and does not rewrite the journal.
 
+### SDK model-facing tool selection
+
+An owned Rust session exposes `active_tool_names` and `set_active_tools` for
+the configured model-facing tool selection. Like Pi the selection is separate
+from the registered tools available for orchestration. Native registry
+validation rejects unknown names without replacing the previous selection.
+The selection applies to future runs of this owned session, and request-time
+registry refreshes can further change the model-facing tools.
+
 ### SDK queued input inspection
 
 Pi exposes the pending steering and follow-up text and each queue's delivery

@@ -1797,6 +1797,34 @@ impl AgentSession {
     pub fn tools(&self) -> Vec<crate::ToolSpec> {
         self.registry.tool_specs()
     }
+    /// Names of the configured tools selected for model advertisement.
+    /// Per-request registry refreshes are not reflected in this snapshot.
+    pub fn active_tool_names(&self) -> Vec<String> {
+        self.registry
+            .active_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect()
+    }
+
+    /// Change the model-facing selection for future runs of this session.
+    /// Registered tools remain available for orchestration. An unregistered
+    /// name rejects the whole selection, matching native registry validation.
+    pub fn set_active_tools(&mut self, names: impl IntoIterator<Item = String>) -> Result<()> {
+        self.ensure_open()?;
+        let journal = self.session.clone();
+        let journal = journal
+            .try_lock()
+            .map_err(|_| Error::Session("session journal is in use".into()))?;
+        let mut registry = (*self.registry).clone();
+        registry.set_active_tools(names)?;
+        let input_hooks = InputHooks::new(&registry, &journal);
+        self.registry = Arc::new(registry);
+        self.refresh_run_config();
+        *self.control.input_hooks.lock().expect("SDK input hooks") = input_hooks;
+        Ok(())
+    }
+
     /// Inspect the session's configured registry, including extension ownership
     /// and model-advertisement status for inactive as well as active tools.
     /// Per-request registry refreshes during a run are not reflected here.
@@ -11635,6 +11663,57 @@ mod tests {
             vec![self.0.clone()]
         }
     }
+    #[tokio::test]
+    async fn sdk_tool_selection_changes_model_requests_without_unregistering_tools() {
+        struct ToolNamesModel;
+
+        #[async_trait::async_trait]
+        impl Model for ToolNamesModel {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                let names = request
+                    .tools
+                    .into_iter()
+                    .map(|spec| spec.name)
+                    .collect::<Vec<_>>();
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text(format!("tools: {}", names.join(", ")))),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+
+        let mut session = SessionBuilder::new(Arc::new(ToolNamesModel), "fixture")
+            .extension(Arc::new(JobExtension(Arc::new(PollingJob {
+                dispatched: AtomicUsize::new(0),
+                polls: AtomicUsize::new(0),
+                started: tokio::sync::Notify::new(),
+            }))))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+
+        assert_eq!(session.active_tool_names(), ["job"]);
+        session.set_active_tools([]).unwrap();
+        assert!(session.active_tool_names().is_empty());
+        assert_eq!(session.tools()[0].name, "job");
+        assert!(!session.registered_tool_info()[0].active);
+        assert_eq!(session.prompt("show selection").await.unwrap(), "tools: ");
+
+        session.set_active_tools(["job".into()]).unwrap();
+        assert!(session.set_active_tools(["missing".into()]).is_err());
+        assert_eq!(session.active_tool_names(), ["job"]);
+        assert_eq!(
+            session.prompt("show new selection").await.unwrap(),
+            "tools: job"
+        );
+
+        session.close().await.unwrap();
+        assert!(session.set_active_tools([]).is_err());
+    }
+
     struct LiveKeyResultHook(bool);
     struct LiveKeyTool(bool);
     #[async_trait::async_trait]
