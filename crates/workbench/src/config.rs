@@ -4,6 +4,8 @@ use serde_json::{Map, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub(super) const DEFAULT_CODE_BLOCK_INDENT: &str = "  ";
+
 pub fn agent_dir() -> PathBuf {
     pi_rs_workbench::agent_dir()
 }
@@ -498,6 +500,12 @@ impl Settings {
             .as_f64()
             .map_or(60, |width| width.min(f64::from(u16::MAX)) as usize)
     }
+    pub fn code_block_indent(&self) -> &str {
+        self.value["markdown"]["codeBlockIndent"]
+            .as_str()
+            .unwrap_or(DEFAULT_CODE_BLOCK_INDENT)
+    }
+
     pub fn mermaid_mode(&self) -> &str {
         self.value["markdown"]["mermaid"]
             .as_str()
@@ -2698,6 +2706,27 @@ mod tests {
         assert_eq!(settings.thinking_for_model("ollama", "b"), Some("max"));
         assert_eq!(settings.thinking_for_model("ollama", "c"), Some("low"));
         validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+    }
+
+    #[test]
+    fn markdown_code_block_indent_accepts_empty_and_custom_prefixes() {
+        let path = Path::new("settings.json");
+        assert_eq!(Settings::default().code_block_indent(), "  ");
+        for indent in ["", "· "] {
+            let settings = Settings {
+                value: json!({"markdown":{"codeBlockIndent":indent}}),
+                ..Settings::default()
+            };
+            validate_settings(settings.value(), path).unwrap();
+            assert_eq!(settings.code_block_indent(), indent);
+        }
+        let invalid = json!({"markdown":{"codeBlockIndent":2}});
+        assert!(
+            validate_settings(&invalid, path)
+                .unwrap_err()
+                .to_string()
+                .contains("/markdown/codeBlockIndent")
+        );
     }
 
     #[test]

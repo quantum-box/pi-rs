@@ -675,6 +675,7 @@ struct RegularLayout {
     expand_tools: bool,
     hide_thinking: bool,
     output: TranscriptOptions<'static>,
+    code_block_indent: String,
 }
 #[derive(Default)]
 struct RegularState {
@@ -4395,9 +4396,10 @@ render_call_id: None,
         Ok(())
     }
 
-    fn transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'_> {
+    fn transcript_options<'a>(&'a self, args: &'a Cli, streaming: bool) -> TranscriptOptions<'a> {
         TranscriptOptions {
             hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            code_block_indent: Some(args.settings.code_block_indent()),
             ..self.base_transcript_options(args, streaming)
         }
     }
@@ -4405,6 +4407,7 @@ render_call_id: None,
     fn base_transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'static> {
         TranscriptOptions {
             hidden_thinking_label: None,
+            code_block_indent: None,
             image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
                 .then(|| args.settings.terminal_image_width()),
             padding: args.settings.output_padding(),
@@ -4532,6 +4535,7 @@ render_call_id: None,
         self.graphics.reset();
         let output = TranscriptOptions {
             hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            code_block_indent: Some(args.settings.code_block_indent()),
             ..self.base_transcript_options(args, false)
         };
         let width = usize::from(terminal::size()?.0.max(1));
@@ -4563,6 +4567,7 @@ render_call_id: None,
             expand_tools: self.expand_tools,
             hide_thinking: self.hide_thinking,
             output: base_output,
+            code_block_indent: args.settings.code_block_indent().to_owned(),
         };
         let redraw = self.regular.layout.is_some()
             && (self.regular.redraw
@@ -4590,6 +4595,7 @@ render_call_id: None,
         }
         let output = TranscriptOptions {
             hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            code_block_indent: Some(args.settings.code_block_indent()),
             ..base_output
         };
         let render_entry = |entry: &Entry| {
@@ -14086,6 +14092,53 @@ exit {exit}
         assert!(view.model_list.is_none());
         assert!(view.picker.is_none());
         assert!(sender.send(Ok(vec!["stale".into()])).is_err());
+    }
+
+    #[test]
+    fn configured_code_block_indent_reaches_saved_and_live_transcript_rows() {
+        use super::*;
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let settings_path = directory.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"outputPad":0,"markdown":{"codeBlockIndent":"· "}}"#,
+        )
+        .unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.workspace = directory.path().to_owned();
+        args.settings =
+            super::super::config::Settings::load_from_paths(&args.workspace, false, &settings_path)
+                .unwrap();
+        let view = View {
+            lines: vec![Entry::user("```\nsaved sample\n```".into())],
+            streaming: "```\nlive sample\n```".into(),
+            ..View::default()
+        };
+        let theme = Theme::system();
+        let saved = view.lines[0].render(
+            &theme,
+            80,
+            false,
+            true,
+            view.transcript_options(&args, false),
+        );
+        let live = Entry::Assistant(view.streaming_markdown(false)).render(
+            &theme,
+            80,
+            false,
+            true,
+            view.transcript_options(&args, true),
+        );
+        for (lines, expected) in [(saved, "· saved sample"), (live, "· live sample")] {
+            let row: String = lines[1]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect();
+            assert_eq!(row, expected);
+        }
     }
 
     #[test]
