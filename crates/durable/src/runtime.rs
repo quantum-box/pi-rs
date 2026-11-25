@@ -3778,6 +3778,49 @@ pub struct UnifiedHistoryPage {
     pub has_more: bool,
 }
 
+/// The inclusive boundary used to copy a conversation's history.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ForkBoundary {
+    Observation,
+    Message { entry_id: Uuid },
+    Application { entry_id: Uuid },
+    Display { entry_id: Uuid },
+}
+
+/// An immutable link to the conversation that exposed the selected history.
+/// The source may be an earlier ancestor for inherited entries.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForkParent {
+    pub conversation: Uuid,
+    pub source: Uuid,
+    pub source_observation: u64,
+    pub boundary: ForkBoundary,
+}
+
+impl ForkParent {
+    fn key(child: Uuid) -> Vec<u8> {
+        format!("runtime/fork-parent/{child}").into_bytes()
+    }
+
+    fn append_to(
+        &self,
+        child: Uuid,
+        batch: &mut crate::task_store::OwnedBatch,
+    ) -> Result<(), Error> {
+        let key = Self::key(child);
+        batch.checks.push(Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        });
+        batch.mutations.push(Mutation::Put {
+            key,
+            value: serde_json::to_vec(self)?,
+        });
+        Ok(())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DisplayForkOrigin {
     source: Uuid,
@@ -8936,6 +8979,42 @@ impl Harness {
         )
     }
 
+    /// Return the immediate parent and the exact inherited cut when recorded.
+    /// Conversations created before ancestry was recorded also return `None`.
+    pub fn fork_parent(&self, id: Uuid) -> Result<Option<ForkParent>, Error> {
+        let store = self.owner.store();
+        let root = Self::key(id);
+        if store.get(&root)?.is_none() {
+            return Err(Error::NotFound);
+        }
+        let key = ForkParent::key(id);
+        let Some(record) = store.get_bounded(&key, 4096)? else {
+            return Ok(None);
+        };
+        let parent: ForkParent = serde_json::from_slice(&record.value)?;
+        let child_commit = store.first_commit_for_key(&root)?;
+        let first_snapshot = format!("runtime/fork/{id}/{:020}", 1);
+        let source_key = format!(
+            "runtime/fork/{}/{:020}",
+            parent.source, parent.source_observation
+        );
+        let source_commit = store.first_commit_for_key(source_key.as_bytes())?;
+        if parent.conversation.is_nil()
+            || parent.source.is_nil()
+            || parent.conversation == id
+            || parent.source == id
+            || parent.source_observation == 0
+            || source_commit
+                .zip(child_commit)
+                .is_none_or(|(source, child)| source >= child)
+            || store.commit_for_version(&key, record.version)? != child_commit
+            || store.first_commit_for_key(first_snapshot.as_bytes())? != child_commit
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        Ok(Some(parent))
+    }
+
     /// Fork the current settled conversation. Queued inputs and request IDs
     /// are not inherited. Use `fork_at` for historical observation cuts.
     pub fn fork(&mut self, id: Uuid) -> Result<Uuid, Error> {
@@ -9005,6 +9084,13 @@ impl Harness {
         retry_document_fork(|| {
             let mut batch = crate::document::Documents::new(self.owner.store())
                 .fork_scope(id, state.id, revision)?;
+            ForkParent {
+                conversation: id,
+                source: id,
+                source_observation: observation.0,
+                boundary: ForkBoundary::Observation,
+            }
+            .append_to(state.id, &mut batch)?;
             self.record_display_fork_origin(&state, id, observation, &mut batch)?;
             membership
                 .append_to(state.id, &mut batch)
@@ -9067,16 +9153,17 @@ impl Harness {
     /// Incomplete tool batches and snapshots without historical state fail closed.
     pub fn fork_at(&mut self, id: Uuid, cursor: crate::observer::Cursor) -> Result<Uuid, Error> {
         let membership = self.fork_membership_proof(id)?;
-        self.fork_at_cut(id, cursor, None, &membership)
-    }
-    fn fork_at_cut(
-        &mut self,
-        id: Uuid,
-        cursor: crate::observer::Cursor,
-        prefix: Option<(usize, usize)>,
-        membership: &crate::session_membership::ForkMembershipProof,
-    ) -> Result<Uuid, Error> {
-        self.fork_at_selected(id, cursor, prefix, None, None, None, &[], membership)
+        self.fork_at_selected(
+            id,
+            cursor,
+            ForkBoundary::Observation,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &membership,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9084,10 +9171,11 @@ impl Harness {
         &mut self,
         id: Uuid,
         cursor: crate::observer::Cursor,
+        boundary: ForkBoundary,
         prefix: Option<(usize, usize)>,
-        application_cut: Option<(u64, Uuid, Vec<crate::application_entry::ApplicationEntry>)>,
+        application_cut: Option<(u64, Vec<crate::application_entry::ApplicationEntry>)>,
         reset_cut: Option<(Conversation, crate::transcript::Cursor, u64, Vec<Check>)>,
-        display_cut: Option<(usize, Uuid)>,
+        display_cut: Option<usize>,
         evidence: &[Check],
         membership: &crate::session_membership::ForkMembershipProof,
     ) -> Result<Uuid, Error> {
@@ -9103,7 +9191,7 @@ impl Harness {
             .ok_or(crate::fork::Error::InvalidCursor)?;
         let revision = match (&application_cut, &reset_cut) {
             (_, Some((_, _, revision, _))) => *revision,
-            (Some((revision, _, _)), None) => *revision,
+            (Some((revision, _)), None) => *revision,
             (None, None) => self
                 .owner
                 .store()
@@ -9121,7 +9209,7 @@ impl Harness {
             }
         }
         let mut value: serde_json::Value = serde_json::from_slice(&entry.value)?;
-        if let Some((len, _)) = display_cut {
+        if let Some(len) = display_cut {
             let writes = value
                 .pointer_mut("/documents/pi-rs~1runtime~1application-writes")
                 .and_then(serde_json::Value::as_array_mut)
@@ -9433,19 +9521,21 @@ impl Harness {
             phase: Phase::Idle,
         };
         retry_document_fork(|| {
-            let current_parent = application_cut
-                .as_ref()
-                .map(|(_, parent, _)| *parent)
-                .or_else(|| display_cut.map(|(_, parent)| parent))
-                .unwrap_or(id);
             let mut batch = crate::document::Documents::new(self.owner.store()).fork_scope_from(
                 id,
-                current_parent,
+                membership.parent(),
                 state.id,
                 revision,
             )?;
             batch.checks.extend_from_slice(evidence);
             batch.checks.extend_from_slice(&source_checks);
+            ForkParent {
+                conversation: membership.parent(),
+                source: id,
+                source_observation: cursor.0,
+                boundary: boundary.clone(),
+            }
+            .append_to(state.id, &mut batch)?;
             membership
                 .append_to(state.id, &mut batch)
                 .map_err(|error| Error::Invalid(format!("fork session membership: {error}")))?;
@@ -9454,7 +9544,7 @@ impl Harness {
             } else {
                 self.record_display_fork_origin(&state, id, cursor, &mut batch)?;
             }
-            if let Some((_, _, entries)) = &application_cut {
+            if let Some((_, entries)) = &application_cut {
                 let target = crate::application_entry::key(state.id);
                 let mutation = batch
                     .mutations
@@ -9734,8 +9824,9 @@ impl Harness {
         self.fork_at_selected(
             origin,
             crate::observer::Cursor(cursor),
+            ForkBoundary::Application { entry_id },
             None,
-            Some((revision, id, visible)),
+            Some((revision, visible)),
             None,
             None,
             &[],
@@ -9764,7 +9855,6 @@ impl Harness {
         let _proof_scope = ResetProofScope::enter();
         self.fork_by_display_entry_with_origin(
             id,
-            id,
             entry_id,
             None,
             Vec::new(),
@@ -9773,11 +9863,9 @@ impl Harness {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn fork_by_display_entry_with_origin(
         &mut self,
         id: Uuid,
-        requested: Uuid,
         entry_id: Uuid,
         through: Option<crate::observer::Cursor>,
         mut checks: Vec<Check>,
@@ -9942,7 +10030,6 @@ impl Harness {
                     ]);
                     return self.fork_by_display_entry_with_origin(
                         origin.source,
-                        requested,
                         entry_id,
                         Some(crate::observer::Cursor(origin.observation)),
                         checks,
@@ -9998,10 +10085,11 @@ impl Harness {
                         return self.fork_at_selected(
                             id,
                             record.cursor,
+                            ForkBoundary::Display { entry_id },
                             None,
                             None,
                             None,
-                            Some((index + 1, requested)),
+                            Some(index + 1),
                             &checks,
                             membership,
                         );
@@ -10062,10 +10150,11 @@ impl Harness {
                 commit,
                 origin,
                 system_end,
+                summary_id,
                 ..
             } => {
                 let occurrences = self.resolved_occurrences(id, position.cursor.clone())?;
-                Some((*commit, *origin, *system_end, occurrences))
+                Some((*commit, *origin, *system_end, *summary_id, occurrences))
             }
             _ => None,
         };
@@ -10076,11 +10165,12 @@ impl Harness {
         };
         let (messages, _, metadata) = change.parts()?;
         let (commit, origin) = metadata
-            .map(|(_, commit, origin)| (commit, origin))
+            .as_ref()
+            .map(|(_, commit, origin)| (*commit, *origin))
             .or_else(|| {
                 compacted_metadata
                     .as_ref()
-                    .map(|(commit, origin, _, _)| (*commit, *origin))
+                    .map(|(commit, origin, ..)| (*commit, *origin))
             })
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
         if origin != id {
@@ -10116,9 +10206,14 @@ impl Harness {
             }
             let (cut, revision, checks) =
                 self.prove_failure_reset_cut(id, &position.cursor, commit)?;
+            let entry_id = metadata
+                .as_ref()
+                .and_then(|(ids, _, _)| ids.get(count - 1).copied())
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
             return self.fork_at_selected(
                 id,
                 record.cursor,
+                ForkBoundary::Message { entry_id },
                 None,
                 None,
                 Some((cut, position.cursor, revision, checks)),
@@ -10159,7 +10254,7 @@ impl Harness {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             }
         }
-        if let Some((_, _, summary_index, occurrences)) = &compacted_metadata
+        if let Some((_, _, summary_index, _, occurrences)) = &compacted_metadata
             && count - 1 != *summary_index
         {
             let (message, history) = occurrences
@@ -10171,17 +10266,34 @@ impl Harness {
             let original = self.original_occurrence_position(history, message)?;
             return self.fork_at_position_with_membership(history.origin, original, membership);
         }
-        if count == messages.len() {
-            return self.fork_at_cut(id, record.cursor, None, membership);
-        }
-        let prefix = stable_prefix.ok_or(crate::fork::Error::InvalidSnapshot)?;
-        let total = prefix
-            .checked_add(count)
+        let entry_id = metadata
+            .as_ref()
+            .and_then(|(ids, _, _)| ids.get(count - 1).copied())
+            .or_else(|| compacted_metadata.as_ref().map(|(_, _, _, id, _)| *id))
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
-        let expected_len = prefix
-            .checked_add(messages.len())
-            .ok_or(crate::fork::Error::InvalidSnapshot)?;
-        self.fork_at_cut(id, record.cursor, Some((total, expected_len)), membership)
+        let prefix = if count == messages.len() {
+            None
+        } else {
+            let prefix = stable_prefix.ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let total = prefix
+                .checked_add(count)
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let expected_len = prefix
+                .checked_add(messages.len())
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            Some((total, expected_len))
+        };
+        self.fork_at_selected(
+            id,
+            record.cursor,
+            ForkBoundary::Message { entry_id },
+            prefix,
+            None,
+            None,
+            None,
+            &[],
+            membership,
+        )
     }
 
     fn original_occurrence_position(
@@ -24105,6 +24217,9 @@ impl Scheduler {
     }
     pub fn fork(&mut self, id: Uuid) -> Result<Uuid, Error> {
         self.harness.fork(id)
+    }
+    pub fn fork_parent(&self, id: Uuid) -> Result<Option<ForkParent>, Error> {
+        self.harness.fork_parent(id)
     }
     pub fn fork_at(&mut self, id: Uuid, cursor: crate::observer::Cursor) -> Result<Uuid, Error> {
         self.harness.fork_at(id, cursor)

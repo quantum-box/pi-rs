@@ -77,6 +77,7 @@ fn checked(key: Vec<u8>, version: u64) -> Check {
 /// Membership evidence captured for the conversation the caller actually
 /// forks, even when the selected history originated in another conversation.
 pub(crate) struct ForkMembershipProof {
+    parent: Uuid,
     checks: Vec<Check>,
     session: Option<Uuid>,
     boundary: u64,
@@ -121,10 +122,15 @@ impl ForkMembershipProof {
             None
         };
         Ok(Self {
+            parent,
             checks,
             session,
             boundary,
         })
+    }
+
+    pub(crate) fn parent(&self) -> Uuid {
+        self.parent
     }
 
     pub(crate) fn append_to(

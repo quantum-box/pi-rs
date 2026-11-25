@@ -419,7 +419,19 @@ async fn compaction_retains_occurrence_provenance_across_reopen_and_fork() {
         .clone();
     let positioned_fork = h.fork_at_position(id, retained_position).unwrap();
     assert!(!h.conversation(positioned_fork).unwrap().messages.iter().any(|message| matches!(message, Message::User { content } if content.contains("summary of prior work"))));
+    use durable_store::{Expected, Store};
+    use pi_rs_durable::{
+        document::{Address, ForkPolicy, Transaction},
+        runtime::{ForkBoundary, ForkParent},
+    };
+    use serde_json::json;
+
+    assert!(h.fork_parent(id).unwrap().is_none());
     let child = h.fork(id).unwrap();
+    let parent = h.fork_parent(child).unwrap().unwrap();
+    assert_eq!(parent.conversation, id);
+    assert_eq!(parent.source, id);
+    assert_eq!(parent.boundary, ForkBoundary::Observation);
     let inherited = h
         .view_positioned(child, NonZeroUsize::new(100).unwrap())
         .unwrap()
@@ -430,7 +442,40 @@ async fn compaction_retains_occurrence_provenance_across_reopen_and_fork() {
         .history
         .unwrap();
     assert_eq!(inherited, original);
+    let address = Address {
+        scope: child.to_string(),
+        name: "current".into(),
+        key: String::new(),
+    };
+    let mut tx = Transaction::new();
+    tx.set_fork_policy(&address, Expected::Missing, &ForkPolicy::Current)
+        .unwrap();
+    let value = json!({"title": "from the immediate parent"});
+    tx.put(&address, Expected::Missing, value.as_object().unwrap())
+        .unwrap();
+    tx.commit(&Store::open(&path).unwrap()).unwrap();
     let historical = h.fork_by_entry_id(child, original.id).unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, opts()).unwrap();
+    assert_eq!(
+        h.fork_parent(historical).unwrap(),
+        Some(ForkParent {
+            conversation: child,
+            source: id,
+            source_observation: original.commit,
+            boundary: ForkBoundary::Message {
+                entry_id: original.id,
+            },
+        }),
+    );
+    let copied = Address {
+        scope: historical.to_string(),
+        ..address
+    };
+    assert_eq!(
+        h.document(&copied).unwrap().unwrap().value,
+        *value.as_object().unwrap(),
+    );
     let historical = h.conversation(historical).unwrap();
     assert!(
         historical
@@ -2923,6 +2968,15 @@ async fn application_entry_fork_uses_atomic_entry_commit_and_reopens() {
     membership.revoke(session, child).unwrap();
     membership.enroll(child_session, child).unwrap();
     let inherited = h.fork_at_application_entry(child, entries[0].id).unwrap();
+    let link = h.fork_parent(inherited).unwrap().unwrap();
+    assert_eq!(link.conversation, child);
+    assert_eq!(link.source, parent);
+    assert_eq!(
+        link.boundary,
+        pi_rs_durable::runtime::ForkBoundary::Application {
+            entry_id: entries[0].id,
+        },
+    );
     membership
         .authorize_pair(child_session, child, inherited)
         .unwrap()
