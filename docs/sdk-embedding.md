@@ -38,6 +38,55 @@ sessions retain their original clients. Hosts needing automatic fallback can
 provide their own `HistoricalModelResolver` instead. This provider-neutral API
 does not depend on Tauri or a desktop runtime.
 
+### Reload saved keys and model routes
+
+Native hosts using the workspace's `pi-rs-workbench` crate can rebuild a live
+catalog with `AuthFileReadGrants` and `ModelClientFactory`. Prepare the exact
+provider and endpoint grants and the complete set of model definitions for
+each reload. Read the granted file once, then build every client from that
+credential snapshot.
+
+```rust,no_run
+use pi_rs::ModelCatalog;
+use pi_rs_workbench::{
+    auth_factory::AuthFileReadGrants,
+    model_factory::{ModelClientFactory, NativeModelDefinition},
+};
+
+fn reload<'a>(
+    live: &mut ModelCatalog,
+    grants: &AuthFileReadGrants,
+    definitions: impl IntoIterator<Item = NativeModelDefinition<'a>>,
+) -> pi_rs::Result<()> {
+    let factory = ModelClientFactory::new(grants.load()?);
+    let candidate = factory.catalog(definitions)?;
+    *live = candidate;
+    Ok(())
+}
+```
+
+If the load or build fails, the previous catalog remains published. A missing
+auth file yields an empty credential snapshot, so building a defined route
+that requires a key fails. For a shared catalog, build the candidate on a
+blocking worker, then take the host's state lock only to publish the completed
+catalog. Serialize reloads or check a host-owned revision before publishing
+so an older rebuild cannot overwrite a newer one.
+
+Use the replacement catalog to start new sessions. Retained sessions, clients,
+and catalog clones keep their original credentials and routes. Release or
+close them when they should stop using those routes. Revoke a retired key at
+the provider if it must stop working regardless of the client's lifetime.
+
+For explicitly granted `models.json` entries, a host can use
+`ModelFileReadGrants::load(&factory)` to build the candidate. That loader can
+return an empty catalog for a missing file, so check any required model
+identities before publishing. These file reads capture separate inputs.
+
+OAuth acquisition and refresh stay with the host. Use `HostAuthBuilder` to
+bind a host-supplied bearer credential to an exact supported route. In Tauri,
+keep the grants, rebuild, and credential values in the Rust backend. Browser
+Wasm clients continue to use the host-configured gateway.
+
 ## Native quickstart
 
 The [Ollama SDK example](../crates/ollama/examples/sdk_chat.rs) creates an
