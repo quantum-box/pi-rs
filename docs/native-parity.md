@@ -6599,22 +6599,37 @@ the metadata. Custom declarations merge individual limit, resize, and
 lifetime fields. Release checks covered the offline catalogs, nested
 overrides, invalid values, and the existing image resize and cost paths.
 
-### Cache miss notices checkpoint
+### Transcript notices checkpoint
 
-`showCacheMissNotices` is available from `/settings` and defaults off.
-Both terminal modes derive notices from measured, completed chat turns
-during a run and when reopening a session. Model switches and recorded
-idle gaps appear in the notice. `/session` totals re-billed tokens and
-estimated cost even when notices are disabled. Compaction and branch
-summaries reset the comparison baseline. Failed requests and summary
-usage stay out of the conversation cache comparison.
+The `/settings` Notices submenu controls `notices.cacheMisses`,
+`notices.cacheWarming`, `notices.compactionCosts`, and
+`notices.reasoningDrops` independently. All four default off, matching
+upstream. Each settings layer migrates a legacy `showCacheMissNotices`
+boolean into any missing notice fields before user and trusted-project
+settings are merged. An explicit field wins within its layer. Loading
+leaves the files untouched. A user settings edit saves any migrated user
+fields and the edited value, without copying project values or defaults.
+Malformed settings retain the usual native validation diagnostics.
+[Pinned settings schema](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/core/settings-schema.ts)
+[Pinned settings manager](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/core/settings-manager.ts)
+
+Both terminal modes update retained cache miss, cache warming and summary
+cost notices when the corresponding setting changes. Cache misses are
+derived from measured, completed chat turns during a run and when
+reopening a session. Model switches and recorded idle gaps appear in the
+notice. `/session` totals re-billed tokens and estimated cost even when
+notices are disabled. Compaction and branch summaries reset the
+comparison baseline. Failed requests and summary usage stay out of the
+conversation cache comparison.
 
 ### Imported cache refresh checkpoint
 
 Imported Pi session entries with `kind: "cache_warm"` preserve their
 cache refresh notice, optional note, and billed cost. They also reset
 the cache comparison baseline to the measured prompt at the refresh
-timestamp. The original usage remains part of session billing. An
+timestamp. `notices.cacheWarming` controls display for both imported and
+native cache refreshes. The separate user setting `cacheWarming` controls
+whether warm-up requests run. The original usage remains part of session billing. An
 offline session import verified display and totals without duplicate
 billing or an additional conversation message.
 
@@ -6681,8 +6696,8 @@ status for the previous head.
 
 Measured summary usage and cost stay attached to compaction and branch
 summary entries, including when a fork omits the original model request.
-The terminal shows the billed tokens and cost when cache notices are
-enabled. RPC session entries expose the cache breakdown and provider
+The terminal shows the billed tokens and cost when
+`notices.compactionCosts` is enabled. RPC session entries expose the cache breakdown and provider
 total. Older native journals recover usage details from the adjacent
 model completion when available. Imported Pi usage remains intact and
 session statistics count each completed summary once.
@@ -6704,9 +6719,10 @@ Anthropic Messages responses retain bounded input transformation diagnostics
 in the assistant's journal metadata and RPC message. A final SSE array
 supersedes the initial array, including when it is empty. Pi JSONL imports
 retain the diagnostic timestamp and transformation type, path, and reason.
-With `showCacheMissNotices` enabled, both terminal modes warn when the
-number of dropped thinking blocks increases compared to the previous
-assistant response on the active branch. Reopening restores that baseline.
+With `notices.reasoningDrops` enabled, both terminal modes warn during a
+live run when the number of dropped thinking blocks increases compared
+to the previous assistant response on the active branch. Reopening
+restores that baseline.
 
 ### Tool-result extension hooks
 
@@ -7005,6 +7021,16 @@ the search temporarily finds no entries.
 Tree search also matches the first 200 UTF-16 units of tool-result text.
 Focused selector tests cover linear chains, branches, hidden records, search,
 and fold/unfold behavior. Other tree layout and navigation differences remain.
+
+### Shell output without a retained file
+
+A truncated user shell result shows `Output truncated` in terminal history and
+in the model context when no full output path is available. The terminal
+keeps the notice visible when the tool output is collapsed. Stored paths
+still appear in the notice, and shell output marked excluded stays outside model
+context. This matches
+[Pi's default shell truncation notice](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/messages.ts#L94-L107).
+Pi's distinct `fullOutputError` detail remains outside this checkpoint.
 
 ### Sparse custom-message import checkpoint
 
