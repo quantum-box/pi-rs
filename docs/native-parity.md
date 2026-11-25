@@ -1134,6 +1134,55 @@ Project configuration follows a stored trust decision, with an interactive
 trust selector and explicit `--trust` / `--no-trust` overrides. Context files
 remain readable independently of project trust. `/skills`, `/prompts`,
 `/skill:name`, prompt argument expansion and `/reload` are available.
+
+Native executables do not currently receive `project_trust`. Upstream calls its
+handlers before reading saved decisions when a folder has trust-requiring
+resources and the CLI has supplied no override. pi-rs treats the closest saved
+decision as a host decision, including a denial inherited from an ancestor.
+Explicit host overrides take precedence over saved decisions, which take
+precedence over the user-level `defaultProjectTrust` policy. Only an unresolved
+`ask` for a folder with trust-requiring resources is eligible for a future
+preflight. The host decision code tests candidates in order and accepts the
+first decisive vote. Errors and undecided votes leave subsequent candidates
+eligible, and an exhausted list falls back to the existing selector or the
+noninteractive untrusted state. A preflight vote writes the canonical workspace
+entry only when it is decisive and requests persistence. Startup currently
+supplies an empty candidate list.
+
+`Resources::load` combines CLI, user, project, and package paths into a flat
+extension list. Its untrusted form still includes transient CLI inputs, and
+configured paths and discovery walks can follow links into the workspace.
+Package preparation can build or run executables, and `ExecutableExtension::load`
+runs `Describe` before it exposes extension metadata. Preflight therefore needs
+provenance in the shared resource resolver before it expands or opens a source.
+It must verify both the user authorization and the resolved source and executable
+locations, excluding workspace-controlled paths and inputs. Use already eligible
+user/global candidates, with no package preparation, project settings, CLI or
+transient sources, MCP startup, or extension-discovered resources in preflight.
+The candidate must have a host-known identity if an ID-based disable rule can
+apply. Starting it to learn its ID would bypass that rule during preflight.
+
+Before enabling the event, wire that resolver into startup after the host has
+selected the effective workspace and before it consumes project settings or
+prepares packages. Carry each preflight `Describe` result into runtime assembly
+by executable identity, while applying the final resource ordering and filters.
+The current per-request process protocol would also need a way to negotiate and
+run the hook in the same startup invocation. Give it only the workspace path and
+host-selected mode, with no session state, session paths, registry host calls, or
+MCP services. Use a host-controlled working directory and environment. Native
+executables currently run with the user's filesystem permissions, so omitting
+session data from the request alone cannot enforce filesystem isolation. Enabling
+the preflight requires a host that can deny access to session storage and prevent
+the executable from loading workspace-controlled code. Recheck host policy if
+it can change while a vote is in flight. Limit initial activation to the
+interactive host. CLI metadata, RPC, other noninteractive invocations, and
+package commands retain their existing trust paths. Managed workers use the
+explicit decision and validated settings snapshot from their parent. A terminal
+worker must be able to reuse a preflight registration without describing the
+same executable again or running the hook itself. Early CLI flag discovery can
+already describe executables, so it needs to share a verified registration for
+an eligible candidate or that candidate must skip preflight.
+
 As in Pi v1.5.0, the project `.agents/skills` trust check scans ancestors to
 the filesystem root, excluding the global home directory. Discovery stops at the
 first `.git` boundary, so an undiscovered skill above it can still prompt trust.
