@@ -10491,6 +10491,7 @@ impl Harness {
                         older: None,
                     });
                 };
+                let parent = self.original_session_cut(parent)?;
                 position.source = parent.source;
                 position.observation = parent.source_observation;
                 position.cutoff = match parent.boundary {
@@ -10498,8 +10499,14 @@ impl Harness {
                     _ => None,
                 };
             }
+            // A fork's initial record can be a copied context with new
+            // local IDs. Its source supplies the original occurrences.
             let mut messages =
-                self.session_messages_in_observation(position.source, position.observation)?;
+                if position.observation == 1 && self.fork_parent(position.source)?.is_some() {
+                    Vec::new()
+                } else {
+                    self.session_messages_in_observation(position.source, position.observation)?
+                };
             if let Some(cutoff) = position.cutoff {
                 let index = messages
                     .iter()
@@ -10531,21 +10538,70 @@ impl Harness {
         }
     }
 
-    fn session_messages_in_observation(
+    /// Resolve a text fork's provisional seed IDs through the proven source
+    /// prefix. Use positions because identical messages can occur in a prefix.
+    fn original_session_cut(&self, mut cut: ForkParent) -> Result<ForkParent, Error> {
+        const INVALID: crate::fork::Error = crate::fork::Error::InvalidSnapshot;
+        let mut visited = HashSet::new();
+        while let ForkBoundary::Message { entry_id } = cut.boundary {
+            if cut.source_observation != 1 {
+                break;
+            }
+            let Some(seed_cut) = self.fork_parent(cut.source)? else {
+                break;
+            };
+            if !visited.insert(cut.source) {
+                return Err(INVALID.into());
+            }
+            let ForkBoundary::Message {
+                entry_id: prefix_end,
+            } = seed_cut.boundary
+            else {
+                return Err(INVALID.into());
+            };
+            let seed = self.session_messages_in_observation(cut.source, 1)?;
+            let index = seed
+                .iter()
+                .position(|entry| entry.history.id == entry_id)
+                .ok_or(INVALID)?;
+            self.authenticate_fork_anchor(seed_cut.source, seed_cut.source_observation)?;
+            let source = self
+                .session_observation_transcript(seed_cut.source, seed_cut.source_observation)?
+                .ok_or(INVALID)?;
+            let occurrences = self.resolved_occurrences(seed_cut.source, source)?;
+            let prefix = occurrences.get(..seed.len()).ok_or(INVALID)?;
+            if prefix
+                .last()
+                .and_then(|(_, history)| history.as_ref())
+                .map(|h| h.id)
+                != Some(prefix_end)
+                || !seed.iter().zip(prefix).all(|(seed, (message, history))| {
+                    seed.blocks.is_none() && &seed.message == message && history.is_some()
+                })
+            {
+                return Err(INVALID.into());
+            }
+            let original = prefix[index].1.as_ref().ok_or(INVALID)?;
+            cut.source = original.origin;
+            cut.source_observation = original.commit;
+            cut.boundary = ForkBoundary::Message {
+                entry_id: original.id,
+            };
+        }
+        Ok(cut)
+    }
+
+    fn session_observation_transcript(
         &self,
         source: Uuid,
         observation: u64,
-    ) -> Result<Vec<SessionMessageEntry>, Error> {
-        // A fork's initial observer record is its inherited context seed. Some
-        // text cuts stored that seed in a fresh batch with local message IDs.
-        // Read the selected source instead of publishing copied occurrences.
-        if observation == 1 && self.fork_parent(source)?.is_some() {
-            return Ok(Vec::new());
-        }
-        let store = self.owner.store();
-        let observer = crate::observer::Observer::new(store, source);
+    ) -> Result<Option<crate::transcript::Cursor>, Error> {
+        let previous = observation
+            .checked_sub(1)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let observer = crate::observer::Observer::new(self.owner.store(), source);
         let page = observer.read_through(
-            crate::observer::Cursor(observation - 1),
+            crate::observer::Cursor(previous),
             crate::observer::Cursor(observation),
             std::num::NonZeroUsize::MIN,
         )?;
@@ -10554,14 +10610,21 @@ impl Harness {
             .first()
             .filter(|record| record.cursor.0 == observation)
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
-        let Some(transcript) = record.value.get("_transcript") else {
+        let reference = record.value.get("_transcript");
+        Ok(serde_json::from_value(
+            reference.cloned().unwrap_or_default(),
+        )?)
+    }
+
+    fn session_messages_in_observation(
+        &self,
+        source: Uuid,
+        observation: u64,
+    ) -> Result<Vec<SessionMessageEntry>, Error> {
+        let Some(mut position) = self.session_observation_transcript(source, observation)? else {
             return Ok(Vec::new());
         };
-        let Some(mut position): Option<crate::transcript::Cursor> =
-            serde_json::from_value(transcript.clone())?
-        else {
-            return Ok(Vec::new());
-        };
+        let store = self.owner.store();
         let transcript = crate::transcript::Transcript::new(store, source);
         let mut batches = Vec::new();
         loop {
@@ -32790,6 +32853,18 @@ mod scheduler_tests {
         let inherited = page.entries.pop().unwrap();
         assert_eq!(&inherited.history, first.history.as_ref().unwrap());
         assert_eq!(&inherited.message, &first.message);
+        let copied = h
+            .view_positioned(child, std::num::NonZeroUsize::MIN)
+            .unwrap();
+        let copied = &copied.entries[0];
+        assert_ne!(copied.history, first.history);
+        let grandchild = h.fork_at_position(child, copied.position.clone()).unwrap();
+        let cursor = h.session_messages_start(grandchild).unwrap();
+        let page = h
+            .session_messages(&cursor, std::num::NonZeroUsize::MIN)
+            .unwrap();
+        assert_eq!(page.entries, [inherited]);
+        assert!(page.older.is_none());
         assert!(
             h.fork_by_entry_id(child, original.entries[0].history.as_ref().unwrap().id)
                 .is_err()
