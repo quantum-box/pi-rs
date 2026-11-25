@@ -4036,6 +4036,16 @@ stored name, as Pi does, including names imported from external JSONL. A
 whitespace-only name clears the title without falling back to an older name;
 reading preserves internal line breaks and does not rewrite the journal.
 
+### SDK queued input inspection
+
+Pi exposes the pending steering and follow-up text and each queue's delivery
+mode. The owned Rust SDK exposes `AgentSession::queued_inputs` and
+`AgentSession::queue_mode` for a host to inspect the active branch. The input
+snapshot preserves queue IDs, kinds and images, including after reopening a
+session. It reflects committed journal state. Input still in the SDK control
+channel appears once committed, and a journal in use returns the same busy error
+as other synchronous snapshots.
+
 ### SDK statistics checkpoint
 
 `Session::statistics` and `AgentSession::statistics` expose the same typed,
