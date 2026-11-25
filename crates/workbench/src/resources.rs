@@ -309,6 +309,13 @@ impl Resources {
             &explicit_extensions,
             &mut resources.warnings,
         )?;
+        if args.no_extensions {
+            resources.packages.extension_packages.clear();
+        }
+        resources
+            .packages
+            .extension_packages
+            .extend(transient.extension_packages);
         resources.themes = resource_paths::resolve(
             args,
             Kind::Theme,
