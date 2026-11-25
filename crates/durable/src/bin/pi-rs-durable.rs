@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod text_rpc;
+
 #[derive(Parser)]
 #[command(about = "Run an experimental durable text conversation using OpenAI Responses")]
 struct Args {
@@ -42,9 +44,13 @@ struct Args {
     #[arg(long)]
     request_id: Option<String>,
     /// Emit newline-delimited conversation, progress and result objects.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "rpc")]
     json: bool,
-    prompt: String,
+    /// Accept text RPC commands over stdin and return session events on stdout.
+    #[arg(long, conflicts_with_all = ["prompt", "request_id"])]
+    rpc: bool,
+    #[arg(required_unless_present = "rpc")]
+    prompt: Option<String>,
 }
 
 struct RoutedModel {
@@ -124,6 +130,7 @@ async fn run(
         request_id,
         prompt,
         json: json_output,
+        rpc,
         ..
     } = args;
     let id = match conversation {
@@ -142,6 +149,10 @@ async fn run(
             })?
         }
     };
+    if rpc {
+        return text_rpc::run(scheduler, id, model).await;
+    }
+    let prompt = prompt.ok_or("a prompt is required")?;
     if json_output {
         emit(&json!({"type": "conversation", "id": id}))?;
     } else {
