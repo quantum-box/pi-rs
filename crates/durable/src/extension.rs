@@ -1748,6 +1748,7 @@ impl Resolved {
         })
     }
     /// Run a durable hook chain, rejecting each invalid replacement before invoking the next hook.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn after_tool_blocks_checked<F, G>(
         &self,
         call: &ToolCall,

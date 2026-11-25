@@ -533,11 +533,11 @@ pub(crate) fn owned_cleanup_receipt_key(conversation: Uuid, attempt: Uuid) -> Ve
 }
 
 #[cfg(test)]
-fn owned_cleanup_final_hooks()
--> &'static std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>> {
-    static HOOKS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>,
-    > = std::sync::OnceLock::new();
+type OwnedCleanupFinalHooks = std::sync::Mutex<HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+
+#[cfg(test)]
+fn owned_cleanup_final_hooks() -> &'static OwnedCleanupFinalHooks {
+    static HOOKS: std::sync::OnceLock<OwnedCleanupFinalHooks> = std::sync::OnceLock::new();
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
@@ -2200,10 +2200,10 @@ struct NestedResume {
 #[cfg(test)]
 fn stop_at_unsafe_park_boundary(stage: &str, state: &Conversation) {
     if std::env::var("PI_UNSAFE_BOUNDARY_STAGE").ok().as_deref() != Some(stage)
-        || !state
+        || state
             .nested_resume
             .as_ref()
-            .is_some_and(|resume| resume.unsafe_park.is_some())
+            .is_none_or(|resume| resume.unsafe_park.is_none())
     {
         return;
     }
@@ -12218,6 +12218,7 @@ impl Harness {
         Ok(())
     }
     /// Revalidate selected definitions and the whole child graph for a parent result read.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn checkpointable_parent_result_read_checks(
         &self,
         task: &crate::task::Task,
@@ -12576,6 +12577,7 @@ impl Harness {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn checkpointable_conversation_checks_inner(
         &self,
         task: &crate::task::Task,

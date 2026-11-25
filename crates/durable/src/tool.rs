@@ -81,6 +81,7 @@ where
 /// Reconstruct a prepared call from the exact arguments stored with its intent.
 /// Call only after the host's recovery policy permits replay, and validate
 /// against the current registration. This function does not grant replay safety.
+#[allow(clippy::result_large_err)]
 pub fn restore<F>(
     tool: &dyn Tool,
     invocation: &Invocation,

@@ -1921,6 +1921,7 @@ impl NestedHost {
     pub(crate) fn explicitly_suspended(&self) -> bool {
         self.shared.explicit_suspend.load(Ordering::Acquire)
     }
+    #[allow(clippy::result_large_err)]
     fn enter(&self) -> Result<Active, Outcome> {
         let mut l = self
             .shared

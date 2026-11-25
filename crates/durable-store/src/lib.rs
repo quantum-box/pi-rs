@@ -1111,7 +1111,7 @@ impl Store {
             } else {
                 None
             };
-            if version.is_none() || matches!(version, Some(1 | 2 | 3)) {
+            if version.is_none() || matches!(version, Some(1..=3)) {
                 let (db, _lock) = owner::acquire_owner_lock(path)
                     .map_err(|error| Error::MigrationOwnerUnavailable(error.to_string()))?;
                 return Self::initialize(Connection::open(db)?, true, true);
@@ -1119,6 +1119,7 @@ impl Store {
         }
         Self::initialize(Connection::open(path)?, true, false)
     }
+    #[cfg(unix)]
     pub(crate) fn open_owned(path: impl AsRef<Path>) -> Result<Self, Error> {
         Self::initialize(Connection::open(path)?, true, true)
     }
@@ -1162,12 +1163,12 @@ impl Store {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if !matches!(version, Some(1 | 2 | 3 | 4))
-                || (matches!(version, Some(1 | 2 | 3)) && disk && !_migration_authorized)
+            if !matches!(version, Some(1..=4))
+                || (matches!(version, Some(1..=3)) && disk && !_migration_authorized)
             {
                 return Err(Error::IncompatibleGraphProtocol);
             }
-            migrate_old = matches!(version, Some(1 | 2 | 3));
+            migrate_old = matches!(version, Some(1..=3));
             old_version = version;
             let guard_name = match version {
                 Some(1) => "pi_graph_protocol() != 1",
@@ -3993,7 +3994,7 @@ mod graph_mutation_revision_tests {
                 root,
             },
         };
-        assert!(store.commit(&[check.clone()], &[]).is_ok());
+        assert!(store.commit(std::slice::from_ref(&check), &[]).is_ok());
         let mut larger = value;
         larger.insert(larger.len() - 2, b'x');
         store
@@ -4248,10 +4249,7 @@ mod graph_mutation_revision_tests {
                     if matches!(
                         code.code,
                         rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                    ) =>
-                {
-                    ()
-                }
+                    ) => {}
                 #[cfg(feature = "experimental-graph-revision")]
                 Err(Error::MigrationOwnerUnavailable(_)) => (),
                 Err(error) => panic!("unexpected concurrent open error: {error}"),

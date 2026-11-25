@@ -1350,8 +1350,8 @@ mod tests {
             let mut mutations: Vec<_> = [&f.root, &f.anchor, &f.event, &entry, &last]
                 .into_iter()
                 .filter(|key| {
-                    !(missing == "root" && *key == &f.root)
-                        && !(missing == "observer" && *key == &f.event)
+                    !(missing == "root" && *key == &f.root
+                        || missing == "observer" && *key == &f.event)
                 })
                 .map(|key| {
                     let mut value = fixture_with_reset_evidence(&f, key);

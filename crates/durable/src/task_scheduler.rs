@@ -1261,6 +1261,7 @@ pub(crate) struct NestedCancelTerminalEvidence {
 }
 
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn validate_nested_cancel_terminal_evidence(
     evidence: &NestedCancelTerminalEvidence,
     conversation: Uuid,
@@ -1517,10 +1518,7 @@ pub(crate) fn nested_cancel_terminal_checks(
                 && claim < start
                 && start < receipt
                 && receipt < terminal
-                && terminal == task =>
-        {
-            ()
-        }
+                && terminal == task => {}
         _ => return Err(Error::Ownership),
     }
     checks.extend([
@@ -1912,9 +1910,9 @@ fn interrupted_owner_checks(
                 {
                     return Err("owner no longer authorizes cleanup".into());
                 }
-                if !parent.task.replay_safe()
-                    && !matches!(parent.task.state(), TaskState::Waiting(_))
-                    && !(parent.task.retains_task_children_on_success()
+                if !(parent.task.replay_safe()
+                    || matches!(parent.task.state(), TaskState::Waiting(_))
+                    || parent.task.retains_task_children_on_success()
                         && matches!(parent.task.state(), TaskState::Completing(_)))
                 {
                     return Err(UNSAFE_ANCESTOR_BUSY.into());
@@ -5659,6 +5657,7 @@ impl AdmissionHandle<'_> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn conversation_cancel_hook_memo(
         &self,
         handler: &dyn Handler,
@@ -5744,6 +5743,7 @@ impl AdmissionHandle<'_> {
         .map(|_| ())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn store_conversation_cancel_receipt_inner(
         &self,
         handler: &dyn Handler,
@@ -6077,6 +6077,7 @@ impl AdmissionHandle<'_> {
     }
 
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn woken_conversation_cancel_hook_memo(
         &self,
         handler: &dyn Handler,
@@ -8149,10 +8150,10 @@ impl AdmissionHandle<'_> {
             {
                 return Err("unsafe or unavailable owner".into());
             }
-            if ancestor.id() != current.task.id()
-                && !ancestor.replay_safe()
-                && !matches!(ancestor.state(), TaskState::Waiting(_))
-                && !(ancestor.retains_task_children_on_success()
+            if !(ancestor.id() == current.task.id()
+                || ancestor.replay_safe()
+                || matches!(ancestor.state(), TaskState::Waiting(_))
+                || ancestor.retains_task_children_on_success()
                     && matches!(ancestor.state(), TaskState::Completing(_)))
             {
                 return Err(UNSAFE_ANCESTOR_BUSY.into());
@@ -11103,14 +11104,14 @@ impl Scheduler {
                                                 let owned_checks: Option<Vec<durable_store::Check>> = Some(Vec::new());
                                                 if bound_conversation == conversation
                                                     && uncertain.is_none()
-                                                    && owned_checks.is_some()
+                                                    && let Some(owned_checks) = owned_checks
                                                     && !has_live_owned(
                                                         store,
                                                         running.task.id(),
                                                         &records,
                                                     )?
                                                 {
-                                                    checks.extend(owned_checks.unwrap());
+                                                    checks.extend(owned_checks);
                                                     checks.extend(binding);
                                                     checks.extend(descendants);
                                                     _nested_identity_leases = leases;
@@ -11249,14 +11250,14 @@ impl Scheduler {
                                             #[cfg(not(feature = "experimental-graph-revision"))]
                                             let owned_checks: Option<Vec<durable_store::Check>> = Some(Vec::new());
                                             if uncertain.is_none()
-                                                && owned_checks.is_some()
+                                                && let Some(owned_checks) = owned_checks
                                                 && !has_live_owned(
                                                     store,
                                                     running.task.id(),
                                                     &records,
                                                 )?
                                             {
-                                                checks.extend(owned_checks.unwrap());
+                                                checks.extend(owned_checks);
                                                 checks.extend(binding);
                                                 checks.extend(descendants);
                                                 _nested_identity_leases = leases;
@@ -13781,7 +13782,7 @@ impl Scheduler {
         }
         let (uncertain, descendant_checks, _nested_leases) =
             authenticated_unsafe_descendant_reconciliation(
-                &store,
+                store,
                 item.task.id(),
                 &self.ts().list()?,
                 boundary,
@@ -13795,14 +13796,14 @@ impl Scheduler {
         checks.extend(park_checks);
         checks.extend(descendant_checks);
         let (saved_conversation, ancestry, ancestry_checks, ancestry_version) =
-            task_store::read_nested_cancel_claim_ancestry(&store, item.task.id(), claim.claim_id)?;
+            task_store::read_nested_cancel_claim_ancestry(store, item.task.id(), claim.claim_id)?;
         if saved_conversation != conversation {
             return Ok(false);
         }
         let marker = serde_json::to_vec(&serde_json::json!({"version": 1, "claim_id":claim.claim_id, "task":claim.task, "attempt":claim.attempt, "lease":claim.lease, "policy":claim.policy})).map_err(|e| Error::Handler(e.to_string()))?;
         let Ok((finished, finished_checks, start_version)) =
             task_store::read_finished_callback_ancestry(
-                &store,
+                store,
                 item.task.id(),
                 conversation,
                 &marker,
@@ -14454,10 +14455,10 @@ impl Scheduler {
                                         #[cfg(not(feature = "experimental-graph-revision"))]
                                         let owned_checks: Option<Vec<durable_store::Check>> = Some(Vec::new());
                                         if uncertain.is_none()
-                                            && owned_checks.is_some()
+                                            && let Some(owned_checks) = owned_checks
                                             && !has_live_owned(store, item.task.id(), &records)?
                                         {
-                                            checks.extend(owned_checks.unwrap());
+                                            checks.extend(owned_checks);
                                             checks.extend(binding);
                                             checks.extend(descendants);
                                             _nested_identity_leases = leases;
@@ -19559,6 +19560,12 @@ fn provisional_woken_owned_checks(
         .map_err(|e| Error::Handler(e.to_string()))
 }
 
+type DescendantReconciliation = (
+    Option<Uuid>,
+    Vec<durable_store::Check>,
+    Vec<crate::nested_identity::IdentityLease>,
+);
+
 /// Verify nested cancelled children while the caller holds the Harness
 /// selection gate. The returned identity leases must remain held through the
 /// same commit as every returned store check. Unverifiable evidence remains an
@@ -19572,14 +19579,7 @@ pub(crate) fn authenticated_unsafe_descendant_reconciliation(
     registry: &Registry,
     harness: &crate::runtime::Harness,
     active_parent_marker: Option<&[u8]>,
-) -> Result<
-    (
-        Option<Uuid>,
-        Vec<durable_store::Check>,
-        Vec<crate::nested_identity::IdentityLease>,
-    ),
-    Error,
-> {
+) -> Result<DescendantReconciliation, Error> {
     authenticated_unsafe_descendant_reconciliation_inner(
         store,
         parent,
@@ -19599,14 +19599,7 @@ pub(crate) fn authenticated_woken_terminal_descendants(
     boundary: u64,
     registry: &Registry,
     harness: &crate::runtime::Harness,
-) -> Result<
-    (
-        Option<Uuid>,
-        Vec<durable_store::Check>,
-        Vec<crate::nested_identity::IdentityLease>,
-    ),
-    Error,
-> {
+) -> Result<DescendantReconciliation, Error> {
     let (_, root_checks) =
         woken_terminal_after_checks(store, parent, boundary).map_err(Error::Handler)?;
     #[cfg(feature = "experimental-graph-revision")]
@@ -19722,14 +19715,7 @@ pub(crate) fn authenticated_parked_terminal_descendants(
     boundary: u64,
     registry: &Registry,
     harness: &crate::runtime::Harness,
-) -> Result<
-    (
-        Option<Uuid>,
-        Vec<durable_store::Check>,
-        Vec<crate::nested_identity::IdentityLease>,
-    ),
-    Error,
-> {
+) -> Result<DescendantReconciliation, Error> {
     let task = parent.task.id();
     let key = conversation_cancel_terminal_key(task);
     let entry = store
@@ -19811,14 +19797,7 @@ fn authenticated_unsafe_descendant_reconciliation_inner(
     harness: &crate::runtime::Harness,
     active_parent_marker: Option<&[u8]>,
     authenticated_woken_root: bool,
-) -> Result<
-    (
-        Option<Uuid>,
-        Vec<durable_store::Check>,
-        Vec<crate::nested_identity::IdentityLease>,
-    ),
-    Error,
-> {
+) -> Result<DescendantReconciliation, Error> {
     let mut pending = vec![parent];
     let mut seen = HashSet::new();
     let mut checks = Vec::new();

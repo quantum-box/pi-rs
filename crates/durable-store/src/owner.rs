@@ -25,10 +25,15 @@ use crate::Store;
 use std::{
     collections::HashMap,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::File,
     io,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex, Weak},
+};
+#[cfg(unix)]
+use std::{
+    fs::{self, OpenOptions},
+    path::PathBuf,
 };
 use uuid::Uuid;
 

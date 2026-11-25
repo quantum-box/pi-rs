@@ -7238,10 +7238,10 @@ async fn exercise_nested_callback_kill(late: bool, actual: bool) {
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let task = loop {
-        if let Ok(value) = std::fs::read_to_string(dir.path().join("ready")) {
-            if let Ok(id) = value.parse::<uuid::Uuid>() {
-                break id;
-            }
+        if let Ok(value) = std::fs::read_to_string(dir.path().join("ready"))
+            && let Ok(id) = value.parse::<uuid::Uuid>()
+        {
+            break id;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -7518,10 +7518,10 @@ async fn exercise_nested_parent_receipt_recovery(mode: &str, child_cut: bool) {
     let claim: crate::task_scheduler::ConversationCancelClaim =
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if let Ok(value) = std::fs::read(dir.path().join("ready")) {
-                    if let Ok(claim) = serde_json::from_slice(&value) {
-                        break claim;
-                    }
+                if let Ok(value) = std::fs::read(dir.path().join("ready"))
+                    && let Ok(claim) = serde_json::from_slice(&value)
+                {
+                    break claim;
                 }
                 assert!(
                     process.try_wait().unwrap().is_none(),
@@ -12273,33 +12273,28 @@ async fn nested_woken_selected_hook_records_receipt_once() {
                 records
                     .iter()
                     .find(|r| r.task.owner() == &crate::task::TaskOwner::Task(root.task.id()))
-            }) {
-                if matches!(child.task.state(), crate::task::TaskState::Failed(_)) {
-                    let key = format!(
-                        "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
-                        child.task.id()
-                    );
-                    let entry = store.get(key.as_bytes()).unwrap().unwrap();
-                    let value: Value = serde_json::from_slice(&entry.value).unwrap();
-                    assert_eq!(value["version"], 2);
-                    assert!(!value["after_result"].is_null());
-                    let key =
-                        crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
-                    let terminal = store
-                        .get(&key)
+            }) && matches!(child.task.state(), crate::task::TaskState::Failed(_))
+            {
+                let key = format!(
+                    "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+                    child.task.id()
+                );
+                let entry = store.get(key.as_bytes()).unwrap().unwrap();
+                let value: Value = serde_json::from_slice(&entry.value).unwrap();
+                assert_eq!(value["version"], 2);
+                assert!(!value["after_result"].is_null());
+                let key = crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
+                let terminal = store
+                    .get(&key)
+                    .unwrap()
+                    .expect("missing nested terminal proof");
+                assert_eq!(
+                    store.commit_for_version(&key, terminal.version).unwrap(),
+                    store
+                        .commit_for_version(&crate::task_store::key(child.task.id()), child.version)
                         .unwrap()
-                        .expect("missing nested terminal proof");
-                    assert_eq!(
-                        store.commit_for_version(&key, terminal.version).unwrap(),
-                        store
-                            .commit_for_version(
-                                &crate::task_store::key(child.task.id()),
-                                child.version
-                            )
-                            .unwrap()
-                    );
-                    break;
-                }
+                );
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -12853,33 +12848,28 @@ async fn nested_woken_after_tamper_blocks_parent_settlement() {
                 records
                     .iter()
                     .find(|r| r.task.owner() == &crate::task::TaskOwner::Task(root.task.id()))
-            }) {
-                if matches!(child.task.state(), crate::task::TaskState::Failed(_)) {
-                    let key = format!(
-                        "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
-                        child.task.id()
-                    );
-                    let entry = store.get(key.as_bytes()).unwrap().unwrap();
-                    let value: Value = serde_json::from_slice(&entry.value).unwrap();
-                    assert_eq!(value["version"], 2);
-                    assert!(!value["after_result"].is_null());
-                    let key =
-                        crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
-                    let terminal = store
-                        .get(&key)
+            }) && matches!(child.task.state(), crate::task::TaskState::Failed(_))
+            {
+                let key = format!(
+                    "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+                    child.task.id()
+                );
+                let entry = store.get(key.as_bytes()).unwrap().unwrap();
+                let value: Value = serde_json::from_slice(&entry.value).unwrap();
+                assert_eq!(value["version"], 2);
+                assert!(!value["after_result"].is_null());
+                let key = crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
+                let terminal = store
+                    .get(&key)
+                    .unwrap()
+                    .expect("missing nested terminal proof");
+                assert_eq!(
+                    store.commit_for_version(&key, terminal.version).unwrap(),
+                    store
+                        .commit_for_version(&crate::task_store::key(child.task.id()), child.version)
                         .unwrap()
-                        .expect("missing nested terminal proof");
-                    assert_eq!(
-                        store.commit_for_version(&key, terminal.version).unwrap(),
-                        store
-                            .commit_for_version(
-                                &crate::task_store::key(child.task.id()),
-                                child.version
-                            )
-                            .unwrap()
-                    );
-                    break;
-                }
+                );
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -13064,33 +13054,28 @@ async fn nested_woken_registry_change_before_read_is_rejected() {
                 records
                     .iter()
                     .find(|r| r.task.owner() == &crate::task::TaskOwner::Task(root.task.id()))
-            }) {
-                if matches!(child.task.state(), crate::task::TaskState::Failed(_)) {
-                    let key = format!(
-                        "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
-                        child.task.id()
-                    );
-                    let entry = store.get(key.as_bytes()).unwrap().unwrap();
-                    let value: Value = serde_json::from_slice(&entry.value).unwrap();
-                    assert_eq!(value["version"], 2);
-                    assert!(!value["after_result"].is_null());
-                    let key =
-                        crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
-                    let terminal = store
-                        .get(&key)
+            }) && matches!(child.task.state(), crate::task::TaskState::Failed(_))
+            {
+                let key = format!(
+                    "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+                    child.task.id()
+                );
+                let entry = store.get(key.as_bytes()).unwrap().unwrap();
+                let value: Value = serde_json::from_slice(&entry.value).unwrap();
+                assert_eq!(value["version"], 2);
+                assert!(!value["after_result"].is_null());
+                let key = crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
+                let terminal = store
+                    .get(&key)
+                    .unwrap()
+                    .expect("missing nested terminal proof");
+                assert_eq!(
+                    store.commit_for_version(&key, terminal.version).unwrap(),
+                    store
+                        .commit_for_version(&crate::task_store::key(child.task.id()), child.version)
                         .unwrap()
-                        .expect("missing nested terminal proof");
-                    assert_eq!(
-                        store.commit_for_version(&key, terminal.version).unwrap(),
-                        store
-                            .commit_for_version(
-                                &crate::task_store::key(child.task.id()),
-                                child.version
-                            )
-                            .unwrap()
-                    );
-                    break;
-                }
+                );
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -13243,33 +13228,28 @@ async fn nested_woken_registry_change_before_commit_blocks_settlement() {
                 records
                     .iter()
                     .find(|r| r.task.owner() == &crate::task::TaskOwner::Task(root.task.id()))
-            }) {
-                if matches!(child.task.state(), crate::task::TaskState::Failed(_)) {
-                    let key = format!(
-                        "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
-                        child.task.id()
-                    );
-                    let entry = store.get(key.as_bytes()).unwrap().unwrap();
-                    let value: Value = serde_json::from_slice(&entry.value).unwrap();
-                    assert_eq!(value["version"], 2);
-                    assert!(!value["after_result"].is_null());
-                    let key =
-                        crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
-                    let terminal = store
-                        .get(&key)
+            }) && matches!(child.task.state(), crate::task::TaskState::Failed(_))
+            {
+                let key = format!(
+                    "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+                    child.task.id()
+                );
+                let entry = store.get(key.as_bytes()).unwrap().unwrap();
+                let value: Value = serde_json::from_slice(&entry.value).unwrap();
+                assert_eq!(value["version"], 2);
+                assert!(!value["after_result"].is_null());
+                let key = crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
+                let terminal = store
+                    .get(&key)
+                    .unwrap()
+                    .expect("missing nested terminal proof");
+                assert_eq!(
+                    store.commit_for_version(&key, terminal.version).unwrap(),
+                    store
+                        .commit_for_version(&crate::task_store::key(child.task.id()), child.version)
                         .unwrap()
-                        .expect("missing nested terminal proof");
-                    assert_eq!(
-                        store.commit_for_version(&key, terminal.version).unwrap(),
-                        store
-                            .commit_for_version(
-                                &crate::task_store::key(child.task.id()),
-                                child.version
-                            )
-                            .unwrap()
-                    );
-                    break;
-                }
+                );
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -13434,33 +13414,28 @@ async fn nested_woken_late_descendant_receipt_blocks_parent() {
                 records
                     .iter()
                     .find(|r| r.task.owner() == &crate::task::TaskOwner::Task(root.task.id()))
-            }) {
-                if matches!(child.task.state(), crate::task::TaskState::Failed(_)) {
-                    let key = format!(
-                        "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
-                        child.task.id()
-                    );
-                    let entry = store.get(key.as_bytes()).unwrap().unwrap();
-                    let value: Value = serde_json::from_slice(&entry.value).unwrap();
-                    assert_eq!(value["version"], 2);
-                    assert!(!value["after_result"].is_null());
-                    let key =
-                        crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
-                    let terminal = store
-                        .get(&key)
+            }) && matches!(child.task.state(), crate::task::TaskState::Failed(_))
+            {
+                let key = format!(
+                    "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+                    child.task.id()
+                );
+                let entry = store.get(key.as_bytes()).unwrap().unwrap();
+                let value: Value = serde_json::from_slice(&entry.value).unwrap();
+                assert_eq!(value["version"], 2);
+                assert!(!value["after_result"].is_null());
+                let key = crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
+                let terminal = store
+                    .get(&key)
+                    .unwrap()
+                    .expect("missing nested terminal proof");
+                assert_eq!(
+                    store.commit_for_version(&key, terminal.version).unwrap(),
+                    store
+                        .commit_for_version(&crate::task_store::key(child.task.id()), child.version)
                         .unwrap()
-                        .expect("missing nested terminal proof");
-                    assert_eq!(
-                        store.commit_for_version(&key, terminal.version).unwrap(),
-                        store
-                            .commit_for_version(
-                                &crate::task_store::key(child.task.id()),
-                                child.version
-                            )
-                            .unwrap()
-                    );
-                    break;
-                }
+                );
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -13684,33 +13659,28 @@ async fn nested_woken_busy_settlement_retains_leases() {
                 records
                     .iter()
                     .find(|r| r.task.owner() == &crate::task::TaskOwner::Task(root.task.id()))
-            }) {
-                if matches!(child.task.state(), crate::task::TaskState::Failed(_)) {
-                    let key = format!(
-                        "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
-                        child.task.id()
-                    );
-                    let entry = store.get(key.as_bytes()).unwrap().unwrap();
-                    let value: Value = serde_json::from_slice(&entry.value).unwrap();
-                    assert_eq!(value["version"], 2);
-                    assert!(!value["after_result"].is_null());
-                    let key =
-                        crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
-                    let terminal = store
-                        .get(&key)
+            }) && matches!(child.task.state(), crate::task::TaskState::Failed(_))
+            {
+                let key = format!(
+                    "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+                    child.task.id()
+                );
+                let entry = store.get(key.as_bytes()).unwrap().unwrap();
+                let value: Value = serde_json::from_slice(&entry.value).unwrap();
+                assert_eq!(value["version"], 2);
+                assert!(!value["after_result"].is_null());
+                let key = crate::task_scheduler::woken_conversation_terminal_key(child.task.id());
+                let terminal = store
+                    .get(&key)
+                    .unwrap()
+                    .expect("missing nested terminal proof");
+                assert_eq!(
+                    store.commit_for_version(&key, terminal.version).unwrap(),
+                    store
+                        .commit_for_version(&crate::task_store::key(child.task.id()), child.version)
                         .unwrap()
-                        .expect("missing nested terminal proof");
-                    assert_eq!(
-                        store.commit_for_version(&key, terminal.version).unwrap(),
-                        store
-                            .commit_for_version(
-                                &crate::task_store::key(child.task.id()),
-                                child.version
-                            )
-                            .unwrap()
-                    );
-                    break;
-                }
+                );
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

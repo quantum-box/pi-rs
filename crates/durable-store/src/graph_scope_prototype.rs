@@ -190,11 +190,19 @@ mod tests {
         let owned = task(child, Node::Task(root));
         let outside = task(child, Node::Task(other));
         assert_eq!(
-            changed_scope(root, &[base.clone()], &[change(&owned, false, true)]),
+            changed_scope(
+                root,
+                std::slice::from_ref(&base),
+                &[change(&owned, false, true)]
+            ),
             Ok(true)
         );
         assert_eq!(
-            changed_scope(root, &[base.clone()], &[change(&owned, true, false)]),
+            changed_scope(
+                root,
+                std::slice::from_ref(&base),
+                &[change(&owned, true, false)]
+            ),
             Ok(true)
         );
         let aba = vec![

@@ -2074,41 +2074,40 @@ impl Handler for Executor {
                             .build()
                             .map_err(|e| e.to_string())?;
                         let cancellation = pi_rs_core::CancellationToken::new();
-                        let result =
-                            runtime.block_on(durable_store::controls::with_callback_context(
-                                claim.conversation,
-                                task.id(),
-                                marker.clone(),
-                                async {
-                                    let scope = durable_store::controls::CallbackScope::current()
-                                        .ok_or("missing callback scope")?;
-                                    let future = cancel.cancel_scoped(
-                                        stored.arguments,
-                                        stored.checkpoint,
-                                        ToolContext {
-                                            operation_id: task.id(),
-                                            cancellation: cancellation.clone(),
-                                        },
-                                        scope,
-                                    );
-                                    let mut future = std::pin::pin!(future);
-                                    let mut leases = Some((start, selection_start));
-                                    tokio::time::timeout(
-                                        std::time::Duration::from_secs(30),
-                                        std::future::poll_fn(|cx| match leases.take() {
-                                            Some((lease, Some(selection))) => {
-                                                selection.poll_first(lease, future.as_mut(), cx)
-                                            }
-                                            Some((lease, None)) => {
-                                                lease.poll_first(future.as_mut(), cx)
-                                            }
-                                            None => future.as_mut().poll(cx),
-                                        }),
-                                    )
-                                    .await
-                                    .map_err(|_| "woken callback timeout")?
-                                },
-                            ))?;
+                        runtime.block_on(durable_store::controls::with_callback_context(
+                            claim.conversation,
+                            task.id(),
+                            marker.clone(),
+                            async {
+                                let scope = durable_store::controls::CallbackScope::current()
+                                    .ok_or("missing callback scope")?;
+                                let future = cancel.cancel_scoped(
+                                    stored.arguments,
+                                    stored.checkpoint,
+                                    ToolContext {
+                                        operation_id: task.id(),
+                                        cancellation: cancellation.clone(),
+                                    },
+                                    scope,
+                                );
+                                let mut future = std::pin::pin!(future);
+                                let mut leases = Some((start, selection_start));
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(30),
+                                    std::future::poll_fn(|cx| match leases.take() {
+                                        Some((lease, Some(selection))) => {
+                                            selection.poll_first(lease, future.as_mut(), cx)
+                                        }
+                                        Some((lease, None)) => {
+                                            lease.poll_first(future.as_mut(), cx)
+                                        }
+                                        None => future.as_mut().poll(cx),
+                                    }),
+                                )
+                                .await
+                                .map_err(|_| "woken callback timeout")?
+                            },
+                        ))?;
                         let (after_result, check) = if std::env::var_os("PI_TEST_WOKEN_MEMO")
                             .is_some()
                         {
@@ -2189,7 +2188,6 @@ impl Handler for Executor {
                             std::path::Path::new(&dir).join("woken-receipt"),
                         )
                         .map_err(|e| e.to_string())?;
-                        std::hint::black_box(result);
                     } else {
                         let _leases = (start, selection_start);
                         loop {

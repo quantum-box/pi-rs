@@ -1358,7 +1358,7 @@ async fn adapter_profile_fits_and_projects_without_losing_stored_tool_images() {
         delivered[1]["text"],
         "(tool image omitted: model does not support images)"
     );
-    assert!(delivered.to_string().find("bmV3").is_none());
+    assert!(!delivered.to_string().contains("bmV3"));
     let expected = c.content_blocks.clone();
     drop(h);
     let h = setup(&path);
