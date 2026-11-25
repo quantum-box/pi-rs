@@ -966,6 +966,11 @@ limited to 16 rendered rows.
 
 ### Native extension editor paste
 
+The native terminal handles Pi's `getToolsExpanded` and `setToolsExpanded` UI
+methods. The getter returns the current session's boolean state. Changing it
+applies the same rendering and status update as the terminal shortcut and does
+not save a setting. An embedded SDK host supplies its own UI implementation.
+
 Native `pasteToEditor` inserts literal text into the prompt draft without
 dispatching key events. The main editor applies the same behavior to
 extension, terminal, and text clipboard pastes. Pastes over ten lines or 1000
@@ -4030,6 +4035,16 @@ Session and owned SDK name reads trim ECMAScript whitespace from the latest
 stored name, as Pi does, including names imported from external JSONL. A
 whitespace-only name clears the title without falling back to an older name;
 reading preserves internal line breaks and does not rewrite the journal.
+
+### SDK queued input inspection
+
+Pi exposes the pending steering and follow-up text and each queue's delivery
+mode. The owned Rust SDK exposes `AgentSession::queued_inputs` and
+`AgentSession::queue_mode` for a host to inspect the active branch. The input
+snapshot preserves queue IDs, kinds and images, including after reopening a
+session. It reflects committed journal state. Input still in the SDK control
+channel appears once committed, and a journal in use returns the same busy error
+as other synchronous snapshots.
 
 ### SDK statistics checkpoint
 

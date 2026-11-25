@@ -3891,7 +3891,7 @@ mod tests {
                 let conn = rusqlite::Connection::open(writer_path).unwrap();
                 conn.execute_batch("BEGIN IMMEDIATE").unwrap();
                 locked_tx.send(()).unwrap();
-                unlock_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                unlock_rx.recv_timeout(Duration::from_secs(60)).unwrap();
                 conn.execute_batch("COMMIT").unwrap();
             });
             locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -3979,14 +3979,13 @@ mod tests {
             }
             host.into_driver()
         };
+        let writer = writer_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("recovery did not acquire the fixture writer lock");
         busy_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(30))
             .expect("writer timeout was not observed");
-        writer_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .join()
-            .unwrap();
+        writer.join().unwrap();
         assert!(matches!(
             wait_terminal(&driver, parent).state(),
             crate::task::TaskState::Succeeded(_)

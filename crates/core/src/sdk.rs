@@ -1860,6 +1860,18 @@ impl AgentSession {
         self.extension_command_and_run(&command.extension_id, &command.name, arguments)
             .await
     }
+    /// Snapshot the active branch's committed steering and follow-up inputs in
+    /// journal order, including any image attachments. Inputs still in the
+    /// control channel become visible once the session commits them.
+    pub fn queued_inputs(&self) -> Result<Vec<QueuedMessage>> {
+        Ok(self.journal()?.queued_inputs())
+    }
+
+    /// Read the active branch's committed delivery mode for this input kind.
+    pub fn queue_mode(&self, kind: InputKind) -> Result<crate::QueueMode> {
+        Ok(self.journal()?.queue_mode(kind))
+    }
+
     pub fn pending_inputs(&self) -> Result<usize> {
         let input = self
             .input
@@ -17447,6 +17459,9 @@ mod tests {
         let mut session = SessionBuilder::new(Arc::new(WaitingModel), "wait")
             .in_memory()
             .unwrap();
+        session
+            .set_queue_mode(InputKind::FollowUp, crate::QueueMode::OneAtATime)
+            .unwrap();
         let control = session.controls();
         let input_id = control
             .follow_up_with_images(
@@ -17477,7 +17492,23 @@ mod tests {
         reopened
             .set_model(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
             .unwrap();
+        let queued = reopened.queued_inputs().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].input.id, input_id);
+        assert_eq!(queued[0].input.kind, InputKind::FollowUp);
+        assert_eq!(queued[0].input.content, "queued image");
+        assert_eq!(queued[0].images.len(), 1);
+        assert_eq!(queued[0].images[0].data, "aW1hZ2U=");
+        assert_eq!(
+            reopened.queue_mode(InputKind::FollowUp).unwrap(),
+            crate::QueueMode::OneAtATime
+        );
+        assert_eq!(
+            reopened.queue_mode(InputKind::Steer).unwrap(),
+            crate::QueueMode::All
+        );
         assert_eq!(reopened.resume().await.unwrap(), "answer 2");
+        assert!(reopened.queued_inputs().unwrap().is_empty());
         assert_eq!(reopened.resume().await.unwrap(), "answer 2");
         assert_eq!(reopened.journal().unwrap().records().iter().filter(|record| matches!(&record.event, crate::Event::InputQueuedWithImages { input } if input.input.id == input_id)).count(), 1);
         assert_eq!(reopened.journal().unwrap().records().iter().filter(|record| matches!(&record.event, crate::Event::UserWithImages { input_id: Some(id), .. } if *id == input_id)).count(), 1);
