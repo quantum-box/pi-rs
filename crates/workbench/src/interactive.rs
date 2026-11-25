@@ -1479,6 +1479,43 @@ impl View {
     fn cancel_extension_dialog(&mut self, id: &Value) {
         self.dialogs.retain(|dialog| json!(dialog.id) != *id);
     }
+    fn ui_request_with_theme(
+        &mut self,
+        value: &Value,
+        args: &mut Cli,
+        theme: &mut Theme,
+    ) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
+        if value["method"] != "setTheme" {
+            return self.ui_request(value);
+        }
+        let id = serde_json::from_value(value["id"].clone())?;
+        let request: pi_rs::UiRequest = serde_json::from_value(value.clone())?;
+        request.validate().map_err(Error::Config)?;
+        let pi_rs::UiRequest::SetTheme { theme: selection } = request else {
+            unreachable!("setTheme discriminant")
+        };
+        let result = match selection {
+            pi_rs::UiThemeSelection::Name(name) => select_extension_theme_name(args, &name),
+            pi_rs::UiThemeSelection::Palette(palette) => Theme::from_extension_palette(palette),
+        };
+        let result = match result {
+            Ok(next) => {
+                *theme = next;
+                self.theme_refresh_requested = true;
+                self.regular.redraw = true;
+                pi_rs::UiThemeChange {
+                    success: true,
+                    error: None,
+                }
+            }
+            Err(error) => pi_rs::UiThemeChange {
+                success: false,
+                error: Some(error.to_string()),
+            },
+        };
+        Ok(Some((id, pi_rs::UiResponse::ThemeChanged(result))))
+    }
+
     fn ui_request(&mut self, value: &Value) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
         let id: uuid::Uuid = serde_json::from_value(value["id"].clone())?;
         let request: pi_rs::UiRequest = serde_json::from_value(value.clone())?;
@@ -1558,6 +1595,11 @@ impl View {
                     pi_rs::UiResponse::Cancelled
                 };
                 return Ok(Some((id, response)));
+            }
+            pi_rs::UiRequest::SetTheme { .. } => {
+                return Err(Error::Config(
+                    "theme selection requires the terminal controller".into(),
+                ));
             }
             pi_rs::UiRequest::GetEditorText => {
                 return Ok(Some((
@@ -5691,6 +5733,20 @@ fn load_resolved_theme(
     Err(error)
 }
 
+fn select_extension_theme_name(args: &mut Cli, name: &str) -> Result<Theme> {
+    if name.contains(['/', '\\', ':']) {
+        return Err(Error::Config(
+            "extension theme selection requires an exact name".into(),
+        ));
+    }
+    let theme = load_resolved_theme(name, &args.theme_paths, &args.workspace, args.trusted)?;
+    if args.settings.string("theme") != Some(name) {
+        args.settings.set_user("theme", json!(name))?;
+    }
+    args.use_theme = Some(name.to_owned());
+    Ok(theme)
+}
+
 #[cfg(any(unix, windows))]
 fn follows_terminal_appearance(selection: Option<&str>) -> bool {
     let selection = selection.unwrap_or("system");
@@ -5701,7 +5757,7 @@ fn follows_terminal_appearance(selection: Option<&str>) -> bool {
 fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
     // A reported background remains authoritative until a newer color reply arrives.
     let changed = crate::ui::theme::set_appearance(dark);
-    let redraw_system = changed && theme.name == "system";
+    let redraw_system = changed && theme.uses_terminal_colors();
     if redraw_system {
         *theme = Theme::system();
     }
@@ -5722,12 +5778,12 @@ fn handle_terminal_appearance(
         crate::ui::theme::clear_terminal_palette();
     }
     let (changed, redraw) = apply_terminal_appearance(theme, dark);
-    if invalidate && theme.name == "system" && !redraw {
+    if invalidate && theme.uses_terminal_colors() && !redraw {
         *theme = Theme::system();
     }
     Ok((
         changed || invalidate,
-        redraw || (invalidate && theme.name == "system"),
+        redraw || (invalidate && theme.uses_terminal_colors()),
     ))
 }
 
@@ -5753,7 +5809,7 @@ fn apply_terminal_color_snapshot(
         }
         colors_reported = true;
     }
-    let redraw_system = colors_reported && theme.name == "system";
+    let redraw_system = colors_reported && theme.uses_terminal_colors();
     if redraw_system {
         *theme = Theme::system();
     }
@@ -5767,7 +5823,7 @@ fn refresh_terminal_theme_selection(args: &Cli, view: &mut View, theme: &mut The
         if let Ok(next) = settings.preview(picker, args) {
             *theme = next;
         }
-    } else if selection.contains('/') {
+    } else if !theme.is_extension_instance() && selection.contains('/') {
         match load_resolved_theme(selection, &args.theme_paths, &args.workspace, args.trusted) {
             Ok(next) => *theme = next,
             Err(error) => view.append(&format!("Theme reload: {error}")),
@@ -5777,7 +5833,7 @@ fn refresh_terminal_theme_selection(args: &Cli, view: &mut View, theme: &mut The
 
 #[cfg(any(unix, windows))]
 fn finish_initial_terminal_colors(theme: &mut Theme) -> bool {
-    if crate::ui::theme::finish_terminal_colors_pending() && theme.name == "system" {
+    if crate::ui::theme::finish_terminal_colors_pending() && theme.uses_terminal_colors() {
         *theme = Theme::system();
         true
     } else {
@@ -6433,7 +6489,7 @@ pub(super) async fn run(
                 }
                 if value["type"] == "extension_ui_request" {
                     let was_expanded = view.expand_tools;
-                    match view.ui_request(&value) {
+                    match view.ui_request_with_theme(&value, &mut args, &mut theme) {
                         Ok(Some((id, value))) => active
                             .send(json!({"type":"extension_ui_response","id":id,"value":value}))?,
                         Ok(None) => {}
@@ -6520,7 +6576,10 @@ pub(super) async fn run(
                 }
                 let resources_changed = value["type"] == "resources_discovered";
                 view.receive_worker(value, &mut args);
-                if resources_changed && let Some(name) = args.theme_setting() {
+                if resources_changed
+                    && !theme.is_extension_instance()
+                    && let Some(name) = args.theme_setting()
+                {
                     match load_resolved_theme(
                         name,
                         &args.theme_paths,
@@ -16075,6 +16134,67 @@ exit {exit}
         view.receive(&serde_json::json!({"type":"tool_call_delta","toolCallDelta":{"index":0,"name":"read","arguments":"{\"path\":\"x"}}));
         view.settle();
         assert!(view.streaming_tools.is_empty());
+    }
+
+    #[test]
+    fn extension_theme_instance_is_local_and_ignores_provenance_path() {
+        use super::*;
+        use clap::Parser;
+        use crossterm::style::Color;
+        let mut args = Cli::parse_from(["pi", "--use-theme", "light"]);
+        let mut view = View::default();
+        let mut theme = Theme::system();
+        let id = uuid::Uuid::nil();
+        let result = view
+            .ui_request_with_theme(
+                &json!({
+                    "id": id, "method": "setTheme",
+                    "theme": {"name":"system", "path":"relative.json", "colors":{
+                        "accent":{"kind":"rgb","r":1,"g":2,"b":3}
+                    }, "dim":["accent"]}
+                }),
+                &mut args,
+                &mut theme,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            Some((
+                id,
+                pi_rs::UiResponse::ThemeChanged(pi_rs::UiThemeChange {
+                    success: true,
+                    error: None
+                })
+            ))
+        );
+        assert_eq!(theme.color("accent"), Color::Rgb { r: 1, g: 2, b: 3 });
+        assert!(theme.is_dim("accent"));
+        assert!(theme.path.is_none());
+        assert!(!theme.uses_terminal_colors());
+        assert!(view.regular.redraw);
+        assert_eq!(args.theme_setting(), Some("light"));
+
+        let bad = view
+            .ui_request_with_theme(
+                &json!({
+                    "id": id, "method": "setTheme",
+                    "theme": {"name":"invalid","colors":{},"dim":[]}
+                }),
+                &mut args,
+                &mut theme,
+            )
+            .unwrap();
+        assert!(matches!(
+            bad,
+            Some((
+                _,
+                pi_rs::UiResponse::ThemeChanged(pi_rs::UiThemeChange {
+                    success: false,
+                    error: Some(_)
+                })
+            ))
+        ));
+        assert_eq!(theme.color("accent"), Color::Rgb { r: 1, g: 2, b: 3 });
     }
 
     #[cfg(any(unix, windows))]

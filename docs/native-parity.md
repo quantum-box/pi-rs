@@ -983,6 +983,16 @@ The request returns palette data and leaves the active theme selection intact.
 [Pi named theme lookup](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L557-L574)
 [Pi RPC extension UI](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/docs/rpc-extension-ui.md)
 
+The `setTheme` UI request accepts an exact name from the terminal's theme
+resources or a resolved palette returned by `getTheme`. A successful named
+selection updates the active terminal and saves the name in user settings.
+A palette applies only to the current session and does not read or watch any
+path supplied with it. Terminal color notifications and resource discovery
+leave that palette in place. The theme protocol reports `{success, error?}`
+and a rejected selection keeps the active theme. Headless RPC returns
+`{success: false, error: "UI not available"}` locally.
+[Pi theme setting](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L2874-L2891)
+
 ### Native extension working indicator
 
 Native extensions can change the working message, hide the working display,

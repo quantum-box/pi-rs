@@ -280,6 +280,22 @@ pub struct UiThemePalette {
     pub dim: std::collections::BTreeSet<String>,
 }
 
+/// A named frontend theme or a session-local resolved palette.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UiThemeSelection {
+    Name(String),
+    Palette(UiThemePalette),
+}
+
+/// The frontend's result after applying a theme selection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiThemeChange {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Configure the indicator shown while the interactive agent is working.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -401,6 +417,10 @@ pub enum UiRequest {
     GetTheme {
         name: String,
     },
+    /// Select a theme. Named selections can persist, while palettes only affect the session.
+    SetTheme {
+        theme: UiThemeSelection,
+    },
     /// Read the terminal's current tool output expansion state.
     GetToolsExpanded,
     /// Change tool output expansion for the current terminal session.
@@ -426,6 +446,15 @@ impl UiRequest {
             > 1024 * 1024
         {
             return Err("extension UI request exceeds 1 MiB".into());
+        }
+        if let Self::SetTheme { theme } = self {
+            let name = match theme {
+                UiThemeSelection::Name(name) => name,
+                UiThemeSelection::Palette(palette) => &palette.name,
+            };
+            if name.trim().is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+                return Err("extension theme name must contain 1–256 non-control bytes".into());
+            }
         }
         if let Self::Select { options, .. } = self
             && (options.is_empty() || options.len() > 128)
@@ -516,6 +545,16 @@ impl UiRequest {
                 theme.name == *name
                     && serde_json::to_vec(theme).is_ok_and(|value| value.len() <= 1024 * 1024)
             }
+            (Self::SetTheme { .. }, UiResponse::ThemeChanged(result)) => {
+                if result.success {
+                    result.error.is_none()
+                } else {
+                    result
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.len() <= 4096)
+                }
+            }
             (Self::Custom { actions, .. }, UiResponse::Text(value)) => {
                 actions.iter().any(|action| &action.value == value)
             }
@@ -537,6 +576,7 @@ impl UiRequest {
                 | Self::GetEditorText
                 | Self::GetAllThemes
                 | Self::GetTheme { .. }
+                | Self::SetTheme { .. }
                 | Self::GetToolsExpanded
         )
     }
@@ -549,6 +589,7 @@ pub enum UiResponse {
     Confirmed(bool),
     Themes(Vec<UiThemeInfo>),
     Theme(UiThemePalette),
+    ThemeChanged(UiThemeChange),
     Cancelled,
 }
 

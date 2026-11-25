@@ -185,6 +185,7 @@ pub struct Theme {
     pub path: Option<PathBuf>,
     colors: BTreeMap<String, Color>,
     dim: BTreeSet<String>,
+    extension_instance: bool,
 }
 /// Watches the selected custom file while retaining the last valid theme.
 pub struct ThemeWatcher {
@@ -326,8 +327,48 @@ impl Theme {
             path,
             colors: parsed.colors,
             dim: BTreeSet::new(),
+            extension_instance: false,
         })
     }
+    pub fn from_extension_palette(palette: pi_rs::UiThemePalette) -> Result<Self> {
+        if palette.colors.is_empty()
+            || palette.colors.len() > 256
+            || palette
+                .dim
+                .iter()
+                .any(|role| !palette.colors.contains_key(role))
+        {
+            return Err(Error::Config("extension theme palette is invalid".into()));
+        }
+        let colors = palette
+            .colors
+            .into_iter()
+            .map(|(role, color)| {
+                let color = match color {
+                    pi_rs::UiThemeColor::Rgb { r, g, b } => Color::Rgb { r, g, b },
+                    pi_rs::UiThemeColor::Indexed { index } => Color::AnsiValue(index),
+                    pi_rs::UiThemeColor::Reset => Color::Reset,
+                };
+                (role, color)
+            })
+            .collect();
+        Ok(Self {
+            name: palette.name,
+            path: None,
+            colors,
+            dim: palette.dim,
+            extension_instance: true,
+        })
+    }
+
+    pub fn is_extension_instance(&self) -> bool {
+        self.extension_instance
+    }
+
+    pub fn uses_terminal_colors(&self) -> bool {
+        self.name == "system" && !self.extension_instance
+    }
+
     pub fn extension_palette(self) -> pi_rs::UiThemePalette {
         pi_rs_workbench::theme_resources::ui_theme_palette(
             self.name,
@@ -350,6 +391,7 @@ impl Theme {
                 path: None,
                 colors: generated.colors,
                 dim: generated.dim,
+                extension_instance: false,
             };
         }
         let background = unpack_terminal_color(TERMINAL_BACKGROUND.load(Ordering::Relaxed));
@@ -373,6 +415,7 @@ impl Theme {
             path: None,
             colors: generated.colors,
             dim: generated.dim,
+            extension_instance: false,
         }
     }
 

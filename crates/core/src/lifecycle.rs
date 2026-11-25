@@ -423,7 +423,9 @@ impl ToolHost for LifecycleUiHost {
         if request.needs_response()
             && !matches!(
                 request,
-                crate::UiRequest::GetAllThemes | crate::UiRequest::GetTheme { .. }
+                crate::UiRequest::GetAllThemes
+                    | crate::UiRequest::GetTheme { .. }
+                    | crate::UiRequest::SetTheme { .. }
             )
         {
             return Err("lifecycle presentation does not support prompts".into());

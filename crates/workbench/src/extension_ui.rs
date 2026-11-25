@@ -54,6 +54,12 @@ impl Broker {
         match (&self.themes, request) {
             (None, UiRequest::GetAllThemes) => Ok(Some(UiResponse::Themes(vec![]))),
             (None, UiRequest::GetTheme { .. }) => Ok(Some(UiResponse::Cancelled)),
+            (None, UiRequest::SetTheme { .. }) => {
+                Ok(Some(UiResponse::ThemeChanged(pi_rs::UiThemeChange {
+                    success: false,
+                    error: Some("UI not available".into()),
+                })))
+            }
             (Some(_), UiRequest::GetTheme { name }) if name == "system" => Ok(None),
             (Some(themes), UiRequest::GetAllThemes | UiRequest::GetTheme { .. }) => themes
                 .lock()
@@ -86,7 +92,7 @@ impl ExtensionUi for Broker {
         request.validate()?;
         if matches!(
             request,
-            UiRequest::GetAllThemes | UiRequest::GetTheme { .. }
+            UiRequest::GetAllThemes | UiRequest::GetTheme { .. } | UiRequest::SetTheme { .. }
         ) && cancellation.is_cancelled()
         {
             return Err("extension UI cancelled".into());
@@ -271,6 +277,20 @@ mod tests {
                 UiResponse::Cancelled
             );
         }
+        assert_eq!(
+            rpc.request(
+                UiRequest::SetTheme {
+                    theme: pi_rs::UiThemeSelection::Name("dark".into())
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+            UiResponse::ThemeChanged(pi_rs::UiThemeChange {
+                success: false,
+                error: Some("UI not available".into()),
+            })
+        );
         assert!(rpc.pending.lock().unwrap().is_empty());
     }
 

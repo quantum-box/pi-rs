@@ -1102,6 +1102,13 @@ else:
         assert lookup('untrusted-project-theme') is None
         assert lookup(expected) is None
         assert lookup('light/dark') is None
+        def select(theme):
+            print(json.dumps({'type':'ui','request':{'method':'setTheme','theme':theme}}), flush=True)
+            return json.loads(sys.stdin.readline())['Ok']
+        assert select('light') == {'success':True}
+        assert select('untrusted-project-theme')['success'] is False
+        assert select('light/dark')['success'] is False
+        assert select(selected) == {'success':True}
         print(json.dumps({'type':'ui','request':{'method':'notify','message':'Startup theme palettes verified'}}), flush=True)
         assert json.loads(sys.stdin.readline()) == {'Ok':None}
     print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
@@ -1162,6 +1169,10 @@ else:
     output_until(&mut master, |text| {
         text.contains("Startup theme palettes verified")
     });
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings["theme"], "light");
 }
 
 #[test]
