@@ -23892,6 +23892,7 @@ impl Scheduler {
         self.harness
             .watch_unified_history(cursor, limit, interval)
             .await
+    }
     pub fn prune_finished_checkpointable_progress(
         &self,
         task: Uuid,
