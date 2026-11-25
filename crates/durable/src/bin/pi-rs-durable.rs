@@ -1,6 +1,5 @@
 use std::{
     io::{self, Write},
-    num::NonZeroUsize,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -15,6 +14,7 @@ use pi_rs_durable::{
     progress,
     recovery::UncertainPolicy,
     runtime::{Config, Options, Scheduler, Status},
+    worker_activity::WorkerKind,
 };
 use pi_rs_workbench::model_factory::{ModelClientFactory, NativeModelApi};
 use serde_json::{Value, json};
@@ -169,36 +169,37 @@ async fn run(
         eprintln!("Conversation {id}");
     }
 
-    let mut watch = scheduler.watch_view(id, NonZeroUsize::MIN, Duration::from_millis(50))?;
     let submission = scheduler.submit(id, request_id, prompt)?;
     if json_output {
-        let completed = scheduler.wait(id);
         let interrupt = tokio::signal::ctrl_c();
-        tokio::pin!(completed, interrupt);
+        tokio::pin!(interrupt);
+        let mut poll = tokio::time::interval(Duration::from_millis(50));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_text = String::new();
-        loop {
+        while scheduler
+            .worker_activity()
+            .snapshot()
+            .iter()
+            .any(|worker| worker.kind == WorkerKind::Conversation && worker.id == id)
+        {
             tokio::select! {
-                result = &mut completed => {
-                    result?;
-                    break;
-                }
                 result = &mut interrupt => {
                     result?;
                     return Err("interrupted".into());
                 }
-                view = watch.next() => {
-                    if let Some(progress::State::Running(partial)) = view?.and_then(|view| {
-                        let active = view.state.submissions.iter().any(|entry| {
-                            entry.id == submission && matches!(entry.status, Status::Running)
-                        });
-                        view.live.filter(|_| active)
-                    }) && partial.text != last_text {
+                _ = poll.tick() => {
+                    let view = scheduler.view_status(id)?;
+                    if view.state.model_request_id(submission).is_some()
+                        && let Some(progress::State::Running(partial)) = view.live
+                        && partial.text != last_text
+                    {
                         last_text = partial.text;
                         emit(&json!({"type": "progress", "text": last_text}))?;
                     }
                 }
             }
         }
+        scheduler.wait(id).await?;
     } else {
         tokio::select! {
             result = scheduler.wait(id) => result?,

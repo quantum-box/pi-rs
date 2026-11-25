@@ -2509,6 +2509,16 @@ impl Conversation {
         self.answer_ids.get(&submission).copied()
     }
 
+    /// Whether ordinary input would be queued behind an active run.
+    pub fn input_run_active(&self) -> bool {
+        self.active.is_some()
+            || pending_failure_continuation(self)
+            || matches!(
+                self.phase,
+                Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
+            )
+    }
+
     /// Current model request identity for a submission placed in this run.
     pub fn model_request_id(&self, submission: Uuid) -> Option<Uuid> {
         match self.phase {
@@ -2529,6 +2539,14 @@ pub struct ConversationView {
     pub tool_progress: Option<crate::tool_progress::State>,
     pub entries: Vec<Message>,
     pub older: Option<ViewCursor>,
+}
+
+/// Committed runtime state and live checkpoints without reading transcript entries.
+pub struct ConversationStatusView {
+    /// The current runtime record, with messages omitted.
+    pub state: Conversation,
+    pub live: Option<crate::progress::State>,
+    pub tool_progress: Option<crate::tool_progress::State>,
 }
 
 /// First terminal reason of a pull-based view watch.
@@ -10571,10 +10589,9 @@ impl Harness {
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
         Ok(crate::document::Documents::new(self.owner.store()).get_at(address, revision)?)
     }
-    /// Capture current state and at most `limit` newest messages. The live
-    /// checkpoint and conversation record are read consistently by retrying if
-    /// the latter changes while the checkpoint is read.
-    pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
+    /// Read the current runtime state and live checkpoints together, without
+    /// projecting transcript entries or their ordered content blocks.
+    pub fn view_status(&self, id: Uuid) -> Result<ConversationStatusView, Error> {
         self.subagent_store()?;
         let store = self.owner.store();
         let (mut state, live, tool_progress) = loop {
@@ -10624,13 +10641,29 @@ impl Harness {
                 break (state, live, tool_progress);
             }
         };
+        state.messages.clear();
+        hide_pending_tool_output(&mut state);
+        Ok(ConversationStatusView {
+            state,
+            live,
+            tool_progress,
+        })
+    }
+
+    /// Capture current state and at most `limit` newest messages. The live
+    /// checkpoint and conversation record are read consistently by retrying if
+    /// the latter changes while the checkpoint is read.
+    pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
+        let ConversationStatusView {
+            state,
+            live,
+            tool_progress,
+        } = self.view_status(id)?;
         let cursor = state.transcript.clone().ok_or_else(|| {
             Error::Invalid(
                 "legacy conversation has no immutable transcript; save it before viewing".into(),
             )
         })?;
-        state.messages.clear();
-        hide_pending_tool_output(&mut state);
         let page = self.view_page(
             id,
             ViewCursor {
@@ -24072,6 +24105,9 @@ impl Scheduler {
     }
     pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
         self.harness.view(id, limit)
+    }
+    pub fn view_status(&self, id: Uuid) -> Result<ConversationStatusView, Error> {
+        self.harness.view_status(id)
     }
     pub fn tool_progress_events(
         &self,

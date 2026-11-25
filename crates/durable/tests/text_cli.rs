@@ -30,6 +30,9 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             "saved before failure",
             "queue base answer",
             "follow-up answer",
+            "queued partial before failure",
+            "retained after failure",
+            "new prompt answer",
             "image prompt answer",
         ]
         .into_iter()
@@ -82,7 +85,7 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             let partial = format!("data: {delta}\n\n");
             let final_frame = match index {
                 4 => serde_json::json!({"type":"error","status":503}),
-                6 => serde_json::json!({"type":"error","status":400}),
+                6 | 9 => serde_json::json!({"type":"error","status":400}),
                 _ => completed,
             };
             let final_event = format!("data: {final_frame}\n\n");
@@ -355,12 +358,28 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
                 r#"{"type":"clear_queue","id":"clear"}"#,
                 r#"{"type":"set_follow_up_mode","id":"mode","mode":"all"}"#,
                 r#"{"type":"get_state","id":"modes"}"#,
+                r#"{"type":"set_follow_up_mode","mode":"one-at-a-time"}"#,
             ] {
                 writeln!(stdin, "{request}").unwrap();
             }
-            writeln!(stdin, "{}", json!({
-                "type":"follow_up", "id":"after", "message":"deliver after base", "images":[image],
-            })).unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                json!({
+                    "type":"follow_up", "message":"deliver after base", "images":[image],
+                })
+            )
+            .unwrap();
+            writeln!(
+                stdin,
+                r#"{{"type":"follow_up","message":"fail between polls"}}"#
+            )
+            .unwrap();
+            writeln!(
+                stdin,
+                r#"{{"type":"follow_up","id":"after","message":"resume retained input"}}"#
+            )
+            .unwrap();
             sent = true;
         }
         match frame["id"].as_str() {
@@ -383,6 +402,7 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
                 assert_eq!(frame["data"]["followUpMode"], "all");
                 assert_eq!(frame["data"]["pendingMessageCount"], 0);
             }
+            Some("resume") => assert_eq!(frame["data"]["disposition"], "started"),
             Some("after") => {
                 assert_eq!(frame["data"]["disposition"], "queued");
                 finish_first_tx.send(()).unwrap();
@@ -391,9 +411,20 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             _ => {}
         }
         if frame["type"] == "agent_end" {
-            assert_eq!(frame["success"], true);
-            if !ends.is_empty() {
+            assert_eq!(frame["success"], ends.len() != 2);
+            if ends.len() == 1 {
                 assert_eq!(frame["messages"][0]["content"][1], image);
+            }
+            if ends.len() == 2 {
+                assert_eq!(
+                    frame["messages"][0]["content"][0]["text"],
+                    "fail between polls"
+                );
+                writeln!(
+                    stdin,
+                    r#"{{"type":"prompt","id":"resume","message":"new prompt resumes queue"}}"#
+                )
+                .unwrap();
             }
             ends.push(
                 frame["messages"][1]["content"][0]["text"]
@@ -401,7 +432,7 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
                     .unwrap()
                     .to_owned(),
             );
-            if ends.len() == 2 {
+            if ends.len() == 5 {
                 break;
             }
         }
@@ -414,7 +445,16 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         String::from_utf8_lossy(&status.stderr)
     );
     assert!(sent && released);
-    assert_eq!(ends, ["queue base answer", "follow-up answer"]);
+    assert_eq!(
+        ends,
+        [
+            "queue base answer",
+            "follow-up answer",
+            "queued partial before failure",
+            "retained after failure",
+            "new prompt answer",
+        ]
+    );
 
     let mut rpc = command(&endpoint, &["--conversation", id, "--rpc"])
         .stdin(Stdio::piped())
@@ -460,15 +500,25 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     assert!(follow_up.contains("deliver after base"));
     assert!(!follow_up.contains("discard steer"));
     assert!(!follow_up.contains("discard follow-up"));
+    assert!(
+        bodies[10]["input"]
+            .to_string()
+            .contains("resume retained input")
+    );
+    assert!(
+        bodies[11]["input"]
+            .to_string()
+            .contains("new prompt resumes queue")
+    );
     let image_url = format!("data:image/png;base64,{image_data}");
-    for index in [8, 9] {
+    for index in [8, 12] {
         let wire = bodies[index]["input"].as_array().unwrap();
         assert!(wire.iter().any(|message| {
             message["content"][1]["type"] == "input_image"
                 && message["content"][1]["image_url"] == image_url
         }));
     }
-    assert_eq!(bodies[9]["model"], "fixture");
+    assert_eq!(bodies[12]["model"], "fixture");
 }
 
 fn frames(output: Output) -> Vec<Value> {
