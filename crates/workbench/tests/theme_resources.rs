@@ -1,4 +1,5 @@
 use crossterm::style::Color;
+use pi_rs_workbench::resource_factory::{ResourceFactory, ResourceReadGrants};
 use pi_rs_workbench::theme_resources::ThemeReadGrants;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -57,6 +58,121 @@ fn only_granted_files_are_read() {
     let snapshot = grants(vec![selected]).load().unwrap();
     assert_eq!(snapshot.themes().len(), 1);
     assert_eq!(snapshot.themes()[0].name(), "selected");
+}
+
+#[test]
+fn combined_snapshot_loads_direct_json_entries_from_granted_theme_directories() {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    fs::create_dir_all(first.join("nested.json")).unwrap();
+    fs::create_dir(&second).unwrap();
+    fs::write(first.join("nested.json/broken.json"), "{").unwrap();
+    fs::write(first.join("UPPER.JSON"), "{").unwrap();
+    fs::write(temp.path().join("ungranted.json"), "{").unwrap();
+    let exact = temp.path().join("exact.json");
+    let paths = [
+        exact.clone(),
+        second.join("z.json"),
+        first.join(".json"),
+        first.join("a.json"),
+    ];
+    for (path, name) in paths.iter().zip(["exact", "second", "hidden", "first"]) {
+        fs::write(path, theme(name).to_string()).unwrap();
+    }
+    let grants = ResourceReadGrants {
+        themes: grants(vec![exact]),
+        ..Default::default()
+    };
+    let factory = ResourceFactory::default();
+    let directories = [second, first.clone()];
+    assert_eq!(factory.load(&grants).unwrap().themes.themes().len(), 1);
+    let snapshot = factory
+        .load_with_theme_directories(&grants, &directories)
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .themes
+            .themes()
+            .iter()
+            .map(|theme| theme.path())
+            .collect::<Vec<_>>(),
+        paths
+    );
+
+    fs::write(first.join("duplicate.json"), theme("exact").to_string()).unwrap();
+    let error = factory
+        .load_with_theme_directories(&grants, &directories)
+        .unwrap_err();
+    assert!(error.to_string().contains("duplicate theme name: exact"));
+    assert_eq!(snapshot.themes.themes().len(), 4);
+}
+
+#[test]
+fn theme_directory_grants_validate_paths_and_bound_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent");
+    let grants = grants(vec![]);
+    assert!(
+        grants
+            .load_with_directories(std::slice::from_ref(&absent))
+            .is_err()
+    );
+    for invalid in [PathBuf::from("relative"), dir.path().join("a/../b")] {
+        let error = grants
+            .load_with_directories(&[absent.clone(), invalid])
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("theme directory path must be absolute")
+        );
+    }
+    for index in 0..65 {
+        std::fs::write(dir.path().join(format!("{index}.json")), "").unwrap();
+    }
+    let error = grants
+        .load_with_directories(&[dir.path().to_owned()])
+        .unwrap_err();
+    assert!(error.to_string().contains("too many theme files"));
+
+    let ignored = dir.path().join("ignored");
+    std::fs::create_dir(&ignored).unwrap();
+    for index in 0..65 {
+        std::fs::write(ignored.join(format!("{index}.txt")), "").unwrap();
+    }
+    let error = grants
+        .load_with_directories(&vec![ignored; 64])
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("too many theme directory entries")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn theme_directory_grants_follow_file_links_and_skip_non_files() {
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
+
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("themes");
+    let target = temp.path().join("theme.txt");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(&target, theme("linked").to_string()).unwrap();
+    let link = directory.join("linked.json");
+    symlink(target, &link).unwrap();
+    symlink(temp.path(), directory.join("directory.json")).unwrap();
+    symlink(temp.path().join("missing"), directory.join("broken.json")).unwrap();
+    let fifo = directory.join("pipe.json");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let snapshot = grants(vec![]).load_with_directories(&[directory]).unwrap();
+    assert_eq!(snapshot.themes().len(), 1);
+    assert_eq!(snapshot.themes()[0].path(), link);
 }
 
 #[test]

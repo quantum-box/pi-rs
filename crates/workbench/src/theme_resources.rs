@@ -1,12 +1,13 @@
 //! Host-granted snapshots of file-based Pi themes.
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use crossterm::style::Color;
 use pi_rs::{Error, Result};
 use serde_json::Value;
 
 const MAX_FILES: usize = 64;
+const MAX_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_VARIABLE_DEPTH: usize = 128;
 
@@ -51,6 +52,62 @@ impl ThemeResource {
 }
 
 impl ThemeReadGrants {
+    /// Read exact file grants first, then direct `.json` files in each granted
+    /// directory. Directory order follows the caller's list and entries are
+    /// sorted by path. Hidden files and symlinks to regular files are included.
+    /// Directory grants must be absolute without parent components and include
+    /// symlink targets. Reads are synchronous and any failure rejects the snapshot.
+    pub fn load_with_directories(&self, directories: &[PathBuf]) -> Result<ThemeSnapshot> {
+        if directories.is_empty() {
+            return self.load();
+        }
+        if directories.len() > MAX_FILES || self.files.len() > MAX_FILES {
+            return Err(Error::Config("too many theme paths".into()));
+        }
+        for directory in directories {
+            validate_path(directory, "directory")?;
+        }
+        for file in &self.files {
+            validate_path(file, "file")?;
+        }
+
+        let mut files = self.files.clone();
+        let mut examined = 0;
+        for directory in directories {
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(directory)? {
+                examined += 1;
+                if examined > MAX_DIRECTORY_ENTRIES {
+                    return Err(Error::Config("too many theme directory entries".into()));
+                }
+                let entry = entry?;
+                if !entry.file_name().as_encoded_bytes().ends_with(b".json") {
+                    continue;
+                }
+                let kind = entry.file_type()?;
+                let path = entry.path();
+                let is_file = if kind.is_symlink() {
+                    match std::fs::metadata(&path) {
+                        Ok(metadata) => metadata.is_file(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    kind.is_file()
+                };
+                if is_file {
+                    if files.len() + entries.len() >= MAX_FILES {
+                        return Err(Error::Config("too many theme files".into()));
+                    }
+                    entries.push(path);
+                }
+            }
+            entries.sort();
+            files.extend(entries);
+        }
+        Self { files }.load()
+    }
+
     /// Read only these files, in order. Any failure rejects the entire snapshot.
     /// Reads are synchronous and should run off a UI thread.
     pub fn load(&self) -> Result<ThemeSnapshot> {
@@ -61,15 +118,7 @@ impl ThemeReadGrants {
         let mut names = HashSet::new();
         let mut themes = Vec::with_capacity(self.files.len());
         for path in &self.files {
-            if !path.is_absolute()
-                || path
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-            {
-                return Err(Error::Config(
-                    "theme file path must be absolute without parent components".into(),
-                ));
-            }
+            validate_path(path, "file")?;
             let text = crate::prompt_resources::read_optional(path)?.ok_or_else(|| {
                 Error::Config(format!("theme file is missing: {}", path.display()))
             })?;
@@ -95,6 +144,15 @@ impl ThemeReadGrants {
         }
         Ok(ThemeSnapshot { themes })
     }
+}
+
+fn validate_path(path: &Path, kind: &str) -> Result<()> {
+    if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+        return Err(Error::Config(format!(
+            "theme {kind} path must be absolute without parent components"
+        )));
+    }
+    Ok(())
 }
 
 // Bound variable recursion before calling the parser shared with the TUI.
