@@ -39,6 +39,9 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{Cli, Provider, TuiMode, changelog, process::Worker, radius_auth, sessions};
 
+mod durable;
+pub(super) use durable::run as run_durable;
+
 // Shell output is displayed separately from the model-facing context framing.
 fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
     // Finish stripping the untrusted output before adding host-generated

@@ -351,11 +351,16 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     for line in BufReader::new(rpc.stdout.take().unwrap()).lines() {
         let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
         if !sent && frame["assistantMessageEvent"]["delta"] == "queue base answer" {
+            writeln!(
+                stdin,
+                "{}",
+                json!({"type":"steer","id":"steer","message":"discard steer","images":[image]})
+            )
+            .unwrap();
             for request in [
-                r#"{"type":"steer","id":"steer","message":"discard steer"}"#,
                 r#"{"type":"prompt","id":"original-follow","message":"discard follow-up","streamingBehavior":"followUp"}"#,
                 r#"{"type":"get_state","id":"pending"}"#,
-                r#"{"type":"clear_queue","id":"clear"}"#,
+                r#"{"type":"clear_queue","id":"clear","includeContent":true}"#,
                 r#"{"type":"set_follow_up_mode","id":"mode","mode":"all"}"#,
                 r#"{"type":"get_state","id":"modes"}"#,
                 r#"{"type":"set_follow_up_mode","mode":"one-at-a-time"}"#,
@@ -388,6 +393,7 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             }
             Some("pending") => assert_eq!(frame["data"]["pendingMessageCount"], 2),
             Some("clear") => {
+                assert_eq!(frame["data"]["inputs"][0]["content"][1], image);
                 assert_eq!(
                     frame["data"]["steering"],
                     serde_json::json!(["discard steer"])

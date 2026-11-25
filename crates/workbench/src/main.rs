@@ -82,7 +82,7 @@ type RpcModelImages = std::sync::Arc<std::sync::Mutex<rpc::ModelImageCache>>;
     version,
     about,
     args_override_self = true,
-    after_help = "Pi aliases: -v (--version), -nt (--no-tools), -nbt (--no-builtin-tools), -xt (--exclude-tools), -ne (--no-extensions), -ns (--no-skills), -np (--no-prompt-templates), -nc (--no-context-files), -na (--no-approve).\nUse pi-rs --durable --help for the experimental durable text CLI."
+    after_help = "Pi aliases: -v (--version), -nt (--no-tools), -nbt (--no-builtin-tools), -xt (--exclude-tools), -ne (--no-extensions), -ns (--no-skills), -np (--no-prompt-templates), -nc (--no-context-files), -na (--no-approve).\nUse pi-rs --durable --help for the experimental Durable CLI, or pi-rs --durable --tui for its terminal interface."
 )]
 struct Cli {
     #[arg(skip)]
@@ -1402,13 +1402,21 @@ fn startup_ready(ready: &mut Option<tokio::sync::oneshot::Sender<()>>) {
 }
 
 fn run_durable_cli() -> Option<i32> {
-    let mut arguments = std::env::args_os().skip(1);
+    let mut arguments = std::env::args_os().skip(1).peekable();
     if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--durable")) {
         return None;
     }
+    let tui = arguments.next_if(|arg| arg == "--tui").is_some();
+    let arguments: Vec<_> = arguments.collect();
+    let help = arguments.iter().any(|arg| arg == "--help" || arg == "-h");
     let result = std::env::current_exe().and_then(|executable| {
         let companion =
             executable.with_file_name(format!("pi-rs-durable{}", std::env::consts::EXE_SUFFIX));
+        if tui && !help {
+            return interactive::run_durable(&companion, &arguments)
+                .map(|()| 0)
+                .map_err(std::io::Error::other);
+        }
         let mut command = std::process::Command::new(companion);
         command.args(arguments);
         #[cfg(unix)]
