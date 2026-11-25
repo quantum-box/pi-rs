@@ -163,7 +163,7 @@ pub fn read_theme_file(path: &Path) -> Result<Option<String>> {
 #[derive(Default)]
 pub struct ExtensionThemeSnapshot {
     catalog: Vec<UiThemeInfo>,
-    palettes: BTreeMap<String, UiThemePalette>,
+    palettes: BTreeMap<String, (UiThemePalette, Option<PathBuf>)>,
 }
 
 impl ExtensionThemeSnapshot {
@@ -172,7 +172,11 @@ impl ExtensionThemeSnapshot {
     }
 
     pub fn palette(&self, name: &str) -> Option<&UiThemePalette> {
-        self.palettes.get(name)
+        self.palettes.get(name).map(|(palette, _)| palette)
+    }
+
+    pub fn path(&self, name: &str) -> Option<&Path> {
+        self.palettes.get(name)?.1.as_deref()
     }
 }
 
@@ -196,7 +200,7 @@ pub fn extension_theme_snapshot(paths: &[PathBuf]) -> Result<ExtensionThemeSnaps
             name: palette.name.clone(),
             path: None,
         });
-        palettes.insert(palette.name.clone(), palette);
+        palettes.insert(palette.name.clone(), (palette, None));
     }
     for path in paths {
         let Ok(Some(text)) = read_theme_file(path) else {
@@ -214,16 +218,14 @@ pub fn extension_theme_snapshot(paths: &[PathBuf]) -> Result<ExtensionThemeSnaps
         if let std::collections::btree_map::Entry::Vacant(entry) =
             palettes.entry(theme.name.clone())
         {
-            let path = path.to_str().map(PathBuf::from);
+            let wire_path = path.to_str().map(PathBuf::from);
             catalog.push(UiThemeInfo {
                 name: theme.name.clone(),
-                path: path.clone(),
+                path: wire_path.clone(),
             });
-            entry.insert(ui_theme_palette(
-                theme.name,
-                path,
-                &theme.colors,
-                Default::default(),
+            entry.insert((
+                ui_theme_palette(theme.name, wire_path, &theme.colors, Default::default()),
+                Some(path.clone()),
             ));
         }
     }
@@ -254,7 +256,7 @@ pub fn ui_theme_palette(
 ) -> UiThemePalette {
     UiThemePalette {
         name,
-        path,
+        path: path.filter(|path| path.to_str().is_some()),
         colors: colors
             .iter()
             .map(|(role, color)| (role.clone(), ui_theme_color(*color)))

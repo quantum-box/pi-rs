@@ -1067,7 +1067,7 @@ fn startup_extension_lists_and_reads_named_theme_palettes() {
     let theme_path = root.path().join("explicit-theme.json");
     let mut theme: serde_json::Value =
         serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
-    theme["name"] = serde_json::json!("startup-fixture-theme");
+    theme["name"] = serde_json::json!("startup:fixture-theme");
     theme["colors"]["accent"] = serde_json::json!("#123456");
     std::fs::write(&theme_path, format!("\u{feff}{theme}")).unwrap();
     let project_themes = root.path().join(".pi/themes");
@@ -1083,17 +1083,27 @@ if '--pi-rs-extension-v1' in sys.argv:
     print(json.dumps({'version':1,'response':{'Ok':result}}))
 else:
     frame = json.loads(sys.stdin.readline())
-    if frame['request']['event']['type'] == 'session_start':
+    event = frame['request']['event']
+    def active():
+        print(json.dumps({'type':'ui','request':{'method':'getActiveTheme'}}), flush=True)
+        return json.loads(sys.stdin.readline())['Ok']
+    def notify(message):
+        print(json.dumps({'type':'ui','request':{'method':'notify','message':message}}), flush=True)
+        assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    if event['type'] == 'session_start' and event['reason'] == 'new':
+        assert active()['name'] == 'light'
+        notify('Rebound theme palette verified')
+    elif event['type'] == 'session_start':
         print(json.dumps({'type':'ui','request':{'method':'getAllThemes'}}), flush=True)
         response = json.loads(sys.stdin.readline())['Ok']
         assert response[0] == {'name':'system'}, response
         expected = os.path.realpath(os.environ['PI_TEST_THEME_PATH'])
-        assert {'name':'startup-fixture-theme','path':expected} in response, response
+        assert {'name':'startup:fixture-theme','path':expected} in response, response
         def lookup(name):
             print(json.dumps({'type':'ui','request':{'method':'getTheme','name':name}}), flush=True)
             return json.loads(sys.stdin.readline())['Ok']
-        selected = lookup('startup-fixture-theme')
-        assert selected['path'] == expected and selected['name'] == 'startup-fixture-theme', selected
+        selected = lookup('startup:fixture-theme')
+        assert selected['path'] == expected and selected['name'] == 'startup:fixture-theme', selected
         assert selected['colors']['accent'] == {'kind':'rgb','r':18,'g':52,'b':86}, selected
         light = lookup('light')
         assert light['name'] == 'light' and 'path' not in light and light['colors'], light
@@ -1105,21 +1115,39 @@ else:
         def select(theme):
             print(json.dumps({'type':'ui','request':{'method':'setTheme','theme':theme}}), flush=True)
             return json.loads(sys.stdin.readline())['Ok']
-        def active():
-            print(json.dumps({'type':'ui','request':{'method':'getActiveTheme'}}), flush=True)
-            return json.loads(sys.stdin.readline())['Ok']
+        assert select('startup:fixture-theme') == {'success':True}
+        assert active() == selected
+        settings_path = os.path.join(os.environ['PI_RS_HOME'], 'settings.json')
+        def settings_bytes():
+            with open(settings_path, 'rb') as file:
+                return file.read()
+        for missing in ['untrusted-project-theme', 'light/dark', expected, 'Startup:fixture-theme']:
+            assert select('light') == {'success':True}
+            assert active() == light
+            saved = settings_bytes()
+            result = select(missing)
+            assert result['success'] is False and result['error'], result
+            fallback = active()
+            assert fallback['name'] == 'system' and 'path' not in fallback, fallback
+            assert settings_bytes() == saved
         assert select('light') == {'success':True}
-        assert active() == light
-        assert select('untrusted-project-theme')['success'] is False
-        assert select('light/dark')['success'] is False
-        assert active() == light
+        saved = settings_bytes()
+        with open(settings_path, 'wb') as file:
+            file.write(b'{')
+        try:
+            result = select('startup:fixture-theme')
+            assert result['success'] is False and result['error'], result
+            assert active() == light
+            assert settings_bytes() == b'{'
+        finally:
+            with open(settings_path, 'wb') as file:
+                file.write(saved)
         assert select(selected) == {'success':True}
         palette = active()
         assert palette['name'] == selected['name'], palette
         assert palette['colors'] == selected['colors'], palette
         assert 'path' not in palette, palette
-        print(json.dumps({'type':'ui','request':{'method':'notify','message':'Startup theme palettes verified'}}), flush=True)
-        assert json.loads(sys.stdin.readline()) == {'Ok':None}
+        notify('Startup theme palettes verified')
     print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
 "##).unwrap();
     std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1163,7 +1191,7 @@ else:
             ])
             .arg("--theme")
             .arg(&theme_path)
-            .args(["--use-theme", "startup-fixture-theme"])
+            .args(["--use-theme", "startup:fixture-theme"])
             .arg("--extension")
             .arg(&extension)
             .env("PI_RS_HOME", root.path().join("home"))
@@ -1177,6 +1205,10 @@ else:
     );
     output_until(&mut master, |text| {
         text.contains("Startup theme palettes verified")
+    });
+    master.write_all(b"/new\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Rebound theme palette verified")
     });
     let settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())

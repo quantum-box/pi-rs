@@ -6,23 +6,42 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+type PendingRequests = Arc<Mutex<BTreeMap<Uuid, PendingResponse>>>;
+
+struct PendingResponse {
+    sender: oneshot::Sender<UiResponse>,
+    theme_claim: Option<ThemeClaim>,
+}
+
+enum ThemeClaim {
+    Unclaimed(CancellationToken),
+    Claimed,
+}
+
 #[derive(Default)]
 pub struct Broker {
-    pending: Arc<Mutex<BTreeMap<Uuid, oneshot::Sender<UiResponse>>>>,
+    pending: PendingRequests,
     themes: Option<Mutex<ExtensionResult<ExtensionThemeSnapshot>>>,
 }
 struct Pending {
     id: Uuid,
-    requests: Arc<Mutex<BTreeMap<Uuid, oneshot::Sender<UiResponse>>>>,
+    requests: PendingRequests,
     completed: bool,
 }
 impl Drop for Pending {
     fn drop(&mut self) {
-        self.requests
+        let removed = self
+            .requests
             .lock()
             .expect("extension UI requests")
             .remove(&self.id);
-        if !self.completed {
+        // A claim already authorizes the frontend to finish the mutation.
+        if !self.completed
+            && !matches!(
+                removed.and_then(|request| request.theme_claim),
+                Some(ThemeClaim::Claimed)
+            )
+        {
             super::output(serde_json::json!({"type":"extension_ui_cancelled","id":self.id}));
         }
     }
@@ -73,14 +92,31 @@ impl Broker {
         }
     }
 
+    pub fn claim_theme(&self, id: Uuid) -> bool {
+        let mut requests = self.pending.lock().expect("extension UI requests");
+        let Some(request) = requests.get_mut(&id) else {
+            return false;
+        };
+        match &request.theme_claim {
+            // Checking the token under the pending-request lock authorizes the mutation.
+            // Cancellation after this point can stop the waiter while the frontend finishes.
+            Some(ThemeClaim::Unclaimed(token)) if !token.is_cancelled() => {
+                request.theme_claim = Some(ThemeClaim::Claimed);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn resolve(&self, id: Uuid, value: UiResponse) {
-        if let Some(sender) = self
-            .pending
-            .lock()
-            .expect("extension UI requests")
-            .remove(&id)
+        let mut requests = self.pending.lock().expect("extension UI requests");
+        if requests
+            .get(&id)
+            .is_some_and(|request| !matches!(request.theme_claim, Some(ThemeClaim::Unclaimed(_))))
+            && let Some(request) = requests.remove(&id)
         {
-            let _ = sender.send(value);
+            drop(requests);
+            let _ = request.sender.send(value);
         }
     }
 }
@@ -116,7 +152,15 @@ impl ExtensionUi for Broker {
             if requests.len() >= 16 {
                 return Err("too many pending extension UI requests".into());
             }
-            requests.insert(id, sender);
+            let theme_claim = matches!(request, UiRequest::SetTheme { .. })
+                .then(|| ThemeClaim::Unclaimed(cancellation.clone()));
+            requests.insert(
+                id,
+                PendingResponse {
+                    sender,
+                    theme_claim,
+                },
+            );
             Some(receiver)
         } else {
             None
@@ -164,6 +208,50 @@ impl ExtensionUi for Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn theme_claim_is_the_mutation_authorization_point() {
+        let broker = Broker::new(true);
+        let pending_id = || *broker.pending.lock().unwrap().keys().next().unwrap();
+        let selection = || UiRequest::SetTheme {
+            theme: pi_rs::UiThemeSelection::Name("light".into()),
+        };
+        let success = UiResponse::ThemeChanged(pi_rs::UiThemeChange {
+            success: true,
+            error: None,
+        });
+
+        let token = CancellationToken::new();
+        let mut request = std::pin::pin!(broker.request(selection(), token.clone()));
+        assert!(futures_util::poll!(&mut request).is_pending());
+        let id = pending_id();
+        token.cancel();
+        // The cancellation token wins even before the waiter is polled again.
+        assert!(!broker.claim_theme(id));
+        assert!(request.await.is_err());
+        assert!(!broker.claim_theme(id));
+
+        let token = CancellationToken::new();
+        let mut request = std::pin::pin!(broker.request(selection(), token.clone()));
+        assert!(futures_util::poll!(&mut request).is_pending());
+        let id = pending_id();
+        broker.resolve(id, success.clone());
+        assert!(futures_util::poll!(&mut request).is_pending());
+        assert!(broker.claim_theme(id));
+        assert!(!broker.claim_theme(id));
+        // The authorization stays valid if the caller stops waiting after the claim.
+        token.cancel();
+        assert!(request.await.is_err());
+        broker.resolve(id, success.clone());
+        assert!(broker.pending.lock().unwrap().is_empty());
+
+        let mut request = std::pin::pin!(broker.request(selection(), CancellationToken::new()));
+        assert!(futures_util::poll!(&mut request).is_pending());
+        let id = pending_id();
+        assert!(broker.claim_theme(id));
+        broker.resolve(id, success.clone());
+        assert_eq!(request.await.unwrap(), success);
+    }
+
     #[tokio::test]
     async fn theme_queries_use_the_worker_snapshot_without_forwarding_to_a_client() {
         let directory = tempfile::tempdir().unwrap();
@@ -320,7 +408,8 @@ mod tests {
         std::fs::write(&path, theme.to_string()).unwrap();
 
         let terminal = Broker::new(true);
-        terminal.refresh_themes(&[path]);
+        let paths = [path.clone()];
+        terminal.refresh_themes(&paths);
         let theme_list = terminal
             .request(UiRequest::GetAllThemes, CancellationToken::new())
             .await
@@ -329,6 +418,9 @@ mod tests {
             serde_json::to_value(theme_list).unwrap()[1],
             serde_json::json!({"name":"custom"}),
         );
+        let selected = crate::ui::theme::Theme::load_extension_name("custom", &paths).unwrap();
+        assert_eq!(selected.path.as_deref(), Some(path.as_path()));
+        assert!(selected.extension_palette().path.is_none());
     }
 
     #[tokio::test]
@@ -349,6 +441,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         let id = *broker.pending.lock().unwrap().keys().next().unwrap();
+        assert!(!broker.claim_theme(id));
         broker.resolve(id, UiResponse::Confirmed(true));
         assert_eq!(task.await.unwrap().unwrap(), UiResponse::Confirmed(true));
         assert!(broker.pending.lock().unwrap().is_empty());

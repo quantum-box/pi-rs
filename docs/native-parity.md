@@ -983,17 +983,26 @@ The request returns palette data and leaves the active theme selection intact.
 [Pi named theme lookup](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L557-L574)
 [Pi RPC extension UI](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/docs/rpc-extension-ui.md)
 
-The `setTheme` UI request accepts an exact name from the terminal's theme
-resources or a resolved palette returned by `getTheme`. A successful named
-selection updates the active terminal and saves the name in user settings.
-A palette applies only to the current session and does not read or watch any
-path supplied with it. Terminal color notifications and resource discovery
-leave that palette in place. The theme protocol reports `{success, error?}`
-and a rejected selection keeps the active theme. `getActiveTheme` exposes
-the current palette, corresponding to Pi’s extension UI `theme` property.
-Headless RPC returns
+The `setTheme` UI request accepts an exact, case-sensitive name from the scoped
+theme catalog or a resolved palette returned by `getTheme`. Named selection
+uses the same resource order as lookup and reads only resolved theme files.
+The terminal must claim the request from the worker before it can change the
+palette or settings. Cancellation before the claim prevents both changes. A
+granted claim authorizes the terminal to finish even if the caller cancels
+while waiting for its response.
+
+A successful named selection applies the theme and saves the name in user
+settings when it differs from the current setting. A named load failure
+applies the live `system` fallback and returns `{success: false, error}`,
+as in Pi, without writing settings. A native settings write failure or an
+invalid supplied palette returns failure and preserves the active theme.
+A supplied palette ignores its path, survives passive terminal and resource
+refreshes even while a picker is open, and is discarded on session rebind or
+reload. `getActiveTheme` exposes the current palette, corresponding to Pi’s
+extension UI `theme` property. Headless RPC returns
 `{success: false, error: "UI not available"}` locally.
 [Pi theme setting](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L2874-L2891)
+[Pi fallback](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L703-L722)
 
 ### Native extension working indicator
 

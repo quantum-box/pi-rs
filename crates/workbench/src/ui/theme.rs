@@ -251,19 +251,19 @@ impl Theme {
             "dark" => Self::parse(include_str!("../../assets/themes/dark.json"), None),
             "light" => Self::parse(include_str!("../../assets/themes/light.json"), None),
             _ => {
-                let mut paths = vec![
-                    crate::config::agent_dir()
-                        .join("themes")
-                        .join(format!("{name}.json")),
-                ];
-                if !discover {
-                    paths.clear();
+                let mut paths = Vec::new();
+                if discover {
+                    paths.push(
+                        crate::config::agent_dir()
+                            .join("themes")
+                            .join(format!("{name}.json")),
+                    );
                 }
                 if trusted && discover {
                     paths.push(workspace.join(".pi/themes").join(format!("{name}.json")));
                 }
                 for path in extra {
-                    paths.push(if path.is_dir() {
+                    paths.push(if discover && path.is_dir() {
                         path.join(format!("{name}.json"))
                     } else {
                         path.clone()
@@ -330,6 +330,18 @@ impl Theme {
             extension_instance: false,
         })
     }
+    pub fn load_extension_name(name: &str, paths: &[PathBuf]) -> Result<Self> {
+        if name == "system" {
+            return Ok(Self::system());
+        }
+        let snapshot = pi_rs_workbench::theme_resources::extension_theme_snapshot(paths)?;
+        let palette = snapshot
+            .palette(name)
+            .ok_or_else(|| Error::Config(format!("theme {name:?} was not found")))?;
+        let path = snapshot.path(name).map(Path::to_path_buf);
+        Ok(Self::from_palette(palette.clone(), path, false))
+    }
+
     pub fn from_extension_palette(palette: pi_rs::UiThemePalette) -> Result<Self> {
         if palette.colors.is_empty()
             || palette.colors.len() > 256
@@ -340,6 +352,14 @@ impl Theme {
         {
             return Err(Error::Config("extension theme palette is invalid".into()));
         }
+        Ok(Self::from_palette(palette, None, true))
+    }
+
+    fn from_palette(
+        palette: pi_rs::UiThemePalette,
+        path: Option<PathBuf>,
+        extension_instance: bool,
+    ) -> Self {
         let colors = palette
             .colors
             .into_iter()
@@ -352,13 +372,13 @@ impl Theme {
                 (role, color)
             })
             .collect();
-        Ok(Self {
+        Self {
             name: palette.name,
-            path: None,
+            path,
             colors,
             dim: palette.dim,
-            extension_instance: true,
-        })
+            extension_instance,
+        }
     }
 
     pub fn is_extension_instance(&self) -> bool {
