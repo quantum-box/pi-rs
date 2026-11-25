@@ -6,6 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use clap::Subcommand;
+use indexmap::IndexMap;
 use pi_rs::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -351,8 +352,7 @@ fn resolve_package_resources(
         let local = !remote(&declaration.source);
         // Single-file native sources retain their existing handling; Pi loads
         // such files directly and does not apply directory package filters.
-        let legacy = local && Path::new(&declaration.source).is_file();
-        if legacy {
+        if local && Path::new(&declaration.source).is_file() {
             let identity = source_identity(&declaration.source);
             extensions.insert(
                 Path::new(&declaration.source),
@@ -363,8 +363,7 @@ fn resolve_package_resources(
             );
             continue;
         }
-        let pi_package =
-            !legacy && local_startup_manifest(&package.root).is_ok_and(|(_, upstream)| upstream);
+        let pi_package = local_startup_manifest(&package.root).is_ok_and(|(_, upstream)| upstream);
         let identity = source_identity(&declaration.source);
         let mut selected_executables = Vec::new();
         for (name, paths, target) in [
@@ -409,7 +408,7 @@ fn resolve_package_resources(
                 Err(error) => return Err(error),
             };
             if let Some(candidates) = diagnostic {
-                match filter.states(&candidates, &package.root, false) {
+                match filter.states(&candidates, &package.root) {
                     Ok(_) => {}
                     Err(_) if local => break,
                     Err(error) => return Err(error),
@@ -418,23 +417,22 @@ fn resolve_package_resources(
             if startup && name != "themes" && paths.is_empty() {
                 continue;
             }
-            let states = match filter.states(paths, &package.root, legacy) {
+            let states = match filter.states(paths, &package.root) {
                 Ok(states) => states,
                 Err(_) if local => break,
                 Err(error) => return Err(error),
             };
-            for (path, state) in paths.iter().zip(states) {
-                if let Some(enabled) = state {
-                    let inserted = target.insert(
-                        path,
-                        enabled,
-                        &identity,
-                        &package.root,
-                        name == "extensions",
-                    );
-                    if inserted && enabled && name == "extensions" {
-                        selected_executables.push(path.clone());
-                    }
+            for (index, enabled) in states {
+                let path = &paths[index];
+                let inserted = target.insert(
+                    path,
+                    enabled,
+                    &identity,
+                    &package.root,
+                    name == "extensions",
+                );
+                if inserted && enabled && name == "extensions" {
+                    selected_executables.push(path.clone());
                 }
             }
         }
@@ -873,69 +871,25 @@ impl ResourceFilter {
             autoload: value["autoload"] != false,
         })
     }
-    // Local and layered packages retain the previous behavior until their
-    // separately caught errors and evaluation order can be reproduced.
-    fn includes_legacy(&self, path: &Path, root: &Path, inherited: bool) -> bool {
-        if self.autoload {
-            return self
-                .patterns
-                .as_ref()
-                .is_none_or(|patterns| selected(path, root, patterns));
-        }
-        self.patterns
-            .iter()
-            .flatten()
-            .fold(inherited, |enabled, pattern| {
-                let prefix = pattern.chars().next();
-                let target = if matches!(prefix, Some('+' | '-' | '!')) {
-                    &pattern[1..]
-                } else {
-                    pattern.as_str()
-                };
-                if resource_matches(path, root, target, matches!(prefix, Some('+' | '-')), false) {
-                    !matches!(prefix, Some('-' | '!'))
-                } else {
-                    enabled
-                }
-            })
-    }
-
-    // Delta filters write only matched paths. Computing from both initial
-    // states distinguishes an untouched path from an explicit enable/disable.
-    fn states(&self, paths: &[PathBuf], root: &Path, legacy: bool) -> Result<Vec<Option<bool>>> {
-        let run = |initial: bool| -> Result<Vec<bool>> {
-            if legacy {
-                Ok(paths
-                    .iter()
-                    .map(|path| self.includes_legacy(path, root, initial))
-                    .collect())
-            } else {
-                self.apply(paths, root, &vec![initial; paths.len()])
-            }
-        };
-        let disabled = run(false)?;
-        if self.autoload {
-            return Ok(disabled.into_iter().map(Some).collect());
-        }
-        let enabled = run(true)?;
-        Ok(disabled
-            .into_iter()
-            .zip(enabled)
-            .map(|(a, b)| (a == b).then_some(a))
-            .collect())
-    }
 
     #[cfg(test)]
     fn includes(&self, path: &Path, root: &Path, inherited: bool) -> Result<bool> {
-        Ok(self.apply(&[path.to_path_buf()], root, &[inherited])?[0])
+        Ok(self
+            .states(&[path.to_path_buf()], root)?
+            .first()
+            .map_or(inherited, |&(_, enabled)| enabled))
     }
 
-    fn apply(&self, paths: &[PathBuf], root: &Path, inherited: &[bool]) -> Result<Vec<bool>> {
+    fn states(&self, paths: &[PathBuf], root: &Path) -> Result<Vec<(usize, bool)>> {
         let Some(patterns) = &self.patterns else {
             return Ok(if self.autoload {
-                vec![true; paths.len()]
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| (index, true))
+                    .collect()
             } else {
-                inherited.to_vec()
+                Vec::new()
             });
         };
         let matches = |path: &Path, pattern: &str, exact: bool| -> Result<bool> {
@@ -953,7 +907,7 @@ impl ResourceFilter {
             Ok(resource_matches(path, root, pattern, exact, false))
         };
         if !self.autoload {
-            let mut enabled = inherited.to_vec();
+            let mut enabled = IndexMap::new();
             for pattern in patterns {
                 let prefix = pattern.chars().next();
                 let override_pattern = matches!(prefix, Some('+' | '-' | '!'));
@@ -962,16 +916,21 @@ impl ResourceFilter {
                 } else {
                     pattern.as_str()
                 };
-                for (path, enabled) in paths.iter().zip(&mut enabled) {
+                // A later pattern replaces the vote while preserving the first match position.
+                for (index, path) in paths.iter().enumerate() {
                     if matches(path, target, matches!(prefix, Some('+' | '-')))? {
-                        *enabled = !matches!(prefix, Some('-' | '!'));
+                        enabled.insert(index, !matches!(prefix, Some('-' | '!')));
                     }
                 }
             }
-            return Ok(enabled);
+            return Ok(enabled.into_iter().collect());
         }
         if patterns.is_empty() {
-            return Ok(vec![false; paths.len()]);
+            return Ok(paths
+                .iter()
+                .enumerate()
+                .map(|(index, _)| (index, false))
+                .collect());
         }
         let any = |path: &Path, prefix: Option<char>, exact: bool| -> Result<bool> {
             for pattern in patterns {
@@ -1007,7 +966,7 @@ impl ResourceFilter {
                 }
             }
         }
-        Ok(enabled)
+        Ok(enabled.into_iter().enumerate().collect())
     }
 }
 
@@ -3168,6 +3127,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resources_for(&args, false).unwrap().prompts.len(), 1);
+        // The first matching delta fixes the position, even if it initially
+        // disables a resource. A later delta can enable it in that same position.
+        let ordered = directory.join("ordered");
+        std::fs::create_dir_all(ordered.join("themes")).unwrap();
+        for name in ["alpha.json", "zeta.json", "untouched.json"] {
+            std::fs::write(ordered.join("themes").join(name), "{}").unwrap();
+        }
+        std::fs::write(
+            directory.join(".pi/settings.json"),
+            json!({"packages":[{
+                "source":ordered,
+                "autoload":false,
+                "themes":["-themes/zeta.json","themes/alpha.json","+themes/zeta.json"]
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(agent.join("settings.json"), "{}").unwrap();
+        let names: Vec<_> = startup_themes(&args, false)
+            .unwrap()
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["zeta.json", "alpha.json"]);
+
         // A project delta resolves against the first user source even when
         // its own revision differs.
         std::fs::write(
@@ -3955,14 +3939,8 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         ).unwrap();
 
         assert_eq!(
-            filter.states(&candidates, root, false).unwrap(),
-            [
-                Some(true),
-                Some(false),
-                Some(true),
-                Some(false),
-                Some(false)
-            ]
+            filter.states(&candidates, root).unwrap(),
+            [(0, true), (1, false), (2, true), (3, false), (4, false)]
         );
 
         let delta = ResourceFilter::new(
@@ -3971,8 +3949,8 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         )
         .unwrap();
         assert_eq!(
-            delta.states(&candidates, root, false).unwrap(),
-            [Some(true), None, None, Some(true), None]
+            delta.states(&candidates, root).unwrap(),
+            [(0, true), (3, true)]
         );
     }
 
@@ -3999,8 +3977,8 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         ] {
             let filter = ResourceFilter::new(&json!({"prompts": patterns}), "prompts").unwrap();
             assert_eq!(
-                filter.states(&candidates, root, false).unwrap(),
-                expected.map(Some),
+                filter.states(&candidates, root).unwrap(),
+                expected.into_iter().enumerate().collect::<Vec<_>>(),
                 "{patterns:?}"
             );
         }
@@ -4050,7 +4028,7 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
             "prompts",
         )
         .unwrap();
-        let error = filter.apply(&paths, &root, &[false, false]).unwrap_err();
+        let error = filter.states(&paths, &root).unwrap_err();
         assert!(error.to_string().contains("URI malformed"));
     }
 
@@ -5608,8 +5586,8 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         ] {
             let filter = ResourceFilter::new(&json!({"prompts": [pattern]}), "prompts").unwrap();
             assert_eq!(
-                filter.apply(&paths, root, &[false; 3]).unwrap(),
-                expected,
+                filter.states(&paths, root).unwrap(),
+                expected.into_iter().enumerate().collect::<Vec<_>>(),
                 "{pattern}"
             );
         }

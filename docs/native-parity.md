@@ -250,7 +250,10 @@ Positive extglobs such as `prompts/@(review|triage).md` work in package filters
 for bounded ASCII patterns and paths without dot-prefixed components. Package
 settings filters also support a single negated group with literal alternatives
 and a supported suffix, such as `prompts/!(review|triage).md`. Exact path and
-force-inclusion rules still apply.
+force-inclusion rules still apply. With `autoload: false`, a path takes its
+position from the first matching pattern and its enabled state from the
+last matching pattern. Unmatched paths remain available to a lower-scope
+declaration, matching Pi's ordered package delta.
 
 An invalid file URL in a package settings filter reports an error when
 reached against an available native or Pi manifest diagnostic candidate. For a local directory
