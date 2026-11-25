@@ -115,7 +115,11 @@ fn theme_directory_grants_validate_paths_and_bound_results() {
     let dir = tempfile::tempdir().unwrap();
     let absent = dir.path().join("absent");
     let grants = grants(vec![]);
-    assert!(grants.load_with_directories(&[absent.clone()]).is_err());
+    assert!(
+        grants
+            .load_with_directories(std::slice::from_ref(&absent))
+            .is_err()
+    );
     for invalid in [PathBuf::from("relative"), dir.path().join("a/../b")] {
         let error = grants
             .load_with_directories(&[absent.clone(), invalid])
