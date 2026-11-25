@@ -907,7 +907,8 @@ pub trait DurableTaskHost: Send + Sync {
     /// checkpointable child regardless of either tool's replay policy.
     /// A replay-unsafe parent authorizes execution only during this live
     /// attempt, and an interrupted child retains its receipt policy.
-    /// Standalone admission requires replay-safe parent and child tools.
+    /// Standalone admission requires both tools to be registered as standalone
+    /// checkpointable tools.
     /// The ordinary `start_child` stages admission for the parent transition.
     async fn start_child_now(
         &self,
