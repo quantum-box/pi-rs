@@ -3135,6 +3135,12 @@ mod tests {
             std::fs::write(ordered.join("themes").join(name), "{}").unwrap();
         }
         std::fs::write(
+            ordered.join("package.json"),
+            json!({"pi":{"themes":["themes/alpha.json", "themes/zeta.json", "themes/untouched.json"]}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
             directory.join(".pi/settings.json"),
             json!({"packages":[{
                 "source":ordered,
