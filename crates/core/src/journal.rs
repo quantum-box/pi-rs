@@ -3900,6 +3900,19 @@ fn publish_snapshot(
     Ok(())
 }
 
+/// Request ID of a journal marker for a display-only cancelled turn partial.
+#[doc(hidden)]
+pub fn aborted_turn_partial_request(event: &Event) -> Option<Uuid> {
+    match event {
+        Event::SourceEntry { format, entry } if format == "pi-rs:aborted-turn-partial" => {
+            entry["requestId"]
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+        }
+        _ => None,
+    }
+}
+
 /// Whether a completion is a marked, display-only cancelled turn partial.
 #[doc(hidden)]
 pub fn is_aborted_turn_partial(records: &[Record], record: &Record) -> bool {
@@ -3919,10 +3932,7 @@ pub fn is_aborted_turn_partial(records: &[Record], record: &Record) -> bool {
     else {
         return false;
     };
-    matches!(&parent.event, Event::SourceEntry { format, entry }
-        if format == "pi-rs:aborted-turn-partial"
-            && entry["requestId"].as_str().and_then(|id| Uuid::parse_str(id).ok()) == Some(*request_id)
-            && !partial.is_empty())
+    aborted_turn_partial_request(&parent.event) == Some(*request_id) && !partial.is_empty()
 }
 
 fn validate_context_edit(

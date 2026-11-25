@@ -1421,6 +1421,7 @@ struct View {
     tokens: u64,
     cache_stats: super::cache_stats::Tracker,
     pending_reasoning_drop: Option<(uuid::Uuid, ReasoningDrop)>,
+    pending_aborted_turn_partial: Option<(u64, uuid::Uuid)>,
     previous_reasoning_drop: Option<(ReasoningDropKind, usize)>,
     cache_warming_status: Option<super::cache_warming::status::State>,
     model_operations: std::collections::HashSet<String>,
@@ -2771,8 +2772,24 @@ impl View {
         }
     }
 
-    fn observe_reasoning_drop(&mut self, event: &pi_rs::Event) -> Option<ReasoningDrop> {
-        match event {
+    fn observe_reasoning_drop(&mut self, record: &pi_rs::Record) -> Option<ReasoningDrop> {
+        let pending_aborted = self.pending_aborted_turn_partial.take();
+        self.pending_aborted_turn_partial =
+            pi_rs::aborted_turn_partial_request(&record.event).map(|id| (record.id, id));
+        match &record.event {
+            pi_rs::Event::ModelFinished {
+                request_id,
+                failure: Some(pi_rs::ModelFailure::Cancelled),
+                partial,
+                ..
+            } if !partial.is_empty()
+                && pending_aborted.is_some_and(|(marker_id, pending_id)| {
+                    record.parent == Some(marker_id) && *request_id == pending_id
+                }) =>
+            {
+                self.pending_reasoning_drop = None;
+                self.previous_reasoning_drop = None;
+            }
             pi_rs::Event::ModelFinished {
                 request_id,
                 metadata,
@@ -3145,7 +3162,7 @@ impl View {
         }
         self.receive(&value);
         if value["type"] == "record"
-            && matches!(
+            && (matches!(
                 value["record"]["event"]["type"].as_str(),
                 Some(
                     "model_selected"
@@ -3159,7 +3176,7 @@ impl View {
                         | "custom_message_delivered"
                         | "custom_entry"
                 )
-            )
+            ) || value["record"]["event"]["format"] == "pi-rs:aborted-turn-partial")
             && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
         {
             if let pi_rs::Event::CustomMessage { message }
@@ -3176,7 +3193,7 @@ impl View {
             self.add_summary(&record, None);
             self.show_summary_billing(&record, &[]);
             self.observe_cache(&record, args);
-            if let Some(drop) = self.observe_reasoning_drop(&record.event)
+            if let Some(drop) = self.observe_reasoning_drop(&record)
                 && args.settings.notices().shows(NoticeKind::ReasoningDrops)
             {
                 self.lines.push(Entry::TranscriptNotice {
@@ -3257,6 +3274,7 @@ impl View {
         self.tokens = 0;
         self.cache_stats = super::cache_stats::Tracker::default();
         self.pending_reasoning_drop = None;
+        self.pending_aborted_turn_partial = None;
         self.previous_reasoning_drop = None;
         self.cache_warming_status = None;
         self.model_operations.clear();
@@ -3439,7 +3457,7 @@ impl View {
             self.add_summary(record, Some(session));
             self.show_summary_billing(record, records);
             self.observe_cache(record, args);
-            self.observe_reasoning_drop(&record.event);
+            self.observe_reasoning_drop(record);
         }
         if show_startup_header(args) {
             self.append(if crate::ui::keys::windows_keybindings() {
@@ -11568,6 +11586,107 @@ mod tests {
             }
         }
         assert_eq!(view.cache_stats.missed_tokens, 25_000);
+    }
+
+    #[test]
+    fn cancelled_turn_partial_resets_reasoning_drop_baseline_live_and_on_restore() {
+        use super::*;
+        use clap::Parser;
+        use pi_rs::{AssistantDiagnostic, Event, ModelFailure, ModelMetadata, UsageReport};
+
+        let mut args = Cli::parse_from(["pi", "--offline"]);
+        let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        initial
+            .append_user_with_images("question".into(), vec![], None)
+            .unwrap();
+        let answered = uuid::Uuid::new_v4();
+        let aborted = uuid::Uuid::new_v4();
+        let request = |id| Event::ModelRequested {
+            model: "fixture".into(),
+            messages: 1,
+            tools: 0,
+            max_output_tokens: 64,
+            request_id: Some(id),
+            context_head: None,
+            context_sha256: None,
+            context_transformed: None,
+            context_configuration_sha256: None,
+            tool_decision: None,
+        };
+        let diagnostics = AssistantDiagnostic::from_pi_diagnostics(&json!([{
+            "type":"openai_input_transformations",
+            "timestamp":17,
+            "details":{"transformations":[{
+                "type":"reasoning","id":"rs_prefix","action":"removed","reason":"prefix_mismatch"
+            }]}
+        }]));
+        let events = [
+            request(answered),
+            Event::ModelFinished {
+                request_id: answered,
+                metadata: ModelMetadata {
+                    diagnostics,
+                    ..Default::default()
+                },
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            },
+            Event::Assistant {
+                request_id: Some(answered),
+                content: "answer".into(),
+                invocations: vec![],
+                usage: None,
+            },
+            request(aborted),
+            Event::SourceEntry {
+                format: "pi-rs:aborted-turn-partial".into(),
+                entry: json!({"requestId":aborted}),
+            },
+            Event::ModelFinished {
+                request_id: aborted,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Cancelled),
+                partial: "partial answer".into(),
+                reply: None,
+            },
+        ];
+        let mut records = initial.records().to_vec();
+        let mut live = View::default();
+        for event in events {
+            let parent = records.last().unwrap();
+            let record = pi_rs::Record {
+                version: parent.version,
+                id: parent.id + 1,
+                parent: Some(parent.id),
+                event,
+                timestamp: None,
+                run_id: None,
+            };
+            live.receive_worker(json!({"type":"record","record":record}), &mut args);
+            records.push(record);
+        }
+        assert!(live.previous_reasoning_drop.is_none());
+
+        let complete = Session::from_records(records.clone()).unwrap();
+        let mut reopened = View::default();
+        reopened.restore_session(&args, &complete).unwrap();
+        assert!(reopened.previous_reasoning_drop.is_none());
+
+        // Cancelling without a displayable partial leaves the preceding reply as the baseline.
+        let Event::ModelFinished { partial, .. } = &mut records.last_mut().unwrap().event else {
+            unreachable!("last record is the cancelled completion");
+        };
+        partial.clear();
+        reopened
+            .restore_session(&args, &Session::from_records(records).unwrap())
+            .unwrap();
+        assert!(matches!(
+            reopened.previous_reasoning_drop,
+            Some((ReasoningDropKind::OpenAi, 1))
+        ));
     }
 
     #[test]
