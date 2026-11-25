@@ -27587,22 +27587,30 @@ mod scheduler_tests {
         let path = dir.path().join("db");
         let mut harness = Harness::open_paused(&path, options(placement_model())).unwrap();
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let writer_path = path.clone();
         let writer = std::thread::spawn(move || {
             let conn = rusqlite::Connection::open(writer_path).unwrap();
             conn.execute_batch("BEGIN IMMEDIATE").unwrap();
             locked_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(6500));
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
             conn.execute_batch("COMMIT").unwrap();
         });
         locked_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        assert!(matches!(
-            harness.create_conversation(config()),
-            Err(Error::Storage(durable_store::Error::WriteLockBusy(_)))
-        ));
+        let blocked = harness.create_conversation(config());
+        release_tx.send(()).unwrap();
         writer.join().unwrap();
+        assert!(
+            matches!(
+                blocked,
+                Err(Error::Storage(durable_store::Error::WriteLockBusy(_)))
+            ),
+            "expected the held write lock to block saving the conversation: {blocked:?}"
+        );
         let id = harness.create_conversation(config()).unwrap();
         assert_eq!(harness.conversation(id).unwrap().id, id);
     }

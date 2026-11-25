@@ -6473,11 +6473,16 @@ async fn exercise_selected_woken_receipt(mode: &str) {
         .unwrap();
     let busy_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let busy_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if mode == "busy" || mode == "busy_success" {
+    let observed_busy = if mode == "busy" || mode == "busy_success" {
         let writer_path = path.clone();
         let busy_ready = busy_ready.clone();
         let busy_released = busy_released.clone();
         let force_stale = mode == "busy";
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let observed_busy = release_tx.clone();
+        crate::task_scheduler::on_woken_conversation_receipt_busy(root.task.id(), move || {
+            release_tx.send(()).unwrap();
+        });
         crate::task_scheduler::on_conversation_receipt_before_commit(root.task.id(), move || {
             if force_stale {
                 let store = durable_store::Store::open(&writer_path).unwrap();
@@ -6502,13 +6507,20 @@ async fn exercise_selected_woken_receipt(mode: &str) {
                 conn.execute_batch("BEGIN IMMEDIATE").unwrap();
                 busy_ready.store(true, Ordering::SeqCst);
                 ready_tx.send(()).unwrap();
-                std::thread::sleep(Duration::from_secs(6));
+                // Hold the lock until both the receipt write and the test
+                // have observed it, regardless of runner speed.
+                for _ in 0..2 {
+                    release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                }
                 conn.execute_batch("ROLLBACK").unwrap();
                 busy_released.store(true, Ordering::SeqCst);
             });
             ready_rx.recv().unwrap();
         });
-    }
+        Some(observed_busy)
+    } else {
+        None
+    };
     if mode == "graph_aba" {
         let writer_path = path.clone();
         let parent = root.task.id();
@@ -6592,7 +6604,7 @@ async fn exercise_selected_woken_receipt(mode: &str) {
     }
     let busy_store = durable_store::Store::open(&path).unwrap();
     let driver = scheduler.start_tasks(registry).unwrap();
-    if mode == "busy" || mode == "busy_success" {
+    if let Some(observed_busy) = observed_busy {
         tokio::time::timeout(Duration::from_secs(10), async {
             while !busy_ready.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6621,6 +6633,7 @@ async fn exercise_selected_woken_receipt(mode: &str) {
                 .unwrap()
                 .is_some()
         );
+        observed_busy.send(()).unwrap();
     }
     if mode == "busy_success" {
         let key = crate::task_scheduler::woken_conversation_receipt_key(root.task.id());
@@ -9673,13 +9686,17 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                     });
                 }
                 let writer_path = path.clone();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                crate::task_scheduler::on_woken_conversation_receipt_busy(root_id, move || {
+                    release_tx.send(()).unwrap();
+                });
                 crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
                     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
                     std::thread::spawn(move || {
                         let conn = rusqlite::Connection::open(writer_path).unwrap();
                         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
                         ready_tx.send(()).unwrap();
-                        std::thread::sleep(Duration::from_secs(6));
+                        release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
                         conn.execute_batch("ROLLBACK").unwrap();
                     });
                     ready_rx.recv().unwrap();

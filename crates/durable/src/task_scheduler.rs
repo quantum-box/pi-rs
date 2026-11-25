@@ -3016,6 +3016,19 @@ fn conversation_receipt_before_commit_hooks() -> &'static BoundaryHooks {
     HOOKS.get_or_init(Default::default)
 }
 #[cfg(test)]
+fn woken_conversation_receipt_busy_hooks() -> &'static BoundaryHooks {
+    static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn on_woken_conversation_receipt_busy(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    woken_conversation_receipt_busy_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
 pub(crate) fn on_conversation_receipt_before_commit(
     id: Uuid,
     hook: impl FnOnce() + Send + 'static,
@@ -6407,7 +6420,13 @@ impl AdmissionHandle<'_> {
                 boundary,
             )
             .map_err(|e| match e {
-                durable_store::Error::WriteLockBusy(_) => HookFenceError::WriteLockBusy,
+                durable_store::Error::WriteLockBusy(_) => {
+                    #[cfg(test)]
+                    if receipt_commit {
+                        invoke_boundary(woken_conversation_receipt_busy_hooks(), current.task.id());
+                    }
+                    HookFenceError::WriteLockBusy
+                }
                 durable_store::Error::Conflict { .. } => HookFenceError::Conflict,
                 other => HookFenceError::Other(other.to_string()),
             })?;
