@@ -720,10 +720,10 @@ impl OpenAiInputTransformations {
     pub fn reasons(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.transformations.iter().filter_map(|removal| {
             Some(match removal.reason? {
-                OpenAiRemovalReason::OrganizationMismatch => "organization_mismatch",
-                OpenAiRemovalReason::EndUserMismatch => "end_user_mismatch",
-                OpenAiRemovalReason::ModelMismatch => "model_mismatch",
-                OpenAiRemovalReason::PrefixMismatch => "prefix_mismatch",
+                OpenAiRemovalReason::Organization => "organization_mismatch",
+                OpenAiRemovalReason::EndUser => "end_user_mismatch",
+                OpenAiRemovalReason::Model => "model_mismatch",
+                OpenAiRemovalReason::Prefix => "prefix_mismatch",
             })
         })
     }
@@ -750,12 +750,10 @@ impl OpenAiInputTransformations {
                         })
                 });
                 let reason = match entry["reason"].as_str() {
-                    Some("organization_mismatch") => {
-                        Some(OpenAiRemovalReason::OrganizationMismatch)
-                    }
-                    Some("end_user_mismatch") => Some(OpenAiRemovalReason::EndUserMismatch),
-                    Some("model_mismatch") => Some(OpenAiRemovalReason::ModelMismatch),
-                    Some("prefix_mismatch") => Some(OpenAiRemovalReason::PrefixMismatch),
+                    Some("organization_mismatch") => Some(OpenAiRemovalReason::Organization),
+                    Some("end_user_mismatch") => Some(OpenAiRemovalReason::EndUser),
+                    Some("model_mismatch") => Some(OpenAiRemovalReason::Model),
+                    Some("prefix_mismatch") => Some(OpenAiRemovalReason::Prefix),
                     _ => None,
                 };
                 Some(OpenAiReasoningRemoval {
@@ -804,12 +802,15 @@ enum OpenAiTransformationAction {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 enum OpenAiRemovalReason {
-    OrganizationMismatch,
-    EndUserMismatch,
-    ModelMismatch,
-    PrefixMismatch,
+    #[serde(rename = "organization_mismatch")]
+    Organization,
+    #[serde(rename = "end_user_mismatch")]
+    EndUser,
+    #[serde(rename = "model_mismatch")]
+    Model,
+    #[serde(rename = "prefix_mismatch")]
+    Prefix,
 }
 
 /// Canonical provider and model names reported by the host adapter.

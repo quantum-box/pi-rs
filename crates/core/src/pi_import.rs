@@ -1793,6 +1793,23 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn openai_reasoning_removal_labels_survive_serialization() {
+        let labels = [
+            "organization_mismatch",
+            "end_user_mismatch",
+            "model_mismatch",
+            "prefix_mismatch",
+        ];
+        let transformations =
+            labels.map(|reason| json!({"type":"reasoning", "action":"removed", "reason":reason}));
+        let stored = json!({"transformations":transformations});
+        let details: crate::OpenAiInputTransformations =
+            serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(details.reasons().collect::<Vec<_>>(), labels);
+        assert_eq!(serde_json::to_value(details).unwrap(), stored);
+    }
+
+    #[test]
     fn openai_reasoning_removal_diagnostics_roundtrip_and_validate_old_pi_conversions() {
         let removal = json!({
             "type":"reasoning", "id":"rs_edited", "action":"removed", "reason":"prefix_mismatch"
