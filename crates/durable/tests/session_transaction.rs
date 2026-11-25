@@ -160,6 +160,121 @@ fn typed_document_edits_keep_fields_and_commit_with_entries() {
 }
 
 #[test]
+fn defined_document_incarnations_survive_reopen_and_fork_independently() {
+    use pi_rs_durable::document::{ConversationDocument, DefinedDocumentFork};
+    use std::num::NonZeroU32;
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct Settings {
+        level: i64,
+    }
+    let mut definition = ConversationDocument {
+        kind: "settings".into(),
+        version: NonZeroU32::MIN,
+        initial: Settings { level: 1 },
+        fork: DefinedDocumentFork::Initial,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let root = harness.create_conversation(config()).unwrap();
+    let original = harness
+        .session_transaction(root, |tx| {
+            assert!(tx.defined_document(&definition, "main")?.is_none());
+            tx.edit_defined_document(&definition, "main", |draft| {
+                draft.level = 5;
+                Ok(())
+            })?;
+            tx.append_entry("settings.updated", Some(json!(5)))?;
+            Ok(tx.defined_document(&definition, "main")?.unwrap())
+        })
+        .unwrap();
+    assert_eq!(original.value.level, 5);
+    let raw = Address {
+        scope: root.to_string(),
+        name: definition.kind.clone(),
+        key: "main".into(),
+    };
+    assert!(matches!(
+        harness.session_transaction(root, |tx| tx.delete_document(&raw)),
+        Err(Error::Document(DocumentError::InvalidDocumentDefinition))
+    ));
+    let fork = harness.fork(root).unwrap();
+    let inherited = harness
+        .session_transaction(fork, |tx| {
+            Ok(tx.defined_document(&definition, "main")?.unwrap())
+        })
+        .unwrap();
+    assert_eq!(inherited.value.level, 1);
+    assert_ne!(inherited.incarnation, original.incarnation);
+    assert!(
+        harness
+            .session_transaction(root, |tx| {
+                assert!(tx.retire_defined_document(&definition, "main")?);
+                assert!(tx.defined_document(&definition, "main")?.is_none());
+                Err::<(), _>(DocumentError::InvalidDocumentDefinition)
+            })
+            .is_err()
+    );
+    assert_eq!(
+        harness
+            .session_transaction(root, |tx| tx.defined_document(&definition, "main"))
+            .unwrap(),
+        Some(original.clone())
+    );
+    harness
+        .session_transaction(root, |tx| {
+            assert!(tx.retire_defined_document(&definition, "main")?);
+            Ok(())
+        })
+        .unwrap();
+    drop(harness);
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let restored = harness
+        .session_transaction(root, |tx| {
+            assert!(tx.defined_document(&definition, "main")?.is_none());
+            assert!(!tx.retire_defined_document(&definition, "main")?);
+            tx.edit_defined_document(&definition, "main", |_| Ok(()))?;
+            Ok(tx.defined_document(&definition, "main")?.unwrap())
+        })
+        .unwrap();
+    assert_ne!(restored.incarnation, original.incarnation);
+    assert_eq!(restored.value.level, 1);
+    assert_eq!(
+        harness
+            .session_transaction(fork, |tx| tx.defined_document(&definition, "main"))
+            .unwrap(),
+        Some(inherited)
+    );
+    definition.version = NonZeroU32::new(2).unwrap();
+    assert!(matches!(
+        harness.session_transaction(root, |tx| tx.defined_document(&definition, "main")),
+        Err(Error::Document(DocumentError::InvalidDocumentDefinition))
+    ));
+    let old = ConversationDocument {
+        kind: definition.kind.clone(),
+        version: NonZeroU32::MIN,
+        initial: definition.initial.clone(),
+        fork: definition.fork,
+    };
+    harness
+        .session_transaction(root, |tx| {
+            tx.migrate_defined_document(&old, &definition, "main", |mut draft| {
+                draft.level += 10;
+                Ok(draft)
+            })
+        })
+        .unwrap();
+    let migrated = harness
+        .session_transaction(root, |tx| {
+            Ok(tx.defined_document(&definition, "main")?.unwrap())
+        })
+        .unwrap();
+    assert_eq!(migrated.incarnation, restored.incarnation);
+    assert_eq!(migrated.value.level, 11);
+}
+
+#[test]
 fn entries_and_documents_read_your_writes_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
