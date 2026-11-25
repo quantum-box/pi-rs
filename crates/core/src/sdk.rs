@@ -1798,7 +1798,8 @@ impl AgentSession {
         self.registry.tool_specs()
     }
     /// Names of the configured tools selected for model advertisement.
-    /// Per-request registry refreshes are not reflected in this snapshot.
+    /// Branch system checkpoints and per-request registry refreshes can
+    /// narrow or otherwise change the tools sent with an individual request.
     pub fn active_tool_names(&self) -> Vec<String> {
         self.registry
             .active_tool_specs()
@@ -1808,6 +1809,7 @@ impl AgentSession {
     }
 
     /// Change the model-facing selection for future runs of this session.
+    /// Branch system checkpoints still control their declared tool loadout.
     /// Registered tools remain available for orchestration. An unregistered
     /// name rejects the whole selection, matching native registry validation.
     pub fn set_active_tools(&mut self, names: impl IntoIterator<Item = String>) -> Result<()> {
@@ -11707,6 +11709,34 @@ mod tests {
         assert_eq!(session.active_tool_names(), ["job"]);
         assert_eq!(
             session.prompt("show new selection").await.unwrap(),
+            "tools: job"
+        );
+
+        let before_checkpoint = session.journal().unwrap().head();
+        session
+            .journal()
+            .unwrap()
+            .append(crate::Event::SystemCheckpoint {
+                content: "Historical context".into(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec![],
+            })
+            .unwrap();
+
+        session.set_active_tools(["job".into()]).unwrap();
+        assert_eq!(session.active_tool_names(), ["job"]);
+        assert_eq!(
+            session.prompt("show checkpoint selection").await.unwrap(),
+            "tools: "
+        );
+
+        let mut before_checkpoint = session.fork_at(before_checkpoint).unwrap();
+        assert_eq!(
+            before_checkpoint
+                .prompt("show fork selection")
+                .await
+                .unwrap(),
             "tools: job"
         );
 
