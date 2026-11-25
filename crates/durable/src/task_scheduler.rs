@@ -2799,7 +2799,10 @@ impl PendingMaintenance {
                     ) {
                         Ok(affected) => Ok(affected),
                         Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
-                        Err(crate::runtime::Error::Invalid(reason)) => {
+                        Err(
+                            crate::runtime::Error::Invalid(reason)
+                            | crate::runtime::Error::CheckpointableSelectionChanged(reason),
+                        ) => {
                             // Invalid wake or binding cannot authorize the callback.
                             // Hold failure locally so ordinary graph maintenance
                             // drains owned work without stopping unrelated roots.
@@ -18439,7 +18442,7 @@ impl Scheduler {
                 .checkpointable_conversation_checks(&running.task, &self.registry)
             {
                 Ok(checks) => checks,
-                Err(crate::runtime::Error::CheckpointableSelectionChanged) => {
+                Err(crate::runtime::Error::CheckpointableSelectionChanged(_)) => {
                     // A host can replace a selection after a hook returns.
                     // Discard this attempt's staged effects and settle the
                     // task through the checked owned-failure path.

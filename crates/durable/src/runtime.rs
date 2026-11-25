@@ -103,8 +103,8 @@ pub enum Error {
     CallbackStartBusy,
     #[error("reentrant conversation abort")]
     ReentrantAbort,
-    #[error("invalid operation: checkpointable extension selection missing or changed")]
-    CheckpointableSelectionChanged,
+    #[error("invalid operation: {0}")]
+    CheckpointableSelectionChanged(String),
     #[error("invalid operation: {0}")]
     Invalid(String),
 }
@@ -5658,7 +5658,9 @@ impl Harness {
             {
                 Ok(())
             }
-            _ => Err(Error::CheckpointableSelectionChanged),
+            _ => Err(Error::CheckpointableSelectionChanged(
+                "checkpointable extension selection missing or changed".into(),
+            )),
         }
     }
     fn selected_extensions(&self, c: &Conversation) -> Result<crate::extension::Resolved, Error> {
