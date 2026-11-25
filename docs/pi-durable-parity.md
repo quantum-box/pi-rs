@@ -471,7 +471,9 @@ the parent's settlement. Tools can park to release a worker during a longer
 wait. The admission checks the registration, ownership and selected hooks. An
 explicitly registered unsafe conversation child retains its usual receipt and
 reconciliation rules. A process loss without a receipt blocks publication of
-the parent's success. The existing `start_child` method stages the child with
+the parent's success. An unhooked replay-safe conversation parent can also
+start an explicitly registered replay-safe generic `TaskTool`. Its plain
+JSON result is exposed as tool text. The existing `start_child` method stages the child with
 the parent's transition, including for unsafe checkpointable parents.
 
 A top-level opt-in [`TaskTool`](../crates/durable/src/task_tool.rs) maps a tool call to a conversation-owned generic task. The operation ID is its task ID. The runtime validates the handler against the attached driver and commits the task and a task-backed pending phase together; polling reads the durable terminal task state, including after reopen. A missing driver or registration fails before admission; an interrupted marker invocation is replay-safe because it performs no task effects. Conversation abort marks the owned task and waits for its cleanup before settling the pending tool. A synchronous handler must return before its abort handler can run. Install the same task definition when reopening; to attach the driver before resuming interrupted marker dispatch, use `Harness::open_paused`. Task output is the task's JSON result (a JSON string becomes text). Because generic task failures do not distinguish a reported error from uncertain effects, any failed task blocks the conversation for reconciliation. This is a single top-level task-backed tool, not upstream nested `wait: false`: nested dispatch, tool checkpoints, parallel child handles and a wake payload are not supplied by this adapter. The adapter fails closed outside its registered top-level runtime dispatch.

@@ -191,6 +191,91 @@ async fn immediately_admitted_unsafe_siblings_publish_committed_results() {
     exercise_immediately_admitted_siblings(false, true).await;
 }
 
+#[tokio::test]
+async fn replay_safe_checkpointable_parent_awaits_live_generic_task_tools() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Step},
+        task_tool::TaskTool,
+    };
+    struct Generic;
+    impl Handler for Generic {
+        fn run(&self, task: &Task) -> Result<Step, String> {
+            Ok(Step::Succeed(task.input()["value"].clone()))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = Registry::default();
+    let generic = Arc::new(Generic);
+    assert!(registry.register_shared("test.generic", true, generic.clone()));
+    let leaf = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "leaf".into(),
+            description: String::new(),
+            parameters: json!({"type": "object"}),
+        },
+        "test.generic",
+        true,
+        1,
+        generic,
+    ));
+    let parent = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(LiveChildrenTool {
+            name: "root",
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            journal: None,
+            hold_after_results: false,
+            expect_uncertain_child: false,
+        }),
+        "live-generic-parent",
+        1,
+        vec![leaf],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let mut scheduler = Scheduler::open(
+        dir.path().join("db"),
+        Options {
+            model: Arc::new(ModelStub {
+                arguments: "{}".into(),
+            }),
+            tools: vec![parent.register()],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+    )
+    .unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(conversation, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(conversation))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        scheduler
+            .conversation(conversation)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| {
+                matches!(message, Message::Tool { content, .. } if content == "left+right")
+            })
+    );
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
 async fn exercise_immediately_admitted_siblings(abort: bool, unsafe_children: bool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

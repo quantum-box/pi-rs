@@ -8616,8 +8616,11 @@ impl AdmissionHandle<'_> {
                     return Err(Error::Registration);
                 }
                 if let Some(harness) = self.validator {
-                    if !registry
-                        .matches_conversation_checkpointable(&tool_identity, &tool.handler())
+                    let checkpointable = registry
+                        .matches_conversation_checkpointable(&tool_identity, &tool.handler());
+                    let generic_safe =
+                        tool_identity.replay_safe && !tool_identity.is_checkpointable();
+                    if !(checkpointable || generic_safe)
                         || !registry.is_conversation_checkpointable_task(&parent.task)
                         || registry.checkpointable_selection_for_kind(parent_kind)
                             != registry.checkpointable_selection_for_kind(&tool_identity.kind)

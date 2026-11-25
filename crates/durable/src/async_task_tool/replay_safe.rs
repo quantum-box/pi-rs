@@ -1224,13 +1224,12 @@ impl DurableTaskHost for Host<'_, '_> {
         if !child.0.belongs_to(self.task.id()) {
             return Err("child belongs to another parent".into());
         }
-        if self
+        let immediate = self
             .immediate
             .lock()
             .map_err(|error| error.to_string())?
-            .contains(&child.task_id())
-            && !docs.owned_child_has_settled(child.task_id())?
-        {
+            .contains(&child.task_id());
+        if immediate && !docs.owned_child_has_settled(child.task_id())? {
             return Ok(None);
         }
         let task = docs.get_owned_child(child.task_id())?;
@@ -1281,8 +1280,28 @@ impl DurableTaskHost for Host<'_, '_> {
         Ok(match child.0.result(&self.task, &mut docs)? {
             None => None,
             Some(NestedTaskResult::Succeeded(value)) => {
-                let result: DurableTaskResult = serde_json::from_value(value)
-                    .map_err(|_| "child result is not a Tool outcome")?;
+                let result: Result<DurableTaskResult, _> = serde::Deserialize::deserialize(&value);
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_)
+                        if immediate
+                            && task.kind().is_some_and(|kind| {
+                                self.children.values().any(|child| {
+                                    child.identity().is_some_and(|id| {
+                                        id.kind == kind && !id.is_checkpointable()
+                                    })
+                                })
+                            }) =>
+                    {
+                        return Ok(Some(AsyncTaskResult::Outcome(Outcome::Succeeded(
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string()),
+                        ))));
+                    }
+                    Err(_) => return Err("child result is not a Tool outcome".into()),
+                };
                 Some(match result {
                     DurableTaskResult::Rich { task_content_v1 } => {
                         validate_content_result(&task_content_v1)?;
