@@ -4,11 +4,12 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    Agent, AgentStartTrigger, BeforeAgentStartEvent, CancellationToken, CustomMessage, Error,
-    Event, Notification, Observer, Record, Result, Session,
+    Agent, AgentInput, AgentStartTrigger, BeforeAgentStartEvent, CancellationToken, CustomMessage,
+    CustomMessageDelivery, Error, Event, Notification, Observer, Record, Result, RunState, Session,
 };
 
 const PLAN_FORMAT: &str = "pi-rs:before-agent-start-v1";
@@ -18,14 +19,17 @@ const PLAN_FORMAT: &str = "pi-rs:before-agent-start-v1";
 pub(crate) struct Plan {
     system_prompt: Option<String>,
     pub(crate) messages: Vec<(Uuid, CustomMessage)>,
+    // New plans use their own journal position as the next-turn queue cutoff.
+    #[serde(default)]
+    pub(crate) captures_next_turn: bool,
 }
 
-fn recorded_plan<'a>(branch: &[&'a Record], run_id: Uuid) -> Option<&'a Value> {
+fn recorded_plan<'a>(branch: &[&'a Record], run_id: Uuid) -> Option<(u64, &'a Value)> {
     branch.iter().rev().find_map(|record| match &record.event {
         Event::SourceEntry { format, entry }
             if record.run_id == Some(run_id) && format == PLAN_FORMAT =>
         {
-            Some(entry)
+            Some((record.id, entry))
         }
         _ => None,
     })
@@ -33,18 +37,64 @@ fn recorded_plan<'a>(branch: &[&'a Record], run_id: Uuid) -> Option<&'a Value> {
 
 pub(crate) fn prompt_override(branch: &[&Record], run_id: Uuid) -> Option<String> {
     recorded_plan(branch, run_id)?
+        .1
         .get("systemPrompt")?
         .as_str()
         .map(str::to_owned)
 }
 
-pub(crate) fn plan(session: &Session, run_id: Uuid) -> Result<Option<Plan>> {
+pub(crate) fn plan(session: &Session, run_id: Uuid) -> Result<Option<(u64, Plan)>> {
     recorded_plan(&session.branch(), run_id)
-        .map(|entry| serde_json::from_value(entry.clone()).map_err(Error::from))
+        .map(|(id, entry)| Ok((id, serde_json::from_value(entry.clone())?)))
         .transpose()
 }
 
+pub(crate) fn pending_run(session: &Session) -> Option<Uuid> {
+    let branch = session.branch();
+    let run = branch
+        .iter()
+        .rev()
+        .find(|record| matches!(record.event, Event::Run { .. }))?;
+    let run_id = run.run_id?;
+    if !matches!(
+        run.event,
+        Event::Run {
+            state: RunState::Running
+                | RunState::WaitingForOperation
+                | RunState::WaitingForReconciliation,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let (plan_id, _) = recorded_plan(&branch, run_id)?;
+    // A custom trigger already has its own recovery protocol, including branch
+    // handoff. Provider dispatch and tool recovery likewise have their own rules.
+    let user_run = branch.iter().any(|record| match &record.event {
+        Event::Run {
+            initial: Some(_), ..
+        } => record.run_id == Some(run_id),
+        Event::User { input_id, .. } | Event::UserWithImages { input_id, .. } => {
+            *input_id == Some(run_id)
+        }
+        _ => false,
+    });
+    let advanced = session.records()[plan_id as usize..].iter().any(|record| {
+        record.run_id == Some(run_id)
+            && matches!(
+                record.event,
+                Event::ModelRequested { .. }
+                    | Event::Run {
+                        state: RunState::Completed | RunState::Failed | RunState::Cancelled,
+                        ..
+                    }
+            )
+    });
+    (user_run && !advanced).then_some(run_id)
+}
+
 fn starting_input(
+    session: &Session,
     branch: &[&Record],
     run_id: Uuid,
     effective_input: Option<&str>,
@@ -55,39 +105,57 @@ fn starting_input(
             images: Vec::new(),
         });
     }
-    branch.iter().find_map(|record| match &record.event {
-        Event::User {
-            content,
-            input_id: Some(id),
-        } if *id == run_id => Some(AgentStartTrigger::User {
-            prompt: content.clone(),
-            images: Vec::new(),
-        }),
-        Event::UserWithImages {
-            content,
-            input_id: Some(id),
-            images,
-        } if *id == run_id => Some(AgentStartTrigger::User {
-            prompt: content.clone(),
-            images: images.clone(),
-        }),
-        Event::CustomMessageQueued { input } | Event::TreeMessageQueued { input }
-            if input.id == run_id
-                && input.delivery == crate::CustomMessageDelivery::TriggerTurn =>
-        {
-            Some(AgentStartTrigger::Custom {
-                message: input.message.clone(),
-            })
-        }
-        _ => None,
-    })
+    branch
+        .iter()
+        .find_map(|record| match &record.event {
+            Event::User {
+                content,
+                input_id: Some(id),
+            } if *id == run_id => Some(AgentStartTrigger::User {
+                prompt: content.clone(),
+                images: Vec::new(),
+            }),
+            Event::UserWithImages {
+                content,
+                input_id: Some(id),
+                images,
+            } if *id == run_id => Some(AgentStartTrigger::User {
+                prompt: content.clone(),
+                images: images.clone(),
+            }),
+            Event::CustomMessageQueued { input } | Event::TreeMessageQueued { input }
+                if input.id == run_id && input.delivery == CustomMessageDelivery::TriggerTurn =>
+            {
+                Some(AgentStartTrigger::Custom {
+                    message: input.message.clone(),
+                })
+            }
+            Event::CustomMessageDelivered { id, message } if *id == run_id => {
+                Some(AgentStartTrigger::Custom {
+                    message: message.clone(),
+                })
+            }
+            _ => None,
+        })
+        .or_else(|| {
+            session
+                .queued_custom_messages()
+                .into_iter()
+                .find_map(|(_, input)| {
+                    (input.id == run_id && input.delivery == CustomMessageDelivery::TriggerTurn)
+                        .then_some(AgentStartTrigger::Custom {
+                            message: input.message,
+                        })
+                })
+        })
 }
 
-pub(crate) async fn prepare(
+pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
     agent: &Agent<'_>,
     session: &mut Session,
     run_id: Uuid,
     effective_input: Option<&str>,
+    inputs: &mut mpsc::Receiver<T>,
     cancel: &CancellationToken,
     observer: &mut Observer<'_>,
 ) -> Result<()> {
@@ -107,7 +175,7 @@ pub(crate) async fn prepare(
     {
         return Ok(());
     }
-    let Some(trigger) = starting_input(&branch, run_id, effective_input) else {
+    let Some(trigger) = starting_input(session, &branch, run_id, effective_input) else {
         return Ok(());
     };
     let mut event = BeforeAgentStartEvent {
@@ -115,28 +183,40 @@ pub(crate) async fn prepare(
         system_prompt: crate::journal::system_context(&branch, agent.system_prompt, Vec::new()).0,
     };
     let states = session.extension_states();
-    let mut plan = Plan::default();
+    let mut plan = Plan {
+        captures_next_turn: true,
+        ..Plan::default()
+    };
     let deadline = crate::runtime::time::Instant::now()
         + agent.limits.model_timeout.min(Duration::from_secs(10));
-    for extension in &agent.registry.extensions {
+    'handlers: for extension in &agent.registry.extensions {
         if !extension.handles_before_agent_start() {
             continue;
         }
-        let callback = std::panic::AssertUnwindSafe(async {
-            extension
-                .before_agent_start(&event, states.get(extension.id()))
-                .await
-        })
-        .catch_unwind();
-        let result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = crate::runtime::time::timeout_at(deadline, callback) => match result {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err("handler panicked".into()),
-                Err(_) => {
-                    report(extension.id(), "handler deadline expired", observer);
-                    break;
+        let result = {
+            let callback = std::panic::AssertUnwindSafe(async {
+                extension
+                    .before_agent_start(&event, states.get(extension.id()))
+                    .await
+            })
+            .catch_unwind();
+            let callback = crate::runtime::time::timeout_at(deadline, callback);
+            tokio::pin!(callback);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = &mut callback => match result {
+                        Ok(Ok(result)) => break result,
+                        Ok(Err(_)) => break Err("handler panicked".into()),
+                        Err(_) => {
+                            report(extension.id(), "handler deadline expired", observer);
+                            break 'handlers;
+                        }
+                    },
+                    Some(input) = inputs.recv() => {
+                        crate::agent::queue_input(session, input.into(), observer)?;
+                    }
                 }
             }
         };
@@ -156,6 +236,7 @@ pub(crate) async fn prepare(
             Err(error) => report(extension.id(), &error, observer),
         }
     }
+    crate::agent::queue_inputs(session, inputs, observer)?;
     if cancel.is_cancelled() {
         return Err(Error::Cancelled);
     }
@@ -240,7 +321,7 @@ mod tests {
             }
             Ok(crate::BeforeAgentStartResult {
                 message: Some(message(self.id)),
-                system_prompt: Some(self.id.into()),
+                system_prompt: Some(if self.id == "clear" { "" } else { self.id }.into()),
             })
         }
     }
@@ -303,89 +384,338 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_agent_start_reuses_recorded_effects_after_reopen() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("session.jsonl");
-        let mut session = Session::open(&path).unwrap();
-        let run_id = Uuid::new_v4();
-        let observations = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = Registry::default();
-        registry
-            .register(Arc::new(Hook {
-                id: "first",
-                observations: observations.clone(),
-            }))
-            .unwrap();
-        registry
-            .register(Arc::new(Hook {
-                id: "last",
-                observations: observations.clone(),
-            }))
-            .unwrap();
-        let cancel = CancellationToken::new();
-        session.set_run_id(Some(run_id));
-        session
-            .append(Event::Run {
-                state: crate::RunState::Running,
-                initial: Some("question".into()),
-            })
-            .unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let model = Capture(requests.clone());
-        let agent = crate::Agent {
-            registry: &registry,
-            model: &model,
-            model_name: "fixture",
-            system_prompt: "host prompt",
-            limits: crate::Limits::default(),
-        };
-        prepare(
-            &agent,
-            &mut session,
-            run_id,
-            Some("question"),
-            &cancel,
-            &mut |_| {},
-        )
-        .await
-        .unwrap();
-        let (id, message) = plan(&session, run_id).unwrap().unwrap().messages.remove(0);
-        session
-            .append(Event::User {
-                content: "question".into(),
-                input_id: Some(run_id),
-            })
-            .unwrap();
-        session
-            .append(Event::CustomMessageDelivered { id, message })
-            .unwrap();
-        drop(session);
-
-        let mut session = Session::open(&path).unwrap();
-        let (_send, mut inputs) = tokio::sync::mpsc::channel::<crate::AgentInput>(1);
-        agent
-            .run_correlated(
-                &mut session,
-                run_id,
-                None,
-                &mut inputs,
-                &cancel,
+    async fn before_agent_start_sdk_resume_reuses_saved_plan_and_run_id() {
+        for partially_delivered in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            let mut journal = Session::open(&path).unwrap();
+            let run_id = Uuid::new_v4();
+            let first_id = Uuid::new_v4();
+            let last_id = Uuid::new_v4();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(Event::Run {
+                    state: RunState::Running,
+                    initial: Some("question".into()),
+                })
+                .unwrap();
+            crate::agent::queue_custom_message(
+                &mut journal,
+                crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    message: message("during preflight"),
+                    delivery: CustomMessageDelivery::NextTurn,
+                },
                 &mut |_| {},
             )
-            .await
             .unwrap();
-        assert_eq!(observations.lock().unwrap().len(), 2);
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(matches!(&requests[0][0], Message::System { content } if content == "last"));
-        let texts: Vec<_> = requests[0]
+            let queue = journal.queued_custom_messages().pop().unwrap().1;
+            let plan_id = journal
+                .append(Event::SourceEntry {
+                    format: PLAN_FORMAT.into(),
+                    entry: serde_json::to_value(Plan {
+                        captures_next_turn: true,
+                        system_prompt: Some("saved prompt".into()),
+                        messages: vec![(first_id, message("first")), (last_id, message("last"))],
+                    })
+                    .unwrap(),
+                })
+                .unwrap()
+                .id;
+            if partially_delivered {
+                journal
+                    .append(Event::User {
+                        content: "question".into(),
+                        input_id: Some(run_id),
+                    })
+                    .unwrap();
+                for (id, message) in [(queue.id, queue.message), (first_id, message("first"))] {
+                    journal
+                        .append(Event::CustomMessageDelivered { id, message })
+                        .unwrap();
+                }
+            }
+            journal.set_run_id(None);
+            crate::agent::queue_custom_message(
+                &mut journal,
+                crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    message: message("after the cutoff"),
+                    delivery: CustomMessageDelivery::NextTurn,
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+            drop(journal);
+
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut sdk = SessionBuilder::new(Arc::new(Capture(requests.clone())), "fixture")
+                .extension(Arc::new(Hook {
+                    id: "unexpected",
+                    observations: observations.clone(),
+                }))
+                .unwrap()
+                .open(&path)
+                .unwrap();
+            assert!(matches!(
+                sdk.prompt("new prompt").await,
+                Err(Error::Session(_))
+            ));
+            sdk.resume().await.unwrap();
+            assert!(observations.lock().unwrap().is_empty());
+            let journal = sdk.journal().unwrap();
+            assert!(
+                journal
+                    .records()
+                    .iter()
+                    .any(|record| record.run_id == Some(run_id)
+                        && matches!(
+                            record.event,
+                            Event::Run {
+                                state: RunState::Completed,
+                                ..
+                            }
+                        ))
+            );
+            assert_eq!(journal.pending_before_agent_start_run(), None);
+            assert_eq!(journal.queued_custom_messages().len(), 1);
+            let mut historical = Session::from_records(journal.records().to_vec()).unwrap();
+            historical.checkout(plan_id).unwrap();
+            assert_eq!(historical.pending_before_agent_start_run(), None);
+            drop(journal);
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                matches!(&requests[0][0], Message::System { content } if content == "saved prompt")
+            );
+            assert_eq!(
+                user_texts(&requests[0]),
+                ["question", "during preflight", "first", "last"]
+            );
+        }
+    }
+
+    fn user_texts(messages: &[Message]) -> Vec<&str> {
+        messages
             .iter()
             .filter_map(|message| match message {
                 Message::User { content } => Some(content.as_str()),
                 _ => None,
             })
-            .collect();
-        assert_eq!(texts, ["question", "first", "last"]);
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_observes_tree_trigger_after_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        let trigger_id = Uuid::new_v4();
+        journal
+            .append(Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: trigger_id,
+                    message: message("tree trigger"),
+                    delivery: CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        journal.checkout(1).unwrap();
+        drop(journal);
+
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut sdk = SessionBuilder::new(Arc::new(Capture(requests.clone())), "fixture")
+            .extension(Arc::new(Hook {
+                id: "observe",
+                observations: observations.clone(),
+            }))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        sdk.start().await.unwrap();
+        assert!(matches!(observations.lock().unwrap().as_slice(),
+            [(_, BeforeAgentStartEvent { trigger: AgentStartTrigger::Custom { message }, .. })]
+                if message.content == ContextContent::Text("tree trigger".into())));
+        assert_eq!(user_texts(&requests.lock().unwrap()[0]), ["tree trigger"]);
+        assert_eq!(sdk.journal().unwrap().pending_custom_trigger(), None);
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_forces_final_prompt_after_context_transforms() {
+        struct Rewrite;
+        #[async_trait::async_trait]
+        impl Extension for Rewrite {
+            fn id(&self) -> &str {
+                "rewrite"
+            }
+            fn handles_context_with_system(&self) -> bool {
+                true
+            }
+            async fn context_with_system(
+                &self,
+                messages: &mut crate::ContextMessages<'_>,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<crate::ContextChange> {
+                messages.remove(0);
+                messages.push(Message::System {
+                    content: "ctx replacement".into(),
+                });
+                messages.push(Message::User {
+                    content: "ctx user edit".into(),
+                });
+                Ok(crate::ContextChange::Changed)
+            }
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let mut sdk = SessionBuilder::new(Arc::new(Capture(requests.clone())), "fixture")
+            .extension(Arc::new(Hook {
+                id: "first",
+                observations: observations.clone(),
+            }))
+            .unwrap()
+            .extension(Arc::new(Hook {
+                id: "clear",
+                observations: observations.clone(),
+            }))
+            .unwrap()
+            .extension(Arc::new(Rewrite))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        sdk.prompt("question").await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(matches!(&requests[0][0], Message::System { content } if content.is_empty()));
+        assert!(
+            !requests[0][1..]
+                .iter()
+                .any(|message| matches!(message, Message::System { .. }))
+        );
+        assert!(user_texts(&requests[0]).contains(&"ctx user edit"));
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_consumes_next_turn_arrivals_before_hook_messages() {
+        struct Paused {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl Extension for Paused {
+            fn id(&self) -> &str {
+                "paused"
+            }
+            fn handles_before_agent_start(&self) -> bool {
+                true
+            }
+            async fn before_agent_start(
+                &self,
+                _: &BeforeAgentStartEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<crate::BeforeAgentStartResult> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(crate::BeforeAgentStartResult {
+                    message: Some(message("hook message")),
+                    system_prompt: None,
+                })
+            }
+        }
+        let paused = Arc::new(Paused {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut sdk = SessionBuilder::new(Arc::new(Capture(requests.clone())), "fixture")
+            .extension(paused.clone())
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        sdk.queue_custom_message_next_turn(message("already queued"))
+            .unwrap();
+        let control = sdk.controls();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (result, ()) = tokio::join!(sdk.prompt("question"), async {
+                paused.entered.notified().await;
+                control
+                    .send_custom_message(
+                        message("arrived during hook"),
+                        CustomMessageDelivery::NextTurn,
+                    )
+                    .await
+                    .unwrap();
+                paused.release.notify_one();
+            });
+            result.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            user_texts(&requests.lock().unwrap()[0]),
+            [
+                "question",
+                "already queued",
+                "arrived during hook",
+                "hook message"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_abort_interrupts_returned_message_lifecycle() {
+        struct PausedMessage(tokio::sync::Notify);
+        #[async_trait::async_trait]
+        impl Extension for PausedMessage {
+            fn id(&self) -> &str {
+                "paused-message"
+            }
+            fn handles_custom_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn custom_message_lifecycle(
+                &self,
+                _: &crate::CustomMessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<CustomMessage>> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let paused = Arc::new(PausedMessage(tokio::sync::Notify::new()));
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut sdk = SessionBuilder::new(Arc::new(Capture(requests.clone())), "fixture")
+            .extension(Arc::new(Hook {
+                id: "first",
+                observations,
+            }))
+            .unwrap()
+            .extension(paused.clone())
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = sdk.controls();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (result, ()) = tokio::join!(sdk.prompt("question"), async {
+                paused.0.notified().await;
+                control.abort();
+            });
+            assert!(matches!(result, Err(Error::Cancelled)));
+        })
+        .await
+        .unwrap();
+        assert!(requests.lock().unwrap().is_empty());
+        let journal = sdk.journal().unwrap();
+        assert!(
+            !journal
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::CustomMessageDelivered { .. }))
+        );
+        assert_eq!(journal.pending_before_agent_start_run(), None);
     }
 
     #[tokio::test]

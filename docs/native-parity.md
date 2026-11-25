@@ -5538,9 +5538,11 @@ its existing inline-image display for image blocks when graphics are enabled.
 Native and executable `before_agent_start` handlers get the initial user
 prompt and its images or the idle custom trigger, in extension load order.
 The current system prompt reflects earlier handlers' full-prompt replacements.
-Returned custom messages enter the run after the initial message and the
-existing next-turn queue. A recorded preparation plan retains the run-local
-prompt and deduplicates its appended messages when the run resumes.
+Returned custom messages enter the run after the initial message and next-turn
+messages queued by the end of preflight, including arrivals during handlers.
+The final prompt override applies after request context transforms. A recorded
+preparation plan retains the run-local prompt and deduplicates its appended
+messages when the run resumes before its first model request is journaled.
 
 This API accepts a full text override. Upstream also exposes mutable prompt
 sections, including the tool loadout, and does its incoming-prompt compaction

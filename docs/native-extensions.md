@@ -340,11 +340,14 @@ trigger, opt into `handles_before_agent_start` and implement
 and receive the `before_agent_start` protocol request. The event identifies
 the starting message and carries the resolved system prompt. Each handler
 sees the latest prompt override in extension load order, and can return an
-exact prompt for the current run and a custom message. Returning an empty
-prompt explicitly clears the prompt text. Returned messages follow the
-starting input and already queued next-turn messages. Handler failures are
-reported while subsequent handlers can still contribute. A journaled plan
-is reused when an interrupted run resumes.
+exact prompt for the current run and a custom message. The final override is
+applied after request context hooks. An empty override clears the prompt text.
+Returned messages follow the starting input and the next-turn messages queued
+by the end of preflight. Cancellation interrupts delivery while a returned
+message's lifecycle hook is running. Handler failures are reported while
+subsequent handlers can still contribute within the shared deadline.
+Until the first model request is journaled, the SDK's `resume()` and native CLI
+recovery reuse the saved plan and run ID on the selected branch.
 
 Extensions that implement `handles_lifecycle` also receive `agent_settled`
 after `agent_end` when a run has finished its retries and automatic compaction.

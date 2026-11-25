@@ -2707,6 +2707,11 @@ impl AgentSession {
                 "pending compaction recovery must be resumed before startup".into(),
             ));
         }
+        if !defer_startup && journal.pending_before_agent_start_run().is_some() {
+            return Err(Error::Session(
+                "pending run preflight must be resumed before startup".into(),
+            ));
+        }
         let recovered = journal.recover_tree_trigger_handoff()?.cloned();
         if let Some(record) = recovered {
             if let Some(events) = &self.events {
@@ -3299,15 +3304,17 @@ impl AgentSession {
         .await
     }
     pub async fn resume(&mut self) -> Result<String> {
-        let (recovery, boundary_run) = {
+        let (recovery, resumable_run) = {
             let journal = self.journal_async().await;
             (
                 crate::agent::resumable_compaction_run(&journal),
-                journal.pending_extension_boundary_run(),
+                journal
+                    .pending_extension_boundary_run()
+                    .or_else(|| journal.pending_before_agent_start_run()),
             )
         };
         let (_, startup_error) = self
-            .start_with_fallback(None, false, recovery.is_some() || boundary_run.is_some())
+            .start_with_fallback(None, false, recovery.is_some() || resumable_run.is_some())
             .await?;
         if let Some(error) = startup_error {
             return Err(error);
@@ -3340,7 +3347,7 @@ impl AgentSession {
                     .into(),
             ));
         }
-        let run_id = recovery.map(|(run_id, _, _)| run_id).or(boundary_run);
+        let run_id = recovery.map(|(run_id, _, _)| run_id).or(resumable_run);
         if run_id.is_none() {
             self.drain_idle_triggers().await?;
         }
