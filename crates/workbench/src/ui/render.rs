@@ -434,8 +434,13 @@ impl Entry {
                 let border = Line::themed(&"─".repeat(inner), theme, "border");
                 let mut lines = vec![Line::default(), border.clone()];
                 match notice {
-                    crate::changelog::Notice::Full(body) => {
-                        let mut title = Span::themed("What's New", theme, "accent");
+                    crate::changelog::Notice::Full(body)
+                    | crate::changelog::Notice::ExtensionsFull(body) => {
+                        let title = match notice {
+                            crate::changelog::Notice::Full(_) => "What's New",
+                            _ => "Extension Updates",
+                        };
+                        let mut title = Span::themed(title, theme, "accent");
                         title.bold = true;
                         lines.extend(wrap(&[title], inner));
                         lines.push(Line::default());
@@ -449,6 +454,11 @@ impl Entry {
                             false,
                         ));
                         lines.push(Line::default());
+                    }
+                    crate::changelog::Notice::ExtensionsCondensed(updates) => {
+                        for update in updates {
+                            lines.extend(wrap(&[Span::themed(update, theme, "text")], inner));
+                        }
                     }
                     crate::changelog::Notice::Condensed(version) => {
                         let mut command = Span::themed("/changelog", theme, "text");
