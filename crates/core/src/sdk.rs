@@ -1745,6 +1745,23 @@ impl AgentSession {
             }
         }
     }
+    /// The stable, Pi-visible session ID. Imported journals can retain an
+    /// external ID that differs from their native storage UUID.
+    pub fn session_id(&self) -> Result<String> {
+        Ok(self.journal()?.external_session_id())
+    }
+
+    /// The absolute path supplied to the SDK when opening or forking a session.
+    /// In-memory sessions and caller-supplied journals have no SDK-managed path.
+    pub fn session_file(&self) -> Option<&Path> {
+        self.session_file.as_deref()
+    }
+
+    /// The latest committed display name, if set. A busy journal returns an error.
+    pub fn session_name(&self) -> Result<Option<String>> {
+        Ok(self.journal()?.name().map(str::to_owned))
+    }
+
     /// Try to borrow the journal. Drop the guard before another session operation.
     pub fn journal(&self) -> Result<tokio::sync::MutexGuard<'_, Session>> {
         self.session
@@ -2654,7 +2671,7 @@ impl AgentSession {
     pub async fn set_name_with_hooks(&mut self, name: &str) -> Result<()> {
         self.start().await?;
         self.set_name(name)?;
-        let name = self.journal()?.name().map(str::to_owned);
+        let name = self.session_name()?;
         self.notify_session_event(crate::LifecycleEvent::SessionInfoChanged { name })
             .await?;
         let _ = self.drain_idle_triggers().await?;
@@ -4990,6 +5007,51 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn sdk_session_metadata_reports_persisted_identity_name_and_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.jsonl");
+        let fork_path = directory.path().join("fork.jsonl");
+        let builder = || SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo");
+
+        let in_memory = builder().in_memory().unwrap();
+        assert_eq!(in_memory.session_name().unwrap(), None);
+        assert_eq!(in_memory.session_file(), None);
+
+        let mut source = builder().open(&path).unwrap();
+        {
+            let mut journal = source.journal().unwrap();
+            let native_id = journal.session_id();
+            journal
+                .append(crate::Event::SourceEntry {
+                    format: "pi-rs:external-session-id".into(),
+                    entry: serde_json::json!({"native_id":native_id,"id":"imported-session"}),
+                })
+                .unwrap();
+        }
+        let source_id = source.session_id().unwrap();
+        assert_eq!(source_id, "imported-session");
+        assert_eq!(source.session_file(), Some(path.as_path()));
+        assert_eq!(source.session_name().unwrap(), None);
+        source.set_name("  review  ").unwrap();
+        let record = {
+            let journal = source.journal().unwrap();
+            assert!(source.session_name().is_err());
+            journal.head()
+        };
+        assert_eq!(source.session_name().unwrap().as_deref(), Some("review"));
+        let fork = source.fork_to(record, &fork_path).unwrap();
+        assert_ne!(fork.session_id().unwrap(), source_id);
+        assert_eq!(fork.session_file(), Some(fork_path.as_path()));
+        drop(source);
+
+        let mut reopened = builder().open(&path).unwrap();
+        assert_eq!(reopened.session_id().unwrap(), source_id);
+        assert_eq!(reopened.session_name().unwrap().as_deref(), Some("review"));
+        reopened.set_name(" ").unwrap();
+        assert_eq!(reopened.session_name().unwrap(), None);
     }
 
     #[tokio::test]

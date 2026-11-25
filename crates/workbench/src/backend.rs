@@ -1084,6 +1084,11 @@ async fn run_worker(
         let entries = runtime.registry.custom_entry_renderers();
         output(json!({
             "type":"backend_ready",
+            "extension_packages":if matches!(startup_reason, SessionStartReason::Startup) {
+                runtime.loaded_extension_packages.as_slice()
+            } else {
+                &[]
+            },
             "custom_message_renderers":messages.types().collect::<Vec<_>>(),
             "custom_entry_renderers":entries.types().collect::<Vec<_>>(),
             "tool_rendering":true,

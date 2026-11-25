@@ -60,6 +60,8 @@ pub enum PackageCommand {
 pub struct PackageResources {
     #[serde(default)]
     pub extensions: Vec<PathBuf>,
+    #[serde(skip)]
+    pub extension_packages: Vec<(Vec<PathBuf>, ExtensionPackage)>,
     #[serde(default)]
     pub skills: Vec<PathBuf>,
     #[serde(default)]
@@ -67,6 +69,42 @@ pub struct PackageResources {
     #[serde(default)]
     pub themes: Vec<PathBuf>,
 }
+/// Package provenance for extensions selected by the native package resolver.
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct ExtensionPackage {
+    pub key: String,
+    pub root: PathBuf,
+    pub source: String,
+    pub version: String,
+}
+
+impl ExtensionPackage {
+    pub fn changelog(&self) -> Option<(String, String)> {
+        let root = self.root.canonicalize().ok()?;
+        let (manifest, _) = local_startup_manifest(&root).ok()?;
+        let pi = manifest_pi(&manifest).ok()?;
+        let relative = Path::new(pi["changelogPath"].as_str().unwrap_or("CHANGELOG.md"));
+        if relative.as_os_str().is_empty() || relative.is_absolute() {
+            return None;
+        }
+        let path = root.join(relative).canonicalize().ok()?;
+        let relative = path.strip_prefix(&root).ok()?.to_str()?;
+        if relative.is_empty() {
+            return None;
+        }
+        let bytes = read_optional_manifest(&root, relative).ok()??;
+        let notes = String::from_utf8(bytes).ok()?;
+        let name = manifest["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&self.source);
+        // A display name occupies one line in either rendering mode.
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        Some((name, notes))
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Installed {
     source: String,
@@ -265,7 +303,14 @@ struct ResourceSelections {
     entries: Vec<(PathBuf, bool, String, ResourceLocation)>,
 }
 impl ResourceSelections {
-    fn insert(&mut self, path: &Path, enabled: bool, identity: &str, root: &Path, extension: bool) {
+    fn insert(
+        &mut self,
+        path: &Path,
+        enabled: bool,
+        identity: &str,
+        root: &Path,
+        extension: bool,
+    ) -> bool {
         let relative = match path.strip_prefix(root) {
             Ok(relative) => ResourceLocation::WithinPackage(relative.to_path_buf()),
             Err(_) if extension => ResourceLocation::BuiltExecutable(
@@ -282,7 +327,9 @@ impl ResourceSelections {
         {
             self.entries
                 .push((path.to_path_buf(), enabled, identity.to_owned(), relative));
+            return true;
         }
+        false
     }
     fn enabled(self) -> Vec<PathBuf> {
         self.entries
@@ -299,6 +346,7 @@ fn resolve_package_resources(
 ) -> Result<PackageResources> {
     let installed = index()?;
     let mut extensions = ResourceSelections::default();
+    let mut extension_packages = Vec::new();
     let mut skills = ResourceSelections::default();
     let mut prompts = ResourceSelections::default();
     let mut themes = ResourceSelections::default();
@@ -331,6 +379,7 @@ fn resolve_package_resources(
         let pi_package =
             !legacy && local_startup_manifest(&package.root).is_ok_and(|(_, upstream)| upstream);
         let identity = source_identity(&declaration.source);
+        let mut selected_executables = Vec::new();
         for (name, paths, target) in [
             ("extensions", &package.resources.extensions, &mut extensions),
             ("skills", &package.resources.skills, &mut skills),
@@ -389,19 +438,41 @@ fn resolve_package_resources(
             };
             for (path, state) in paths.iter().zip(states) {
                 if let Some(enabled) = state {
-                    target.insert(
+                    let inserted = target.insert(
                         path,
                         enabled,
                         &identity,
                         &package.root,
                         name == "extensions",
                     );
+                    if inserted && enabled && name == "extensions" {
+                        selected_executables.push(path.clone());
+                    }
                 }
             }
+        }
+        if !selected_executables.is_empty()
+            && let Some(version) = package.version
+        {
+            let scope = declaration.scope_order;
+            // Project installations can resolve different versions of the same
+            // source in different workspaces.
+            let project = (scope == 0).then_some(&args.workspace);
+            let package_key = key(&format!("{scope}:{project:?}:{identity}"));
+            extension_packages.push((
+                selected_executables,
+                ExtensionPackage {
+                    key: package_key,
+                    root: package.root,
+                    source: display_source(&declaration.source),
+                    version,
+                },
+            ));
         }
     }
     Ok(PackageResources {
         extensions: extensions.enabled(),
+        extension_packages,
         skills: skills.enabled(),
         prompts: prompts.enabled(),
         themes: themes.enabled(),
@@ -4695,6 +4766,67 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
             vec![root.join("prompts/.hidden.md"), root.join("prompts/git.md")]
         );
     }
+    #[test]
+    fn extension_changelog_discovery_honors_package_manifest_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("package");
+        std::fs::create_dir(&root).unwrap();
+        let package = ExtensionPackage {
+            key: "fixture".into(),
+            root: root.clone(),
+            source: "fallback".into(),
+            version: "1.2.0".into(),
+        };
+        assert!(package.changelog().is_none());
+        std::fs::write(root.join("CHANGELOG.md"), "default").unwrap();
+        std::fs::write(root.join("NEWS.md"), "custom").unwrap();
+        assert_eq!(
+            package.changelog(),
+            Some(("fallback".into(), "default".into()))
+        );
+
+        let pi_manifest = root.join("package.json");
+        std::fs::write(
+            &pi_manifest,
+            r#"{"name":"from-package-json","pi":{"changelogPath":"NEWS.md"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            package.changelog(),
+            Some(("from-package-json".into(), "custom".into()))
+        );
+        std::fs::remove_file(pi_manifest).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"from-cargo\"\n[package.metadata.pi]\nchangelogPath = \"NEWS.md\"",
+        )
+        .unwrap();
+        assert_eq!(
+            package.changelog(),
+            Some(("from-cargo".into(), "custom".into()))
+        );
+
+        let native_manifest = root.join("pi-package.json");
+        std::fs::write(directory.path().join("outside.md"), "outside").unwrap();
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        std::fs::write(root.join("invalid.md"), [0xff]).unwrap();
+        for path in ["", "../outside.md", "missing.md", "subdir", "invalid.md"] {
+            std::fs::write(
+                &native_manifest,
+                json!({"pi":{"changelogPath":path}}).to_string(),
+            )
+            .unwrap();
+            assert!(package.changelog().is_none(), "{path}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(directory.path().join("outside.md"), root.join("link.md"))
+                .unwrap();
+            std::fs::write(&native_manifest, r#"{"pi":{"changelogPath":"link.md"}}"#).unwrap();
+            assert!(package.changelog().is_none());
+        }
+    }
+
     #[test]
     fn explicit_manifest_excludes_undeclared_resource_types() {
         let directory = tempfile::tempdir().unwrap();

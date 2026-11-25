@@ -98,7 +98,11 @@ pub fn local_startup_manifest(root: &Path) -> Result<(Value, bool)> {
             .and_then(|value| value.get("metadata"))
             .and_then(|value| value.get("pi"))
     }) {
-        return Ok((json!({"pi": metadata}), false));
+        let name = cargo_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.get("package"))
+            .and_then(|package| package.get("name"));
+        return Ok((json!({"pi": metadata, "name": name}), false));
     }
     let pi_package = package_manifest.is_some();
     Ok((package_manifest.unwrap_or_else(|| json!({})), pi_package))
@@ -169,15 +173,18 @@ fn parse_pi_package_json(path: &Path, bytes: &[u8]) -> Result<Value> {
         validate_pi(pi)?;
     }
     let explicit = pi.is_some_and(has_resource_fields);
-    let theme_only = if explicit {
+    let mut theme_only = if explicit {
         json!({"extensions": [], "skills": [], "prompts": [],
             "themes": pi.and_then(|pi| pi.get("themes")).cloned().unwrap_or_else(|| json!([]))})
     } else {
         json!({})
     };
+    if let Some(path) = pi.and_then(|pi| pi["changelogPath"].as_str()) {
+        theme_only["changelogPath"] = json!(path);
+    }
     // Treat an explicit Pi resource manifest as authoritative before scanning
     // native executables; only theme entries are supported from this format.
-    Ok(json!({"pi": theme_only, "version": value.get("version")}))
+    Ok(json!({"pi": theme_only, "version": value.get("version"), "name": value.get("name")}))
 }
 
 pub fn validate_patterns(patterns: &[String]) -> Result<()> {
