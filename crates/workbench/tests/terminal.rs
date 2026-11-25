@@ -918,6 +918,93 @@ fn debug_command_and_global_shortcut_write_session_snapshots() {
 }
 
 #[test]
+fn startup_extension_lists_an_explicit_theme_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let theme_path = root.path().join("explicit-theme.json");
+    let mut theme: serde_json::Value =
+        serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+    theme["name"] = serde_json::json!("startup-fixture-theme");
+    std::fs::write(&theme_path, format!("\u{feff}{theme}")).unwrap();
+    let extension = root.path().join("theme-catalog");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request = json.load(sys.stdin)
+    result = {'id':'theme-catalog','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True} if request['type'] == 'describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame = json.loads(sys.stdin.readline())
+    if frame['request']['event']['type'] == 'session_start':
+        print(json.dumps({'type':'ui','request':{'method':'getAllThemes'}}), flush=True)
+        response = json.loads(sys.stdin.readline())['Ok']
+        assert response[0] == {'name':'system'}, response
+        expected = os.path.realpath(os.environ['PI_TEST_THEME_PATH'])
+        assert {'name':'startup-fixture-theme','path':expected} in response, response
+        print(json.dumps({'type':'ui','request':{'method':'notify','message':'Startup theme catalog verified'}}), flush=True)
+        assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .arg("--theme")
+            .arg(&theme_path)
+            .args(["--use-theme", "startup-fixture-theme"])
+            .arg("--extension")
+            .arg(&extension)
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("PI_TEST_THEME_PATH", &theme_path)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| {
+        text.contains("Startup theme catalog verified")
+    });
+}
+
+#[test]
 fn extension_tool_renderer_displays_resumed_result_and_updates_on_expand() {
     use std::os::unix::fs::PermissionsExt;
 
