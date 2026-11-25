@@ -385,7 +385,17 @@ mod tests {
 
     #[tokio::test]
     async fn before_agent_start_sdk_resume_reuses_saved_plan_and_run_id() {
-        for partially_delivered in [false, true] {
+        enum Resume {
+            BySession,
+            WithObserver,
+            WithEventObserver,
+        }
+        for (partially_delivered, resume) in [
+            (false, Resume::BySession),
+            (true, Resume::BySession),
+            (false, Resume::WithObserver),
+            (true, Resume::WithEventObserver),
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("session.jsonl");
             let mut journal = Session::open(&path).unwrap();
@@ -462,7 +472,40 @@ mod tests {
                 sdk.prompt("new prompt").await,
                 Err(Error::Session(_))
             ));
-            sdk.resume().await.unwrap();
+            assert!(matches!(
+                sdk.run(None, Uuid::new_v4(), &mut |_| {}).await,
+                Err(Error::Session(_))
+            ));
+            assert!(matches!(
+                sdk.run(Some("new prompt".into()), run_id, &mut |_| {})
+                    .await,
+                Err(Error::Session(_))
+            ));
+            let mut observed_run = None;
+            let mut observe = |notification: Notification<'_>| {
+                if let Notification::RunStarted { run_id } = notification {
+                    observed_run = Some(run_id);
+                }
+            };
+            match resume {
+                Resume::BySession => {
+                    sdk.resume().await.unwrap();
+                }
+                Resume::WithObserver => {
+                    sdk.run(None, run_id, &mut observe).await.unwrap();
+                    assert_eq!(observed_run, Some(run_id));
+                }
+                Resume::WithEventObserver => {
+                    sdk.run_with_events(None, run_id, &mut |event| {
+                        if let crate::AgentEvent::Notification(notification) = event {
+                            observe(notification);
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(observed_run, Some(run_id));
+                }
+            }
             assert!(observations.lock().unwrap().is_empty());
             let journal = sdk.journal().unwrap();
             assert!(

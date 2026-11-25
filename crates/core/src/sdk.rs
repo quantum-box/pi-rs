@@ -2111,11 +2111,12 @@ impl AgentSession {
             Some(_) => return Err(Error::Config("invalid model provider".into())),
             None => None,
         };
-        let (fallback_previous, startup_error) = self
+        let (fallback_previous, startup_error, _) = self
             .start_with_fallback(
                 Some((model.clone(), provider.clone(), name.clone())),
                 true,
                 false,
+                None,
             )
             .await?;
         let (previous_provider, previous_name, previous_level) = match fallback_previous {
@@ -2680,7 +2681,7 @@ impl AgentSession {
 
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
-        let (_, error) = self.start_with_fallback(None, true, false).await?;
+        let (_, error, _) = self.start_with_fallback(None, true, false, None).await?;
         error.map_or(Ok(()), Err)
     }
 
@@ -2692,7 +2693,12 @@ impl AgentSession {
         fallback: Option<(Arc<dyn Model>, Option<String>, String)>,
         drain_triggers: bool,
         defer_startup: bool,
-    ) -> Result<(Option<(Option<String>, String, String)>, Option<Error>)> {
+        correlated_preflight: Option<Uuid>,
+    ) -> Result<(
+        Option<(Option<String>, String, String)>,
+        Option<Error>,
+        bool,
+    )> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
@@ -2707,7 +2713,10 @@ impl AgentSession {
                 "pending compaction recovery must be resumed before startup".into(),
             ));
         }
-        if !defer_startup && journal.pending_before_agent_start_run().is_some() {
+        let pending_preflight = journal.pending_before_agent_start_run();
+        let resume_preflight =
+            pending_preflight.is_some() && pending_preflight == correlated_preflight;
+        if !defer_startup && !resume_preflight && pending_preflight.is_some() {
             return Err(Error::Session(
                 "pending run preflight must be resumed before startup".into(),
             ));
@@ -2777,7 +2786,7 @@ impl AgentSession {
                 )));
             }
         }
-        let startup = if defer_startup {
+        let startup = if defer_startup || resume_preflight {
             None
         } else {
             self.pending_start.lock().expect("session startup").take()
@@ -2804,13 +2813,15 @@ impl AgentSession {
         drop(journal);
         drop(order);
         let startup_result = match startup_result {
-            Ok(()) if drain_triggers => self.drain_idle_triggers().await.map(|_| ()),
+            Ok(()) if drain_triggers && !resume_preflight => {
+                self.drain_idle_triggers().await.map(|_| ())
+            }
             Ok(()) => Ok(()),
             Err(error) => Err(error),
         };
         match startup_result {
-            Ok(()) => Ok((replaced, None)),
-            Err(error) if replaced.is_some() => Ok((replaced, Some(error))),
+            Ok(()) => Ok((replaced, None, resume_preflight)),
+            Err(error) if replaced.is_some() => Ok((replaced, Some(error), resume_preflight)),
             Err(error) => Err(error),
         }
     }
@@ -3313,8 +3324,13 @@ impl AgentSession {
                     .or_else(|| journal.pending_before_agent_start_run()),
             )
         };
-        let (_, startup_error) = self
-            .start_with_fallback(None, false, recovery.is_some() || resumable_run.is_some())
+        let (_, startup_error, _) = self
+            .start_with_fallback(
+                None,
+                false,
+                recovery.is_some() || resumable_run.is_some(),
+                None,
+            )
             .await?;
         if let Some(error) = startup_error {
             return Err(error);
@@ -3373,6 +3389,7 @@ impl AgentSession {
         result
     }
     /// A duplicate run ID follows the core's durable idempotency rules.
+    /// Pass no input and the saved run ID to resume an interrupted preflight.
     pub async fn run(
         &mut self,
         input: Option<String>,
@@ -3429,9 +3446,19 @@ impl AgentSession {
         already_started: bool,
         observer: &mut crate::AgentObserver<'_>,
     ) -> Result<String> {
-        if !already_started {
-            self.start().await?;
-        }
+        let resume_preflight = if already_started {
+            false
+        } else {
+            let correlated_preflight =
+                (!prepare && input.is_none() && images.is_none()).then_some(run_id);
+            let (_, error, resume_preflight) = self
+                .start_with_fallback(None, true, false, correlated_preflight)
+                .await?;
+            if let Some(error) = error {
+                return Err(error);
+            }
+            resume_preflight
+        };
         let journal_owner = self
             .control
             .owner
@@ -3566,6 +3593,15 @@ impl AgentSession {
             && let Err(error) = final_inputs
         {
             result = Err(error);
+        }
+        if result.is_ok()
+            && resume_preflight
+            && crate::agent::resumable_compaction_run(&journal).is_none()
+        {
+            drop(active);
+            drop(input_queue);
+            drop(journal);
+            self.start().await?;
         }
         result
     }

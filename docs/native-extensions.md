@@ -347,7 +347,9 @@ by the end of preflight. Cancellation interrupts delivery while a returned
 message's lifecycle hook is running. Handler failures are reported while
 subsequent handlers can still contribute within the shared deadline.
 Until the first model request is journaled, the SDK's `resume()` and native CLI
-recovery reuse the saved plan and run ID on the selected branch.
+recovery reuse the saved plan and run ID on the selected branch. SDK hosts
+using `run` or `run_with_events` can also resume with the saved run ID and no
+new input, keeping their per-run observer.
 
 Extensions that implement `handles_lifecycle` also receive `agent_settled`
 after `agent_end` when a run has finished its retries and automatic compaction.
