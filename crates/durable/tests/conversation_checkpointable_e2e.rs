@@ -26,6 +26,7 @@ struct LiveChildrenTool {
     journal: Option<std::path::PathBuf>,
     hold_after_results: bool,
     expect_uncertain_child: bool,
+    expected_outputs: [String; 2],
 }
 
 #[async_trait]
@@ -86,7 +87,7 @@ impl DurableAsyncTool for LiveChildrenTool {
                 .await
                 .is_err()
         );
-        for (child, expected) in [(&left, "left"), (&right, "right")] {
+        for (child, expected) in [&left, &right].into_iter().zip(&self.expected_outputs) {
             let result = host
                 .wait_child_result(child, Duration::from_secs(15))
                 .await?
@@ -99,7 +100,7 @@ impl DurableAsyncTool for LiveChildrenTool {
             } else {
                 assert_eq!(
                     result,
-                    AsyncTaskResult::Outcome(Outcome::Succeeded(expected.into()))
+                    AsyncTaskResult::Outcome(Outcome::Succeeded(expected.clone()))
                 );
             }
         }
@@ -138,6 +139,7 @@ fn live_children_setup(
             journal: journal.clone(),
             hold_after_results,
             expect_uncertain_child,
+            expected_outputs: ["left".into(), "right".into()],
         });
         let adapter = if name == "leaf" && unsafe_children {
             register_conversation_unsafe_durable_tool(
@@ -199,9 +201,17 @@ async fn replay_safe_checkpointable_parent_awaits_live_generic_task_tools() {
         task_tool::TaskTool,
     };
     struct Generic;
+    fn payload(status: &str) -> Value {
+        json!({"status":status,"detail":"application data"})
+    }
     impl Handler for Generic {
         fn run(&self, task: &Task) -> Result<Step, String> {
-            Ok(Step::Succeed(task.input()["value"].clone()))
+            let status = if task.input()["value"] == "left" {
+                "failed"
+            } else {
+                "unknown"
+            };
+            Ok(Step::Succeed(payload(status)))
         }
     }
 
@@ -219,7 +229,15 @@ async fn replay_safe_checkpointable_parent_awaits_live_generic_task_tools() {
         1,
         generic,
     ));
-    exercise_registered_leaf(registry, leaf).await;
+    exercise_registered_leaf(
+        registry,
+        leaf,
+        [
+            payload("failed").to_string(),
+            payload("unknown").to_string(),
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -259,12 +277,13 @@ async fn replay_safe_checkpointable_parent_calls_an_ordinary_registered_leaf() {
         UnsafeDurableAuthorization::interruption_requires_reconciliation(),
     )
     .unwrap();
-    exercise_registered_leaf(registry, leaf).await;
+    exercise_registered_leaf(registry, leaf, ["left".into(), "right".into()]).await;
 }
 
 async fn exercise_registered_leaf(
     mut registry: Registry,
     leaf: Arc<pi_rs_durable::task_tool::TaskTool>,
+    expected_outputs: [String; 2],
 ) {
     let dir = tempfile::tempdir().unwrap();
     let leaf_registration = leaf.register();
@@ -277,6 +296,7 @@ async fn exercise_registered_leaf(
             journal: None,
             hold_after_results: false,
             expect_uncertain_child: false,
+            expected_outputs,
         }),
         "live-generic-parent",
         1,
