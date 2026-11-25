@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use crossterm::style::Color;
-use pi_rs::{Error, Result};
+use pi_rs::{Error, Result, UiThemeInfo};
 use serde_json::Value;
 
 const MAX_FILES: usize = 64;
@@ -144,6 +144,66 @@ impl ThemeReadGrants {
         }
         Ok(ThemeSnapshot { themes })
     }
+}
+
+/// Resolve a presentation catalog from the worker's already resolved theme files.
+#[doc(hidden)]
+pub fn extension_theme_catalog(paths: &[PathBuf]) -> Result<Vec<UiThemeInfo>> {
+    if paths.len() > MAX_DIRECTORY_ENTRIES {
+        return Err(Error::Config("too many resolved theme files".into()));
+    }
+    let mut bytes = 0usize;
+    let mut seen = HashSet::from(["system".to_owned(), "dark".to_owned(), "light".to_owned()]);
+    let mut themes = vec![
+        UiThemeInfo {
+            name: "dark".into(),
+            path: None,
+        },
+        UiThemeInfo {
+            name: "light".into(),
+            path: None,
+        },
+    ];
+    for path in paths {
+        let Ok(Some(text)) = crate::prompt_resources::read_optional_resource(path, "theme file")
+        else {
+            continue;
+        };
+        bytes += text.len();
+        if bytes > MAX_TOTAL_BYTES {
+            return Err(Error::Config(
+                "theme catalog exceeds its read size limit".into(),
+            ));
+        }
+        if validate_variable_depth(&text).is_err() {
+            continue;
+        }
+        let Ok(theme) = crate::theme_parser::parse_theme(&text) else {
+            continue;
+        };
+        if seen.insert(theme.name.clone()) {
+            themes.push(UiThemeInfo {
+                name: theme.name,
+                path: path.to_str().map(PathBuf::from),
+            });
+        }
+    }
+    let locale = crate::locale::select(|name| std::env::var(name).ok());
+    let collator = crate::locale::collator(&locale).ok();
+    themes.sort_by(|left, right| {
+        collator.as_ref().map_or_else(
+            || left.name.cmp(&right.name),
+            |collator| collator.compare(&left.name, &right.name),
+        )
+    });
+    themes.insert(
+        0,
+        UiThemeInfo {
+            name: "system".into(),
+            path: None,
+        },
+    );
+    Ok(themes)
 }
 
 fn validate_path(path: &Path, kind: &str) -> Result<()> {

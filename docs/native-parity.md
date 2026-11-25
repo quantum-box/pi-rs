@@ -950,12 +950,17 @@ requests, including in terminal session and selection callbacks.
 
 ### Native extension theme discovery
 
-Extensions can send the correlated `getAllThemes` UI request and receive
-`UiResponse::Themes`. The interactive host lists `system` first and includes
-valid themes from its resolved resources, with the first source winning for
-a duplicate name. Native built-ins are embedded and omit the path. The request
-does not select or persist a theme. Native theme objects and theme switching
-through the extension UI remain open.
+Extensions can query `getAllThemes` and receive `UiResponse::Themes`. The
+terminal worker snapshots its resolved theme files at startup and refreshes
+the catalog after resource discovery. Session start can query the base catalog,
+then later calls see the additional discovered files. Headless RPC returns an
+empty list locally, as Pi does. It does not ask the RPC client for a reply.
+
+The list puts `system` first and sorts other names by the host locale. The first
+valid source wins for duplicate names. Embedded themes and paths that cannot be
+represented in UTF-8 omit their file path. The snapshot skips invalid files and
+uses the native theme resource read limits. Native theme objects and switching
+through extension UI remain open.
 [Pi theme listing](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L403-L434)
 
 ### Native extension working indicator

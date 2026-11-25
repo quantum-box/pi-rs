@@ -1,7 +1,7 @@
 //! Pi theme roles and color formats, rendered without embedded escape strings.
 use crossterm::style::Color;
 use palette::Srgb;
-use pi_rs::{Error, Result, UiThemeInfo};
+use pi_rs::{Error, Result};
 #[cfg(test)]
 use pi_rs_workbench::theme_parser::resolve;
 #[cfg(test)]
@@ -286,6 +286,7 @@ impl Theme {
         trusted: bool,
         discover: bool,
     ) -> Vec<String> {
+        let mut names = vec!["system".into(), "dark".into(), "light".into()];
         let mut paths = extra.to_vec();
         if discover {
             paths.push(crate::config::agent_dir().join("themes"));
@@ -293,54 +294,29 @@ impl Theme {
         if trusted && discover {
             paths.push(workspace.join(".pi/themes"));
         }
-        Self::catalog(&paths).into_keys().collect()
-    }
-
-    // Only enumerate tiered paths already resolved by the resource loader.
-    fn catalog(paths: &[PathBuf]) -> BTreeMap<String, Option<PathBuf>> {
-        let mut themes = BTreeMap::from([
-            ("system".into(), None),
-            ("dark".into(), None),
-            ("light".into(), None),
-        ]);
         for path in paths {
-            if path.is_dir() {
-                let mut files = std::fs::read_dir(path)
+            let files = if path.is_dir() {
+                std::fs::read_dir(path)
                     .into_iter()
                     .flatten()
-                    .filter_map(std::result::Result::ok)
+                    .filter_map(|entry| entry.ok())
                     .map(|entry| entry.path())
                     .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-                    .collect::<Vec<_>>();
-                files.sort();
-                for file in &files {
-                    Self::record_catalog_theme(&mut themes, file);
-                }
+                    .collect::<Vec<_>>()
             } else {
-                Self::record_catalog_theme(&mut themes, path);
+                vec![path]
+            };
+            for file in files {
+                if let Ok(text) = std::fs::read_to_string(&file)
+                    && let Ok(theme) = Self::parse(&text, Some(file))
+                {
+                    names.push(theme.name);
+                }
             }
         }
-        themes
-    }
-
-    fn record_catalog_theme(themes: &mut BTreeMap<String, Option<PathBuf>>, path: &Path) {
-        if path.is_file()
-            && let Ok(text) = std::fs::read_to_string(path)
-            && let Ok(theme) = Self::parse(&text, None)
-        {
-            themes
-                .entry(theme.name)
-                .or_insert_with(|| Some(path.to_owned()));
-        }
-    }
-
-    pub(crate) fn available_for_extension(paths: &[PathBuf]) -> Vec<UiThemeInfo> {
-        let mut themes = Self::catalog(paths);
-        themes.remove("system");
-        std::iter::once(("system".into(), None))
-            .chain(themes)
-            .map(|(name, path)| UiThemeInfo { name, path })
-            .collect()
+        names.sort();
+        names.dedup();
+        names
     }
 
     pub fn parse(text: &str, path: Option<PathBuf>) -> Result<Self> {

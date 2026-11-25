@@ -1,5 +1,5 @@
 //! Correlated extension interactions between the worker and its frontend.
-use pi_rs::{CancellationToken, ExtensionResult, ExtensionUi, UiRequest, UiResponse};
+use pi_rs::{CancellationToken, ExtensionResult, ExtensionUi, UiRequest, UiResponse, UiThemeInfo};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -8,6 +8,7 @@ use uuid::Uuid;
 #[derive(Default)]
 pub struct Broker {
     pending: Arc<Mutex<BTreeMap<Uuid, oneshot::Sender<UiResponse>>>>,
+    themes: Option<Mutex<ExtensionResult<Vec<UiThemeInfo>>>>,
 }
 struct Pending {
     id: Uuid,
@@ -26,6 +27,21 @@ impl Drop for Pending {
     }
 }
 impl Broker {
+    pub fn new(terminal_managed: bool) -> Self {
+        Self {
+            themes: terminal_managed.then(|| Mutex::new(Ok(Vec::new()))),
+            ..Self::default()
+        }
+    }
+
+    pub fn refresh_themes(&self, paths: &[std::path::PathBuf]) {
+        if let Some(themes) = &self.themes {
+            let snapshot = pi_rs_workbench::theme_resources::extension_theme_catalog(paths)
+                .map_err(|error| error.to_string());
+            *themes.lock().expect("extension theme catalog") = snapshot;
+        }
+    }
+
     pub fn resolve(&self, id: Uuid, value: UiResponse) {
         if let Some(sender) = self
             .pending
@@ -45,6 +61,21 @@ impl ExtensionUi for Broker {
         cancellation: CancellationToken,
     ) -> ExtensionResult<UiResponse> {
         request.validate()?;
+        if matches!(request, UiRequest::GetAllThemes) {
+            if cancellation.is_cancelled() {
+                return Err("extension UI cancelled".into());
+            }
+            let themes = self.themes.as_ref().map_or_else(
+                || Ok(Vec::new()),
+                |themes| themes.lock().expect("extension theme catalog").clone(),
+            )?;
+            let response = UiResponse::Themes(themes);
+            return if request.accepts_response(&response) {
+                Ok(response)
+            } else {
+                Err("extension theme catalog exceeds the UI response limit".into())
+            };
+        }
         let id = Uuid::new_v4();
         let response = if request.needs_response() {
             let (sender, receiver) = oneshot::channel();
@@ -100,6 +131,76 @@ impl ExtensionUi for Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn theme_queries_use_the_worker_snapshot_without_forwarding_to_a_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.json");
+        let invalid = directory.path().join("invalid.json");
+        let later = directory.path().join("later.json");
+        let replaced = directory.path().join("replaced.json");
+        let shadow = directory.path().join("embedded.json");
+        let mut theme: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        std::fs::write(&shadow, theme.to_string()).unwrap();
+        theme["name"] = serde_json::json!("fixture");
+        for path in [&first, &later] {
+            std::fs::write(path, theme.to_string()).unwrap();
+        }
+        std::fs::write(&invalid, "invalid theme").unwrap();
+        std::fs::create_dir(&replaced).unwrap();
+        theme["name"] = serde_json::json!("unresolved");
+        std::fs::write(replaced.join("child.json"), theme.to_string()).unwrap();
+
+        let paths = [invalid, first.clone(), later, replaced, shadow];
+        let terminal = Broker::new(true);
+        terminal.refresh_themes(&paths);
+        std::fs::remove_file(&first).unwrap();
+        let themes = terminal
+            .request(UiRequest::GetAllThemes, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(themes).unwrap(),
+            serde_json::json!([{"name":"system"},{"name":"dark"},{"name":"fixture","path":first},{"name":"light"}])
+        );
+        assert!(terminal.pending.lock().unwrap().is_empty());
+
+        let rpc = Broker::default();
+        rpc.refresh_themes(&paths);
+        assert_eq!(
+            rpc.request(UiRequest::GetAllThemes, CancellationToken::new())
+                .await
+                .unwrap(),
+            UiResponse::Themes(vec![])
+        );
+        assert!(rpc.pending.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn theme_catalog_omits_paths_with_non_utf8_filenames() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"custom-\xff.json"));
+        let mut theme: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        theme["name"] = serde_json::json!("custom");
+        std::fs::write(&path, theme.to_string()).unwrap();
+
+        let terminal = Broker::new(true);
+        terminal.refresh_themes(&[path]);
+        let theme_list = terminal
+            .request(UiRequest::GetAllThemes, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(theme_list).unwrap()[1],
+            serde_json::json!({"name":"custom"}),
+        );
+    }
+
     #[tokio::test]
     async fn replies_are_correlated_and_cancelled_dialogs_release_their_slot() {
         let broker = Arc::new(Broker::default());
