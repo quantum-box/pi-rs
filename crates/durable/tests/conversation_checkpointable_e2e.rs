@@ -460,6 +460,15 @@ impl DurableAsyncTool for StreamingTool {
         }
         host.report_progress(DurableToolProgress {
             details: Some(json!({"source":"stream"})),
+            diagnostics: if args["mode"] == "diagnostics" {
+                vec![pi_rs_durable::runtime::ToolDiagnostic {
+                    severity: pi_rs_durable::runtime::DiagnosticSeverity::Warn,
+                    code: Some("fixture".into()),
+                    message: "checkpointable warning".into(),
+                }]
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         })
         .await?;
@@ -518,7 +527,14 @@ async fn wait_for_stream_text(
 
 #[tokio::test]
 async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
-    for mode in ["inherited", "explicit", "bounded", "abort", "wake"] {
+    for mode in [
+        "inherited",
+        "explicit",
+        "bounded",
+        "abort",
+        "wake",
+        "diagnostics",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let advance = Arc::new(tokio::sync::Semaphore::new(0));
@@ -684,6 +700,11 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
                 .unwrap();
             if mode == "explicit" {
                 assert_eq!(content, "");
+            } else if mode == "diagnostics" {
+                assert!(content.starts_with(&second.text));
+                assert!(content.contains("[warn] checkpointable warning"));
+                assert_eq!(conversation.tool_results[0].diagnostics, second.diagnostics);
+                assert!(!conversation.tool_results[0].is_error);
             } else {
                 assert_eq!(content, second.text);
                 assert_eq!(conversation.tool_results[0].details, second.details);

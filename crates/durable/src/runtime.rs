@@ -2903,6 +2903,27 @@ enum DiagnosticCheckpoint {
     Legacy(Vec<ToolDiagnostic>),
     Journal(DiagnosticJournal),
 }
+pub(crate) fn prepare_checkpointable_result_diagnostics(
+    conversation: Uuid,
+    operation: Uuid,
+    diagnostics: Vec<ToolDiagnostic>,
+) -> Result<crate::task_store::OwnedBatch, serde_json::Error> {
+    let key = diagnostic_key(conversation, operation);
+    Ok(crate::task_store::OwnedBatch {
+        checks: vec![Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        }],
+        mutations: vec![Mutation::Put {
+            key,
+            value: serde_json::to_vec(&DiagnosticJournal {
+                diagnostics,
+                keys: Default::default(),
+            })?,
+        }],
+    })
+}
+
 impl DiagnosticCheckpoint {
     fn journal(self) -> DiagnosticJournal {
         match self {

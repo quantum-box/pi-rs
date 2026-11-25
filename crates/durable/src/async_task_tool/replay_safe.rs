@@ -3683,6 +3683,23 @@ impl Handler for Executor {
             }
         };
         let docs = host.docs.into_inner().map_err(|e| e.to_string())?;
+        if admission.is_conversation_checkpointable()
+            && self.hook.is_none()
+            && matches!(
+                &result,
+                DurableToolStep::Complete(
+                    Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. }
+                )
+            )
+        {
+            let diagnostics = host
+                .progress
+                .into_inner()
+                .map_err(|error| error.to_string())?
+                .replacement
+                .diagnostics;
+            docs.stage_checkpointable_result_diagnostics(diagnostics)?;
+        }
         if no_dispatch {
             let DurableToolStep::Complete(outcome) = &result else {
                 return Err("invalid no-dispatch result".into());

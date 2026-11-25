@@ -2681,6 +2681,25 @@ impl<'a> TaskDocuments<'a> {
         self.signals.batch.mutations.push(mutation);
         Ok(())
     }
+    pub(crate) fn stage_checkpointable_result_diagnostics(
+        &mut self,
+        diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+    ) -> Result<(), String> {
+        if let crate::task::TaskOwner::Conversation(conversation) = self.task.owner()
+            && !diagnostics.is_empty()
+        {
+            let mut batch = crate::runtime::prepare_checkpointable_result_diagnostics(
+                *conversation,
+                self.task.id(),
+                diagnostics,
+            )
+            .map_err(|error| error.to_string())?;
+            self.signals.batch.checks.append(&mut batch.checks);
+            self.signals.batch.mutations.append(&mut batch.mutations);
+        }
+        Ok(())
+    }
+
     pub(crate) fn stage_checkpointable_durable_result(
         &mut self,
         intent_key: Vec<u8>,
