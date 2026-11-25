@@ -477,8 +477,13 @@ JSON result is exposed as tool text. The `checkpointable_leaf` adapter also opts
 a regular tool's argument preparation and invocation into durable registration
 with an explicit replay policy. The adapter journals text blocks and `details`
 from `ToolHost::report_progress` before acknowledging the update. The final
-outcome comes from the invoked tool. Nested calls, UI and extension state
-remain unavailable in this host. The existing `start_child` method stages the child with
+outcome comes from the invoked tool. The opt-in `checkpointable_tool` adapter
+also exposes explicitly registered children through the ordinary ToolHost.
+It admits requests in call order, reattaches by that order on replay, and
+returns each result in the corresponding call position. Rich child results
+use the structured outcome envelope. A timeout or cancellation after
+admission reports uncertainty. UI and extension state remain unavailable.
+The existing `start_child` method stages the child with
 the parent's transition, including for unsafe checkpointable parents.
 
 A replay-unsafe conversation checkpointable parent can also start a registered
