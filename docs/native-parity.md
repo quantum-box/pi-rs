@@ -4540,20 +4540,19 @@ fixture verified folding, label editing, checkout and terminal restoration.
 
 ### Offline startup and native package update checkpoint
 
-`pi update` and `pi update --extensions` reconcile configured native
-packages. `pi update <source>` updates a single source. Upstream Pi can
-also update its JavaScript installation from `pi update`; its global
-`selfUpdateCommand` and `PI_SELF_UPDATE_COMMAND` customize that installation
-step. pi-rs leaves updates of the native binary to the installation method.
-Native package updates do not run either upstream self-update command.
+Native bare `pi update` and `pi update --extensions` reconcile configured
+packages. `pi update <source>` updates a single source. Upstream bare
+`pi update` targets the Pi installation and skips extension updates.
+Its global `selfUpdateCommand` setting and `PI_SELF_UPDATE_COMMAND`
+environment variable customize the JavaScript installation step.
+Install or update the pi-rs binary through its original installation method.
 
 Pi's `enableInstallTelemetry`, `enableAnalytics`, and `trackingId` settings
-do not enable analytics or update telemetry in pi-rs. The native changelog
-and package update paths do not submit Pi telemetry. Explicit model
-diagnostics, OAuth, and package downloads follow their own configuration.
+are specific to upstream Pi. pi-rs keeps changelog state local. Explicit
+model diagnostics, OAuth, and package downloads follow their own
+configuration.
 
-`--offline` and
-`PI_OFFLINE=1` suppress automatic Cargo registry and Git package downloads,
+`--offline` and `PI_OFFLINE=1` suppress automatic Cargo registry and Git package downloads,
 including refreshes of temporary packages, and reuse the installed resources.
 Uncached remote packages are skipped with a diagnostic.
 A transient Git source pinned to a commit reuses its cached checkout when
