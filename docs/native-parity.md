@@ -1527,6 +1527,15 @@ clamps them to at least one and uses Pi's numeric comparison and notices.
 
 ### Model-selection checkpoint
 
+The public Rust `ModelCatalog` supports Pi-style synchronous inspection of
+configured models by exact provider and model identity. Hosts can list model
+descriptors, find an exact pair even when it has no metadata, or find a provider
+and list its registered models. The Rust catalog reflects the host's immutable
+registration snapshot. Reads expose descriptive metadata and perform no config
+I/O, credential resolution, provider probes, or route fallback. Hosts publish a
+new snapshot when definitions change. Providers appear once they have a
+registered model.
+
 Native hosts can build a `ModelCatalog` from explicitly authorized provider,
 endpoint, protocol and model definitions through `ModelClientFactory::catalog`.
 Optional metadata describes entries. A missing credential or invalid entry
