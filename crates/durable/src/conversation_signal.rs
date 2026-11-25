@@ -1,0 +1,968 @@
+//! Durable conversation signal inbox primitives for a future hook sleep gate.
+//!
+//! A prepared wake must be committed in the same transaction as the
+//! conversation phase transition and its associated observer/fork writes.
+//! A pending scan is only a snapshot; callers must periodically rescan.
+
+use durable_store::{Check, Expected, Mutation, Store};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Store(#[from] durable_store::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("conversation not found")]
+    NotFound,
+    #[error("signal ID already used with different content")]
+    Mismatch,
+    #[error("signal key already has a value")]
+    Duplicate,
+    #[error("signal key is closed")]
+    Closed,
+    #[error("cannot wait on a consumed or expired signal key")]
+    InvalidWait,
+    #[error("signal key points to a missing receipt")]
+    Corrupt,
+    #[error("callback start is temporarily fenced")]
+    CallbackStartBusy,
+    #[error("signal retry cancelled")]
+    Cancelled,
+    #[error("callback cannot wait for its own signal fence")]
+    ReentrantCallback,
+}
+
+/// Signal IDs are scoped to a conversation and remain reserved after delivery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signal {
+    pub id: Uuid,
+    pub conversation_id: Uuid,
+    pub name: String,
+    pub payload: Value,
+    consumed: bool,
+}
+impl Signal {
+    pub fn new(id: Uuid, conversation_id: Uuid, name: String, payload: Value) -> Self {
+        Self {
+            id,
+            conversation_id,
+            name,
+            payload,
+            consumed: false,
+        }
+    }
+    pub fn is_consumed(&self) -> bool {
+        self.consumed
+    }
+}
+
+fn conversation_key(id: Uuid) -> Vec<u8> {
+    format!("runtime/conversation/{id}").into_bytes()
+}
+fn prefix(id: Uuid) -> Vec<u8> {
+    format!("runtime/conversation-signal/{id}/").into_bytes()
+}
+fn key(conversation: Uuid, id: Uuid) -> Vec<u8> {
+    format!("runtime/conversation-signal/{conversation}/{id}").into_bytes()
+}
+pub(crate) fn revision(id: Uuid) -> Vec<u8> {
+    format!("runtime/conversation-signal-revision/{id}").into_bytes()
+}
+
+// Hex encoding keeps arbitrary names unambiguous in the store keyspace.
+// Durable counterpart of the process-local start gate. The marker spans the
+// first poll through receipt or unknown settlement; a crash leaves evidence
+// requiring reconciliation.
+pub(crate) fn callback_start_key(conversation: Uuid) -> Vec<u8> {
+    format!("runtime/conversation-callback-start/{conversation}").into_bytes()
+}
+
+/// Prepare only the signal part of a callback-start transaction. This does
+/// not authorize dispatch: the caller must compose live claim, identity,
+/// attempt, owner, abort and late-outcome checks, then hold the marker through
+/// the first poll and retire it with an exact version check.
+#[allow(dead_code)]
+pub(crate) fn prepare_callback_start_signal_fence(
+    store: &Store,
+    conversation: Uuid,
+    marker: &[u8],
+) -> Result<crate::task_store::OwnedBatch, Error> {
+    if marker.is_empty() {
+        return Err(Error::Corrupt);
+    }
+    let conversation_key = conversation_key(conversation);
+    let conversation_entry = store.get(&conversation_key)?.ok_or(Error::NotFound)?;
+    let rev_key = revision(conversation);
+    let observed = store.get(&rev_key)?;
+    Ok(crate::task_store::OwnedBatch {
+        checks: vec![
+            Check {
+                key: conversation_key,
+                expected: Expected::Version(conversation_entry.version),
+            },
+            Check {
+                key: callback_start_key(conversation),
+                expected: Expected::Missing,
+            },
+            Check {
+                key: rev_key,
+                expected: observed
+                    .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+            },
+        ],
+        mutations: vec![Mutation::Put {
+            key: callback_start_key(conversation),
+            value: marker.to_vec(),
+        }],
+    })
+}
+
+/// Prepare exact-marker retirement after the first poll. The caller must
+/// compose the retained claim and lease evidence in this same transaction.
+#[allow(dead_code)]
+pub(crate) fn prepare_callback_finish_signal_fence(
+    store: &Store,
+    conversation: Uuid,
+    expected_marker: &[u8],
+) -> Result<crate::task_store::OwnedBatch, Error> {
+    let key = callback_start_key(conversation);
+    let entry = store.get(&key)?.ok_or(Error::Corrupt)?;
+    if expected_marker.is_empty() || entry.value != expected_marker {
+        return Err(Error::Corrupt);
+    }
+    Ok(crate::task_store::OwnedBatch {
+        checks: vec![Check {
+            key: key.clone(),
+            expected: Expected::Version(entry.version),
+        }],
+        mutations: vec![Mutation::Delete { key }],
+    })
+}
+
+pub(crate) fn clear_callback_start_check(
+    store: &Store,
+    conversation: Uuid,
+) -> Result<Check, Error> {
+    let key = callback_start_key(conversation);
+    if store.get(&key)?.is_some() {
+        return Err(Error::CallbackStartBusy);
+    }
+    Ok(Check {
+        key,
+        expected: Expected::Missing,
+    })
+}
+
+pub(crate) fn reentrant_callback(store: &Store, conversation: Uuid) -> Result<bool, Error> {
+    let Some(marker) = durable_store::controls::current_callback_marker() else {
+        return Ok(false);
+    };
+    Ok(store
+        .get(&callback_start_key(conversation))?
+        .is_some_and(|entry| entry.value == marker))
+}
+
+fn slot(conversation: Uuid, name: &str) -> Vec<u8> {
+    let encoded: String = name.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    format!("runtime/conversation-signal-slot/{conversation}/{encoded}").into_bytes()
+}
+#[derive(Serialize, Deserialize)]
+enum Slot {
+    Value(Uuid),
+    Expired,
+}
+
+#[cfg(test)]
+type SignalHooks = std::sync::Mutex<std::collections::HashMap<Uuid, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+fn before_signal_commit_hooks() -> &'static SignalHooks {
+    static HOOKS: std::sync::OnceLock<SignalHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn on_signal_before_commit(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    before_signal_commit_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+#[cfg(test)]
+fn signal_conflict_hooks() -> &'static SignalHooks {
+    static HOOKS: std::sync::OnceLock<SignalHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+fn run_signal_hook(hooks: &SignalHooks, id: Uuid) {
+    let hook = hooks.lock().unwrap().remove(&id);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+pub struct Inbox<'a> {
+    store: &'a Store,
+}
+impl<'a> Inbox<'a> {
+    pub fn new(store: &'a Store) -> Self {
+        Self { store }
+    }
+
+    /// Insert once, checking the target version so deletion cannot race insertion.
+    pub fn send(&self, signal: &Signal) -> Result<(), Error> {
+        self.send_with_clock(signal, &crate::runtime::wall_time_millis)
+    }
+
+    /// Retry a signal while a durable callback-start marker owns the target.
+    /// Cancellation while waiting leaves the signal unqueued.
+    pub async fn send_with_retry(
+        &self,
+        signal: &Signal,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<(), Error> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            match self.send(signal) {
+                Err(Error::CallbackStartBusy) => {
+                    if reentrant_callback(self.store, signal.conversation_id)? {
+                        return Err(Error::ReentrantCallback);
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::Cancelled),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => (),
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Deliver using an injected Unix-millisecond timestamp.
+    pub fn send_at(&self, signal: &Signal, now: i64) -> Result<(), Error> {
+        self.send_with_clock(signal, &|| now)
+    }
+
+    pub(crate) fn send_with_clock(
+        &self,
+        signal: &Signal,
+        clock: &dyn Fn() -> i64,
+    ) -> Result<(), Error> {
+        let k = key(signal.conversation_id, signal.id);
+        let sk = slot(signal.conversation_id, &signal.name);
+        let target = conversation_key(signal.conversation_id);
+        let mut fresh = signal.clone();
+        fresh.consumed = false;
+        'retry: loop {
+            let callback_start = clear_callback_start_check(self.store, signal.conversation_id)?;
+            if let Some(entry) = self.store.get(&k)? {
+                let old: Signal = serde_json::from_slice(&entry.value)?;
+                return if old.id == fresh.id
+                    && old.conversation_id == fresh.conversation_id
+                    && old.name == fresh.name
+                    && old.payload == fresh.payload
+                {
+                    Ok(())
+                } else {
+                    Err(Error::Mismatch)
+                };
+            }
+            let entry = self.store.get(&target)?.ok_or(Error::NotFound)?;
+            let revision_key = revision(signal.conversation_id);
+            let observed_revision = self.store.get(&revision_key)?;
+            let revision_check = Check {
+                key: revision_key,
+                expected: observed_revision
+                    .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+            };
+            if signal.name.is_empty() {
+                return Err(Error::InvalidWait);
+            }
+            if let Some(existing) = self.store.get(&sk)? {
+                match serde_json::from_slice::<Slot>(&existing.value)? {
+                    // A concurrent insertion of this receipt may have committed
+                    // after our first read. Recheck its content for idempotency.
+                    Slot::Value(id) if id == fresh.id => {
+                        if self.store.get(&k)?.is_none() {
+                            return Err(Error::Corrupt);
+                        }
+                        continue;
+                    }
+                    Slot::Value(_) => return Err(Error::Duplicate),
+                    Slot::Expired => return Err(Error::Closed),
+                }
+            }
+            // Older stores predate slots; never accept another value for such a key.
+            for (_, old) in self.store.list(&prefix(signal.conversation_id))? {
+                let old: Signal = serde_json::from_slice(&old.value)?;
+                if old.name == signal.name {
+                    if old.id == fresh.id {
+                        continue 'retry;
+                    }
+                    return Err(Error::Duplicate);
+                }
+            }
+            let closed = crate::runtime::signal_target_closed(&entry.value, &signal.name, clock())?;
+            if closed {
+                let checks = [
+                    callback_start.clone(),
+                    revision_check.clone(),
+                    Check {
+                        key: target.clone(),
+                        expected: Expected::Version(entry.version),
+                    },
+                    Check {
+                        key: sk.clone(),
+                        expected: Expected::Missing,
+                    },
+                ];
+                let writes = [
+                    Mutation::Put {
+                        key: sk.clone(),
+                        value: serde_json::to_vec(&Slot::Expired)?,
+                    },
+                    Mutation::Put {
+                        key: revision(signal.conversation_id),
+                        value: vec![],
+                    },
+                ];
+                match self.store.commit(&checks, &writes) {
+                    Ok(()) => return Err(Error::Closed),
+                    Err(durable_store::Error::Conflict { .. }) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            let checks = [
+                callback_start,
+                revision_check,
+                Check {
+                    key: sk.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: k.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: target.clone(),
+                    expected: Expected::Version(entry.version),
+                },
+            ];
+            let writes = [
+                Mutation::Put {
+                    key: sk.clone(),
+                    value: serde_json::to_vec(&Slot::Value(signal.id))?,
+                },
+                Mutation::Put {
+                    key: k.clone(),
+                    value: serde_json::to_vec(&fresh)?,
+                },
+                Mutation::Put {
+                    key: revision(signal.conversation_id),
+                    value: vec![],
+                },
+            ];
+            #[cfg(test)]
+            run_signal_hook(before_signal_commit_hooks(), signal.id);
+            match self.store.commit(&checks, &writes) {
+                Ok(()) => return Ok(()),
+                Err(durable_store::Error::Conflict { .. }) => {
+                    #[cfg(test)]
+                    run_signal_hook(signal_conflict_hooks(), signal.id);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    pub fn receipt(&self, conversation: Uuid, id: Uuid) -> Result<Option<Signal>, Error> {
+        self.store
+            .get(&key(conversation, id))?
+            .map(|e| serde_json::from_slice(&e.value).map_err(Error::from))
+            .transpose()
+    }
+
+    /// Fence validation against concurrent deliveries and expiration.
+    pub fn prepare_wait(
+        &self,
+        conversation: Uuid,
+        names: &[String],
+    ) -> Result<PreparedWake, Error> {
+        let callback_start = clear_callback_start_check(self.store, conversation)?;
+        let rk = revision(conversation);
+        let rev = self.store.get(&rk)?;
+        let entries = self.store.list(&prefix(conversation))?;
+        for name in names {
+            if let Some(entry) = self.store.get(&slot(conversation, name))?
+                && matches!(serde_json::from_slice::<Slot>(&entry.value)?, Slot::Expired)
+            {
+                return Err(Error::InvalidWait);
+            }
+            for (_, entry) in &entries {
+                let signal: Signal = serde_json::from_slice(&entry.value)?;
+                if signal.name == *name && signal.consumed {
+                    return Err(Error::InvalidWait);
+                }
+            }
+        }
+        Ok(PreparedWake {
+            signal: None,
+            checks: vec![
+                callback_start,
+                Check {
+                    key: rk,
+                    expected: rev.map_or(Expected::Missing, |e| Expected::Version(e.version)),
+                },
+            ],
+            mutations: vec![],
+        })
+    }
+
+    /// Prepare a wake for an absolute Unix-millisecond deadline or matching signal.
+    /// Commit the returned checks and mutations together with a version-checked
+    /// conversation transition. Conflict requires reloading and rescanning.
+    pub fn prepare_wake(
+        &self,
+        conversation: Uuid,
+        names: &[String],
+        deadline: Option<i64>,
+        now: i64,
+    ) -> Result<Option<PreparedWake>, Error> {
+        let callback_start = clear_callback_start_check(self.store, conversation)?;
+        let revision_key = revision(conversation);
+        let rev = self.store.get(&revision_key)?;
+        let mut checks = vec![
+            callback_start,
+            Check {
+                key: revision_key,
+                expected: rev.map_or(Expected::Missing, |e| Expected::Version(e.version)),
+            },
+        ];
+        let mut mutations = Vec::new();
+        let mut delivered = None;
+        let entries = self.store.list(&prefix(conversation))?;
+        for name in names {
+            for (k, entry) in &entries {
+                let mut signal: Signal = serde_json::from_slice(&entry.value)?;
+                if !signal.consumed && signal.name == *name {
+                    signal.consumed = true;
+                    checks.push(Check {
+                        key: k.clone(),
+                        expected: Expected::Version(entry.version),
+                    });
+                    mutations.push(Mutation::Put {
+                        key: k.clone(),
+                        value: serde_json::to_vec(&signal)?,
+                    });
+                    delivered = Some(signal);
+                    break;
+                }
+            }
+            if delivered.is_some() {
+                break;
+            }
+        }
+        if delivered.is_none() && deadline.is_some_and(|d| now >= d) {
+            let mut seen = std::collections::HashSet::new();
+            for name in names {
+                if !seen.insert(name) {
+                    continue;
+                }
+                let sk = slot(conversation, name);
+                if self.store.get(&sk)?.is_none()
+                    && !entries.iter().any(|(_, e)| {
+                        serde_json::from_slice::<Signal>(&e.value).is_ok_and(|s| s.name == *name)
+                    })
+                {
+                    checks.push(Check {
+                        key: sk.clone(),
+                        expected: Expected::Missing,
+                    });
+                    mutations.push(Mutation::Put {
+                        key: sk,
+                        value: serde_json::to_vec(&Slot::Expired)?,
+                    });
+                }
+            }
+        }
+        if delivered.is_none() && deadline.is_none_or(|d| now < d) {
+            return Ok(None);
+        }
+        Ok(Some(PreparedWake {
+            signal: delivered,
+            checks,
+            mutations,
+        }))
+    }
+}
+
+/// Transaction fragments; the caller must add the conversation CAS and phase write.
+pub struct PreparedWake {
+    pub signal: Option<Signal>,
+    pub checks: Vec<Check>,
+    pub mutations: Vec<Mutation>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn create(store: &Store, id: Uuid) {
+        store
+            .commit(
+                &[Check {
+                    key: conversation_key(id),
+                    expected: Expected::Missing,
+                }],
+                &[Mutation::Put {
+                    key: conversation_key(id),
+                    value: b"{}".to_vec(),
+                }],
+            )
+            .unwrap();
+    }
+    fn commit_wake(
+        store: &Store,
+        id: Uuid,
+        version: u64,
+        mut wake: PreparedWake,
+    ) -> Result<(), durable_store::Error> {
+        wake.checks.push(Check {
+            key: conversation_key(id),
+            expected: Expected::Version(version),
+        });
+        wake.mutations.push(Mutation::Put {
+            key: conversation_key(id),
+            value: b"awake".to_vec(),
+        });
+        store.commit(&wake.checks, &wake.mutations)
+    }
+
+    #[test]
+    fn delivery_retries_when_signal_revision_changes_before_commit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let store = Arc::new(Store::memory().unwrap());
+        let conversation = Uuid::new_v4();
+        create(&store, conversation);
+        let first = Signal::new(
+            Uuid::new_v4(),
+            conversation,
+            "first".into(),
+            serde_json::json!(1),
+        );
+        let second = Signal::new(
+            Uuid::new_v4(),
+            conversation,
+            "second".into(),
+            serde_json::json!(2),
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (conflict_tx, conflict_rx) = mpsc::channel();
+        before_signal_commit_hooks().lock().unwrap().insert(
+            first.id,
+            Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }),
+        );
+        signal_conflict_hooks().lock().unwrap().insert(
+            first.id,
+            Box::new(move || {
+                conflict_tx.send(()).unwrap();
+            }),
+        );
+        let worker_store = store.clone();
+        let worker_signal = first.clone();
+        let worker = std::thread::spawn(move || Inbox::new(&worker_store).send(&worker_signal));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        Inbox::new(&store).send(&second).unwrap();
+        release_tx.send(()).unwrap();
+        conflict_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap().unwrap();
+        let inbox = Inbox::new(&store);
+        assert!(inbox.receipt(conversation, first.id).unwrap().is_some());
+        assert!(inbox.receipt(conversation, second.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn independent_inbox_and_callback_start_have_one_transactional_winner() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Arc::new(Store::open(&path).unwrap());
+        let other = Store::open(&path).unwrap();
+        let conversation = Uuid::new_v4();
+        create(&store, conversation);
+        let signal = Signal::new(
+            Uuid::new_v4(),
+            conversation,
+            "first".into(),
+            serde_json::json!(1),
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        on_signal_before_commit(signal.id, move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let worker_store = store.clone();
+        let worker_signal = signal.clone();
+        let worker = std::thread::spawn(move || Inbox::new(&worker_store).send(&worker_signal));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start = prepare_callback_start_signal_fence(&other, conversation, b"claim").unwrap();
+        other.commit(&start.checks, &start.mutations).unwrap();
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(Error::CallbackStartBusy)
+        ));
+        assert!(
+            Inbox::new(&other)
+                .receipt(conversation, signal.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            prepare_callback_finish_signal_fence(&other, conversation, b"other-claim"),
+            Err(Error::Corrupt)
+        ));
+        let finish = prepare_callback_finish_signal_fence(&other, conversation, b"claim").unwrap();
+        other.commit(&finish.checks, &finish.mutations).unwrap();
+        Inbox::new(&other).send(&signal).unwrap();
+        assert!(
+            Inbox::new(&store)
+                .receipt(conversation, signal.id)
+                .unwrap()
+                .is_some()
+        );
+        let stale_start =
+            prepare_callback_start_signal_fence(&other, conversation, b"claim-2").unwrap();
+        let next = Signal::new(
+            Uuid::new_v4(),
+            conversation,
+            "second".into(),
+            serde_json::json!(2),
+        );
+        Inbox::new(&store).send(&next).unwrap();
+        assert!(matches!(
+            other.commit(&stale_start.checks, &stale_start.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            other
+                .get(&callback_start_key(conversation))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn interrupted_callback_start_remains_fenced_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let conversation = Uuid::new_v4();
+        let unrelated = Uuid::new_v4();
+        {
+            let store = Store::open(&path).unwrap();
+            create(&store, conversation);
+            create(&store, unrelated);
+            let start =
+                prepare_callback_start_signal_fence(&store, conversation, b"claim").unwrap();
+            store.commit(&start.checks, &start.mutations).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let blocked = Signal::new(
+            Uuid::new_v4(),
+            conversation,
+            "signal".into(),
+            serde_json::json!(1),
+        );
+        let other = Signal::new(
+            Uuid::new_v4(),
+            unrelated,
+            "signal".into(),
+            serde_json::json!(2),
+        );
+        let inbox = Inbox::new(&store);
+        assert!(matches!(
+            inbox.send(&blocked),
+            Err(Error::CallbackStartBusy)
+        ));
+        inbox.send(&other).unwrap();
+        assert!(inbox.receipt(conversation, blocked.id).unwrap().is_none());
+        assert!(inbox.receipt(unrelated, other.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn prepared_wake_cannot_commit_during_callback_start() {
+        let store = Store::memory().unwrap();
+        let conversation = Uuid::new_v4();
+        create(&store, conversation);
+        let signal = Signal::new(
+            Uuid::new_v4(),
+            conversation,
+            "wake".into(),
+            serde_json::json!(1),
+        );
+        let inbox = Inbox::new(&store);
+        inbox.send(&signal).unwrap();
+        let wake = inbox
+            .prepare_wake(conversation, &["wake".into()], None, 0)
+            .unwrap()
+            .unwrap();
+        let start = prepare_callback_start_signal_fence(&store, conversation, b"claim").unwrap();
+        store.commit(&start.checks, &start.mutations).unwrap();
+        assert!(matches!(
+            store.commit(&wake.checks, &wake.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            !inbox
+                .receipt(conversation, signal.id)
+                .unwrap()
+                .unwrap()
+                .is_consumed()
+        );
+        assert!(matches!(
+            inbox.prepare_wake(conversation, &["wake".into()], None, 0),
+            Err(Error::CallbackStartBusy)
+        ));
+    }
+
+    #[test]
+    fn concurrent_dedup_and_atomic_consumption_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signals.db");
+        let id = Uuid::new_v4();
+        let signal = Signal::new(Uuid::new_v4(), id, "go".into(), serde_json::json!({"x": 1}));
+        let store = Arc::new(Store::open(&path).unwrap());
+        create(&store, id);
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let signal = signal.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Inbox::new(&store).send(&signal).unwrap();
+                })
+            })
+            .collect();
+        barrier.wait();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let inbox = Inbox::new(&store);
+        let mut mismatch = signal.clone();
+        mismatch.payload = serde_json::json!(2);
+        assert!(matches!(inbox.send(&mismatch), Err(Error::Mismatch)));
+        let version = store.get(&conversation_key(id)).unwrap().unwrap().version;
+        let first = inbox
+            .prepare_wake(id, &["go".into()], None, 0)
+            .unwrap()
+            .unwrap();
+        let second = inbox
+            .prepare_wake(id, &["go".into()], None, 0)
+            .unwrap()
+            .unwrap();
+        commit_wake(&store, id, version, first).unwrap();
+        assert!(matches!(
+            commit_wake(&store, id, version, second),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let inbox = Inbox::new(&store);
+        assert!(inbox.receipt(id, signal.id).unwrap().unwrap().is_consumed());
+        assert_eq!(
+            store.get(&conversation_key(id)).unwrap().unwrap().value,
+            b"awake"
+        );
+        inbox.send(&signal).unwrap();
+        assert!(
+            inbox
+                .prepare_wake(id, &["go".into()], None, 0)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_same_receipt_is_always_idempotent() {
+        for _ in 0..20 {
+            let store = Arc::new(Store::memory().unwrap());
+            let id = Uuid::new_v4();
+            create(&store, id);
+            let signal = Signal::new(Uuid::new_v4(), id, "key".into(), Value::Null);
+            let barrier = Arc::new(Barrier::new(9));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (store, signal, barrier) = (store.clone(), signal.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        Inbox::new(&store).send(&signal)
+                    })
+                })
+                .collect();
+            barrier.wait();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn insertion_fences_a_prepared_deadline_wake() {
+        let store = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&store, id);
+        let inbox = Inbox::new(&store);
+        assert!(
+            inbox
+                .prepare_wake(id, &["go".into()], Some(100), 99)
+                .unwrap()
+                .is_none()
+        );
+        let version = store.get(&conversation_key(id)).unwrap().unwrap().version;
+        let wake = inbox
+            .prepare_wake(id, &["go".into()], Some(100), 100)
+            .unwrap()
+            .unwrap();
+        let signal = Signal::new(Uuid::new_v4(), id, "go".into(), Value::Null);
+        inbox.send(&signal).unwrap();
+        assert!(matches!(
+            commit_wake(&store, id, version, wake),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(!inbox.receipt(id, signal.id).unwrap().unwrap().is_consumed());
+        let wake = inbox
+            .prepare_wake(id, &["go".into()], Some(100), 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(wake.signal.as_ref().unwrap().id, signal.id);
+        commit_wake(&store, id, version, wake).unwrap();
+    }
+    #[test]
+    fn conversation_change_fences_wake_without_consuming() {
+        let store = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&store, id);
+        let inbox = Inbox::new(&store);
+        let signal = Signal::new(Uuid::new_v4(), id, "go".into(), Value::Null);
+        inbox.send(&signal).unwrap();
+        let version = store.get(&conversation_key(id)).unwrap().unwrap().version;
+        let wake = inbox
+            .prepare_wake(id, &["go".into()], None, 0)
+            .unwrap()
+            .unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: conversation_key(id),
+                    expected: Expected::Version(version),
+                }],
+                &[Mutation::Put {
+                    key: conversation_key(id),
+                    value: b"aborted".to_vec(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            commit_wake(&store, id, version, wake),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(!inbox.receipt(id, signal.id).unwrap().unwrap().is_consumed());
+        let other = Uuid::new_v4();
+        assert!(inbox.receipt(other, signal.id).unwrap().is_none());
+        let missing = Signal::new(Uuid::new_v4(), other, "go".into(), Value::Null);
+        assert!(matches!(inbox.send(&missing), Err(Error::NotFound)));
+    }
+    #[test]
+    fn slots_are_single_use_and_expiration_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = Uuid::new_v4();
+        let a = Signal::new(Uuid::new_v4(), id, "a".into(), Value::Null);
+        {
+            let store = Store::open(&path).unwrap();
+            create(&store, id);
+            let inbox = Inbox::new(&store);
+            inbox.send_at(&a, 0).unwrap();
+            let duplicate = Signal::new(Uuid::new_v4(), id, "a".into(), Value::Null);
+            assert!(matches!(
+                inbox.send_at(&duplicate, 0),
+                Err(Error::Duplicate)
+            ));
+            let version = store.get(&conversation_key(id)).unwrap().unwrap().version;
+            let wake = inbox
+                .prepare_wake(id, &["a".into(), "b".into()], Some(5), 5)
+                .unwrap()
+                .unwrap();
+            assert_eq!(wake.signal.as_ref().unwrap().id, a.id);
+            commit_wake(&store, id, version, wake).unwrap();
+            assert!(matches!(
+                inbox.prepare_wait(id, &["a".into()]),
+                Err(Error::InvalidWait)
+            ));
+            let version = store.get(&conversation_key(id)).unwrap().unwrap().version;
+            let wake = inbox
+                .prepare_wake(id, &["b".into()], Some(5), 5)
+                .unwrap()
+                .unwrap();
+            commit_wake(&store, id, version, wake).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let inbox = Inbox::new(&store);
+        inbox.send_at(&a, 50).unwrap();
+        assert!(matches!(
+            inbox.prepare_wait(id, &["b".into()]),
+            Err(Error::InvalidWait)
+        ));
+        let late = Signal::new(Uuid::new_v4(), id, "b".into(), Value::Null);
+        assert!(matches!(inbox.send_at(&late, 50), Err(Error::Closed)));
+    }
+    #[test]
+    fn concurrent_distinct_receipts_compete_for_one_key_and_fence_wait() {
+        let store = Arc::new(Store::memory().unwrap());
+        let id = Uuid::new_v4();
+        create(&store, id);
+        let inbox = Inbox::new(&store);
+        let wait = inbox.prepare_wait(id, &["one".into()]).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|n| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let signal =
+                        Signal::new(Uuid::new_v4(), id, "one".into(), serde_json::json!(n));
+                    barrier.wait();
+                    Inbox::new(&store).send_at(&signal, 0)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(Error::Duplicate)))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            store.commit(&wait.checks, &wait.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+    }
+}

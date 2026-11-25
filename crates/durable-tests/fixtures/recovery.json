@@ -1,0 +1,195 @@
+{
+  "format_version": 1,
+  "upstream_commit": "827383a15262905f82e418483825a49dbb1adbf5",
+  "scenarios": [
+    {
+      "id": "transfer-effect-before-outcome",
+      "sources": ["test/harness-tasks-recovery.test.ts: resumes an intent/effect/outcome task interrupted after its intent across close and reopen", "docs/spec.md: 5.2"],
+      "setup": "Create Transfer T with amount 7; enable scheduling.",
+      "steps": [
+        {"action": "run_to", "boundary": "intent and memo durable; service applied key; outcome transaction not started", "expect": ["service calls=1", "service applications=1"]},
+        {"action": "crash", "boundary": "before_commit: terminal outcome and receipt entry"},
+        {"action": "reopen"},
+        {"action": "observe", "expect": ["T pending at apply with key transfer-T", "T memo requested=7", "service calls=1"]},
+        {"action": "resume and wait for T"},
+        {"action": "reopen and observe"}
+      ],
+      "expect_final": ["T completed receipt=70", "service calls=2", "service applications=1", "one receipt:70 entry", "terminal T has no checkpoint or memos"]
+    },
+    {
+      "id": "atomic-progress-before-commit",
+      "sources": ["docs/spec.md: 5.2", "test/harness-tasks.test.ts: commits results with entries atomically"],
+      "setup": "Create Atomic task T at initial checkpoint, document value 0, no E or C; enable scheduling.",
+      "steps": [
+        {"action": "run_to", "boundary": "all four writes staged, atomic transaction not durable"},
+        {"action": "crash", "boundary": "before_commit: checkpoint, entry, document and child"},
+        {"action": "reopen and observe"}
+      ],
+      "expect_final": ["T has initial checkpoint", "document value=0", "entry E absent", "child C absent"]
+    },
+    {
+      "id": "atomic-progress-after-commit",
+      "sources": ["docs/spec.md: 5.2", "test/harness-tasks.test.ts: commits results with entries atomically"],
+      "setup": "Create Atomic task T at initial checkpoint, document value 0, no E or C; enable scheduling.",
+      "steps": [
+        {"action": "run_to", "boundary": "atomic checkpoint, entry, document and child transaction durable; before next phase"},
+        {"action": "crash", "boundary": "after_commit: checkpoint, entry, document and child"},
+        {"action": "reopen and observe"}
+      ],
+      "expect_final": ["T checkpoint=next", "document value=1", "exactly one entry E", "exactly one child C"]
+    },
+    {
+      "id": "abort-mark-not-durable",
+      "sources": ["test/harness-tasks-recovery.test.ts: crash while the mark commit is in storage: the run resumes", "docs/spec.md: 5.4"],
+      "setup": "Create Abort task T and gate its first run invocation.",
+      "steps": [
+        {"action": "request abort and hold mark transaction", "boundary": "before_commit: abort_mark"},
+        {"action": "crash"}, {"action": "reopen and observe", "expect": ["T pending", "abort mark absent"]},
+        {"action": "resume and gate next invocation"}
+      ],
+      "expect_final": ["handler invocation sequence: run, run", "abort handler invocations=0"]
+    },
+    {
+      "id": "abort-mark-durable",
+      "sources": ["test/harness-tasks-recovery.test.ts: crash after the mark before the run joins: only the abort handler runs", "docs/spec.md: 5.4"],
+      "setup": "Create Abort task T and gate its first run invocation so it does not join.",
+      "steps": [
+        {"action": "request abort and wait for mark", "boundary": "after_commit: abort_mark; before run joins"},
+        {"action": "crash"}, {"action": "reopen and observe", "expect": ["T pending", "abort mark present"]},
+        {"action": "resume and wait for T"}
+      ],
+      "expect_final": ["handler invocation sequence: run, abort", "T terminal aborted", "run does not execute again"]
+    },
+    {
+      "id": "abort-handler-interrupted",
+      "sources": ["test/harness-tasks-recovery.test.ts: crash while the abort handler runs: a fresh abort invocation settles the task"],
+      "setup": "Create Abort task T; request abort before its run; gate abort handler before its terminal commit.",
+      "steps": [
+        {"action": "resume and run_to", "boundary": "abort handler entered, no terminal outcome committed"},
+        {"action": "crash"}, {"action": "reopen"}, {"action": "resume and wait for T"}
+      ],
+      "expect_final": ["handler invocation sequence: abort, abort", "T terminal aborted"]
+    },
+    {
+      "id": "terminal-survives-reopen",
+      "sources": ["test/harness-tasks-recovery.test.ts: crash after the terminal outcome: nothing runs again", "docs/spec.md: 5.3"],
+      "setup": "Create Abort task T; request abort before its run.",
+      "steps": [
+        {"action": "resume and wait for T", "boundary": "after_commit: terminal aborted"},
+        {"action": "crash"}, {"action": "reopen"}, {"action": "resume and observe T"}
+      ],
+      "expect_final": ["handler invocation sequence: abort", "T terminal aborted", "no handler reruns"]
+    },
+    {
+      "id": "sleep-survives-restart",
+      "sources": ["README.md: Sleeping and Waking Up", "docs/spec.md: 5.6"],
+      "setup": "Create Sleeper T with clock=0; enable scheduling.",
+      "steps": [
+        {"action": "run_to", "boundary": "after_commit: sleeping until 100 at deliver"},
+        {"action": "crash"}, {"action": "reopen and resume"},
+        {"action": "set clock=99 and drain scheduler", "expect": ["T sleeping", "deliver invocations=0"]},
+        {"action": "set clock=100 and wait for T"}
+      ],
+      "expect_final": ["deliver invocations=1", "T terminal completed"]
+    },
+    {
+      "id": "waiting-all-settled",
+      "sources": ["test/harness-tasks.test.ts: resumes a waiting task once every task in `on` is terminal, whatever the outcome", "docs/spec.md: 5.5"],
+      "setup": "Create Waiter T and its children C1 and C2; both are controlled.",
+      "steps": [
+        {"action": "run_to", "boundary": "after_commit: T waiting allSettled on C1 and C2"},
+        {"action": "settle C1 completed"}, {"action": "crash"}, {"action": "reopen and resume"},
+        {"action": "drain scheduler", "expect": ["T still waiting", "T resume invocations=0"]},
+        {"action": "settle C2 faulted and wait for T"}
+      ],
+      "expect_final": ["T resume invocations=1", "T observes C1 completed and C2 faulted", "T terminal completed"]
+    },
+    {
+      "id": "submission-request-id",
+      "sources": ["README.md: Persist and Resume", "docs/spec.md: 6 Submissions and inbox"],
+      "setup": "Open conversations A and B with empty inboxes.",
+      "steps": [
+        {"action": "submit input hello to A with requestId R; save submission identity S"},
+        {"action": "crash", "boundary": "after_commit: admission"}, {"action": "reopen"},
+        {"action": "submit input hello to A with requestId R", "expect": ["returned identity=S", "one submission for A/R", "one admitted input for A/R"]},
+        {"action": "submit input hello to B with requestId R", "expect": ["returned identity differs from S"]},
+        {"action": "submit a write to A with requestId R", "expect": ["request rejected because submission type differs", "no extra A/R submission"]}
+      ],
+      "expect_final": ["A and B each have one submission for R"]
+    },
+    {
+      "id": "memo-first-writer",
+      "sources": ["docs/spec.md: 5.2"],
+      "setup": "Create live task T and gate its phase.",
+      "steps": [
+        {"action": "concurrently memo T/key with candidates alpha and beta and wait for both"},
+        {"action": "crash", "boundary": "after_commit: both memo calls returned"},
+        {"action": "reopen and observe"},
+        {"action": "resume T and memo T/key with candidate gamma"}
+      ],
+      "expect_final": ["all three memo calls return the same winner", "winner is alpha or beta", "reopened live T stores that winner", "gamma does not replace winner"]
+    },
+    {
+      "id": "tool-safe-replay",
+      "sources": ["README.md: Tools", "docs/suspendable/spec.md: Recovery of execute"],
+      "setup": "Create Tool call T registered replay safe; gate execute after recording its first invocation and before result commit.",
+      "steps": [
+        {"action": "run_to", "boundary": "intent durable; execute entered; result not committed"},
+        {"action": "crash"}, {"action": "reopen with replay safe"}, {"action": "resume and wait for result"}
+      ],
+      "expect_final": ["execute invocations=2", "one terminal tool result", "external effects may occur twice unless service deduplicates"]
+    },
+    {
+      "id": "tool-unsafe-interrupted",
+      "sources": ["README.md: Tools", "docs/suspendable/spec.md: Recovery of execute"],
+      "setup": "Create Tool call T registered replay unsafe; gate execute after recording its first invocation and before result commit.",
+      "steps": [
+        {"action": "run_to", "boundary": "intent durable; execute entered; result not committed"},
+        {"action": "crash"}, {"action": "reopen with replay unsafe"}, {"action": "resume and wait for result"}
+      ],
+      "expect_final": ["execute invocations=1", "tool result is error with interrupted diagnostic"]
+    },
+    {
+      "id": "tool-policy-changed",
+      "sources": ["docs/suspendable/spec.md: Recovery of execute"],
+      "setup": "Create Tool call T registered replay safe; gate execute after recording its first invocation and before result commit.",
+      "steps": [
+        {"action": "run_to", "boundary": "intent durable; execute entered; result not committed"},
+        {"action": "crash"}, {"action": "reopen with replay unsafe"}, {"action": "resume and wait for result"}
+      ],
+      "expect_final": ["execute invocations=1", "tool result is error with interrupted diagnostic"]
+    },
+    {
+      "id": "crash-loop-limit",
+      "sources": ["docs/spec.md: 5.4 Restarts"],
+      "setup": "Create extension task T with restartLimit=2; phase never advances checkpoint and is gated after reservation.",
+      "steps": [
+        {"action": "resume and gate phase", "boundary": "after_commit: running reservation"}, {"action": "crash"},
+        {"action": "reopen and observe", "expect": ["T pending", "restart count=1"]},
+        {"action": "resume and gate phase", "boundary": "after_commit: running reservation"}, {"action": "crash"},
+        {"action": "reopen and resume; wait for T"}
+      ],
+      "expect_final": ["phase invocations=2", "T terminal faulted with reason restart_limit"]
+    },
+    {
+      "id": "clean-close-not-crash",
+      "sources": ["docs/spec.md: 5.4 Restarts"],
+      "setup": "Create extension task T with restartLimit=2; phase cooperatively exits on close without advancing checkpoint.",
+      "steps": [
+        {"action": "resume and gate phase", "boundary": "after_commit: running reservation"},
+        {"action": "close cleanly and wait for close"}, {"action": "reopen and observe"}
+      ],
+      "expect_final": ["T pending", "restart count not incremented", "T is not terminal"]
+    },
+    {
+      "id": "missing-task-definition",
+      "sources": ["test/harness-tasks-recovery.test.ts: keeps a task with a missing definition pending, and live for idle waits", "docs/spec.md: 5.4 Scheduler"],
+      "setup": "Persist a pending extension task T, close, then open with its definition absent.",
+      "steps": [
+        {"action": "resume and drain scheduler", "expect": ["T remains pending and blocked missing_task", "T counts as live for idle"]},
+        {"action": "install matching definition and wait for T"}
+      ],
+      "expect_final": ["T runs and reaches its defined terminal outcome"]
+    }
+  ]
+}

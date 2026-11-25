@@ -1,0 +1,42 @@
+[package]
+name = "pi-rs-durable"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Experimental durable agent runtime for pi-rs"
+
+[features]
+default = []
+experimental-graph-scope = ["durable-store/experimental-graph-scope"]
+experimental-graph-revision = ["durable-store/experimental-graph-revision"]
+# Explicitly enabled only by synchronization tests.
+test-hooks = []
+coding-tools = ["dep:pi-rs-workbench"]
+builtin-images = ["dep:image"]
+
+[dependencies]
+durable-task-schema = { path = "../durable-task-schema" }
+base64 = "0.22"
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+pi-rs-core = { path = "../core" }
+pi-rs-workbench = { path = "../workbench", optional = true }
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time", "net", "process"] }
+durable-store = { path = "../durable-store" }
+thiserror = "2"
+jsonschema = { version = "0.33", default-features = false }
+async-trait = "0.1"
+regex = "1"
+unicode-normalization = "0.1"
+unicode-segmentation = "1.12"
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+async-trait = "0.1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }

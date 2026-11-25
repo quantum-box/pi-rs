@@ -1,0 +1,1973 @@
+//! Independent extension resolution and hook execution. Nothing here schedules
+//! work or persists state; a host must commit memo writes before returning.
+use std::{
+    collections::HashSet,
+    panic::AssertUnwindSafe,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use async_trait::async_trait;
+use futures_util::FutureExt;
+use pi_rs_core::Tool;
+use serde_json::Value;
+
+// Convert only inputs whose content order is representable by core's user message.
+pub(crate) fn yield_input(value: &Value) -> Option<pi_rs_core::Message> {
+    if let Some(text) = value.as_str() {
+        return Some(pi_rs_core::Message::User {
+            content: text.into(),
+        });
+    }
+    let blocks = value.as_array().filter(|blocks| !blocks.is_empty())?;
+    let mut text = None;
+    let mut images = Vec::new();
+    for block in blocks {
+        let fields = block.as_object()?;
+        match block.get("type")?.as_str()? {
+            "text" if text.is_none() && images.is_empty() && fields.len() == 2 => {
+                text = Some(block.get("text")?.as_str()?.to_owned());
+            }
+            "image" if fields.len() == 3 => {
+                let image = pi_rs_core::ImageContent {
+                    data: block.get("data")?.as_str()?.to_owned(),
+                    mime_type: block.get("mimeType")?.as_str()?.to_owned(),
+                };
+                image.validate().ok()?;
+                images.push(image);
+            }
+            _ => return None,
+        }
+    }
+    let content = text.unwrap_or_default();
+    Some(if images.is_empty() {
+        pi_rs_core::Message::User { content }
+    } else {
+        pi_rs_core::Message::UserWithImages { content, images }
+    })
+}
+
+#[cfg(test)]
+mod yield_input_tests {
+    use super::yield_input;
+    use serde_json::json;
+
+    #[test]
+    fn rejects_unrepresentable_or_invalid_content_without_partial_conversion() {
+        for value in [
+            json!([]),
+            json!([{"type":"text"}]),
+            json!([{"type":"text","text":"a","textSignature":"opaque"}]),
+            json!([{"type":"image","data":"aGk=","mimeType":"image/png","extra":true}]),
+            json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            json!([{"type":"image","data":"aGk=","mimeType":"image/png"},{"type":"text","text":"after"}]),
+            json!([{"type":"image","data":"invalid","mimeType":"image/png"}]),
+        ] {
+            assert!(yield_input(&value).is_none(), "{value}");
+        }
+        assert!(
+            yield_input(&json!([{"type":"image","data":"aGk=","mimeType":"image/png"}])).is_some()
+        );
+    }
+}
+
+/// Host-provided task-scoped memo storage. `get_or_insert` must atomically
+/// persist the first value before returning it, including across process restarts.
+#[async_trait]
+pub trait Memo: Send + Sync {
+    async fn get(&self, key: &str) -> Result<Option<Value>, String>;
+    async fn get_or_insert(&self, key: &str, value: Value) -> Result<Value, String>;
+    /// Read a checkpointable task hook's durable gate signal, including expiry.
+    async fn read_signal(
+        &self,
+        _key: &str,
+    ) -> Result<Option<crate::task_store::SignalState>, String> {
+        Err("hook signal reads are unavailable in this context".into())
+    }
+}
+
+/// Token used with `task_driver::Driver::deliver_signal` for checkpointable hook gates.
+pub fn checkpointable_hook_signal_token() -> crate::task_store::SignalToken {
+    crate::task_store::SignalToken::new("pi-rs.hook-gate", 1).expect("valid built-in token")
+}
+
+/// Durable first-writer-wins values scoped to one stable task identity.
+/// A failed store operation poisons all memo handles sharing the runtime's
+/// failure flag, because a failed commit may nevertheless have committed.
+pub struct DurableMemo {
+    owner: Arc<durable_store::owner::OwnedStore>,
+    task: uuid::Uuid,
+    failed: Arc<AtomicBool>,
+    fence: Option<crate::nested_fence::Binding>,
+    claim: Option<durable_store::Check>,
+}
+
+impl DurableMemo {
+    pub(crate) fn new(
+        owner: Arc<durable_store::owner::OwnedStore>,
+        task: uuid::Uuid,
+        failed: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            owner,
+            task,
+            failed,
+            fence: None,
+            claim: None,
+        }
+    }
+
+    pub(crate) fn with_nested_fence(mut self, fence: Option<crate::nested_fence::Binding>) -> Self {
+        self.fence = fence;
+        self
+    }
+
+    pub(crate) fn with_nested_claim(mut self, claim: Option<durable_store::Check>) -> Self {
+        self.claim = claim;
+        self
+    }
+
+    fn key(&self, key: &str) -> Vec<u8> {
+        let mut result = format!("runtime/extension-memo/{}/", self.task).into_bytes();
+        result.extend_from_slice(key.as_bytes());
+        result
+    }
+
+    fn read(&self, key: &[u8]) -> Result<Option<Value>, String> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err("store failed; reopen before using memo".into());
+        }
+        let entry = self.owner.store().get(key).map_err(|e| {
+            self.failed.store(true, Ordering::Release);
+            e.to_string()
+        })?;
+        entry
+            .map(|e| serde_json::from_slice(&e.value).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    fn check_live(&self) -> Result<(), String> {
+        let checks: Vec<_> = self.claim.iter().cloned().collect();
+        match &self.fence {
+            Some(binding) => binding
+                .commit(self.owner.store(), &checks, &[])
+                .map_err(|e| e.to_string()),
+            None if !checks.is_empty() => self
+                .owner
+                .store()
+                .commit(&checks, &[])
+                .map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[async_trait]
+impl Memo for DurableMemo {
+    async fn get(&self, key: &str) -> Result<Option<Value>, String> {
+        let value = self.read(&self.key(key))?;
+        self.check_live()?;
+        Ok(value)
+    }
+
+    async fn get_or_insert(&self, key: &str, value: Value) -> Result<Value, String> {
+        let key = self.key(key);
+        if let Some(existing) = self.read(&key)? {
+            self.check_live()?;
+            return Ok(existing);
+        }
+        let encoded = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+        let mut checks = vec![durable_store::Check {
+            key: key.clone(),
+            expected: durable_store::Expected::Missing,
+        }];
+        checks.extend(self.claim.iter().cloned());
+        let mutations = [durable_store::Mutation::Put {
+            key: key.clone(),
+            value: encoded,
+        }];
+        let result = match &self.fence {
+            Some(binding) => binding.commit(self.owner.store(), &checks, &mutations),
+            None => self
+                .owner
+                .store()
+                .commit(&checks, &mutations)
+                .map_err(crate::nested_fence::Error::from),
+        };
+        match result {
+            Ok(()) => Ok(value),
+            Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict {
+                key: conflict,
+            })) if conflict == key => {
+                let value = self
+                    .read(&key)?
+                    .ok_or_else(|| "memo disappeared after conflict".to_string())?;
+                self.check_live()?;
+                Ok(value)
+            }
+            Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict { .. })) => {
+                Err("nested memo claim changed".into())
+            }
+            Err(crate::nested_fence::Error::Store(error)) => {
+                self.failed.store(true, Ordering::Release);
+                Err(error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+/// Committed data and durable task-scoped memo access supplied by the host.
+pub struct Context<'a> {
+    pub snapshot: &'a Value,
+    pub memo: &'a dyn Memo,
+}
+impl Context<'_> {
+    /// Read this task's committed hook-gate signal; values remain readable after wake.
+    pub async fn read_signal(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::task_store::SignalState>, String> {
+        self.memo.read_signal(key).await
+    }
+}
+
+#[async_trait]
+pub trait Section: Send + Sync {
+    fn key(&self) -> &str;
+    fn tagged(&self) -> bool {
+        true
+    }
+    async fn render(&self, context: &Context<'_>) -> Result<Option<String>, String>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolCall {
+    pub name: String,
+    pub arguments: Value,
+}
+/// The finalized channels an opt-in after-tool hook may replace.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolResult {
+    pub output: String,
+    pub is_error: bool,
+    pub details: Option<Value>,
+    pub structured_output: Option<Value>,
+    pub attachments: Vec<pi_rs_core::AttachmentRef>,
+    pub diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+}
+/// Describes whether a hook deliberately replaced the output channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputProvenance {
+    /// Preserve the incoming output; changed values are still treated as replacements.
+    Retained,
+    /// A new output, including when it compares equal to the incoming output.
+    Replaced,
+    /// Infer replacement by comparing output values (the legacy default).
+    Infer,
+}
+
+fn output_replaced<T: PartialEq>(before: &T, after: &T, provenance: OutputProvenance) -> bool {
+    before != after || provenance == OutputProvenance::Replaced
+}
+
+fn remove_cloned_derived_diagnostics(
+    before: &[crate::runtime::ToolDiagnostic],
+    after: &mut Vec<crate::runtime::ToolDiagnostic>,
+    derived: &[crate::runtime::ToolDiagnostic],
+) {
+    let mut handled = Vec::new();
+    for item in derived {
+        if handled.contains(item) {
+            continue;
+        }
+        handled.push(item.clone());
+        let before_count = before.iter().filter(|d| *d == item).count();
+        let after_count = after.iter().filter(|d| *d == item).count();
+        let derived_count = derived.iter().filter(|d| *d == item).count();
+        if after_count < before_count {
+            // Equal occurrences lost identity when the hook removed one.
+            after.retain(|d| d != item);
+        } else {
+            for _ in 0..derived_count {
+                if let Some(index) = after.iter().rposition(|d| d == item) {
+                    after.remove(index);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn remaining_derived_diagnostics(
+    before: &[crate::runtime::ToolDiagnostic],
+    after: &[crate::runtime::ToolDiagnostic],
+    derived: &[crate::runtime::ToolDiagnostic],
+) -> Vec<crate::runtime::ToolDiagnostic> {
+    let mut remaining = Vec::new();
+    for item in derived {
+        let before_count = before.iter().filter(|d| *d == item).count();
+        let after_count = after.iter().filter(|d| *d == item).count();
+        let derived_count = derived.iter().filter(|d| *d == item).count();
+        let ambiguous = after_count < before_count;
+        let available = if ambiguous {
+            after_count
+        } else {
+            derived_count.min(after_count)
+        };
+        while remaining.iter().filter(|d| *d == item).count() < available {
+            remaining.push(item.clone());
+        }
+    }
+    remaining
+}
+
+/// A block-aware tool result for hosts that can persist and deliver ordered output.
+/// Unknown result fields are retained when a hook rewrites the output.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ToolBlockResult {
+    pub output: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
+}
+
+impl ToolBlockResult {
+    fn valid(&self) -> bool {
+        !self.extra.contains_key("output")
+            && !self.extra.contains_key("diagnostics")
+            && crate::content::UserContent::from_yield(Value::Array(self.output.clone()), false)
+                .is_some()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sleep {
+    pub signals: Vec<String>,
+    pub until_millis: Option<i64>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum BeforeTool {
+    Pass,
+    Rewrite(Value),
+    Block(String),
+    Sleep(Sleep),
+}
+
+/// Generation events have separate chains. Values are host-defined JSON; the
+/// host validates their shape before using them or scheduling requested tasks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationEvent {
+    BeforeRequest,
+    BeforeProviderRequest,
+    AfterResponse,
+    OnYield,
+    AfterTools,
+    AfterRun,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum GenerationDecision {
+    Pass,
+    Replace(Value),
+    Continue(Value),
+    Tasks(Vec<HookTask>),
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct HookTask {
+    pub name: String,
+    pub input: Value,
+}
+
+/// The selected message range; entry identifiers are not available in this host.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactionInput {
+    pub reason: CompactionReason,
+    pub messages: Vec<pi_rs_core::Message>,
+    /// Ordered user and tool blocks indexed into `messages`, preserving occurrence IDs.
+    /// A bound message is an empty placeholder; its blocks are the content.
+    pub content_blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+    pub first_kept: usize,
+    pub instructions: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CompactionReason {
+    Manual,
+    Threshold,
+    Overflow,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum BeforeCompact {
+    Pass,
+    Decline,
+    Summary(String),
+}
+
+#[async_trait]
+pub trait Hook: Send + Sync {
+    /// Opt in only when `before_compact` handles ordered block bindings and
+    /// never treats the associated empty message placeholder as its content.
+    fn supports_compaction_blocks(&self) -> bool {
+        false
+    }
+    /// Also opt in when `before_compact` understands tool-result block placeholders.
+    fn supports_compaction_tool_blocks(&self) -> bool {
+        false
+    }
+    async fn before_compact(
+        &self,
+        _input: &CompactionInput,
+        _ctx: &Context<'_>,
+    ) -> Result<BeforeCompact, String> {
+        Ok(BeforeCompact::Pass)
+    }
+    async fn before_tool(
+        &self,
+        _call: &ToolCall,
+        _ctx: &Context<'_>,
+    ) -> Result<BeforeTool, String> {
+        Ok(BeforeTool::Pass)
+    }
+    async fn after_tool(
+        &self,
+        _call: &ToolCall,
+        _result: &Value,
+        _ctx: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+    /// Replace all result channels explicitly. Runs after the legacy text hooks.
+    async fn after_tool_result(
+        &self,
+        _call: &ToolCall,
+        _result: &ToolResult,
+        _ctx: &Context<'_>,
+    ) -> Result<Option<ToolResult>, String> {
+        Ok(None)
+    }
+    /// Override to declare output provenance, including an equal-valued replacement.
+    async fn after_tool_result_with_provenance(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+        ctx: &Context<'_>,
+    ) -> Result<Option<(ToolResult, OutputProvenance)>, String> {
+        Ok(self
+            .after_tool_result(call, result, ctx)
+            .await?
+            .map(|value| (value, OutputProvenance::Infer)))
+    }
+    /// Declare provenance for block hooks; the default compares output values.
+    async fn after_tool_blocks_with_provenance(
+        &self,
+        call: &ToolCall,
+        result: &ToolBlockResult,
+        nested: bool,
+        ctx: &Context<'_>,
+    ) -> Result<Option<(ToolBlockResult, OutputProvenance)>, String> {
+        Ok(self
+            .after_tool_blocks(call, result, nested, ctx)
+            .await?
+            .map(|value| (value, OutputProvenance::Infer)))
+    }
+    /// Opt in to the runtime block hook after legacy and structured hooks have run.
+    fn supports_runtime_tool_blocks(&self) -> bool {
+        false
+    }
+    /// Block-aware result hook for hosts that can persist and deliver blocks.
+    /// Legacy string hooks are bridged only for one plain text block.
+    async fn after_tool_blocks(
+        &self,
+        call: &ToolCall,
+        result: &ToolBlockResult,
+        _nested: bool,
+        ctx: &Context<'_>,
+    ) -> Result<Option<ToolBlockResult>, String> {
+        if result.output.len() != 1 {
+            return Ok(None);
+        }
+        let block = &result.output[0];
+        let Some(object) = block.as_object() else {
+            return Ok(None);
+        };
+        if object.len() != 2 || block.get("type").and_then(Value::as_str) != Some("text") {
+            return Ok(None);
+        }
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        match self
+            .after_tool(call, &Value::String(text.to_owned()), ctx)
+            .await?
+        {
+            None => Ok(None),
+            Some(Value::String(text)) => {
+                let mut rewritten = result.clone();
+                rewritten.output = vec![serde_json::json!({"type":"text", "text":text})];
+                Ok(Some(rewritten))
+            }
+            Some(_) => Err("legacy after-tool hook returned non-text output".into()),
+        }
+    }
+    async fn generation(
+        &self,
+        _event: GenerationEvent,
+        _value: &Value,
+        _ctx: &Context<'_>,
+    ) -> Result<GenerationDecision, String> {
+        Ok(GenerationDecision::Pass)
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct Extension {
+    pub name: String,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub sections: Vec<Arc<dyn Section>>,
+    pub hooks: Vec<Arc<dyn Hook>>,
+    /// Real scheduler handlers, keyed by their registered task kind.
+    pub tasks: Vec<(String, Arc<dyn crate::task_scheduler::Handler>)>,
+}
+
+/// Host assertion for one extension implementation and its configuration.
+/// The fingerprint and hook identifiers must not contain secrets. The host
+/// must change them whenever behavior, configuration, or hook order changes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionIdentity {
+    version: u32,
+    fingerprint: String,
+    hooks: Vec<String>,
+}
+impl ExtensionIdentity {
+    pub fn new(version: u32, fingerprint: String, hooks: Vec<String>) -> Result<Self, String> {
+        let identity = Self {
+            version,
+            fingerprint,
+            hooks,
+        };
+        if !identity.valid() {
+            return Err("invalid extension or hook identity".into());
+        }
+        Ok(identity)
+    }
+    fn valid(&self) -> bool {
+        let valid = |s: &str| !s.trim().is_empty() && s.len() <= 4096;
+        self.version != 0
+            && valid(&self.fingerprint)
+            && self.hooks.len() <= 256
+            && self.hooks.iter().all(|s| valid(s))
+            && self.hooks.iter().collect::<HashSet<_>>().len() == self.hooks.len()
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RegistryError {
+    #[error("extension name must not be empty")]
+    EmptyName,
+    #[error("duplicate {kind} name {name} in extension {extension}")]
+    Duplicate {
+        kind: &'static str,
+        name: String,
+        extension: String,
+    },
+    #[error("invalid or reserved section key {0}")]
+    InvalidSection(String),
+    #[error("task name {0} is already installed or reserved")]
+    TaskConflict(String),
+}
+
+#[derive(Clone, Default)]
+pub struct Registry {
+    current: Snapshot,
+}
+#[derive(Clone)]
+pub struct Snapshot {
+    extensions: Vec<Arc<Extension>>,
+    epoch: uuid::Uuid,
+    registration_ids: Vec<uuid::Uuid>,
+    stable_ids: Vec<Option<ExtensionIdentity>>,
+}
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            extensions: Vec::new(),
+            epoch: uuid::Uuid::new_v4(),
+            registration_ids: Vec::new(),
+            stable_ids: Vec::new(),
+        }
+    }
+}
+impl Registry {
+    pub fn snapshot(&self) -> Snapshot {
+        self.current.clone()
+    }
+    /// Validate the entire candidate before publishing; replacement keeps position.
+    pub fn install(&mut self, extension: Extension) -> Result<(), RegistryError> {
+        self.install_inner(extension, None)
+    }
+    /// Opt in to host-declared recovery identity for this exact registration.
+    pub fn install_identified(
+        &mut self,
+        extension: Extension,
+        identity: ExtensionIdentity,
+    ) -> Result<(), String> {
+        if !identity.valid() || identity.hooks.len() != extension.hooks.len() {
+            return Err("invalid extension or hook identity".into());
+        }
+        self.install_inner(extension, Some(identity))
+            .map_err(|error| error.to_string())
+    }
+    fn install_inner(
+        &mut self,
+        extension: Extension,
+        identity: Option<ExtensionIdentity>,
+    ) -> Result<(), RegistryError> {
+        validate(&extension)?;
+        let mut next = self.current.extensions.clone();
+        let mut ids = self.current.registration_ids.clone();
+        let mut stable = self.current.stable_ids.clone();
+        if let Some(i) = next.iter().position(|x| x.name == extension.name) {
+            next[i] = Arc::new(extension);
+            ids[i] = uuid::Uuid::new_v4();
+            stable[i] = identity;
+        } else {
+            next.push(Arc::new(extension));
+            ids.push(uuid::Uuid::new_v4());
+            stable.push(identity);
+        }
+        let mut tasks = HashSet::new();
+        for ext in &next {
+            for (name, _) in &ext.tasks {
+                if name.is_empty()
+                    || matches!(name.as_str(), "pi.generation" | "pi.tool" | "pi.compaction")
+                    || !tasks.insert(name.clone())
+                {
+                    return Err(RegistryError::TaskConflict(name.clone()));
+                }
+            }
+        }
+        self.current = Snapshot {
+            extensions: next,
+            epoch: self.current.epoch,
+            registration_ids: ids,
+            stable_ids: stable,
+        };
+        Ok(())
+    }
+    pub fn uninstall(&mut self, name: &str) {
+        if let Some(i) = self.current.extensions.iter().position(|x| x.name == name) {
+            self.current.extensions.remove(i);
+            self.current.registration_ids.remove(i);
+            self.current.stable_ids.remove(i);
+        }
+    }
+}
+fn validate(ext: &Extension) -> Result<(), RegistryError> {
+    if ext.name.trim().is_empty() {
+        return Err(RegistryError::EmptyName);
+    }
+    let mut tools = HashSet::new();
+    for t in &ext.tools {
+        let name = t.spec().name;
+        if name.is_empty() || !tools.insert(name.clone()) {
+            return Err(RegistryError::Duplicate {
+                kind: "tool",
+                name,
+                extension: ext.name.clone(),
+            });
+        }
+    }
+    let mut sections = HashSet::new();
+    for s in &ext.sections {
+        let key = s.key();
+        let mut chars = key.chars();
+        if !matches!(chars.next(), Some('a'..='z'))
+            || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            || key == "instructions"
+        {
+            return Err(RegistryError::InvalidSection(key.into()));
+        }
+        if !sections.insert(key.to_string()) {
+            return Err(RegistryError::Duplicate {
+                kind: "section",
+                name: key.into(),
+                extension: ext.name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Report {
+    pub extension: String,
+    pub operation: String,
+    pub error: String,
+}
+fn failure(extension: &str, operation: &'static str, error: String) -> Report {
+    Report {
+        extension: extension.into(),
+        operation: operation.into(),
+        error,
+    }
+}
+// Callbacks must be invoked inside the future passed here: a hand-written
+// async-trait implementation can panic before it returns its future.
+async fn protect<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    match AssertUnwindSafe(f).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => {
+            discard_panic_payload(payload);
+            Err("extension panicked".into())
+        }
+    }
+}
+
+pub(crate) fn discard_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    // A user-defined payload may panic when dropped. Its new panic payload may
+    // have the same property, so it cannot safely be dropped here.
+    if let Err(secondary) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        std::mem::forget(secondary);
+    }
+}
+
+#[cfg(test)]
+mod panic_boundary_tests {
+    use super::protect;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn cancelling_pending_callback_drops_it_without_completing() {
+        struct OnDrop(Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = OnDrop(dropped.clone());
+        let future = protect(async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), String>>().await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), future)
+                .await
+                .is_err()
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod task_hook_registration_tests {
+    use super::{BeforeTool, Context, Extension, Hook, Memo, Registry, ToolCall};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+
+    struct Memory;
+    #[async_trait::async_trait]
+    impl Memo for Memory {
+        async fn get(&self, _: &str) -> Result<Option<Value>, String> {
+            Ok(None)
+        }
+        async fn get_or_insert(&self, _: &str, value: Value) -> Result<Value, String> {
+            Ok(value)
+        }
+    }
+    struct Change {
+        block: bool,
+        invalid: bool,
+    }
+
+    #[tokio::test]
+    async fn stable_selection_reopens_only_with_matching_host_identity() {
+        use super::{ExtensionIdentity, StableExtensionSelection};
+        use durable_store::{Check, Expected, Mutation, Store};
+        fn install(registry: &mut Registry, fingerprint: &str, hook_id: &str) {
+            registry
+                .install_identified(
+                    Extension {
+                        name: "hook".into(),
+                        hooks: vec![Arc::new(Change {
+                            block: false,
+                            invalid: false,
+                        })],
+                        ..Default::default()
+                    },
+                    ExtensionIdentity::new(1, fingerprint.into(), vec![hook_id.into()]).unwrap(),
+                )
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let names = vec!["hook".to_string()];
+        let mut original = Registry::default();
+        install(&mut original, "implementation-config-v1", "before-after-v1");
+        let evidence = original.snapshot().stable_selection(&names).unwrap();
+        let store = Store::open(&path).unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: b"selection".to_vec(),
+                    expected: Expected::Missing,
+                }],
+                &[Mutation::Put {
+                    key: b"selection".to_vec(),
+                    value: serde_json::to_vec(&evidence).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let saved: StableExtensionSelection =
+            serde_json::from_slice(&store.get(b"selection").unwrap().unwrap().value).unwrap();
+        let mut reopened = Registry::default();
+        install(&mut reopened, "implementation-config-v1", "before-after-v1");
+        let snapshot = reopened.snapshot();
+        let selected = snapshot.resolve_stable(&names, &saved).unwrap();
+        let state = json!({});
+        let memo = Memory;
+        let context = Context {
+            snapshot: &state,
+            memo: &memo,
+        };
+        let (call, decision, _) = selected
+            .before_tool_checked(
+                ToolCall {
+                    name: "tool".into(),
+                    arguments: json!({"n":1}),
+                },
+                &context,
+                &json!({"type":"object"}),
+            )
+            .await;
+        assert_eq!(decision, BeforeTool::Pass);
+        assert_eq!(call.arguments, json!({"n":2}));
+        assert_eq!(
+            selected
+                .after_tool(&call, json!("original"), &context)
+                .await
+                .0,
+            json!("changed")
+        );
+        install(&mut reopened, "changed-config", "before-after-v1");
+        assert!(reopened.snapshot().resolve_stable(&names, &saved).is_none());
+        install(&mut reopened, "implementation-config-v1", "different-hook");
+        assert!(reopened.snapshot().resolve_stable(&names, &saved).is_none());
+        reopened
+            .install(Extension {
+                name: "hook".into(),
+                hooks: vec![Arc::new(Change {
+                    block: false,
+                    invalid: false,
+                })],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(reopened.snapshot().resolve_stable(&names, &saved).is_none());
+        assert!(snapshot.resolve_stable(&[], &saved).is_none());
+        let forged: StableExtensionSelection =
+            serde_json::from_value(json!({"selected":[]})).unwrap();
+        assert!(snapshot.resolve_stable(&names, &forged).is_none());
+        assert!(
+            serde_json::from_value::<StableExtensionSelection>(
+                json!({"selected":[],"unexpected":true})
+            )
+            .is_err()
+        );
+        assert!(ExtensionIdentity::new(0, "id".into(), vec![]).is_err());
+        assert!(ExtensionIdentity::new(1, "".into(), vec![]).is_err());
+        assert!(ExtensionIdentity::new(1, "id".into(), vec!["dup".into(), "dup".into()]).is_err());
+        reopened
+            .install_identified(
+                Extension {
+                    name: "second".into(),
+                    ..Default::default()
+                },
+                ExtensionIdentity::new(1, "second-v1".into(), vec![]).unwrap(),
+            )
+            .unwrap();
+        install(&mut reopened, "implementation-config-v1", "before-after-v1");
+        let ordered = vec!["hook".to_string(), "second".to_string()];
+        let reverse = vec!["second".to_string(), "hook".to_string()];
+        let ordered_evidence = reopened.snapshot().stable_selection(&ordered).unwrap();
+        assert!(
+            reopened
+                .snapshot()
+                .resolve_stable(&reverse, &ordered_evidence)
+                .is_none()
+        );
+    }
+    #[async_trait::async_trait]
+    impl Hook for Change {
+        async fn before_tool(&self, _: &ToolCall, _: &Context<'_>) -> Result<BeforeTool, String> {
+            Ok(if self.block {
+                BeforeTool::Block("denied".into())
+            } else if self.invalid {
+                BeforeTool::Rewrite(json!({"n":"bad"}))
+            } else {
+                BeforeTool::Rewrite(json!({"n":2}))
+            })
+        }
+        async fn after_tool(
+            &self,
+            _: &ToolCall,
+            _: &Value,
+            _: &Context<'_>,
+        ) -> Result<Option<Value>, String> {
+            Ok(Some(json!("changed")))
+        }
+    }
+
+    #[tokio::test]
+    async fn real_hook_blocks_rewrites_revalidates_and_changes_result() {
+        let schema =
+            json!({"type":"object", "required":["n"], "properties":{"n":{"type":"integer"}}});
+        let snapshot = json!({});
+        let memo = Memory;
+        let ctx = Context {
+            snapshot: &snapshot,
+            memo: &memo,
+        };
+        for (block, invalid) in [(true, false), (false, false), (false, true)] {
+            let mut registry = Registry::default();
+            registry
+                .install(Extension {
+                    name: "hook".into(),
+                    hooks: vec![Arc::new(Change { block, invalid })],
+                    ..Default::default()
+                })
+                .unwrap();
+            let selected = registry.snapshot().resolve_exact(&["hook".into()]).unwrap();
+            let (call, decision, reports) = selected
+                .before_tool_checked(
+                    ToolCall {
+                        name: "tool".into(),
+                        arguments: json!({"n":1}),
+                    },
+                    &ctx,
+                    &schema,
+                )
+                .await;
+            assert!(reports.is_empty());
+            if block || invalid {
+                assert!(matches!(decision, BeforeTool::Block(_)));
+            } else {
+                assert_eq!(decision, BeforeTool::Pass);
+                assert_eq!(call.arguments, json!({"n":2}));
+                let (result, reports) = selected.after_tool(&call, json!("original"), &ctx).await;
+                assert_eq!(result, json!("changed"));
+                assert!(reports.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn exact_selection_detects_missing_replacement_and_order() {
+        let mut registry = Registry::default();
+        for name in ["first", "second"] {
+            registry
+                .install(Extension {
+                    name: name.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let names = vec!["first".to_string(), "second".to_string()];
+        let old = registry.snapshot().resolve_exact(&names).unwrap();
+        let evidence = old.registration_evidence().unwrap();
+        let encoded = serde_json::to_vec(&evidence).unwrap();
+        let restored: super::RegistrationEvidence = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored, evidence);
+        assert!(old.same_registrations(&registry.snapshot().resolve_exact(&names).unwrap()));
+        assert_eq!(
+            Some(evidence.clone()),
+            registry
+                .snapshot()
+                .resolve_exact(&names)
+                .unwrap()
+                .registration_evidence()
+        );
+        let reversed = vec!["second".to_string(), "first".to_string()];
+        assert!(!old.same_registrations(&registry.snapshot().resolve_exact(&reversed).unwrap()));
+        registry
+            .install(Extension {
+                name: "first".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!old.same_registrations(&registry.snapshot().resolve_exact(&names).unwrap()));
+        assert_ne!(
+            Some(evidence.clone()),
+            registry
+                .snapshot()
+                .resolve_exact(&names)
+                .unwrap()
+                .registration_evidence()
+        );
+        let mut reopened = Registry::default();
+        assert_ne!(
+            registry
+                .snapshot()
+                .resolve_exact(&[])
+                .unwrap()
+                .registration_evidence(),
+            reopened
+                .snapshot()
+                .resolve_exact(&[])
+                .unwrap()
+                .registration_evidence()
+        );
+        for name in ["first", "second"] {
+            reopened
+                .install(Extension {
+                    name: name.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert_ne!(
+            Some(evidence),
+            reopened
+                .snapshot()
+                .resolve_exact(&names)
+                .unwrap()
+                .registration_evidence()
+        );
+        registry.uninstall("second");
+        assert!(registry.snapshot().resolve_exact(&names).is_none());
+    }
+}
+
+/// An immutable phase-local selection, in the requested order. Missing names are
+/// ignored and duplicate selections use their first occurrence.
+#[derive(Clone, Default)]
+pub struct Resolved {
+    extensions: Vec<Arc<Extension>>,
+    epoch: uuid::Uuid,
+    registration_ids: Vec<uuid::Uuid>,
+}
+
+/// Process-local registration evidence suitable for persistence. A fresh
+/// registry has a new epoch, so recovery must reject rather than infer that
+/// new registrations implement the same hooks.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RegistrationEvidence {
+    epoch: uuid::Uuid,
+    selected: Vec<(String, uuid::Uuid)>,
+}
+
+/// Persistable host-declared ordered selection. This is evidence, not an
+/// authorization token; durable writers and the host identity declarations
+/// must be trusted, and dispatch still requires attempt and abort fencing.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableExtensionSelection {
+    selected: Vec<(String, ExtensionIdentity)>,
+}
+impl StableExtensionSelection {
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.selected.iter().map(|(name, _)| name.as_str())
+    }
+    pub(crate) fn hook_count(&self) -> usize {
+        self.selected
+            .iter()
+            .map(|(_, identity)| identity.hooks.len())
+            .sum()
+    }
+}
+
+/// Per-name gates are weakly retained so unsuccessful or removed registrations
+/// do not leave an unbounded registry. A lease retains the outer Arc as well
+/// as the gate's own internal state until the operation ends.
+#[derive(Default)]
+pub(crate) struct SelectionStartGates {
+    gates: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            std::sync::Weak<durable_store::controls::CallbackStartGate>,
+        >,
+    >,
+}
+
+pub(crate) struct SelectionMutationLease {
+    _lease: durable_store::controls::MutationLease,
+    _gate: std::sync::Arc<durable_store::controls::CallbackStartGate>,
+}
+
+pub(crate) struct SelectionStartLease {
+    leases: Vec<durable_store::controls::CallbackStartLease>,
+    _gates: Vec<std::sync::Arc<durable_store::controls::CallbackStartGate>>,
+}
+
+impl SelectionStartGates {
+    fn gate(
+        &self,
+        name: &str,
+    ) -> Result<std::sync::Arc<durable_store::controls::CallbackStartGate>, ()> {
+        let mut gates = self.gates.lock().map_err(|_| ())?;
+        if let Some(gate) = gates.get(name).and_then(std::sync::Weak::upgrade) {
+            return Ok(gate);
+        }
+        gates.retain(|_, gate| gate.strong_count() != 0);
+        let gate = std::sync::Arc::new(durable_store::controls::CallbackStartGate::default());
+        gates.insert(name.to_owned(), std::sync::Arc::downgrade(&gate));
+        Ok(gate)
+    }
+
+    pub(crate) fn try_mutation(&self, name: &str) -> Result<SelectionMutationLease, ()> {
+        let gate = self.gate(name)?;
+        let lease = gate.try_enter().ok_or(())?;
+        Ok(SelectionMutationLease {
+            _gate: gate,
+            _lease: lease,
+        })
+    }
+
+    pub(crate) fn try_start(
+        &self,
+        selection: &StableExtensionSelection,
+    ) -> Result<SelectionStartLease, ()> {
+        self.try_start_many(std::iter::once(selection))
+    }
+
+    /// Hold the union once: two nested conversations may select the same
+    /// extension and its start gate is deliberately non-reentrant.
+    pub(crate) fn try_start_many<'a>(
+        &self,
+        selections: impl IntoIterator<Item = &'a StableExtensionSelection>,
+    ) -> Result<SelectionStartLease, ()> {
+        let mut names: Vec<_> = selections
+            .into_iter()
+            .flat_map(|selection| selection.names())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        let mut gates = Vec::with_capacity(names.len());
+        let mut leases = Vec::with_capacity(names.len());
+        for name in names {
+            let gate = self.gate(name)?;
+            leases.push(gate.try_start().ok_or(())?);
+            gates.push(gate);
+        }
+        Ok(SelectionStartLease {
+            _gates: gates,
+            leases,
+        })
+    }
+}
+
+impl SelectionStartLease {
+    pub(crate) fn poll_first<F: std::future::Future + ?Sized>(
+        self,
+        conversation: durable_store::controls::CallbackStartLease,
+        future: std::pin::Pin<&mut F>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        self.poll_first_many(vec![conversation], future, context)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn poll_first_many<F: std::future::Future + ?Sized>(
+        mut self,
+        conversations: Vec<durable_store::controls::CallbackStartLease>,
+        future: std::pin::Pin<&mut F>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        self.leases.extend(conversations);
+        durable_store::controls::CallbackStartLease::poll_first_many(
+            std::mem::take(&mut self.leases),
+            future,
+            context,
+        )
+    }
+}
+
+#[cfg(test)]
+mod selection_start_gate_tests {
+    use super::*;
+
+    fn selection() -> StableExtensionSelection {
+        StableExtensionSelection {
+            selected: vec![(
+                "policy".into(),
+                ExtensionIdentity::new(1, "identity".into(), vec!["hook".into()]).unwrap(),
+            )],
+        }
+    }
+
+    #[test]
+    fn overlapping_selections_share_one_start_lease() {
+        let gates = SelectionStartGates::default();
+        let first = selection();
+        let second = selection();
+        let lease = gates.try_start_many([&first, &second]).unwrap();
+        assert!(gates.try_mutation("policy").is_err());
+        drop(lease);
+        assert!(gates.try_mutation("policy").is_ok());
+    }
+
+    #[test]
+    fn start_excludes_only_selected_mutations_until_first_poll_returns() {
+        let gates = SelectionStartGates::default();
+        let mutation = gates.try_mutation("policy").unwrap();
+        assert!(gates.try_start(&selection()).is_err());
+        drop(mutation);
+        let selection = gates.try_start(&selection()).unwrap();
+        assert!(gates.try_mutation("policy").is_err());
+        let conversation = durable_store::controls::CallbackStartGate::default()
+            .try_start()
+            .unwrap();
+        let mut future = std::pin::pin!(std::future::poll_fn(|_| {
+            assert!(gates.try_mutation("policy").is_err());
+            assert!(gates.try_mutation("other").is_ok());
+            std::task::Poll::<()>::Pending
+        }));
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(
+            selection
+                .poll_first(conversation, future.as_mut(), &mut context)
+                .is_pending()
+        );
+        assert!(gates.try_mutation("policy").is_ok());
+    }
+
+    #[test]
+    fn panic_releases_all_start_leases() {
+        let gates = SelectionStartGates::default();
+        let selection = gates.try_start(&selection()).unwrap();
+        let conversation_gate = durable_store::controls::CallbackStartGate::default();
+        let conversation = conversation_gate.try_start().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut future = std::pin::pin!(std::future::poll_fn(|_| -> std::task::Poll<()> {
+                panic!("test")
+            }));
+            let waker = futures_util::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            selection.poll_first(conversation, future.as_mut(), &mut context)
+        }));
+        assert!(result.is_err());
+        assert!(gates.try_mutation("policy").is_ok());
+        assert!(conversation_gate.try_enter().is_some());
+    }
+}
+impl Snapshot {
+    pub fn names(&self) -> Vec<&str> {
+        self.extensions.iter().map(|x| x.name.as_str()).collect()
+    }
+    /// Capture exactly the requested ordered selection, rejecting missing or
+    /// unidentified registrations and duplicate names.
+    pub fn stable_selection(&self, names: &[String]) -> Option<StableExtensionSelection> {
+        let mut seen = HashSet::new();
+        let mut selected = Vec::with_capacity(names.len());
+        for name in names {
+            if !seen.insert(name) {
+                return None;
+            }
+            let i = self.extensions.iter().position(|e| e.name == *name)?;
+            let identity = self.stable_ids.get(i)?.as_ref()?;
+            if !identity.valid() || identity.hooks.len() != self.extensions[i].hooks.len() {
+                return None;
+            }
+            selected.push((name.clone(), identity.clone()));
+        }
+        Some(StableExtensionSelection { selected })
+    }
+    /// Resolve only when the durable selection matches current registrations
+    /// and the caller's independently obtained conversation selection.
+    pub fn resolve_stable(
+        &self,
+        names: &[String],
+        saved: &StableExtensionSelection,
+    ) -> Option<Resolved> {
+        if self.stable_selection(names).as_ref() != Some(saved) {
+            return None;
+        }
+        self.resolve_exact(names)
+    }
+    /// Resolve every requested name, failing closed when any is unavailable.
+    pub(crate) fn resolve_exact(&self, names: &[String]) -> Option<Resolved> {
+        let mut seen = HashSet::new();
+        let mut extensions = Vec::new();
+        let mut registration_ids = Vec::new();
+        for name in names {
+            if seen.insert(name) {
+                let i = self.extensions.iter().position(|e| e.name == *name)?;
+                extensions.push(self.extensions[i].clone());
+                registration_ids.push(self.registration_ids[i]);
+            }
+        }
+        Some(Resolved {
+            extensions,
+            epoch: self.epoch,
+            registration_ids,
+        })
+    }
+    pub fn resolve(&self, names: Option<&[String]>) -> Resolved {
+        let extensions = match names {
+            None => self.extensions.clone(),
+            Some(names) => {
+                let mut seen = HashSet::new();
+                names
+                    .iter()
+                    .filter(|n| seen.insert((*n).clone()))
+                    .filter_map(|n| self.extensions.iter().find(|x| x.name == *n).cloned())
+                    .collect()
+            }
+        };
+        let registration_ids = extensions
+            .iter()
+            .map(|extension| {
+                let i = self
+                    .extensions
+                    .iter()
+                    .position(|candidate| Arc::ptr_eq(candidate, extension))
+                    .expect("snapshot member");
+                self.registration_ids[i]
+            })
+            .collect();
+        Resolved {
+            extensions,
+            epoch: self.epoch,
+            registration_ids,
+        }
+    }
+}
+impl Resolved {
+    #[allow(dead_code)] // Not yet connected to task admission or dispatch.
+    pub(crate) fn registration_evidence(&self) -> Option<RegistrationEvidence> {
+        if self.epoch.is_nil() || self.extensions.len() != self.registration_ids.len() {
+            return None;
+        }
+        Some(RegistrationEvidence {
+            epoch: self.epoch,
+            selected: self
+                .extensions
+                .iter()
+                .zip(&self.registration_ids)
+                .map(|(extension, id)| (extension.name.clone(), *id))
+                .collect(),
+        })
+    }
+    /// Run the before chain and reject a rewritten value that no longer
+    /// matches the tool schema. The caller must validate the original input
+    /// before invoking this chain and use `tool::restore` after it to enforce
+    /// size and schema limits. This alone is not dispatch authority: callers
+    /// must bind the selection, attempt, cancellation, and durable result.
+    #[allow(dead_code)]
+    pub(crate) async fn before_tool_checked(
+        &self,
+        call: ToolCall,
+        ctx: &Context<'_>,
+        schema: &Value,
+    ) -> (ToolCall, BeforeTool, Vec<Report>) {
+        let (call, decision, reports) = self.before_tool(call, ctx).await;
+        if matches!(decision, BeforeTool::Pass)
+            && (!call.arguments.is_object()
+                || !jsonschema::validator_for(schema).is_ok_and(|v| v.is_valid(&call.arguments)))
+        {
+            return (
+                call,
+                BeforeTool::Block("hook arguments do not match tool schema".into()),
+                reports,
+            );
+        }
+        (call, decision, reports)
+    }
+    /// Compare the actual ordered registrations, not only their names.
+    /// This is a snapshot comparison and does not grant dispatch authority.
+    #[allow(dead_code)]
+    pub(crate) fn same_registrations(&self, other: &Self) -> bool {
+        self.extensions.len() == other.extensions.len()
+            && self
+                .extensions
+                .iter()
+                .zip(&other.extensions)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+    }
+    pub fn tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.extensions
+            .iter()
+            .rev()
+            .flat_map(|e| e.tools.iter().rev())
+            .find(|t| t.spec().name == name)
+            .cloned()
+    }
+    /// Effective tools, with later selected extensions replacing earlier ones.
+    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        let mut tools = std::collections::BTreeMap::new();
+        for extension in &self.extensions {
+            for tool in &extension.tools {
+                tools.insert(tool.spec().name, tool.clone());
+            }
+        }
+        tools.into_values().collect()
+    }
+    pub fn task(&self, name: &str) -> Option<Arc<dyn crate::task_scheduler::Handler>> {
+        self.extensions
+            .iter()
+            .flat_map(|e| e.tasks.iter())
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| h.clone())
+    }
+    pub(crate) fn task_owner(&self, name: &str) -> Option<&str> {
+        self.extensions
+            .iter()
+            .find(|e| e.tasks.iter().any(|(kind, _)| kind == name))
+            .map(|e| e.name.as_str())
+    }
+    /// Later sections replace by key without moving the key's original position.
+    pub async fn prompt(
+        &self,
+        ctx: &Context<'_>,
+        instructions: Option<&str>,
+    ) -> (String, Vec<Report>) {
+        let mut sections: Vec<(&str, &Arc<dyn Section>)> = Vec::new();
+        for e in &self.extensions {
+            for s in &e.sections {
+                if let Some(i) = sections.iter().position(|(_, old)| old.key() == s.key()) {
+                    sections[i] = (&e.name, s);
+                } else {
+                    sections.push((&e.name, s));
+                }
+            }
+        }
+        let mut parts = Vec::new();
+        let mut reports = Vec::new();
+        for (owner, s) in sections {
+            match protect(async { s.render(ctx).await }).await {
+                Ok(Some(text)) => parts.push(if s.tagged() {
+                    format!("<{}>\n{}\n</{}>", s.key(), text, s.key())
+                } else {
+                    text
+                }),
+                Ok(None) => (),
+                Err(e) => reports.push(failure(owner, "section", e)),
+            }
+        }
+        if let Some(text) = instructions {
+            parts.push(format!("<instructions>\n{text}\n</instructions>"));
+        }
+        (parts.join("\n\n"), reports)
+    }
+    pub(crate) fn supports_compaction_tool_blocks(&self) -> bool {
+        self.extensions
+            .iter()
+            .flat_map(|extension| &extension.hooks)
+            .all(|hook| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hook.supports_compaction_tool_blocks()
+                }))
+                .unwrap_or(false)
+            })
+    }
+    pub(crate) fn supports_compaction_blocks(&self) -> bool {
+        self.extensions
+            .iter()
+            .flat_map(|extension| &extension.hooks)
+            .all(|hook| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hook.supports_compaction_blocks()
+                }))
+                .unwrap_or(false)
+            })
+    }
+    /// First decision wins; ordinary hook errors are collected and skipped.
+    pub async fn before_compact(
+        &self,
+        input: &CompactionInput,
+        ctx: &Context<'_>,
+    ) -> (BeforeCompact, Vec<Report>) {
+        let mut reports = vec![];
+        for e in &self.extensions {
+            for h in &e.hooks {
+                match protect(async { h.before_compact(input, ctx).await }).await {
+                    Ok(BeforeCompact::Pass) => (),
+                    Ok(decision) => return (decision, reports),
+                    Err(err) => reports.push(failure(&e.name, "before_compact", err)),
+                }
+            }
+        }
+        (BeforeCompact::Pass, reports)
+    }
+    /// Any hook failure stops dispatch; a host must also validate a sleep and
+    /// re-run the complete chain on wake before dispatching.
+    pub async fn before_tool(
+        &self,
+        mut call: ToolCall,
+        ctx: &Context<'_>,
+    ) -> (ToolCall, BeforeTool, Vec<Report>) {
+        for e in &self.extensions {
+            for h in &e.hooks {
+                match protect(async { h.before_tool(&call, ctx).await }).await {
+                    Ok(BeforeTool::Pass) => (),
+                    Ok(BeforeTool::Rewrite(args)) => call.arguments = args,
+                    Ok(stop @ (BeforeTool::Block(_) | BeforeTool::Sleep(_))) => {
+                        return (call, stop, vec![]);
+                    }
+                    Err(err) => {
+                        let report = failure(&e.name, "before_tool", err);
+                        return (
+                            call,
+                            BeforeTool::Block("before-tool hook failed".into()),
+                            vec![report],
+                        );
+                    }
+                }
+            }
+        }
+        (call, BeforeTool::Pass, vec![])
+    }
+    pub async fn after_tool(
+        &self,
+        call: &ToolCall,
+        result: Value,
+        ctx: &Context<'_>,
+    ) -> (Value, Vec<Report>) {
+        let (result, _, reports) = self.after_tool_with_replacement(call, result, ctx).await;
+        (result, reports)
+    }
+    pub(crate) async fn after_tool_with_replacement(
+        &self,
+        call: &ToolCall,
+        mut result: Value,
+        ctx: &Context<'_>,
+    ) -> (Value, bool, Vec<Report>) {
+        let mut reports = vec![];
+        let mut replaced = false;
+        for e in &self.extensions {
+            for h in &e.hooks {
+                match protect(async { h.after_tool(call, &result, ctx).await }).await {
+                    Ok(Some(value)) => {
+                        replaced |= value.is_string();
+                        result = value;
+                    }
+                    Ok(None) => (),
+                    Err(err) => reports.push(failure(&e.name, "after_tool", err)),
+                }
+            }
+        }
+        (result, replaced, reports)
+    }
+    pub async fn after_tool_result(
+        &self,
+        call: &ToolCall,
+        result: ToolResult,
+        ctx: &Context<'_>,
+    ) -> (ToolResult, bool, Vec<Report>) {
+        let (result, changed, _, reports) = self
+            .after_tool_result_with_provenance(call, result, ctx)
+            .await;
+        (result, changed, reports)
+    }
+    pub(crate) async fn after_tool_result_with_provenance(
+        &self,
+        call: &ToolCall,
+        result: ToolResult,
+        ctx: &Context<'_>,
+    ) -> (ToolResult, bool, bool, Vec<Report>) {
+        self.after_tool_result_with_derived(call, result, ctx, &[])
+            .await
+    }
+    pub(crate) async fn after_tool_result_with_derived(
+        &self,
+        call: &ToolCall,
+        mut result: ToolResult,
+        ctx: &Context<'_>,
+        derived: &[crate::runtime::ToolDiagnostic],
+    ) -> (ToolResult, bool, bool, Vec<Report>) {
+        let mut remaining_derived = derived.to_vec();
+        let mut reports = Vec::new();
+        let mut replaced = false;
+        let mut output_changed = false;
+        for extension in &self.extensions {
+            for hook in &extension.hooks {
+                match protect(async {
+                    hook.after_tool_result_with_provenance(call, &result, ctx)
+                        .await
+                })
+                .await
+                {
+                    Ok(Some((mut value, provenance))) => {
+                        let output_is_replaced =
+                            output_replaced(&result.output, &value.output, provenance);
+                        if output_is_replaced {
+                            remove_cloned_derived_diagnostics(
+                                &result.diagnostics,
+                                &mut value.diagnostics,
+                                &remaining_derived,
+                            );
+                        }
+                        let valid_diagnostics = value.diagnostics.len() <= 32
+                            && value.diagnostics.iter().all(|d| {
+                                d.message.len() <= 4096
+                                    && d.code.as_ref().is_none_or(|code| code.len() <= 256)
+                            });
+                        let bounded = serde_json::to_vec(&(
+                            &value.details,
+                            &value.structured_output,
+                            &value.attachments,
+                            &value.diagnostics,
+                        ))
+                        .is_ok_and(|bytes| bytes.len() <= 65_536);
+                        if valid_diagnostics && bounded {
+                            if output_is_replaced {
+                                remaining_derived.clear();
+                            } else {
+                                remaining_derived = remaining_derived_diagnostics(
+                                    &result.diagnostics,
+                                    &value.diagnostics,
+                                    &remaining_derived,
+                                );
+                            }
+                            output_changed |= output_is_replaced;
+                            result = value;
+                            replaced = true;
+                        } else {
+                            reports.push(failure(
+                                &extension.name,
+                                "after_tool_result",
+                                "replacement metadata exceeds limits".into(),
+                            ));
+                        }
+                    }
+                    Ok(None) => (),
+                    Err(error) => {
+                        reports.push(failure(&extension.name, "after_tool_result", error))
+                    }
+                }
+            }
+        }
+        (result, replaced, output_changed, reports)
+    }
+    /// Run ordered block-aware hooks. The caller must durably persist the returned
+    /// result before exposing it to a model. Harness uses its own opt-in chain
+    /// after its legacy and structured result hooks.
+    pub async fn after_tool_blocks(
+        &self,
+        call: &ToolCall,
+        mut result: ToolBlockResult,
+        nested: bool,
+        ctx: &Context<'_>,
+    ) -> Result<(ToolBlockResult, Vec<Report>), String> {
+        if !result.valid() {
+            return Err("invalid tool output blocks".into());
+        }
+        let mut reports = vec![];
+        for e in &self.extensions {
+            for h in &e.hooks {
+                match protect(async { h.after_tool_blocks(call, &result, nested, ctx).await }).await
+                {
+                    Ok(Some(value)) if value.valid() => result = value,
+                    Ok(Some(_)) => reports.push(failure(
+                        &e.name,
+                        "after_tool",
+                        "invalid tool output blocks".into(),
+                    )),
+                    Ok(None) => (),
+                    Err(err) => reports.push(failure(&e.name, "after_tool", err)),
+                }
+            }
+        }
+        Ok((result, reports))
+    }
+    fn durable_text_result(blocks: &ToolBlockResult) -> Result<Option<ToolResult>, String> {
+        let [block] = blocks.output.as_slice() else {
+            return Ok(None);
+        };
+        let Some(object) = block.as_object() else {
+            return Ok(None);
+        };
+        if object.len() != 2 || block.get("type").and_then(Value::as_str) != Some("text") {
+            return Ok(None);
+        }
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let attachments = blocks
+            .extra
+            .get("attachments")
+            .map(|value| serde_json::from_value(value.clone()).map_err(|e| e.to_string()))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Some(ToolResult {
+            output: text.to_owned(),
+            is_error: blocks
+                .extra
+                .get("isError")
+                .and_then(Value::as_bool)
+                .ok_or("invalid error status")?,
+            details: blocks.extra.get("details").cloned(),
+            structured_output: blocks.extra.get("structuredOutput").cloned(),
+            attachments,
+            diagnostics: blocks.diagnostics.clone(),
+        }))
+    }
+    fn durable_result_blocks(
+        value: ToolResult,
+        input: &ToolResult,
+        original: &ToolBlockResult,
+    ) -> Result<ToolBlockResult, String> {
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("isError".into(), Value::Bool(value.is_error));
+        if let Some(details) = value.details {
+            extra.insert("details".into(), details);
+        }
+        if let Some(data) = value.structured_output {
+            extra.insert("structuredOutput".into(), data);
+        }
+        if value.attachments == input.attachments {
+            if let Some(attachments) = original.extra.get("attachments") {
+                extra.insert("attachments".into(), attachments.clone());
+            }
+        } else {
+            if let Some(attachments) = original.extra.get("attachments")
+                && serde_json::to_value(&input.attachments).map_err(|e| e.to_string())?
+                    != *attachments
+            {
+                return Err("attachment metadata cannot be preserved by text result hook".into());
+            }
+            if !value.attachments.is_empty() {
+                extra.insert(
+                    "attachments".into(),
+                    serde_json::to_value(value.attachments).map_err(|e| e.to_string())?,
+                );
+            }
+        }
+        Ok(ToolBlockResult {
+            output: vec![serde_json::json!({"type":"text", "text":value.output})],
+            diagnostics: value.diagnostics,
+            extra,
+        })
+    }
+    /// Run a durable hook chain, rejecting each invalid replacement before invoking the next hook.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn after_tool_blocks_checked<F, G>(
+        &self,
+        call: &ToolCall,
+        mut result: ToolBlockResult,
+        nested: bool,
+        ctx: &Context<'_>,
+        validate_initial: F,
+        validate: G,
+        strip_structured: bool,
+    ) -> Result<ToolBlockResult, String>
+    where
+        F: Fn(&ToolBlockResult) -> Result<(), String> + Sync,
+        G: Fn(&ToolBlockResult) -> Result<(), String> + Sync,
+    {
+        validate_initial(&result)?;
+        for extension in &self.extensions {
+            for hook in &extension.hooks {
+                if let Some(input) = Self::durable_text_result(&result)? {
+                    match protect(async {
+                        hook.after_tool_result_with_provenance(call, &input, ctx)
+                            .await
+                    })
+                    .await
+                    {
+                        Ok(Some((value, _))) if value != input => {
+                            let mut candidate =
+                                Self::durable_result_blocks(value, &input, &result)?;
+                            if strip_structured {
+                                candidate.extra.remove("structuredOutput");
+                            }
+                            validate(&candidate)?;
+                            result = candidate;
+                        }
+                        Ok(Some(_)) => (),
+                        Ok(None) => (),
+                        Err(error) => return Err(error),
+                    }
+                }
+                match protect(async { hook.after_tool_blocks(call, &result, nested, ctx).await })
+                    .await
+                {
+                    Ok(Some(mut value)) => {
+                        if strip_structured {
+                            value.extra.remove("structuredOutput");
+                        }
+                        validate(&value)?;
+                        result = value;
+                    }
+                    Ok(None) => (),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(result)
+    }
+    pub(crate) async fn runtime_after_tool_blocks_with_derived(
+        &self,
+        call: &ToolCall,
+        mut result: ToolBlockResult,
+        nested: bool,
+        ctx: &Context<'_>,
+        derived: &[crate::runtime::ToolDiagnostic],
+    ) -> Result<(ToolBlockResult, bool, Vec<Report>), String> {
+        if !result.valid() {
+            return Err("invalid tool output blocks".into());
+        }
+        let mut remaining_derived = derived.to_vec();
+        let mut reports = vec![];
+        let mut replaced = false;
+        for extension in &self.extensions {
+            for hook in &extension.hooks {
+                match protect(async {
+                    if hook.supports_runtime_tool_blocks() {
+                        hook.after_tool_blocks_with_provenance(call, &result, nested, ctx)
+                            .await
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await
+                {
+                    Ok(Some((mut value, provenance)))
+                        if value.valid() && value.extra == result.extra =>
+                    {
+                        let output_is_replaced =
+                            output_replaced(&result.output, &value.output, provenance);
+                        if output_is_replaced {
+                            remove_cloned_derived_diagnostics(
+                                &result.diagnostics,
+                                &mut value.diagnostics,
+                                &remaining_derived,
+                            );
+                        }
+                        if output_is_replaced {
+                            remaining_derived.clear();
+                        } else {
+                            remaining_derived = remaining_derived_diagnostics(
+                                &result.diagnostics,
+                                &value.diagnostics,
+                                &remaining_derived,
+                            );
+                        }
+                        result = value;
+                        replaced |= output_is_replaced;
+                    }
+                    Ok(Some(_)) => reports.push(failure(
+                        &extension.name,
+                        "after_tool_blocks",
+                        "invalid block result or metadata replacement".into(),
+                    )),
+                    Ok(None) => (),
+                    Err(error) => {
+                        reports.push(failure(&extension.name, "after_tool_blocks", error))
+                    }
+                }
+            }
+        }
+        Ok((result, replaced, reports))
+    }
+    /// Request replacements pass down the chain; the first onYield decision wins.
+    /// Returned task requests are only collected, never scheduled here.
+    pub async fn generation(
+        &self,
+        event: GenerationEvent,
+        value: Value,
+        ctx: &Context<'_>,
+    ) -> (Value, Option<Value>, Vec<HookTask>, Vec<Report>) {
+        self.generation_inner(event, value, ctx, false, false).await
+    }
+    pub(crate) async fn lifecycle_generation(
+        &self,
+        event: GenerationEvent,
+        value: Value,
+        ctx: &Context<'_>,
+        durable_blocks: bool,
+    ) -> (Value, Option<Value>, Vec<HookTask>, Vec<Report>) {
+        self.generation_inner(event, value, ctx, true, durable_blocks)
+            .await
+    }
+    async fn generation_inner(
+        &self,
+        event: GenerationEvent,
+        mut value: Value,
+        ctx: &Context<'_>,
+        validate_owner: bool,
+        durable_blocks: bool,
+    ) -> (Value, Option<Value>, Vec<HookTask>, Vec<Report>) {
+        let mut tasks = vec![];
+        let mut reports = vec![];
+        for e in &self.extensions {
+            for h in &e.hooks {
+                match protect(async { h.generation(event, &value, ctx).await }).await {
+                    Ok(GenerationDecision::Pass) => (),
+                    Ok(GenerationDecision::Replace(v))
+                        if matches!(
+                            event,
+                            GenerationEvent::BeforeRequest | GenerationEvent::BeforeProviderRequest
+                        ) =>
+                    {
+                        if event == GenerationEvent::BeforeProviderRequest {
+                            if let Some(payload) = v.get("payload") {
+                                value["payload"] = payload.clone();
+                            } else {
+                                reports.push(failure(
+                                    &e.name,
+                                    "generation",
+                                    "provider replacement omitted payload".into(),
+                                ));
+                            }
+                        } else {
+                            value = v;
+                        }
+                    }
+                    Ok(GenerationDecision::Continue(v)) if event == GenerationEvent::OnYield => {
+                        if yield_input(&v).is_some()
+                            || (durable_blocks
+                                && crate::content::UserContent::from_yield(v.clone(), false)
+                                    .is_some())
+                        {
+                            return (value, Some(v), tasks, reports);
+                        }
+                        reports.push(failure(
+                            &e.name,
+                            "generation",
+                            "OnYield continuation is invalid or cannot be represented".into(),
+                        ));
+                    }
+                    Ok(GenerationDecision::Tasks(mut t))
+                        if matches!(
+                            event,
+                            GenerationEvent::OnYield
+                                | GenerationEvent::AfterTools
+                                | GenerationEvent::AfterRun
+                        ) =>
+                    {
+                        if validate_owner {
+                            t.retain(|task| {
+                                let valid = e.tasks.iter().any(|(name, _)| name == &task.name);
+                                if !valid {
+                                    reports.push(failure(&e.name, "generation", format!("unselected task registration or task owned by another extension: {}", task.name)));
+                                }
+                                valid
+                            });
+                        }
+                        let has_tasks = !t.is_empty();
+                        tasks.append(&mut t);
+                        if event == GenerationEvent::OnYield && has_tasks {
+                            return (value, None, tasks, reports);
+                        }
+                    }
+                    Ok(_) => reports.push(failure(
+                        &e.name,
+                        "generation",
+                        "decision is invalid for this event".into(),
+                    )),
+                    Err(err) => reports.push(failure(&e.name, "generation", err)),
+                }
+            }
+        }
+        (value, None, tasks, reports)
+    }
+}

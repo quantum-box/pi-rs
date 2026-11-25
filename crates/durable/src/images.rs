@@ -1,0 +1,874 @@
+//! Opt-in preparation of host-supplied images before transcript admission.
+//!
+//! Hosts may supply a processor, or enable the `builtin-images` feature.
+use base64::{
+    Engine, alphabet,
+    engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
+};
+use serde_json::{Value, json};
+
+/// Model image limits; `max_bytes` measures the length of base64 data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImageLimits {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_bytes: usize,
+}
+
+impl Default for ImageLimits {
+    fn default() -> Self {
+        Self {
+            max_width: 2000,
+            max_height: 2000,
+            max_bytes: 4_718_592,
+        }
+    }
+}
+
+/// Optional per-model overrides; missing fields use the upstream defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageLimitOverrides {
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
+    pub max_bytes: Option<usize>,
+}
+
+impl ImageLimitOverrides {
+    pub fn resolve(self) -> ImageLimits {
+        let defaults = ImageLimits::default();
+        ImageLimits {
+            max_width: self.max_width.unwrap_or(defaults.max_width),
+            max_height: self.max_height.unwrap_or(defaults.max_height),
+            max_bytes: self.max_bytes.unwrap_or(defaults.max_bytes),
+        }
+    }
+}
+
+/// Per-model limits from host-supplied upstream-shaped model descriptors.
+/// Keys are exact conversation model names; missing models use the defaults.
+#[derive(Clone, Debug, Default)]
+pub struct ImageLimitsCatalog(std::collections::BTreeMap<String, ImageLimitOverrides>);
+
+impl ImageLimitsCatalog {
+    /// Read `inputLimits.images.resize`; absent fields inherit the defaults.
+    /// Invalid or zero dimensions/byte limits are rejected.
+    pub fn insert(&mut self, model: impl Into<String>, descriptor: &Value) -> Result<(), String> {
+        let model = model.into();
+        if model.is_empty() || !descriptor.is_object() {
+            return Err("invalid model descriptor".into());
+        }
+        let mut node = descriptor;
+        for key in ["inputLimits", "images", "resize"] {
+            match node.get(key) {
+                None | Some(Value::Null) => {
+                    self.0.insert(model, ImageLimitOverrides::default());
+                    return Ok(());
+                }
+                Some(value) if value.is_object() => node = value,
+                _ => return Err(format!("invalid {key} in model descriptor")),
+            }
+        }
+        fn field<T: TryFrom<u64>>(node: &Value, key: &str) -> Result<Option<T>, String> {
+            match node.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .filter(|n| *n > 0)
+                    .and_then(|n| T::try_from(n).ok())
+                    .map(Some)
+                    .ok_or_else(|| format!("invalid {key} in model descriptor")),
+            }
+        }
+        let limits = ImageLimitOverrides {
+            max_width: field(node, "maxWidth")?,
+            max_height: field(node, "maxHeight")?,
+            max_bytes: field(node, "maxBytes")?,
+        };
+        self.0.insert(model, limits);
+        Ok(())
+    }
+    pub fn limits(&self, model: &str) -> ImageLimits {
+        self.0.get(model).copied().unwrap_or_default().resolve()
+    }
+    /// Resolver for `create_fit_images_extension`, using the persisted model name.
+    pub fn resolver(self) -> std::sync::Arc<ToolImageLimits> {
+        std::sync::Arc::new(move |snapshot| {
+            self.limits(snapshot["config"]["model"].as_str().unwrap_or(""))
+        })
+    }
+}
+
+/// Image capability and fitting limits for one concrete model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelImageProfile {
+    pub supports_images: bool,
+    pub limits: ImageLimits,
+}
+
+/// Lookup in the bundled pi-rs model catalog. Unknown providers and models
+/// return `None`, rather than guessing their input capabilities.
+pub fn builtin_model_image_profile(adapter_id: &str, model: &str) -> Option<ModelImageProfile> {
+    let provider = match adapter_id {
+        "openai-responses-api/v1" => "openai",
+        "anthropic-messages/v1" => "anthropic",
+        "google-generative-ai/v1" | "google-generative-ai-ordered-tool-blocks/v1" => "google",
+        _ => return None,
+    };
+    let model = if provider == "google" {
+        model.strip_prefix("models/").unwrap_or(model)
+    } else {
+        model
+    };
+    let catalog: Value =
+        serde_json::from_str(include_str!("../assets/model-image-profiles.json")).ok()?;
+    let descriptor = catalog
+        .get(provider)?
+        .as_array()?
+        .iter()
+        .find(|v| v["id"].as_str() == Some(model))?;
+    let input = descriptor.get("input")?.as_array()?;
+    let mut limits = ImageLimitsCatalog::default();
+    limits.insert(model, descriptor).ok()?;
+    Some(ModelImageProfile {
+        supports_images: input.iter().any(|v| v.as_str() == Some("image")),
+        limits: limits.limits(model),
+    })
+}
+
+/// Create a fit hook using the selected adapter's model profile at tool completion.
+/// Unknown profiles use the upstream default limits.
+pub fn create_model_fit_images_extension(
+    processor: std::sync::Arc<dyn ImageProcessor>,
+) -> crate::extension::Extension {
+    create_fit_images_extension(
+        processor,
+        std::sync::Arc::new(|snapshot| {
+            snapshot
+                .get("_model_image_profile")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<ModelImageProfile>(v).ok())
+                .map(|p| p.limits)
+                .unwrap_or_default()
+        }),
+    )
+}
+
+#[cfg(feature = "builtin-images")]
+mod builtin;
+#[cfg(feature = "builtin-images")]
+pub use builtin::BuiltinImageProcessor;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dimensions {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resize {
+    pub from: Dimensions,
+    pub to: Dimensions,
+}
+
+/// Processor output, including optional conversion and coordinate information.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedImage {
+    pub data: String,
+    pub mime_type: String,
+    pub resized: Option<Resize>,
+    pub converted_from: Option<String>,
+}
+
+/// A host-provided image decoder and processor. `Ok(None)` means it cannot prepare the image.
+#[async_trait::async_trait]
+pub trait ImageProcessor: Send + Sync {
+    async fn prepare(
+        &self,
+        bytes: &[u8],
+        mime_type: &str,
+        limits: ImageLimits,
+    ) -> Result<Option<PreparedImage>, String>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FittedImage {
+    Fitted { image: Value, notes: Vec<String> },
+    Omitted { note: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FittedImages {
+    Unchanged,
+    Fitted {
+        content: Vec<Value>,
+        notes: Vec<String>,
+    },
+}
+
+fn omitted(mime_type: &str, reason: Option<&str>) -> FittedImage {
+    let reason = reason
+        .map(|reason| format!(": {reason}"))
+        .unwrap_or_default();
+    FittedImage::Omitted {
+        note: format!(
+            "An image ({mime_type}) cannot be prepared for the model and was left out{reason}."
+        ),
+    }
+}
+
+/// Explicit host-selected processor for user input admission.
+pub struct UserImageAdmission {
+    processor: std::sync::Arc<dyn ImageProcessor>,
+}
+impl UserImageAdmission {
+    pub fn new(processor: std::sync::Arc<dyn ImageProcessor>) -> Self {
+        Self { processor }
+    }
+    /// Prepare host-supplied input (including on-yield continuations) with explicit limits.
+    /// Notes are appended as model-visible text and returned separately.
+    pub async fn prepare_blocks(
+        &self,
+        blocks: &[Value],
+        limits: ImageLimits,
+    ) -> Result<(Vec<Value>, Vec<String>), String> {
+        if blocks.is_empty() {
+            return Err("empty user content blocks".into());
+        }
+        let (mut output, notes) = match fit_images(blocks, limits, self.processor.as_ref()).await? {
+            FittedImages::Unchanged => (blocks.to_vec(), Vec::new()),
+            FittedImages::Fitted { content, notes } => (content, notes),
+        };
+        if !notes.is_empty() {
+            output.push(json!({"type":"text", "text":notes.join(" ")}));
+        }
+        Ok((output, notes))
+    }
+    /// Prepare continuation blocks against the lifecycle hook's current model profile.
+    pub async fn prepare_for_context(
+        &self,
+        blocks: &[Value],
+        context: &crate::extension::Context<'_>,
+    ) -> Result<(Vec<Value>, Vec<String>), String> {
+        let limits = context
+            .snapshot
+            .get("_model_image_profile")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<ModelImageProfile>(v).ok())
+            .map(|profile| profile.limits)
+            .unwrap_or_default();
+        self.prepare_blocks(blocks, limits).await
+    }
+    pub(crate) async fn fit(
+        &self,
+        content: &[Value],
+        limits: ImageLimits,
+    ) -> Result<FittedImages, String> {
+        fit_images(content, limits, self.processor.as_ref()).await
+    }
+}
+/// Durable submission identity and preparation notes. Notes also enter the transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageAdmissionResult {
+    pub submission_id: uuid::Uuid,
+    pub notes: Vec<String>,
+}
+
+/// Prepare bytes before admission; detected image types take precedence over the declaration.
+pub async fn fit_image(
+    bytes: &[u8],
+    mime_type: &str,
+    limits: ImageLimits,
+    processor: &dyn ImageProcessor,
+) -> FittedImage {
+    let detected = detect_image_mime_type(bytes).unwrap_or(mime_type);
+    let prepared = match processor.prepare(bytes, detected, limits).await {
+        Ok(Some(image)) => image,
+        Ok(None) => return omitted(mime_type, None),
+        Err(error) => return omitted(mime_type, Some(&error)),
+    };
+    let mut notes = Vec::new();
+    if let Some(from) = &prepared.converted_from {
+        notes.push(format!("Converted from {from} to {}.", prepared.mime_type));
+    }
+    if let Some(resized) = prepared.resized {
+        let scale = resized.from.width as f64 / resized.to.width as f64;
+        notes.push(format!("Resized from {}x{} to {}x{}. Multiply coordinates by {:.2} to map them to the original.", resized.from.width, resized.from.height, resized.to.width, resized.to.height, scale));
+    }
+    FittedImage::Fitted {
+        image: json!({"type":"image", "data":prepared.data, "mimeType":prepared.mime_type}),
+        notes,
+    }
+}
+
+/// Fit ordered text/image blocks, preserving text and unchanged images verbatim.
+/// Malformed block shapes return an error without returning a partial result.
+pub async fn fit_images(
+    content: &[Value],
+    limits: ImageLimits,
+    processor: &dyn ImageProcessor,
+) -> Result<FittedImages, String> {
+    if crate::content::UserContent::from_yield(Value::Array(content.to_vec()), false).is_none() {
+        return Err("invalid user content blocks".into());
+    }
+    let mut fitted = Vec::with_capacity(content.len());
+    let mut notes = Vec::new();
+    let mut changed = false;
+    for item in content {
+        if item["type"] != "image" {
+            fitted.push(item.clone());
+            continue;
+        }
+        let data = item["data"].as_str().unwrap();
+        let mime = item["mimeType"].as_str().unwrap();
+        let bytes: Vec<u8> = data
+            .bytes()
+            .filter(|b| !matches!(b, b'\t' | b'\n' | 0x0c | b'\r' | b' '))
+            .collect();
+        let decoder = GeneralPurpose::new(
+            &alphabet::STANDARD,
+            GeneralPurposeConfig::new()
+                .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+                .with_decode_allow_trailing_bits(true),
+        );
+        let result = match decoder.decode(bytes) {
+            Ok(bytes) => fit_image(&bytes, mime, limits, processor).await,
+            Err(error) => omitted(mime, Some(&error.to_string())),
+        };
+        match result {
+            FittedImage::Omitted { note } => {
+                changed = true;
+                notes.push(note);
+            }
+            FittedImage::Fitted {
+                image,
+                notes: image_notes,
+            } => {
+                if image["data"] == item["data"] && image["mimeType"] == item["mimeType"] {
+                    fitted.push(item.clone());
+                } else {
+                    changed = true;
+                    fitted.push(image);
+                    notes.extend(image_notes);
+                }
+            }
+        }
+    }
+    Ok(if changed {
+        FittedImages::Fitted {
+            content: fitted,
+            notes,
+        }
+    } else {
+        FittedImages::Unchanged
+    })
+}
+
+/// Match upstream's supported-format sniffing, including its animated PNG exclusion.
+pub fn detect_image_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return (bytes.get(3) != Some(&0xf7)).then_some("image/jpeg");
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        if bytes.len() < 16 || bytes[8..16] != *b"\0\0\0\rIHDR" {
+            return None;
+        }
+        let mut offset: usize = 8;
+        while let Some(header) = bytes.get(offset..offset.saturating_add(8)) {
+            let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            match &header[4..8] {
+                b"acTL" => return None,
+                b"IDAT" => break,
+                _ => {}
+            }
+            let Some(next) = offset.checked_add(12).and_then(|n| n.checked_add(length)) else {
+                break;
+            };
+            if next > bytes.len() {
+                break;
+            }
+            offset = next;
+        }
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"BM") && bytes.len() >= 26 {
+        let le32 = |at| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let file = le32(2);
+        let pixels = le32(10);
+        let dib = le32(14);
+        if (file != 0 && file < 26)
+            || u64::from(pixels) < 14 + u64::from(dib)
+            || (file != 0 && pixels >= file)
+        {
+            return None;
+        }
+        let pos = if dib == 12 {
+            22
+        } else if (40..=124).contains(&dib) && bytes.len() >= 30 {
+            26
+        } else {
+            return None;
+        };
+        let planes = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let bits = u16::from_le_bytes(bytes[pos + 2..pos + 4].try_into().unwrap());
+        if planes == 1 && [1, 4, 8, 16, 24, 32].contains(&bits) {
+            return Some("image/bmp");
+        }
+    }
+    None
+}
+
+/// Resolve limits for the current conversation snapshot. The host must supply
+/// model-specific limits because core does not expose upstream's image catalog.
+pub type ToolImageLimits = dyn Fn(&serde_json::Value) -> ImageLimits + Send + Sync;
+
+struct FitToolImages {
+    processor: std::sync::Arc<dyn ImageProcessor>,
+    limits: std::sync::Arc<ToolImageLimits>,
+}
+
+/// Create an opt-in block-aware after-tool hook. Hosts must invoke the block
+/// hook chain and persist its output before dispatching a model request.
+pub fn create_fit_images_extension(
+    processor: std::sync::Arc<dyn ImageProcessor>,
+    limits: std::sync::Arc<ToolImageLimits>,
+) -> crate::extension::Extension {
+    crate::extension::Extension {
+        name: "fit-images".into(),
+        hooks: vec![std::sync::Arc::new(FitToolImages { processor, limits })],
+        ..Default::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::extension::Hook for FitToolImages {
+    fn supports_compaction_blocks(&self) -> bool {
+        true
+    }
+    fn supports_compaction_tool_blocks(&self) -> bool {
+        true
+    }
+    fn supports_runtime_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn after_tool_blocks(
+        &self,
+        _call: &crate::extension::ToolCall,
+        result: &crate::extension::ToolBlockResult,
+        nested: bool,
+        ctx: &crate::extension::Context<'_>,
+    ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+        if nested || !result.output.iter().any(|block| block["type"] == "image") {
+            return Ok(None);
+        }
+        match fit_images(
+            &result.output,
+            (self.limits)(ctx.snapshot),
+            self.processor.as_ref(),
+        )
+        .await?
+        {
+            FittedImages::Unchanged => Ok(None),
+            FittedImages::Fitted { content, notes } => {
+                let mut fitted = result.clone();
+                fitted.output = content;
+                if !notes.is_empty() {
+                    fitted.diagnostics.push(crate::runtime::ToolDiagnostic {
+                        severity: crate::runtime::DiagnosticSeverity::Info,
+                        code: Some("image".into()),
+                        message: notes.join(" "),
+                    });
+                }
+                Ok(Some(fitted))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Processor {
+        calls: Mutex<Vec<String>>,
+        output: Result<Option<PreparedImage>, String>,
+    }
+    #[async_trait::async_trait]
+    impl ImageProcessor for Processor {
+        async fn prepare(
+            &self,
+            _: &[u8],
+            mime: &str,
+            _: ImageLimits,
+        ) -> Result<Option<PreparedImage>, String> {
+            self.calls.lock().unwrap().push(mime.into());
+            self.output.clone()
+        }
+    }
+    fn processor(output: Result<Option<PreparedImage>, String>) -> Processor {
+        Processor {
+            calls: Mutex::new(Vec::new()),
+            output,
+        }
+    }
+    fn prepared(data: &str, mime: &str) -> PreparedImage {
+        PreparedImage {
+            data: data.into(),
+            mime_type: mime.into(),
+            resized: None,
+            converted_from: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fits_ordered_blocks_and_detects_bytes_before_processing() {
+        let mut result = prepared("bmV3", "image/jpeg");
+        result.converted_from = Some("image/bmp".into());
+        result.resized = Some(Resize {
+            from: Dimensions {
+                width: 400,
+                height: 100,
+            },
+            to: Dimensions {
+                width: 200,
+                height: 50,
+            },
+        });
+        let p = processor(Ok(Some(result)));
+        let input = vec![
+            json!({"type":"text","text":"before","signature":"kept"}),
+            json!({"type":"image","data":"/9j/AA==","mimeType":"image/png"}),
+            json!({"type":"text","text":"after"}),
+        ];
+        let fitted = fit_images(&input, ImageLimits::default(), &p)
+            .await
+            .unwrap();
+        assert_eq!(*p.calls.lock().unwrap(), vec!["image/jpeg"]);
+        assert_eq!(fitted, FittedImages::Fitted {
+            content: vec![input[0].clone(), json!({"type":"image","data":"bmV3","mimeType":"image/jpeg"}), input[2].clone()],
+            notes: vec!["Converted from image/bmp to image/jpeg.".into(), "Resized from 400x100 to 200x50. Multiply coordinates by 2.00 to map them to the original.".into()],
+        });
+    }
+
+    #[tokio::test]
+    async fn unchanged_and_omissions_match_upstream() {
+        let image = json!({"type":"image","data":"aGk=","mimeType":"image/png","detail":"high"});
+        let p = processor(Ok(Some(prepared("aGk=", "image/png"))));
+        assert_eq!(
+            fit_images(std::slice::from_ref(&image), ImageLimits::default(), &p)
+                .await
+                .unwrap(),
+            FittedImages::Unchanged
+        );
+        assert_eq!(
+            fit_images(
+                &[json!({"type":"text","text":"a"})],
+                ImageLimits::default(),
+                &p
+            )
+            .await
+            .unwrap(),
+            FittedImages::Unchanged
+        );
+        assert_eq!(p.calls.lock().unwrap().len(), 1);
+        let p = processor(Err("worker exited".into()));
+        assert_eq!(fit_image(b"hi", "image/png", ImageLimits::default(), &p).await, FittedImage::Omitted { note: "An image (image/png) cannot be prepared for the model and was left out: worker exited.".into() });
+        let p = processor(Ok(None));
+        let input = vec![
+            json!({"type":"text","text":"a"}),
+            image,
+            json!({"type":"image","data":"%%%","mimeType":"image/png"}),
+        ];
+        let FittedImages::Fitted { content, notes } =
+            fit_images(&input, ImageLimits::default(), &p)
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(content, vec![input[0].clone()]);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(
+            notes[0],
+            "An image (image/png) cannot be prepared for the model and was left out."
+        );
+        assert!(notes[1].starts_with(
+            "An image (image/png) cannot be prepared for the model and was left out: "
+        ));
+        assert_eq!(p.calls.lock().unwrap().len(), 1);
+        assert!(
+            fit_images(&[json!({"type":"image"})], ImageLimits::default(), &p)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_decoded_bytes_and_chosen_limits() {
+        struct Check;
+        #[async_trait::async_trait]
+        impl ImageProcessor for Check {
+            async fn prepare(
+                &self,
+                bytes: &[u8],
+                mime: &str,
+                limits: ImageLimits,
+            ) -> Result<Option<PreparedImage>, String> {
+                assert_eq!(bytes, b"hi");
+                assert_eq!(mime, "image/png");
+                assert_eq!(
+                    limits,
+                    ImageLimits {
+                        max_width: 123,
+                        max_height: 456,
+                        max_bytes: 789
+                    }
+                );
+                Ok(Some(prepared("aGk=", "image/png")))
+            }
+        }
+        let limits = ImageLimits {
+            max_width: 123,
+            max_height: 456,
+            max_bytes: 789,
+        };
+        let input = vec![json!({"type":"image", "data":"aGk", "mimeType":"image/png"})];
+        let FittedImages::Fitted { content, notes } =
+            fit_images(&input, limits, &Check).await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(content[0]["data"], "aGk=");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn model_catalog_uses_exact_model_and_rejects_invalid_limits() {
+        let mut catalog = ImageLimitsCatalog::default();
+        catalog
+            .insert(
+                "vendor/model",
+                &json!({"inputLimits":{"images":{"resize":{"maxWidth":123,"maxBytes":456}}}}),
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.limits("vendor/model"),
+            ImageLimits {
+                max_width: 123,
+                max_height: 2000,
+                max_bytes: 456
+            }
+        );
+        assert_eq!(catalog.limits("model"), ImageLimits::default());
+        assert!(
+            catalog
+                .insert(
+                    "vendor/model",
+                    &json!({"inputLimits":{"images":{"resize":{"maxWidth":0}}}})
+                )
+                .is_err()
+        );
+        assert_eq!(catalog.limits("vendor/model").max_width, 123);
+        let resolve = catalog.resolver();
+        assert_eq!(
+            resolve(&json!({"config":{"model":"vendor/model"}})).max_bytes,
+            456
+        );
+    }
+
+    #[test]
+    fn defaults_overrides_and_signatures() {
+        assert_eq!(
+            ImageLimitOverrides {
+                max_width: Some(100),
+                ..Default::default()
+            }
+            .resolve(),
+            ImageLimits {
+                max_width: 100,
+                max_height: 2000,
+                max_bytes: 4_718_592
+            }
+        );
+        assert_eq!(detect_image_mime_type(b"\xff\xd8\xff\xf7"), None);
+        assert_eq!(detect_image_mime_type(b"GIF89a"), Some("image/gif"));
+        assert_eq!(detect_image_mime_type(b"RIFF0000WEBP"), Some("image/webp"));
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&[0; 17]);
+        png.extend_from_slice(b"\0\0\0\x08acTL");
+        assert_eq!(detect_image_mime_type(&png), None);
+    }
+}
+
+const USER_IMAGE_OMITTED: &str = "(image omitted: model does not support images)";
+const TOOL_IMAGE_OMITTED: &str = "(tool image omitted: model does not support images)";
+
+fn project_blocks(blocks: &mut Vec<Value>, placeholder: &str) {
+    let mut projected = Vec::with_capacity(blocks.len());
+    let mut previous_placeholder = false;
+    for block in std::mem::take(blocks) {
+        if block["type"] == "image" {
+            if !previous_placeholder {
+                projected.push(json!({"type": "text", "text": placeholder}));
+            }
+            previous_placeholder = true;
+        } else {
+            previous_placeholder = block["type"] == "text" && block["text"] == placeholder;
+            projected.push(block);
+        }
+    }
+    *blocks = projected;
+}
+
+/// Replace images on an outgoing request and its bindings with upstream
+/// placeholders. Callers must pass copies when original history must be kept.
+pub fn project_nonvision_request(
+    request: &mut pi_rs_core::ModelRequest,
+    blocks: &mut std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+    tool_blocks: &mut std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+) {
+    for binding in blocks.values_mut() {
+        project_blocks(&mut binding.blocks, USER_IMAGE_OMITTED);
+    }
+    for binding in tool_blocks.values_mut() {
+        project_blocks(&mut binding.blocks, TOOL_IMAGE_OMITTED);
+    }
+    for message in &mut request.messages {
+        match message {
+            pi_rs_core::Message::UserWithImages { content, images } if !images.is_empty() => {
+                let content = if content.is_empty() {
+                    USER_IMAGE_OMITTED.to_owned()
+                } else {
+                    format!("{content}\n{USER_IMAGE_OMITTED}")
+                };
+                *message = pi_rs_core::Message::User { content };
+            }
+            pi_rs_core::Message::Tool { content, .. } => {
+                // Legacy tools can embed images in data.content, which core adapters extract.
+                // Replace only images core would otherwise extract; keep the JSON envelope.
+                if let Ok(mut value) = serde_json::from_str::<Value>(content)
+                    && let Some(items) = value
+                        .get_mut("data")
+                        .and_then(|v| v.get_mut("content"))
+                        .and_then(Value::as_array_mut)
+                {
+                    let mut previous = false;
+                    let mut changed = false;
+                    let mut out = Vec::with_capacity(items.len());
+                    for block in std::mem::take(items) {
+                        let extracted = block["type"] == "image"
+                            && block["data"]
+                                .as_str()
+                                .is_some_and(|s| s.len() <= 8 * 1024 * 1024)
+                            && matches!(
+                                block["mimeType"].as_str(),
+                                Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+                            );
+                        if extracted {
+                            changed = true;
+                            if !previous {
+                                out.push(json!({"type":"text", "text": TOOL_IMAGE_OMITTED}));
+                            }
+                            previous = true;
+                        } else {
+                            previous =
+                                block["type"] == "text" && block["text"] == TOOL_IMAGE_OMITTED;
+                            out.push(block);
+                        }
+                    }
+                    *items = out;
+                    if changed {
+                        *content = value.to_string();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_profile_tests {
+    use super::*;
+    #[test]
+    fn legacy_and_ordered_images_are_projected_only_in_request_copy() {
+        use pi_rs_core::{ImageContent, Message};
+        let image = json!({"type":"image","data":"aGk=","mimeType":"image/png"});
+        let mut request = crate::model::model_request(
+            "test",
+            vec![
+                Message::UserWithImages {
+                    content: "hello".into(),
+                    images: vec![ImageContent {
+                        data: "aGk=".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                },
+                Message::Tool {
+                    is_error: false,
+                    is_structured: None,
+                    call_id: "1".into(),
+                    content: json!({"data":{"content":[image.clone()]}}).to_string(),
+                },
+            ],
+            vec![],
+            100,
+        );
+        let original = request.clone();
+        let binding = crate::transcript::MessageContentBlocks {
+            message_id: uuid::Uuid::new_v4(),
+            blocks: vec![image.clone(), image],
+        };
+        let mut blocks = std::collections::BTreeMap::from([(0, binding.clone())]);
+        let mut tools = std::collections::BTreeMap::new();
+        project_nonvision_request(&mut request, &mut blocks, &mut tools);
+        assert!(
+            matches!(&request.messages[0], Message::User { content } if content.contains(USER_IMAGE_OMITTED))
+        );
+        assert!(
+            matches!(&request.messages[1], Message::Tool { content, .. } if content.contains(TOOL_IMAGE_OMITTED) && !content.contains("aGk="))
+        );
+        assert_eq!(blocks[&0].blocks.len(), 1);
+        assert_eq!(binding.blocks.len(), 2);
+        assert!(matches!(
+            &original.messages[0],
+            Message::UserWithImages { .. }
+        ));
+    }
+    #[test]
+    fn catalog_and_nonvision_projection() {
+        assert!(
+            !builtin_model_image_profile("openai-responses-api/v1", "o3-mini")
+                .unwrap()
+                .supports_images
+        );
+        assert!(
+            builtin_model_image_profile("openai-responses-api/v1", "gpt-4o")
+                .unwrap()
+                .supports_images
+        );
+        assert!(builtin_model_image_profile("unknown", "gpt-4o").is_none());
+        assert!(builtin_model_image_profile("openai-responses-api/v1", "not-in-catalog").is_none());
+        let mut blocks = vec![
+            json!({"type":"text", "text":"before"}),
+            json!({"type":"image", "data":"a"}),
+            json!({"type":"image", "data":"b"}),
+            json!({"type":"text", "text":"after"}),
+        ];
+        project_blocks(&mut blocks, USER_IMAGE_OMITTED);
+        assert_eq!(
+            blocks,
+            vec![
+                json!({"type":"text", "text":"before"}),
+                json!({"type":"text", "text": USER_IMAGE_OMITTED}),
+                json!({"type":"text", "text":"after"})
+            ]
+        );
+    }
+}

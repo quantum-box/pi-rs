@@ -67,7 +67,8 @@ jobs:
   native:
     name: Native tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # The Unix matrix also runs the Durable crash and recovery suite.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 30 || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -89,13 +90,26 @@ jobs:
       - name: Check formatting
         run: cargo +1.89.0 fmt --all -- --check
       - name: Check all targets
-        run: cargo +1.89.0 clippy --locked --workspace --all-features --all-targets -- -D warnings
+        shell: bash
+        run: |
+          workspace=(--workspace)
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # Durable's scheduler requires Unix filesystem ownership checks.
+            workspace+=(--exclude pi-rs-durable --exclude durable-store)
+          fi
+          cargo +1.89.0 clippy --locked "${workspace[@]}" --all-features --all-targets -- -D warnings
       - name: Run native acceptance tests
         env:
           # The CLI fixtures start independent workers that sync journals to disk.
           # Serial execution keeps their per-request deadlines stable on shared runners.
           RUST_TEST_THREADS: 1
-        run: cargo +1.89.0 test --locked --workspace --all-features
+        shell: bash
+        run: |
+          workspace=(--workspace)
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            workspace+=(--exclude pi-rs-durable --exclude durable-store)
+          fi
+          cargo +1.89.0 test --locked "${workspace[@]}" --all-features
       - name: Test native SDK host example
         run: |
           cargo +1.89.0 test --locked --example native_sdk_host

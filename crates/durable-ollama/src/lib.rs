@@ -1,0 +1,537 @@
+//! Explicitly installed durable adapter for Ollama's OpenAI-compatible endpoint.
+//! Encoding and SSE decoding adapted from pi-rs-ollama, under the MIT license.
+use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
+use pi_rs_core::{
+    Error, Message, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result,
+    ToolCall, ToolCallDelta, Usage,
+};
+use pi_rs_durable::model::{
+    DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt, ProviderResultRequest,
+};
+use reqwest::{Client, Url};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::{collections::BTreeMap, net::IpAddr, time::Duration};
+
+/// Loopback-only client; installing and selecting it in the durable harness is explicit.
+pub struct OllamaAdapter {
+    client: Client,
+    endpoint: Url,
+    model_inputs: pi_rs_durable::tool_projection::ModelInputs,
+}
+impl OllamaAdapter {
+    /// Override the bundled model image profile using an upstream-shaped descriptor.
+    pub fn set_model_descriptor(
+        &mut self,
+        model: impl Into<String>,
+        descriptor: &Value,
+    ) -> Result<()> {
+        self.model_inputs.insert(model, descriptor)
+    }
+    /// Accepts a numeric loopback base URL, e.g. `http://127.0.0.1:11434`.
+    pub fn new(base: &str) -> Result<Self> {
+        let mut endpoint =
+            Url::parse(base).map_err(|_| Error::Config("invalid Ollama URL".into()))?;
+        let loopback = endpoint
+            .host_str()
+            .and_then(|s| s.trim_matches(['[', ']']).parse::<IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+        if endpoint.scheme() != "http"
+            || !loopback
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || !matches!(endpoint.path(), "" | "/")
+        {
+            return Err(Error::Config(
+                "Ollama URL must be a numeric loopback HTTP origin".into(),
+            ));
+        }
+        endpoint.set_path("/v1/chat/completions");
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|_| Error::Config("could not create HTTP client".into()))?;
+        Ok(Self {
+            client,
+            endpoint,
+            model_inputs: Default::default(),
+        })
+    }
+}
+#[async_trait::async_trait]
+impl ProviderAdapter for OllamaAdapter {
+    fn image_profile(&self, model: &str) -> Option<pi_rs_durable::images::ModelImageProfile> {
+        self.model_inputs.profile(self.id(), model)
+    }
+    fn supports_tool_result_metadata(&self) -> bool {
+        true
+    }
+    async fn prepare_with_result_metadata(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ProviderResultRequest,
+    ) -> Result<Value> {
+        let mut body = self
+            .prepare(attempt, &request.request.request.request)
+            .await?;
+        body["messages"] = json!(result_messages(
+            request,
+            self.image_profile(&request.request.request.request.model)
+        )?);
+        Ok(body)
+    }
+    fn validate_with_result_metadata(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ProviderResultRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request.request.request, body)?;
+        if body.get("messages")
+            != Some(&json!(result_messages(
+                request,
+                self.image_profile(&request.request.request.request.model)
+            )?))
+        {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
+    fn supports_durable_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+    ) -> Result<Value> {
+        self.prepare_with_result_metadata(
+            attempt,
+            &ProviderResultRequest {
+                request: request.clone(),
+                tool_errors: Default::default(),
+            },
+        )
+        .await
+    }
+    fn validate_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate_with_result_metadata(
+            attempt,
+            &ProviderResultRequest {
+                request: request.clone(),
+                tool_errors: Default::default(),
+            },
+            body,
+        )
+    }
+    fn supports_durable_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+    ) -> Result<Value> {
+        let mut body = self.prepare(attempt, &request.request).await?;
+        body["messages"] = json!(result_messages(
+            &pi_rs_durable::tool_projection::wrap_durable(request),
+            self.image_profile(&request.request.model)
+        )?);
+        Ok(body)
+    }
+    fn validate_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request, body)?;
+        if (!request.blocks.is_empty()
+            || request
+                .request
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { .. })))
+            && body.get("messages")
+                != Some(&json!(result_messages(
+                    &pi_rs_durable::tool_projection::wrap_durable(request),
+                    self.image_profile(&request.request.model)
+                )?))
+        {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
+    fn id(&self) -> &str {
+        "ollama-local-openai/v1"
+    }
+    async fn prepare(&self, _: &ProviderAttempt, request: &ModelRequest) -> Result<Value> {
+        let messages = result_messages(
+            &pi_rs_durable::tool_projection::wrap_plain(request),
+            self.image_profile(&request.model),
+        )?;
+        let tools: Vec<_> = request
+            .tools
+            .iter()
+            .map(|function| json!({"type":"function","function":function}))
+            .collect();
+        let mut body = json!({"model":request.model,"messages":messages,"stream":true,"max_tokens":request.max_output_tokens,"stream_options":{"include_usage":true}});
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
+        Ok(body)
+    }
+    fn validate(&self, _: &ProviderAttempt, request: &ModelRequest, body: &Value) -> Result<()> {
+        let fail = || Error::Config("invalid or unauthorized Ollama request body".into());
+        let obj = body.as_object().ok_or_else(fail)?;
+        if body["model"] != request.model
+            || body["stream"] != true
+            || !body["messages"].is_array()
+            || body["max_tokens"]
+                .as_u64()
+                .is_none_or(|n| n == 0 || n > u64::from(request.max_output_tokens))
+            || obj.contains_key("max_completion_tokens")
+            || obj.contains_key("max_output_tokens")
+            || obj.contains_key("functions")
+            || obj.contains_key("function_call")
+            || obj.get("n").is_some_and(|n| n.as_u64() != Some(1))
+            || serde_json::to_vec(body)?.len() > 4 * 1024 * 1024
+        {
+            return Err(fail());
+        }
+        let expected_tools: Vec<_> = request
+            .tools
+            .iter()
+            .map(|function| json!({"type":"function","function":function}))
+            .collect();
+        if (expected_tools.is_empty() && obj.contains_key("tools"))
+            || (!expected_tools.is_empty() && body["tools"] != json!(expected_tools))
+        {
+            return Err(fail());
+        }
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ModelRequest,
+        body: Value,
+    ) -> Result<ModelStream> {
+        self.validate(attempt, request, &body)?;
+        let response = self
+            .client
+            .post(self.endpoint.clone())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| Error::RetryableModel("HTTP connection failed".into()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let s = format!("HTTP status {status}");
+            return Err(
+                if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+                    Error::RetryableModel(s)
+                } else {
+                    Error::Model(s)
+                },
+            );
+        }
+        if !response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"))
+        {
+            return Err(Error::Model("expected an SSE response".into()));
+        }
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut bytes = 0usize;
+            let mut events = response.bytes_stream().map(move |chunk| {
+                let chunk = chunk.map_err(|_| Error::RetryableModel("broken HTTP stream".into()))?;
+                bytes = bytes.saturating_add(chunk.len());
+                if bytes > 4 * 1024 * 1024 { return Err(Error::Model("model stream exceeds size limit".into())); }
+                Ok(chunk)
+            }).eventsource();
+            let mut calls = BTreeMap::<usize, CallDelta>::new();
+            let mut usage = None;
+            let mut metadata = ModelMetadata { provider_api: Some(ModelApi::OpenaiCompletions), ..Default::default() };
+            let mut reasoning = String::new();
+            while let Some(event) = events.next().await {
+                let event = event.map_err(|e| match e { eventsource_stream::EventStreamError::Transport(e) => e, _ => Error::RetryableModel("broken SSE stream".into()) })?;
+                if event.data == "[DONE]" {
+                    let reason = metadata.finish_reason.as_deref();
+                    match reason {
+                        Some("length") => {}
+                        Some("stop") if calls.is_empty() => {}
+                        Some("tool_calls") if !calls.is_empty() => {}
+                        _ => Err(Error::Model("model response did not finish successfully".into()))?,
+                    }
+                    let mut ids = std::collections::HashSet::new();
+                    if calls.values().any(|call| {
+                        call.id.is_empty() || call.name.is_empty() || !ids.insert(&call.id)
+                            || (!call.has_arguments && reason != Some("length"))
+                    }) {
+                        Err(Error::Model("incomplete or duplicate tool call".into()))?;
+                    }
+                    if !reasoning.is_empty() { metadata.reasoning = Some(reasoning); yield ModelEvent::Metadata(metadata); }
+                    yield ModelEvent::Complete { calls: calls.into_values().map(|c| ToolCall { id:c.id, name:c.name, arguments:c.arguments }).collect(), usage };
+                    return;
+                }
+                let chunk: Chunk = serde_json::from_str(&event.data).map_err(|_| Error::Model("malformed SSE chunk".into()))?;
+                if chunk.error.is_some() { Err(Error::Model("provider returned a stream error".into()))?; }
+                let previous = metadata.clone();
+                if let Some(id) = chunk.id.filter(|id| id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))) { metadata.provider_request_id = Some(id); }
+                if let Some(stats) = chunk.usage { usage = Some(Usage { input_tokens: stats.prompt_tokens, output_tokens: stats.completion_tokens }); }
+                for choice in chunk.choices {
+                    if choice.index != 0 || metadata.finish_reason.is_some() { Err(Error::Model("unexpected choice in model stream".into()))?; }
+                    if let Some(text) = [choice.delta.reasoning, choice.delta.reasoning_content, choice.delta.reasoning_text].into_iter().flatten().find(|s| !s.is_empty()) { reasoning.push_str(&text); yield ModelEvent::Reasoning(text); }
+                    if let Some(text) = choice.delta.content.filter(|s| !s.is_empty()) { yield ModelEvent::Text(text); }
+                    for delta in choice.delta.tool_calls.unwrap_or_default() {
+                        if delta.index >= 64 { Err(Error::Model("invalid tool call index".into()))?; }
+                        let (name, arguments, has_arguments) = delta.function.map(|f| (f.name.unwrap_or_default(), f.arguments.clone().unwrap_or_default(), f.arguments.is_some())).unwrap_or_default();
+                        let id = delta.id.unwrap_or_default(); let call = calls.entry(delta.index).or_default();
+                        call.has_arguments |= has_arguments;
+                        call.id.push_str(&id); call.name.push_str(&name); call.arguments.push_str(&arguments);
+                        yield ModelEvent::ToolCallDelta(ToolCallDelta { index: delta.index as u64, id, name, arguments });
+                    }
+                    metadata.finish_reason = choice.finish_reason.map(|r| match r.as_str() { "stop"|"tool_calls"|"length"|"content_filter" => r, "end" => "stop".into(), "function_call" => "tool_calls".into(), _ => "other".into() });
+                }
+                if metadata != previous { yield ModelEvent::Metadata(metadata.clone()); }
+            }
+            Err(Error::RetryableModel("SSE closed before the end marker".into()))?;
+        }))
+    }
+}
+fn durable_messages(durable: &DurableRequest) -> Result<Vec<Value>> {
+    let mut ids = std::collections::BTreeSet::new();
+    if durable.blocks.iter().any(|(index, binding)| {
+        *index >= durable.request.messages.len()
+            || binding.message_id.is_nil()
+            || !ids.insert(binding.message_id)
+    }) {
+        return Err(Error::Config("invalid durable content bindings".into()));
+    }
+    let mut messages = Vec::new();
+    for (index, message) in durable.request.messages.iter().enumerate() {
+        let Some(binding) = durable.blocks.get(&index) else {
+            messages.extend(encode_message(message.clone()));
+            continue;
+        };
+        if !matches!(message, Message::User { content } if content.is_empty()) {
+            return Err(Error::Config("durable block placeholder mismatch".into()));
+        }
+        let mut blocks = Vec::new();
+        for block in &binding.blocks {
+            let object = block
+                .as_object()
+                .ok_or_else(|| Error::Config("invalid content block".into()))?;
+            match block["type"].as_str() {
+                Some("text") if object.len() == 2 => {
+                    let text = block["text"]
+                        .as_str()
+                        .ok_or_else(|| Error::Config("invalid text block".into()))?;
+                    blocks.push(json!({"type":"text","text":text}));
+                }
+                Some("image")
+                    if object.len() == 3
+                        && object
+                            .keys()
+                            .all(|k| ["type", "data", "mimeType"].contains(&k.as_str())) =>
+                {
+                    let image = pi_rs_core::ImageContent {
+                        data: block["data"]
+                            .as_str()
+                            .ok_or_else(|| Error::Config("invalid image".into()))?
+                            .into(),
+                        mime_type: block["mimeType"]
+                            .as_str()
+                            .ok_or_else(|| Error::Config("invalid image".into()))?
+                            .into(),
+                    };
+                    image.validate()?;
+                    blocks.push(json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}",image.mime_type,image.data)}}));
+                }
+                _ => return Err(Error::Config("unsupported durable block metadata".into())),
+            }
+        }
+        if blocks.is_empty() {
+            return Err(Error::Config(
+                "empty user block array unsupported by Ollama".into(),
+            ));
+        }
+        messages.push(json!({"role":"user","content":blocks}));
+    }
+    Ok(messages)
+}
+
+fn result_messages(
+    request: &ProviderResultRequest,
+    profile: Option<pi_rs_durable::images::ModelImageProfile>,
+) -> Result<Vec<Value>> {
+    use pi_rs_durable::tool_projection::{self, Block};
+    request.validate_bindings()?;
+    let request = tool_projection::project_request(request, profile);
+    let durable = &request.request;
+    let mut result = Vec::new();
+    let mut images = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, message) in durable.request.request.messages.iter().enumerate() {
+        if !matches!(message, Message::Tool { .. }) && !images.is_empty() {
+            let mut content =
+                vec![json!({"type":"text","text":"Attached image(s) from tool result:"})];
+            content.append(&mut images);
+            result.push(json!({"role":"user","content":content}));
+        }
+        if let Message::Tool { call_id, .. } = message {
+            if !seen.insert(call_id.clone()) {
+                return Err(Error::Config("ambiguous tool result call ID".into()));
+            }
+            let mut texts = Vec::new();
+            let mut found_image = false;
+            for block in tool_projection::blocks(durable, index, false)? {
+                match block {
+                    Block::Text(text) => texts.push(text),
+                    Block::Image { image, .. } => {
+                        found_image = true;
+                        images.push(json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}",image.mime_type,image.data)}}));
+                    }
+                }
+            }
+            let text = texts.join("\n");
+            let text = if tool_projection::has_text(&text) {
+                text.as_str()
+            } else if found_image {
+                "(see attached image)"
+            } else {
+                "(no tool output)"
+            };
+            result.push(json!({"role":"tool","tool_call_id":call_id,"content":text}));
+        } else if let Some(binding) = durable.request.blocks.get(&index) {
+            let mut sample = durable.request.request.clone();
+            sample.messages = vec![message.clone()];
+            let user = DurableRequest {
+                request: sample,
+                blocks: [(0, binding.clone())].into_iter().collect(),
+            };
+            result.extend(durable_messages(&user)?);
+        } else {
+            result.extend(encode_message(message.clone()));
+        }
+    }
+    if !images.is_empty() {
+        let mut content = vec![json!({"type":"text","text":"Attached image(s) from tool result:"})];
+        content.append(&mut images);
+        result.push(json!({"role":"user","content":content}));
+    }
+    Ok(result)
+}
+
+fn encode_message(message: Message) -> Vec<Value> {
+    match message {
+        Message::System { content } => vec![json!({"role": "system", "content": content})],
+        Message::User { content } => vec![json!({"role": "user", "content": content})],
+        Message::UserWithImages { content, images } => {
+            let mut blocks = vec![json!({"type":"text","text":content})];
+            blocks.extend(images.into_iter().map(|image| json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}", image.mime_type, image.data)}})));
+            vec![json!({"role":"user","content":blocks})]
+        }
+        Message::Tool {
+            call_id, content, ..
+        } => encode_tool_result(&call_id, content),
+        Message::Assistant { content, calls, .. } => {
+            let mut message = json!({"role": "assistant", "content": content});
+            if !calls.is_empty() {
+                message["tool_calls"] = Value::Array(
+                    calls
+                        .into_iter()
+                        .map(|call| {
+                            json!({
+                                "id": call.id, "type": "function",
+                                "function": {"name": call.name, "arguments": call.arguments}
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            vec![message]
+        }
+    }
+}
+
+fn encode_tool_result(call_id: &str, content: String) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let (content, images) = pi_rs_core::extract_tool_images(content);
+    let mut images: Vec<_> = images
+        .into_iter()
+        .map(|image| {
+            let url = format!("data:{};base64,{}", image.mime_type, image.data);
+            json!({"type":"image_url","image_url":{"url":url}})
+        })
+        .collect();
+    messages.push(json!({"role":"tool","tool_call_id":call_id,"content":content}));
+    if !images.is_empty() {
+        images.insert(
+            0,
+            json!({"type":"text","text":"Images from the preceding tool result."}),
+        );
+        messages.push(json!({"role":"user","content":images}));
+    }
+    messages
+}
+
+#[derive(Deserialize)]
+struct Chunk {
+    id: Option<String>,
+    #[serde(default)]
+    choices: Vec<Choice>,
+    error: Option<Value>,
+    usage: Option<WireUsage>,
+}
+#[derive(Deserialize)]
+struct WireUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+#[derive(Deserialize)]
+struct Choice {
+    index: u32,
+    delta: Delta,
+    finish_reason: Option<String>,
+}
+#[derive(Deserialize)]
+struct Delta {
+    content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning_text: Option<String>,
+    tool_calls: Option<Vec<WireCall>>,
+}
+#[derive(Deserialize)]
+struct WireCall {
+    index: usize,
+    id: Option<String>,
+    function: Option<WireFunction>,
+}
+#[derive(Deserialize)]
+struct WireFunction {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+#[derive(Default)]
+struct CallDelta {
+    id: String,
+    name: String,
+    arguments: String,
+    has_arguments: bool,
+}

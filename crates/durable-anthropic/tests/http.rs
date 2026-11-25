@@ -1,0 +1,702 @@
+use pi_rs_core::{CancellationToken, Error, Message, ModelRequest};
+use pi_rs_durable::model::{DurableRequest, ProviderAdapter, ProviderAttempt, collect_generation};
+use pi_rs_durable::transcript::MessageContentBlocks;
+use pi_rs_durable_anthropic::AnthropicAdapter;
+use serde_json::{Value, json};
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    sync::mpsc,
+    time::Duration,
+};
+use uuid::Uuid;
+
+#[tokio::test]
+async fn ordered_durable_blocks_preserve_content_and_reject_tampering() {
+    let adapter = AnthropicAdapter::new("http://127.0.0.1:1", "key".into()).unwrap();
+    let mut base = request();
+    base.messages = vec![Message::User {
+        content: String::new(),
+    }];
+    let durable = DurableRequest {
+        request: base,
+        blocks: [(
+            0,
+            MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![
+                    json!({"type":"text","text":"first"}),
+                    json!({"type":"image","mimeType":"image/png","data":"aGk="}),
+                    json!({"type":"text","text":"last"}),
+                ],
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let a = attempt();
+    let mut body = adapter.prepare_durable(&a, &durable).await.unwrap();
+    assert_eq!(
+        body["messages"][0]["content"],
+        json!([{"type":"text","text":"first"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},{"type":"text","text":"last"}])
+    );
+    adapter.validate_durable(&a, &durable, &body).unwrap();
+    body["messages"][0]["content"][0]["text"] = json!("changed");
+    assert!(adapter.validate_durable(&a, &durable, &body).is_err());
+    let mut bad = durable.clone();
+    bad.blocks.get_mut(&0).unwrap().blocks[0]["textSignature"] = json!("opaque");
+    assert!(adapter.prepare_durable(&a, &bad).await.is_err());
+    bad = durable.clone();
+    bad.blocks.get_mut(&0).unwrap().blocks.clear();
+    assert!(adapter.prepare_durable(&a, &bad).await.is_err());
+    bad = durable;
+    bad.blocks.get_mut(&0).unwrap().message_id = Uuid::nil();
+    assert!(adapter.prepare_durable(&a, &bad).await.is_err());
+}
+
+fn attempt() -> ProviderAttempt {
+    ProviderAttempt {
+        session_id: Uuid::new_v4(),
+        request_id: Uuid::new_v4(),
+        turn: 0,
+        retries: 0,
+        restarts: 0,
+    }
+}
+fn request() -> ModelRequest {
+    ModelRequest {
+        model: "test".into(),
+        messages: vec![Message::User {
+            content: "hello".into(),
+        }],
+        tools: vec![],
+        max_output_tokens: 100,
+    }
+}
+fn server(
+    response: &'static str,
+    delay: bool,
+) -> (String, mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
+    server_with_options(response, delay, false, false)
+}
+fn server_with_options(
+    response: &'static str,
+    delay: bool,
+    fragment: bool,
+    pause_after_headers: bool,
+) -> (String, mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut b = vec![];
+        let end;
+        loop {
+            let mut part = [0; 4096];
+            let n = socket.read(&mut part).unwrap();
+            assert!(n > 0);
+            b.extend_from_slice(&part[..n]);
+            if let Some(i) = b.windows(4).position(|w| w == b"\r\n\r\n") {
+                end = i + 4;
+                break;
+            }
+        }
+        let headers = String::from_utf8_lossy(&b[..end]).into_owned();
+        let len: usize = headers
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .map(|s| s.parse().unwrap())
+            })
+            .unwrap();
+        while b.len() - end < len {
+            let mut part = [0; 4096];
+            let n = socket.read(&mut part).unwrap();
+            assert!(n > 0);
+            b.extend_from_slice(&part[..n]);
+        }
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("x-api-key: fixture-secret\r\n")
+        );
+        tx.send(serde_json::from_slice(&b[end..end + len]).unwrap())
+            .unwrap();
+        if delay {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if pause_after_headers {
+            let end = response.find("\r\n\r\n").unwrap() + 4;
+            let _ = socket.write_all(&response.as_bytes()[..end]);
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = socket.write_all(&response.as_bytes()[end..]);
+        } else if fragment {
+            for byte in response.as_bytes() {
+                if socket.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        } else {
+            let _ = socket.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{addr}"), rx, thread)
+}
+
+fn http(body: &str) -> &'static str {
+    Box::leak(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).into_boxed_str())
+}
+
+#[tokio::test]
+async fn post_hook_body_text_and_tool_stream() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"usage\":{\"input_tokens\":3}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"猫\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c\",\"name\":\"read\",\"input\":{}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":1}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":4}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (url, rx, thread) = server_with_options(http(events), false, true, false);
+    let ad = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let r = request();
+    let mut body = ad.prepare(&a, &r).await.unwrap();
+    body["messages"][0]["content"][0]["text"] = json!("rewritten");
+    body["temperature"] = json!(0.3);
+    let result = collect_generation(
+        ad.dispatch(&a, &r, body.clone()),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), body);
+    assert_eq!(result.content, "猫");
+    assert_eq!(result.calls[0].arguments, "{\"x\":1}");
+    assert_eq!(result.usage.unwrap().output_tokens, 4);
+    thread.join().unwrap();
+}
+#[tokio::test]
+async fn invalid_requests_and_endpoints_are_rejected() {
+    let ad = AnthropicAdapter::new("http://127.0.0.1:1", "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let r = request();
+    for (key, value) in [
+        ("model", json!("other")),
+        ("stream", json!(false)),
+        ("max_tokens", json!(101)),
+        ("tools", json!([])),
+        ("metadata", json!({})),
+        ("messages", json!([{"role":"system","content":"bad"}])),
+        ("messages", json!([{"role":"user","content":123}])),
+        ("temperature", json!(2)),
+        ("top_p", json!("bad")),
+        ("top_k", json!(-1)),
+        ("stop_sequences", json!([7])),
+    ] {
+        let mut b = ad.prepare(&a, &r).await.unwrap();
+        b[key] = value;
+        assert!(ad.dispatch(&a, &r, b).await.is_err());
+    }
+    for url in [
+        "http://example.com",
+        "http://localhost",
+        "https://user@example.com",
+        "https://example.com/?key=secret",
+        "https://example.com/#x",
+    ] {
+        assert!(AnthropicAdapter::new(url, "secret".into()).is_err());
+    }
+    assert!(AnthropicAdapter::new("https://example.com", "bad\nkey".into()).is_err());
+}
+#[tokio::test]
+async fn errors_and_truncated_streams_fail() {
+    for content in [
+        "data: nope\n\n",
+        "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n",
+    ] {
+        let (url, rx, t) = server(http(content), false);
+        let ad = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+        let a = attempt();
+        let r = request();
+        let b = ad.prepare(&a, &r).await.unwrap();
+        assert!(
+            collect_generation(ad.dispatch(&a, &r, b), &CancellationToken::new(), |_| {})
+                .await
+                .is_err()
+        );
+        rx.recv().unwrap();
+        t.join().unwrap();
+    }
+}
+#[tokio::test]
+async fn cancellation_drops_pending_response() {
+    let (url, rx, t) = server(http(""), true);
+    let ad = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let r = request();
+    let b = ad.prepare(&a, &r).await.unwrap();
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trigger.cancel();
+    });
+    assert!(matches!(
+        collect_generation(ad.dispatch(&a, &r, b), &cancel, |_| {}).await,
+        Err(Error::Cancelled)
+    ));
+    rx.recv().unwrap();
+    t.join().unwrap();
+}
+#[tokio::test]
+async fn redirect_and_http_error_are_not_followed_or_exposed() {
+    for response in [
+        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 14\r\n\r\nfixture-secret",
+    ] {
+        let (url, rx, t) = server(response, false);
+        let ad = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+        let a = attempt();
+        let r = request();
+        let b = ad.prepare(&a, &r).await.unwrap();
+        let error = match ad.dispatch(&a, &r, b).await {
+            Err(e) => e,
+            Ok(_) => panic!("unexpected success"),
+        };
+        assert!(!error.to_string().contains("fixture-secret"));
+        rx.recv().unwrap();
+        t.join().unwrap();
+    }
+}
+#[tokio::test]
+async fn token_limit_is_marked_as_truncated() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (url, rx, t) = server(http(events), false);
+    let ad = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let r = request();
+    let b = ad.prepare(&a, &r).await.unwrap();
+    let generation = collect_generation(ad.dispatch(&a, &r, b), &CancellationToken::new(), |_| {})
+        .await
+        .unwrap();
+    assert!(generation.is_truncated());
+    rx.recv().unwrap();
+    t.join().unwrap();
+}
+#[tokio::test]
+async fn cancellation_during_stream() {
+    let (url, rx, t) = server_with_options(
+        http("data: {\"type\":\"message_start\",\"message\":{}}\n\n"),
+        false,
+        false,
+        true,
+    );
+    let ad = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let r = request();
+    let b = ad.prepare(&a, &r).await.unwrap();
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trigger.cancel();
+    });
+    assert!(matches!(
+        collect_generation(ad.dispatch(&a, &r, b), &cancel, |_| {}).await,
+        Err(Error::Cancelled)
+    ));
+    rx.recv().unwrap();
+    t.join().unwrap();
+}
+
+#[tokio::test]
+async fn rejects_mixed_initial_and_streamed_tool_input() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c\",\"name\":\"read\",\"input\":{\"path\":\"a\"}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (url, rx, thread) = server(http(events), false);
+    let adapter = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let r = request();
+    let body = adapter.prepare(&a, &r).await.unwrap();
+    assert!(
+        collect_generation(
+            adapter.dispatch(&a, &r, body),
+            &CancellationToken::new(),
+            |_| {}
+        )
+        .await
+        .is_err()
+    );
+    rx.recv().unwrap();
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn partial_tool_arguments_are_kept_only_for_truncated_completion() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"working\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c\",\"name\":\"read\",\"input\":{}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":4}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    for reason in ["max_tokens", "tool_use"] {
+        let events = events.replace("max_tokens", reason);
+        let (url, rx, thread) = server(http(&events), false);
+        let adapter = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+        let a = attempt();
+        let r = request();
+        let body = adapter.prepare(&a, &r).await.unwrap();
+        let result = collect_generation(
+            adapter.dispatch(&a, &r, body),
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await;
+        if reason == "max_tokens" {
+            let result = result.unwrap();
+            assert!(result.is_truncated());
+            assert_eq!(result.content, "working");
+            let usage = result.usage.unwrap();
+            assert_eq!((usage.input_tokens, usage.output_tokens), (3, 4));
+            assert_eq!(result.calls.len(), 1);
+            assert_eq!(result.calls[0].arguments, r#"{"path":"#);
+        } else {
+            assert!(result.is_err());
+        }
+        rx.recv().unwrap();
+        thread.join().unwrap();
+    }
+}
+
+fn ordered_tool_request() -> pi_rs_durable::model::DurableToolRequest {
+    let mut request = request();
+    request.messages = vec![
+        Message::User {
+            content: "go".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        },
+        Message::Tool {
+            is_error: false,
+            is_structured: None,
+            call_id: "c1".into(),
+            content: String::new(),
+        },
+    ];
+    pi_rs_durable::model::DurableToolRequest {
+        request: pi_rs_durable::model::DurableRequest {
+            request,
+            blocks: Default::default(),
+        },
+        tool_blocks: [(
+            2,
+            pi_rs_durable::transcript::MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![
+                    json!({"type":"text","text":"first"}),
+                    json!({"type":"image","mimeType":"image/png","data":"aGk="}),
+                    json!({"type":"text","text":"last"}),
+                ],
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+#[tokio::test]
+async fn tool_blocks_reach_http_in_order_and_reject_hook_tampering() {
+    let (url, rx, thread) = server(
+        http(
+            "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
+        false,
+    );
+    let adapter = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let req = ordered_tool_request();
+    let body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
+    assert_eq!(
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|v| v["content"].as_array().unwrap().iter())
+            .find(|v| v["type"] == "tool_result")
+            .unwrap()["content"]
+            .clone(),
+        json!([{"type":"text","text":"first"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},{"type":"text","text":"last"}])
+    );
+    adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
+    let mut changed = body.clone();
+    let key = if changed.get("input").is_some() {
+        "input"
+    } else {
+        "messages"
+    };
+    changed[key] = json!([]);
+    assert!(
+        adapter
+            .validate_with_tool_blocks(&a, &req, &changed)
+            .is_err()
+    );
+    let mut duplicate = req.clone();
+    duplicate.request.request.messages.push(Message::Tool {
+        is_error: false,
+        is_structured: None,
+        call_id: "c1".into(),
+        content: String::new(),
+    });
+    assert!(
+        adapter
+            .prepare_with_tool_blocks(&a, &duplicate)
+            .await
+            .is_err()
+    );
+    collect_generation(
+        adapter.dispatch(&a, &req.request.request, body.clone()),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), body);
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn upstream_tool_status_and_image_profile_fixtures() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    let mut adapter = AnthropicAdapter::new("http://127.0.0.1:1", "key".into()).unwrap();
+    let builtin = adapter
+        .image_profile("claude-fable-5")
+        .unwrap()
+        .supports_images;
+    adapter
+        .set_model_descriptor(
+            "claude-fable-5",
+            &json!({"input": if builtin { vec!["text"] } else { vec!["text", "image"] }}),
+        )
+        .unwrap();
+    assert_eq!(
+        adapter
+            .image_profile("claude-fable-5")
+            .unwrap()
+            .supports_images,
+        !builtin
+    );
+    let a = attempt();
+    let req = ordered_tool_request();
+    for error in [None, Some(false), Some(true)] {
+        let result = ProviderResultRequest {
+            request: req.clone(),
+            tool_errors: error
+                .map(|v| [(2, v)].into_iter().collect())
+                .unwrap_or_default(),
+        };
+        let body = adapter
+            .prepare_with_result_metadata(&a, &result)
+            .await
+            .unwrap();
+        let content = body["messages"][2]["content"].as_array().unwrap();
+        let item = &content[0];
+        match error {
+            Some(v) => assert_eq!(item["is_error"], v),
+            None => assert!(item.get("is_error").is_none()),
+        }
+        if error == Some(true) {
+            assert_eq!(
+                item["content"],
+                "first\n(image attached after the tool results)\nlast"
+            );
+            assert_eq!(
+                content[1]["text"],
+                "Images from the error result of tool call c1 (read):"
+            );
+            assert_eq!(content[2]["source"]["data"], "aGk=");
+        } else {
+            assert_eq!(item["content"][1]["source"]["data"], "aGk=");
+        }
+        adapter
+            .validate_with_result_metadata(&a, &result, &body)
+            .unwrap();
+    }
+    adapter
+        .set_model_descriptor("test", &json!({"input":["text"]}))
+        .unwrap();
+    let result = ProviderResultRequest {
+        request: req,
+        tool_errors: [(2, true)].into_iter().collect(),
+    };
+    let mut body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    assert_eq!(
+        body["messages"][2]["content"][0]["content"],
+        "first\n(tool image omitted: model does not support images)\nlast"
+    );
+    assert!(body["messages"][2]["content"].as_array().unwrap().len() == 1);
+    assert!(!body.to_string().contains("aGk="));
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
+    body["messages"][2]["content"][0]["is_error"] = json!(false);
+    assert!(
+        adapter
+            .validate_with_result_metadata(&a, &result, &body)
+            .is_err()
+    );
+    adapter
+        .set_model_descriptor("test", &json!({"input":["text","image"]}))
+        .unwrap();
+    assert!(adapter.image_profile("test").unwrap().supports_images);
+}
+
+#[tokio::test]
+async fn status_aware_body_reaches_fake_http() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    let (url, rx, thread) = server(
+        http(
+            "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
+        false,
+    );
+    let adapter = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let result = ProviderResultRequest {
+        request: ordered_tool_request(),
+        tool_errors: [(2, true)].into_iter().collect(),
+    };
+    let body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
+    collect_generation(
+        adapter.dispatch(&a, &result.request.request.request, body.clone()),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), body);
+    thread.join().unwrap();
+}
+
+mod lifecycle {
+    use super::*;
+    const LIFECYCLE_CALL: &str = "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"read\",\"input\":{}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+    const LIFECYCLE_DONE: &str = "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+    fn lifecycle_adapter(url: &str) -> std::sync::Arc<dyn pi_rs_durable::model::ProviderAdapter> {
+        let mut adapter = AnthropicAdapter::new(url, "fixture-secret".into()).unwrap();
+        adapter
+            .set_model_descriptor(
+                "test",
+                &json!({"input":["text"],"inputLimits":{"images":{"resize":{"maxWidth":512}}}}),
+            )
+            .unwrap();
+        std::sync::Arc::new(adapter)
+    }
+    fn lifecycle_assert(body: &Value) {
+        let item = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|v| v["content"].as_array().unwrap())
+            .find(|v| v["type"] == "tool_result")
+            .unwrap();
+        assert_eq!(item["is_error"], true);
+        assert_eq!(
+            item["content"],
+            "before\n(tool image omitted: model does not support images)\nafter"
+        );
+    }
+    include!("../../durable/tests/fixtures/provider_tool_lifecycle.rs");
+}
+
+#[tokio::test]
+async fn error_images_follow_all_consecutive_tool_results() {
+    use pi_rs_durable::{model::ProviderResultRequest, transcript::MessageContentBlocks};
+    let adapter = AnthropicAdapter::new("http://127.0.0.1:1", "key".into()).unwrap();
+    let a = attempt();
+    let mut req = ordered_tool_request();
+    if let Message::Assistant { calls, .. } = &mut req.request.request.messages[1] {
+        calls.push(pi_rs_core::ToolCall {
+            id: "c2".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+    }
+    req.request.request.messages.push(Message::Tool {
+        is_error: false,
+        is_structured: None,
+        call_id: "c2".into(),
+        content: String::new(),
+    });
+    req.tool_blocks.insert(
+        3,
+        MessageContentBlocks {
+            message_id: Uuid::new_v4(),
+            blocks: vec![json!({"type":"image","mimeType":"image/png","data":"aGk="})],
+        },
+    );
+    let result = ProviderResultRequest {
+        request: req,
+        tool_errors: [(2, true), (3, false)].into_iter().collect(),
+    };
+    let body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    let content = body["messages"][2]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "tool_result");
+    assert_eq!(content[0]["is_error"], true);
+    assert_eq!(content[1]["type"], "tool_result");
+    assert_eq!(content[1]["tool_use_id"], "c2");
+    assert_eq!(content[1]["is_error"], false);
+    assert_eq!(content[1]["content"][0]["text"], "(see attached image)");
+    assert_eq!(
+        content[2]["text"],
+        "Images from the error result of tool call c1 (read):"
+    );
+    assert_eq!(content[3]["source"]["data"], "aGk=");
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
+}

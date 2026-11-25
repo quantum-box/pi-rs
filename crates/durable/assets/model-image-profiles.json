@@ -1,0 +1,1578 @@
+{
+  "openai": [
+    {
+      "id": "chat-latest",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-4",
+      "input": [
+        "text"
+      ]
+    },
+    {
+      "id": "gpt-4-turbo",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-4.1",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-4.1-mini",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-4.1-nano",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-4o",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-4o-2024-05-13",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-4o-2024-08-06",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-4o-2024-11-20",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-4o-mini",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5-chat-latest",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5-mini",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5-nano",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5-pro",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.1",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.2",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.2-pro",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.3-codex",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.3-codex-spark",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.4",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.4-nano",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.4-pro",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.5-pro",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.6-cyber",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-6-astra",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-6-luna",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-6-sol",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-daybreak-blue-latest",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-daybreak-red-latest",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "o1",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "o1-pro",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "o3",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "o3-mini",
+      "input": [
+        "text"
+      ]
+    },
+    {
+      "id": "o3-pro",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "o4-mini",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 536870912,
+        "images": {
+          "maxPerRequest": 1500,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    }
+  ],
+  "anthropic": [
+    {
+      "id": "claude-fable-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-fable-5-1",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 100,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-haiku-4-5-20251001",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 100,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-opus-4-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 100,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-opus-4-5-20251101",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 100,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-opus-4-6",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-opus-4-7",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-opus-4-8",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-opus-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-opus-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-sonnet-4-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 100,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-sonnet-4-5-20250929",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 100,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-sonnet-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 33554432,
+        "images": {
+          "maxPerRequest": 600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    }
+  ],
+  "google": [
+    {
+      "id": "deep-research-max-preview-04-2026",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "deep-research-preview-04-2026",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-2.5-computer-use-preview-10-2025",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-2.5-flash-lite",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3-flash-preview",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.1-flash-lite",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.1-flash-lite-preview",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.1-pro-preview-customtools",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.6-flash",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.7-flash",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-4-argon",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-flash-latest",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-flash-lite-latest",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-pro-latest",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-robotics-er-2-preview",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemma-4-26b-a4b-it",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    },
+    {
+      "id": "gemma-4-31b-it",
+      "input": [
+        "text",
+        "image"
+      ],
+      "inputLimits": {
+        "maxRequestBytes": 20971520,
+        "images": {
+          "maxPerRequest": 3600,
+          "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 4718592,
+            "jpegQuality": 80
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+# Durable OpenAI Responses adapter
+
+This standalone MIT-licensed crate is opt-in. Add it as a path dependency, construct `OpenAiResponsesAdapter::new(endpoint, token)`, install it with `Harness::install_provider_adapter(Arc::new(adapter))`, then enable it for a conversation with `select_provider_adapter(id, true)`. Install the same adapter identity before reopening selected conversations. No provider is registered automatically. Test independently with `cargo test --manifest-path crates/durable-openai/Cargo.toml`.
+
+The encoder and SSE event handling are adapted from `crates/openai/src/lib.rs` under the repository MIT license. It supports the API-key Responses protocol: text, refusal and reasoning-summary deltas, function calls, basic usage, and completed output replay. Image input and tool-output images use the existing provider's representation. A `max_output_tokens` incomplete result is marked `length` with no replay, so the durable runtime can reject partial tool calls. Other incomplete responses, malformed events, mismatched final tool calls or output indices, tool items with empty arguments or an explicit unfinished status in a completed response, and streams without a terminal response fail. Server-supplied incomplete reasons are not exposed in errors.
+
+The token belongs to the adapter and is added as a bearer header after hook validation; it is not included in the prepared payload or errors. The endpoint must be HTTPS or numeric-loopback HTTP, with no URL credentials, query, or fragment. The caller must trust the configured endpoint and any installed hooks: HTTPS endpoints may be arbitrary hosts and hooks can inspect or replace input. Proxies and redirects are disabled. Requests and raw SSE responses are limited to 4 MiB and 4 MiB respectively. Connect and read inactivity timeouts apply. Cancellation drops the opening future or response stream; it cannot guarantee remote execution stopped.
+
+Validation fixes the model, streaming, `store: false`, authorized tool definitions, and the maximum output token limit. Only a documented-in-code allowlist of top-level request fields can be supplied by hooks. This is not a general authorization or cost policy; hooks may modify conversation input and allowed options. Host control of hooks and provider-side budgets remains necessary.
+
+This adapter does not implement ChatGPT plan OAuth, token refresh, custom headers or proxies, model discovery, non-streaming responses, background mode, server-side conversation state, built-in/hosted tools, arbitrary custom provider identities, or the full Responses API. It has no configuration API for reasoning or sampling; trusted hooks may supply the allowed fields. Unknown SSE event types are ignored as in the existing provider and unsupported output modalities are not surfaced as text. Usage is limited to the existing provider's counters. HTTP errors expose status only rather than reading provider error bodies, so specialized ChatGPT plan quota classification is unavailable. It is independently maintained and may drift from the ordinary provider and upstream pi.
+
+Ordered durable user blocks support text and base64 images in their original order, with optional image `detail` (`low`, `high`, or `auto`). Empty arrays and other block metadata are rejected before dispatch. Provider hooks may change other supported request fields, but cannot rewrite `input` when durable blocks are present.
+
+The adapter consumes durable tool-result status and model image profiles. A host
+can call `set_model_descriptor(model, descriptor)` with an upstream-shaped
+`input` array; this overrides the bundled profile (if any), and must be
+reapplied after reopening. For a known text-only profile the runtime projects
+images to upstream placeholder text on a request copy; stored blocks remain
+unchanged. Unknown profiles retain the image-capable behavior. The adapter
+checks the projected body after provider hooks. Metadata without a provable
+occurrence binding fails closed; missing legacy metadata remains unknown.
+
+As in upstream Responses, text blocks are joined by newlines and images follow
+in `function_call_output`; no independent error flag is present on the wire.
+Image detail defaults to `auto`; the existing explicit detail extension remains
+supported.

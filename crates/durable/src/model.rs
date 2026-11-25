@@ -1,0 +1,544 @@
+//! Provider-neutral generation adapter. Persistence and retry policy belong to the caller.
+//!
+//! Progress is separate from completed output; `progress` provides optional durable
+//! snapshots. Tool-call deltas must never be executed. A `length`
+//! finish reason means the caller must fail the calls rather than execute them.
+
+use std::{collections::HashSet, future::Future};
+
+use futures_util::StreamExt;
+use pi_rs_core::{
+    CancellationToken, Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    Result, ToolCall, ToolCallDelta, ToolSpec, Usage,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Construct a provider request from already prepared core conversation and tool definitions.
+pub fn model_request(
+    model: impl Into<String>,
+    messages: Vec<Message>,
+    tools: Vec<ToolSpec>,
+    max_output_tokens: u32,
+) -> ModelRequest {
+    ModelRequest {
+        model: model.into(),
+        messages,
+        tools,
+        max_output_tokens,
+    }
+}
+
+/// Identity of a committed generation attempt. A retry or recovery gets a new
+/// request ID; the conversation and turn remain stable. Counters are zero-based.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderAttempt {
+    pub session_id: Uuid,
+    pub request_id: Uuid,
+    pub turn: u32,
+    pub retries: u32,
+    pub restarts: u32,
+}
+
+/// A model request with lossless user blocks indexed into `request.messages`.
+#[derive(Clone, Debug)]
+pub struct DurableRequest {
+    pub request: ModelRequest,
+    pub blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+}
+
+/// Ordered tool results indexed into the request, separate from user blocks.
+/// A bound tool message must have empty content and retains its call ID.
+#[derive(Clone, Debug)]
+pub struct DurableToolRequest {
+    pub request: DurableRequest,
+    pub tool_blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+}
+
+/// Tool-result statuses indexed by request message position. Missing entries
+/// mean legacy or unavailable metadata, never an inferred success.
+#[derive(Clone, Debug)]
+pub struct ProviderResultRequest {
+    pub request: DurableToolRequest,
+    pub tool_errors: std::collections::BTreeMap<usize, bool>,
+}
+impl ProviderResultRequest {
+    pub fn validate_bindings(&self) -> Result<()> {
+        self.request.validate_bindings()?;
+        if self.tool_errors.keys().any(|i| !matches!(self.request.request.request.messages.get(*i), Some(Message::Tool { call_id, .. }) if !call_id.is_empty())) {
+            return Err(Error::Config("invalid tool result metadata binding".into()));
+        }
+        Ok(())
+    }
+}
+
+impl DurableToolRequest {
+    /// Check occurrence identities and tool placeholders before asking an adapter to encode.
+    pub fn validate_bindings(&self) -> Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        for (&index, binding) in &self.request.blocks {
+            if index >= self.request.request.messages.len()
+                || binding.message_id.is_nil()
+                || !ids.insert(binding.message_id)
+            {
+                return Err(Error::Config("invalid durable occurrence identity".into()));
+            }
+        }
+        for (&index, binding) in &self.tool_blocks {
+            if self.request.blocks.contains_key(&index)
+                || !matches!(self.request.request.messages.get(index), Some(Message::Tool { call_id, content, .. }) if !call_id.is_empty() && content.is_empty())
+                || binding.message_id.is_nil()
+                || !ids.insert(binding.message_id)
+                || crate::content::UserContent::from_yield(
+                    serde_json::Value::Array(binding.blocks.clone()),
+                    false,
+                )
+                .is_none()
+            {
+                return Err(Error::Config("invalid durable tool block binding".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An opt-in host implementation for one provider. `dispatch` must send exactly
+/// the validated body and enforce its own authorization, budgets and endpoint
+/// restrictions. Preparation must not send a request. Errors fail closed.
+#[async_trait::async_trait]
+pub trait ProviderAdapter: Send + Sync {
+    /// Opt in only if durable block requests are implemented without truncation.
+    fn supports_durable_blocks(&self) -> bool {
+        false
+    }
+    async fn prepare_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+    ) -> Result<serde_json::Value> {
+        if !request.blocks.is_empty() {
+            return Err(Error::Config(
+                "durable content blocks unsupported by provider".into(),
+            ));
+        }
+        self.prepare(attempt, &request.request).await
+    }
+    fn validate_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        if !request.blocks.is_empty() {
+            return Err(Error::Config(
+                "durable content blocks unsupported by provider".into(),
+            ));
+        }
+        self.validate(attempt, &request.request, body)
+    }
+    /// Explicitly opt in to consuming durable tool result blocks. An adapter must
+    /// document any provider-specific projection that combines or reorders them;
+    /// the durable transcript itself remains unchanged.
+    fn supports_durable_tool_blocks(&self) -> bool {
+        false
+    }
+    /// Prepare a body with tool blocks. Existing adapters reject them by default.
+    async fn prepare_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+    ) -> Result<serde_json::Value> {
+        request.validate_bindings()?;
+        if !request.tool_blocks.is_empty() {
+            return Err(Error::Config(
+                "durable tool content blocks unsupported by provider".into(),
+            ));
+        }
+        self.prepare_durable(attempt, &request.request).await
+    }
+    /// Validate the exact body after provider hooks; tool-block adapters must
+    /// enforce the exact documented projection of each bound result and call ID,
+    /// including any intentionally lossy upstream-compatible projection.
+    fn validate_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        request.validate_bindings()?;
+        if !request.tool_blocks.is_empty() {
+            return Err(Error::Config(
+                "durable tool content blocks unsupported by provider".into(),
+            ));
+        }
+        self.validate_durable(attempt, &request.request, body)
+    }
+    /// Opt in to receiving status metadata for tool-result occurrences. Such
+    /// adapters must also support durable tool blocks: even text-only results
+    /// are stored as blocks to bind their status across fork and compaction.
+    fn supports_tool_result_metadata(&self) -> bool {
+        false
+    }
+    async fn prepare_with_result_metadata(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ProviderResultRequest,
+    ) -> Result<serde_json::Value> {
+        request.validate_bindings()?;
+        if !request.tool_errors.is_empty() {
+            return Err(Error::Config(
+                "tool result metadata unsupported by provider".into(),
+            ));
+        }
+        self.prepare_with_tool_blocks(attempt, &request.request)
+            .await
+    }
+    fn validate_with_result_metadata(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ProviderResultRequest,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        request.validate_bindings()?;
+        if !request.tool_errors.is_empty() {
+            return Err(Error::Config(
+                "tool result metadata unsupported by provider".into(),
+            ));
+        }
+        self.validate_with_tool_blocks(attempt, &request.request, body)
+    }
+    /// Resolve image capabilities for the selected model. Override for custom
+    /// endpoints or a newer catalog. Unknown capability preserves existing behavior.
+    fn image_profile(&self, model: &str) -> Option<crate::images::ModelImageProfile> {
+        crate::images::builtin_model_image_profile(self.id(), model)
+    }
+    /// Stable, versioned identity used to bind persisted conversations.
+    fn id(&self) -> &str;
+    async fn prepare(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ModelRequest,
+    ) -> Result<serde_json::Value>;
+    /// Validate provider-specific invariants after all hooks have run.
+    fn validate(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ModelRequest,
+        body: &serde_json::Value,
+    ) -> Result<()>;
+    async fn dispatch(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ModelRequest,
+        body: serde_json::Value,
+    ) -> Result<ModelStream>;
+}
+
+/// Transient display updates; these do not constitute a completed generation.
+#[derive(Clone, Debug)]
+pub enum GenerationProgress {
+    Text(String),
+    Reasoning(String),
+    ToolCallDelta(ToolCallDelta),
+    /// Latest provider metadata, a replacement rather than a delta.
+    Metadata(Box<ModelMetadata>),
+}
+
+/// The authoritative result of a completed stream, suitable for durable storage.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CompletedGeneration {
+    pub content: String,
+    pub calls: Vec<ToolCall>,
+    pub usage: Option<Usage>,
+    pub metadata: ModelMetadata,
+}
+
+/// Caller-provided identity and exact input for one model invocation.
+/// Persist the intent before invoking the model when recovery requires it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GenerationRequest {
+    pub request_id: Uuid,
+    pub session_id: Uuid,
+    pub request: ModelRequest,
+}
+
+/// A completed invocation, including the identity and input needed for recovery.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GenerationResult {
+    pub request: GenerationRequest,
+    pub generation: CompletedGeneration,
+}
+
+/// Invoke the existing session-aware model interface with caller-provided IDs.
+///
+/// The caller owns intent and checkpoint persistence, retries, usage settlement,
+/// and tool execution. An error or cancellation does not return partial output;
+/// it does not establish whether the remote provider executed the request.
+pub async fn generate_in_session<M, F>(
+    model: &M,
+    request: GenerationRequest,
+    cancel: &CancellationToken,
+    progress: F,
+) -> Result<GenerationResult>
+where
+    M: Model + ?Sized,
+    F: FnMut(GenerationProgress),
+{
+    let generation = collect_generation(
+        model.stream_in_session(
+            request.request_id,
+            request.session_id,
+            request.request.clone(),
+        ),
+        cancel,
+        progress,
+    )
+    .await?;
+    Ok(GenerationResult {
+        request,
+        generation,
+    })
+}
+
+impl CompletedGeneration {
+    /// A truncated response's tool arguments cannot safely be executed.
+    pub fn is_truncated(&self) -> bool {
+        self.metadata.finish_reason.as_deref() == Some("length")
+    }
+
+    /// Preserve provider replay data when appending this response to model context.
+    pub fn assistant_message(&self) -> Message {
+        Message::Assistant {
+            content: self.content.clone(),
+            calls: self.calls.clone(),
+            replay: self.metadata.replay.clone(),
+        }
+    }
+}
+
+/// Open a normal model stream and collect it. For correlated/session-aware calls,
+/// use `collect_generation` with the future returned by `Model::stream_in_session`.
+pub async fn generate<M, F>(
+    model: &M,
+    request: ModelRequest,
+    cancel: &CancellationToken,
+    progress: F,
+) -> Result<CompletedGeneration>
+where
+    M: Model + ?Sized,
+    F: FnMut(GenerationProgress),
+{
+    collect_generation(model.stream(request), cancel, progress).await
+}
+
+/// Collect through the authoritative completion event. Cancellation wins races
+/// both while opening and while reading; dropping the future drops the stream.
+/// Provider errors retain their original classification for the caller's retry policy.
+/// The synchronous progress callback should return promptly and must not persist deltas
+/// as completed output. No usage settlement or tool execution is performed here.
+pub async fn collect_generation<O, F>(
+    opening: O,
+    cancel: &CancellationToken,
+    progress: F,
+) -> Result<CompletedGeneration>
+where
+    O: Future<Output = Result<ModelStream>>,
+    F: FnMut(GenerationProgress),
+{
+    collect_generation_inner(opening, cancel, progress, false).await
+}
+
+/// Collect with metadata progress events for an opt-in durable snapshot sink.
+pub async fn collect_generation_with_metadata<O, F>(
+    opening: O,
+    cancel: &CancellationToken,
+    progress: F,
+) -> Result<CompletedGeneration>
+where
+    O: Future<Output = Result<ModelStream>>,
+    F: FnMut(GenerationProgress),
+{
+    collect_generation_inner(opening, cancel, progress, true).await
+}
+
+async fn collect_generation_inner<O, F>(
+    opening: O,
+    cancel: &CancellationToken,
+    mut progress: F,
+    metadata_events: bool,
+) -> Result<CompletedGeneration>
+where
+    O: Future<Output = Result<ModelStream>>,
+    F: FnMut(GenerationProgress),
+{
+    let mut stream = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(Error::Cancelled),
+        result = opening => result?,
+    };
+    let mut content = String::new();
+    let mut metadata = ModelMetadata::default();
+    const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            event = stream.next() => event,
+        };
+        match event {
+            None => return Err(Error::Model("stream ended before completion".into())),
+            Some(Err(error)) => return Err(error),
+            Some(Ok(ModelEvent::Text(delta))) => {
+                if delta.len() > MAX_RESPONSE_BYTES.saturating_sub(content.len()) {
+                    return Err(Error::Model("response exceeds size limit".into()));
+                }
+                content.push_str(&delta);
+                progress(GenerationProgress::Text(delta));
+            }
+            Some(Ok(ModelEvent::Reasoning(delta))) => {
+                progress(GenerationProgress::Reasoning(delta))
+            }
+            Some(Ok(ModelEvent::ToolCallDelta(delta))) => {
+                progress(GenerationProgress::ToolCallDelta(delta))
+            }
+            Some(Ok(ModelEvent::Metadata(update))) => {
+                metadata = update.clone();
+                if metadata_events {
+                    progress(GenerationProgress::Metadata(Box::new(update)));
+                }
+            }
+            Some(Ok(ModelEvent::Complete { calls, usage })) => {
+                if calls.len() > 64 {
+                    return Err(Error::Model("too many tool calls".into()));
+                }
+                let mut ids = HashSet::new();
+                if calls
+                    .iter()
+                    .any(|call| call.id.is_empty() || call.name.is_empty() || !ids.insert(&call.id))
+                {
+                    return Err(Error::Model(
+                        "invalid or duplicate tool call identifier".into(),
+                    ));
+                }
+                return Ok(CompletedGeneration {
+                    content,
+                    calls,
+                    usage,
+                    metadata,
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "model_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+mod session_adapter_tests {
+    use super::*;
+    use futures_util::{StreamExt, stream};
+    use std::sync::Mutex;
+
+    struct TestModel {
+        seen: Mutex<Vec<GenerationRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for TestModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            panic!("session-aware interface must be used")
+        }
+
+        async fn stream_in_session(
+            &self,
+            request_id: Uuid,
+            session_id: Uuid,
+            request: ModelRequest,
+        ) -> Result<ModelStream> {
+            self.seen.lock().unwrap().push(GenerationRequest {
+                request_id,
+                session_id,
+                request,
+            });
+            Ok(stream::iter(vec![
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Metadata(ModelMetadata {
+                    provider_request_id: Some("provider-id".into()),
+                    finish_reason: Some("tool_calls".into()),
+                    ..Default::default()
+                })),
+                Ok(ModelEvent::Complete {
+                    calls: vec![ToolCall {
+                        id: "tool-id".into(),
+                        name: "read".into(),
+                        arguments: "{\"path\":\"a\"}".into(),
+                    }],
+                    usage: Some(Usage {
+                        input_tokens: 5,
+                        output_tokens: 7,
+                    }),
+                }),
+            ])
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_identity_input_and_completed_output_roundtrip() {
+        let model = TestModel {
+            seen: Mutex::new(Vec::new()),
+        };
+        let request = GenerationRequest {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            request: model_request(
+                "model",
+                vec![Message::User {
+                    content: "hi".into(),
+                }],
+                vec![],
+                42,
+            ),
+        };
+        let result =
+            generate_in_session(&model, request.clone(), &CancellationToken::new(), |_| {})
+                .await
+                .unwrap();
+        assert_eq!(*model.seen.lock().unwrap(), vec![request.clone()]);
+        assert_eq!(result.request, request);
+        assert_eq!(result.generation.content, "answer");
+        assert_eq!(result.generation.calls[0].id, "tool-id");
+        assert_eq!(result.generation.calls[0].arguments, "{\"path\":\"a\"}");
+        assert_eq!(result.generation.usage.unwrap().output_tokens, 7);
+        assert_eq!(
+            result.generation.metadata.provider_request_id.as_deref(),
+            Some("provider-id")
+        );
+        let bytes = serde_json::to_vec(&result).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<GenerationResult>(&bytes).unwrap(),
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_does_not_open_stream() {
+        let model = TestModel {
+            seen: Mutex::new(Vec::new()),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let request = GenerationRequest {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            request: model_request("model", vec![], vec![], 1),
+        };
+        assert!(matches!(
+            generate_in_session(&model, request, &cancel, |_| {}).await,
+            Err(Error::Cancelled)
+        ));
+        assert!(model.seen.lock().unwrap().is_empty());
+    }
+}
