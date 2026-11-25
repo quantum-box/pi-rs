@@ -77,6 +77,12 @@ pub struct SessionTransaction<'a> {
     children: Vec<SessionChild>,
 }
 
+struct CheckedDocument {
+    address: Address,
+    policy: StoredDocumentPolicy,
+    document: Option<Map<String, Value>>,
+}
+
 impl<'a> SessionTransaction<'a> {
     pub(crate) fn new(
         store: &'a Store,
@@ -335,7 +341,9 @@ impl<'a> SessionTransaction<'a> {
     where
         T: serde::de::DeserializeOwned + serde::Serialize,
     {
-        let (_, policy, document) = self.checked_document_definition(definition, key)?;
+        let CheckedDocument {
+            policy, document, ..
+        } = self.checked_document_definition(definition, key)?;
         let Some(value) = document else {
             return Ok(None);
         };
@@ -365,7 +373,11 @@ impl<'a> SessionTransaction<'a> {
     where
         T: Clone + serde::de::DeserializeOwned + serde::Serialize,
     {
-        let (address, mut policy, document) = self.checked_document_definition(definition, key)?;
+        let CheckedDocument {
+            address,
+            mut policy,
+            document,
+        } = self.checked_document_definition(definition, key)?;
         let result = self.edit_document(&address, || definition.initial.clone(), edit)?;
         if document.is_none() {
             policy
@@ -385,7 +397,11 @@ impl<'a> SessionTransaction<'a> {
         definition: &ConversationDocument<T>,
         key: &str,
     ) -> Result<bool, Error> {
-        let (address, mut policy, document) = self.checked_document_definition(definition, key)?;
+        let CheckedDocument {
+            address,
+            mut policy,
+            document,
+        } = self.checked_document_definition(definition, key)?;
         if document.is_none() {
             return Ok(false);
         }
@@ -415,7 +431,11 @@ impl<'a> SessionTransaction<'a> {
         if old.kind != new.kind || old.version >= new.version {
             return Err(Error::InvalidDocumentDefinition);
         }
-        let (address, current, document) = self.checked_document_definition(old, key)?;
+        let CheckedDocument {
+            address,
+            policy: current,
+            document,
+        } = self.checked_document_definition(old, key)?;
         if self.stored_document_policy(&address)?.definition.is_none() {
             return Err(Error::InvalidDocumentDefinition);
         }
@@ -444,7 +464,7 @@ impl<'a> SessionTransaction<'a> {
         &mut self,
         definition: &ConversationDocument<T>,
         key: &str,
-    ) -> Result<(Address, StoredDocumentPolicy, Option<Map<String, Value>>), Error> {
+    ) -> Result<CheckedDocument, Error> {
         let address = Address {
             scope: self.state.id.to_string(),
             name: definition.kind.clone(),
@@ -457,7 +477,11 @@ impl<'a> SessionTransaction<'a> {
             if document.is_some() {
                 return Err(Error::InvalidDocumentDefinition);
             }
-            return Ok((address, expected, None));
+            return Ok(CheckedDocument {
+                address,
+                policy: expected,
+                document: None,
+            });
         };
         let expected_binding = expected.definition.expect("constructed definition");
         if binding.schema != expected_binding.schema
@@ -468,7 +492,11 @@ impl<'a> SessionTransaction<'a> {
         {
             return Err(Error::InvalidDocumentDefinition);
         }
-        Ok((address, stored, document))
+        Ok(CheckedDocument {
+            address,
+            policy: stored,
+            document,
+        })
     }
 
     /// Read the fork policy at the transaction's snapshot or its staged replacement.
