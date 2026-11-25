@@ -309,11 +309,16 @@ async fn respond(
     let command = request["type"].as_str().unwrap_or_default();
     let mut admitted = false;
     let result = match command {
-        "prompt" | "steer" | "follow_up" => submit_input(scheduler, id, command, &request).await
-            .map(|running| {
+        "prompt" | "steer" | "follow_up" => {
+            let state = scheduler.conversation(id).map_err(io::Error::other)?;
+            // Admit against the same observation used to deliver an earlier failure.
+            // A concurrent transition must not let a queued request start an idle run.
+            publish_turns(&state, active, seen, None, true, None)?;
+            submit_input(scheduler, &state, command, &request).await.map(|started| {
                 admitted = true;
-                Some(json!({"disposition": if running { "started" } else { "queued" }}))
-            }),
+                Some(json!({"disposition": if started { "started" } else { "queued" }}))
+            })
+        },
         "clear_queue" => scheduler.clear_input_queue(id).map(|withdrawn| {
             let (mut steering, mut follow_up) = (Vec::new(), Vec::new());
             for input in withdrawn {
@@ -373,7 +378,7 @@ async fn respond(
 
 async fn submit_input(
     scheduler: &mut Scheduler,
-    id: Uuid,
+    state: &Conversation,
     command: &str,
     request: &Value,
 ) -> Result<bool, String> {
@@ -395,9 +400,6 @@ async fn submit_input(
         (_, Some(value)) if value == "followUp" => Some(InputMode::FollowUp),
         _ => return Err("streamingBehavior must be steer or followUp".into()),
     };
-    let state = scheduler
-        .conversation(id)
-        .map_err(|error| error.to_string())?;
     let running = state.input_run_active();
     let queued = command != "prompt" || running;
     if queued && behavior.is_none() {
@@ -406,11 +408,11 @@ async fn submit_input(
     let options = AdmissionOptions {
         mode: behavior.unwrap_or(InputMode::FollowUp),
         reject_when_busy: !queued,
-        reject_when_idle: command != "prompt",
+        reject_when_idle: queued,
         on_abort: OnAbort::Keep,
     };
     let submission = if attachments.is_empty() {
-        scheduler.submit_with_options(id, None, message.to_owned(), options)
+        scheduler.submit_with_options(state.id, None, message.to_owned(), options)
     } else {
         if attachments.iter().any(|image| {
             image["type"] != "image" || !image["data"].is_string() || !image["mimeType"].is_string()
@@ -422,7 +424,7 @@ async fn submit_input(
         let admission = UserImageAdmission::new(Arc::new(BuiltinImageProcessor));
         scheduler
             .submit_fitted_user_blocks_with_options(
-                id,
+                state.id,
                 None,
                 blocks,
                 &admission,
