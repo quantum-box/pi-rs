@@ -103,7 +103,7 @@ pub(super) struct Registrations(BTreeMap<PathBuf, Registration>);
 #[derive(Clone, Deserialize, Serialize)]
 struct Registration {
     sha256: String,
-    verified: bool,
+    identity: Option<(u64, u64)>,
     // A failed Describe is kept so startup cannot retry it without the sandbox.
     description: Option<Value>,
 }
@@ -121,6 +121,7 @@ impl Registrations {
         #[cfg(target_os = "macos")]
         if !self.is_empty() {
             let canonical = path.canonicalize().ok();
+            let identity = macos::executable_identity(path);
             let trusted_workspace = trusted_workspace.and_then(|path| path.canonicalize().ok());
             let (path, registration) = self
                 .0
@@ -134,11 +135,14 @@ impl Registrations {
                     self.0.iter().find(|(source, registration)| {
                         // An initially ineligible user alias must not shadow a
                         // separate project executable after project approval.
-                        (registration.verified
+                        (registration.identity.is_some()
                             || !trusted_workspace
                                 .as_ref()
                                 .is_some_and(|workspace| canonical.starts_with(workspace)))
-                            && source.canonicalize().is_ok_and(|path| &path == canonical)
+                            && (registration
+                                .identity
+                                .is_some_and(|original| Some(original) == identity)
+                                || source.canonicalize().is_ok_and(|path| &path == canonical))
                     })
                 })?;
             return Some((|| {
@@ -147,7 +151,12 @@ impl Registrations {
                 };
                 // Use the original regular file and verify its bytes again.
                 // A changed or missing file never retries Describe.
-                let bytes = macos::verified_executable(path, &registration.sha256)?;
+                let (bytes, identity) = macos::verified_executable(path, &registration.sha256)?;
+                if Some(identity) != registration.identity {
+                    return Err(Error::Config(
+                        "project_trust voter file identity changed".into(),
+                    ));
+                }
                 pi_rs_extensions::project_trust::load_described(path, description, bytes).map(Some)
             })());
         }
@@ -309,9 +318,15 @@ mod macos {
         Ok(bytes)
     }
 
-    pub(super) fn verified_executable(path: &Path, sha256: &str) -> Result<Vec<u8>> {
+    pub(super) fn executable_identity(path: &Path) -> Option<(u64, u64)> {
+        let metadata = path.metadata().ok()?;
+        metadata.is_file().then(|| (metadata.dev(), metadata.ino()))
+    }
+
+    pub(super) fn verified_executable(path: &Path, sha256: &str) -> Result<(Vec<u8>, (u64, u64))> {
         let file = private_user_file(path)?;
-        if file.metadata()?.mode() & 0o100 == 0 {
+        let metadata = file.metadata()?;
+        if metadata.mode() & 0o100 == 0 {
             return Err(Error::Config(
                 "project_trust voter must be executable".into(),
             ));
@@ -320,7 +335,7 @@ mod macos {
         if format!("{:x}", Sha256::digest(&bytes)) != sha256 {
             return Err(Error::Config("project_trust voter SHA-256 changed".into()));
         }
-        Ok(bytes)
+        Ok((bytes, (metadata.dev(), metadata.ino())))
     }
 
     fn dispatch(
@@ -336,12 +351,12 @@ mod macos {
             .entry(source.path.clone())
             .or_insert(Registration {
                 sha256: source.sha256,
-                verified: false,
+                identity: None,
                 description: None,
             });
-        let bytes = verified_executable(&source.path, &registration.sha256)
+        let (bytes, identity) = verified_executable(&source.path, &registration.sha256)
             .map_err(|error| error.to_string())?;
-        registration.verified = true;
+        registration.identity = Some(identity);
         let (temporary, voter) =
             pi_rs_extensions::project_trust::stage(&bytes).map_err(|error| error.to_string())?;
         let workspace_handle =
