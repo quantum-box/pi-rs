@@ -1600,6 +1600,20 @@ pub struct BashExecution {
     pub exclude_from_context: bool,
 }
 impl BashExecution {
+    /// Human-readable truncation status for a shell result, including the
+    /// retained output path when one is available.
+    pub fn truncation_note(&self) -> Option<String> {
+        self.truncated.then(|| {
+            self.full_output_path
+                .as_deref()
+                .filter(|path| !path.is_empty())
+                .map_or_else(
+                    || "Output truncated".into(),
+                    |path| format!("Output truncated. Full output: {path}"),
+                )
+        })
+    }
+
     pub fn context_text(&self) -> String {
         let mut text = format!("Ran `{}`\n", self.command);
         if self.output.is_empty() {
@@ -1612,10 +1626,8 @@ impl BashExecution {
         } else if let Some(code) = self.exit_code.filter(|code| *code != 0) {
             text.push_str(&format!("\n\nCommand exited with code {code}"));
         }
-        if self.truncated
-            && let Some(path) = &self.full_output_path
-        {
-            text.push_str(&format!("\n\n[Output truncated. Full output: {path}]"));
+        if let Some(note) = self.truncation_note() {
+            text.push_str(&format!("\n\n[{note}]"));
         }
         text
     }

@@ -6292,7 +6292,7 @@ mod shell_tests {
             output: "visible".into(),
             exit_code: Some(0),
             cancelled: false,
-            truncated: false,
+            truncated: true,
             full_output_path: None,
             exclude_from_context: false,
         };
@@ -6309,7 +6309,7 @@ mod shell_tests {
         let messages = session.conversation_at(session.head()).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(
-            matches!(&messages[0], Message::User { content } if content.contains("visible") && !content.contains("secret"))
+            matches!(&messages[0], Message::User { content } if content.contains("visible") && !content.contains("secret") && content.ends_with("[Output truncated]"))
         );
         assert_eq!(
             session
