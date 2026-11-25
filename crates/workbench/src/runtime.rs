@@ -17,6 +17,7 @@ pub struct Runtime {
     operation_models: Option<super::operation_models::Operations>,
     pub registry: Registry,
     pub extension_sources: std::collections::BTreeMap<String, std::path::PathBuf>,
+    pub(super) loaded_extension_packages: Vec<super::packages::ExtensionPackage>,
     shell: ShellConfig,
     read_image_model: ReadImageModel,
     system_prompt: String,
@@ -1613,7 +1614,7 @@ async fn configure_after(
             extensions.push(connection.clone());
         }
 
-        let extension_sources = extensions
+        let extension_sources: std::collections::BTreeMap<_, _> = extensions
             .iter()
             .filter_map(|extension| {
                 extension
@@ -1645,6 +1646,29 @@ async fn configure_after(
             .collect();
         let mut registry =
             Registry::compose_with_mcp_declarations(extensions, &disabled, mcp_enabled)?;
+        let loaded_extension_packages = if args.terminal_managed_worker {
+            let loaded_paths = extension_sources
+                .iter()
+                .filter(|(id, _)| !disabled.contains(*id))
+                .map(|(_, path)| path)
+                .collect::<std::collections::BTreeSet<_>>();
+            local_resources
+                .packages
+                .extension_packages
+                .iter()
+                .filter(|(paths, _)| {
+                    paths.iter().any(|path| {
+                        local_resources.extensions.contains(path)
+                            && path
+                                .canonicalize()
+                                .is_ok_and(|path| loaded_paths.contains(&path))
+                    })
+                })
+                .map(|(_, package)| package.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         registry.omit_default_tool_timeout(args.tool_timeout_secs.is_none());
         registry.publish_tool_attempts(matches!(
             args.mode,
@@ -1752,6 +1776,7 @@ async fn configure_after(
             read_image_model,
             registry,
             extension_sources,
+            loaded_extension_packages,
             shell,
             system_prompt,
             resources: local_resources,

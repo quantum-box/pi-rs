@@ -250,6 +250,7 @@ impl Line {
 pub enum ToolPart {
     Text(String),
     Warning(String),
+    TruncationNotice(String),
     Image(std::sync::Arc<super::images::InlineImage>),
 }
 
@@ -314,6 +315,10 @@ impl TranscriptMarkdown {
 #[derive(Clone)]
 pub enum Entry {
     Notice(String),
+    TranscriptNotice {
+        kind: crate::config::NoticeKind,
+        text: String,
+    },
     Changelog(crate::changelog::Notice),
     Status(String),
     Warning(String),
@@ -364,6 +369,7 @@ pub enum Entry {
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranscriptOptions<'a> {
+    pub notices: crate::config::NoticeSettings,
     pub image_width: Option<usize>,
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
@@ -430,12 +436,28 @@ impl Entry {
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
             Self::Notice(text) => return wrap(&[Span::themed(text, theme, "muted")], width),
+            Self::TranscriptNotice { kind, text } => {
+                if !options.notices.shows(*kind) {
+                    return Vec::new();
+                }
+                let role = if *kind == crate::config::NoticeKind::CacheWarming {
+                    "muted"
+                } else {
+                    "warning"
+                };
+                return wrap(&[Span::themed(text, theme, role)], width);
+            }
             Self::Changelog(notice) => {
                 let border = Line::themed(&"─".repeat(inner), theme, "border");
                 let mut lines = vec![Line::default(), border.clone()];
                 match notice {
-                    crate::changelog::Notice::Full(body) => {
-                        let mut title = Span::themed("What's New", theme, "accent");
+                    crate::changelog::Notice::Full(body)
+                    | crate::changelog::Notice::ExtensionsFull(body) => {
+                        let title = match notice {
+                            crate::changelog::Notice::Full(_) => "What's New",
+                            _ => "Extension Updates",
+                        };
+                        let mut title = Span::themed(title, theme, "accent");
                         title.bold = true;
                         lines.extend(wrap(&[title], inner));
                         lines.push(Line::default());
@@ -449,6 +471,11 @@ impl Entry {
                             false,
                         ));
                         lines.push(Line::default());
+                    }
+                    crate::changelog::Notice::ExtensionsCondensed(updates) => {
+                        for update in updates {
+                            lines.extend(wrap(&[Span::themed(update, theme, "text")], inner));
+                        }
                     }
                     crate::changelog::Notice::Condensed(version) => {
                         let mut command = Span::themed("/changelog", theme, "text");
@@ -800,13 +827,13 @@ impl Entry {
                     if expand_tools
                         && parts
                             .iter()
-                            .any(|part| !matches!(part, ToolPart::Warning(_)))
+                            .any(|part| matches!(part, ToolPart::Text(_) | ToolPart::Image(_)))
                         && let Some(limit) = options.image_width
                     {
                         for part in parts {
                             match part {
                                 ToolPart::Text(text) => render_text(text, &mut lines),
-                                ToolPart::Warning(_) => {}
+                                ToolPart::Warning(_) | ToolPart::TruncationNotice(_) => {}
                                 ToolPart::Image(image) => {
                                     lines.extend(image.lines(width, limit, padding))
                                 }
@@ -835,7 +862,7 @@ impl Entry {
                     }
                 }
                 for part in parts {
-                    if let ToolPart::Warning(warning) = part {
+                    if let ToolPart::Warning(warning) | ToolPart::TruncationNotice(warning) = part {
                         lines.extend(wrap(&[Span::themed(warning, theme, "warning")], inner));
                     }
                 }
