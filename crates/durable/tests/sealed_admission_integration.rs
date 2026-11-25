@@ -997,18 +997,20 @@ fn sealed_receipt_busy_retains_outcome_and_revalidates_lease() {
     release.store(true, Ordering::SeqCst);
     at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(6500));
+        let _ = unlock_rx.recv_timeout(Duration::from_secs(35));
         conn.execute_batch("COMMIT").unwrap();
     });
     locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     resume_tx.send(()).unwrap();
     busy_rx
-        .recv_timeout(Duration::from_secs(7))
+        .recv_timeout(Duration::from_secs(20))
         .expect("receipt capture did not reach busy timeout");
+    unlock_tx.send(()).unwrap();
     writer.join().unwrap();
     until(|| {
         driver
