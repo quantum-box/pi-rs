@@ -1,6 +1,6 @@
 # Durable の機能優先順位と残りタスク
 
-初回統合の [PR #723](https://github.com/quantum-box/pi-rs/pull/723) は `main`（`872aea19e`）にマージ済み。この一覧は、利用時の影響と機能間の依存関係で順序をつけたもの。
+初回統合の [PR #723](https://github.com/quantum-box/pi-rs/pull/723) は `main`（`872aea19e`）にマージ済み。この一覧は、利用時の影響と機能間の依存関係で順序をつけたもの。[PR #730](https://github.com/quantum-box/pi-rs/pull/730) に途中出力の基礎、[PR #731](https://github.com/quantum-box/pi-rs/pull/731) に各領域の追加実装をまとめている。
 
 ## 実装の優先順位
 
@@ -31,8 +31,8 @@ cargo run -p pi-rs-durable --features text-cli --bin pi-rs-durable -- \
 
 ### マージ後のCI確認
 
-- [マージ後の Rust parity](https://github.com/quantum-box/pi-rs/actions/runs/45543611515) では、確認時点で Windows は成功、Linux は実行中。macOS では書き込み競合のテスト `unsafe_initial_memo_busy_retries_without_dispatching_early` が失敗した。Durable の実行テストは Linux・macOS で行う。[macOS ジョブ](https://github.com/quantum-box/pi-rs/actions/runs/45543611515/job/138967939053)
-- 失敗時はジョブログを確認し、機能の回帰、テストの競合、実行時間上限のどれに当たるかを切り分ける。修正が必要なら該当ケースを再現し、修正後に対象ジョブを再実行する。
+- 初回マージ後の検証は Windows が成功、macOS が失敗、Linux が取り消しになった。[実行結果](https://github.com/quantum-box/pi-rs/actions/runs/45543611515)
+- PR #730 の再検証では Linux と Windows が成功。macOS の競合テストは、SQLite が競合を返す前に固定時間でロックを解放していた。ロック解放を競合の通知に合わせ、ローカルで対象テスト群35件の成功を確認した。[修正前の macOS ジョブ](https://github.com/quantum-box/pi-rs/actions/runs/45551181860/job/138992569329)
 - **完了条件**　マージ後の対象ジョブが成功し、結果を実行履歴から確認できる。
 
 ### 実験機能の既定化判断
