@@ -4124,6 +4124,8 @@ fn entry_id_fork_uses_exact_snapshot_across_reset_and_reopen() {
     state.aborted_generations.push(AbortedGeneration {
         request_id: Uuid::new_v4(),
         text: "partial".into(),
+        submission: None,
+        terminal: false,
     });
     h.save(&state, Expected::Version(version)).unwrap();
     let page = h
