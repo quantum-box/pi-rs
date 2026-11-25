@@ -1087,8 +1087,10 @@ impl Agent<'_> {
                         observer(event);
                     };
                     let ui_events = crate::ui_prompt::RunEvents::default();
+                    // The turn driver retains the provider and tool futures. Store it
+                    // on the heap to keep browser resume within the WASM stack.
                     let result = ui_events
-                        .scope(self.drive(
+                        .scope(Box::pin(self.drive(
                             session,
                             run_id,
                             DriveStart {
@@ -1103,7 +1105,7 @@ impl Agent<'_> {
                             followups,
                             cancel,
                             &mut retry_observer,
-                        ))
+                        )))
                         .await;
                     ui_events.finish(&mut retry_observer).await;
                     result
