@@ -23,6 +23,12 @@ struct ModelStub {
     arguments: String,
 }
 struct ClaimPassHook(Option<Arc<std::sync::atomic::AtomicUsize>>, bool);
+fn publish_ready_marker(path: std::path::PathBuf, data: impl AsRef<[u8]>) {
+    let staging = path.with_extension("tmp");
+    std::fs::write(&staging, data).unwrap();
+    std::fs::rename(staging, path).unwrap();
+}
+
 #[async_trait]
 impl crate::extension::Hook for ClaimPassHook {
     async fn before_tool(
@@ -85,7 +91,7 @@ impl crate::extension::Hook for ClaimPassHook {
                         .into_iter()
                         .find(|(key, _)| key.ends_with(b"/conversation-park-cancel-claim"))
                         .unwrap();
-                    std::fs::write(dir.join("ready"), claim.value).unwrap();
+                    publish_ready_marker(dir.join("ready"), claim.value);
                     loop {
                         std::thread::park();
                     }
@@ -474,7 +480,7 @@ async fn exercise_conversation_park_claim_with_late_publication(
                 let dir = std::path::PathBuf::from(
                     std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").unwrap(),
                 );
-                std::fs::write(dir.join("ready"), context.operation_id.to_string()).unwrap();
+                publish_ready_marker(dir.join("ready"), context.operation_id.to_string());
                 std::future::pending::<()>().await;
             }
             if self.1 == "dispatch_late" || self.1 == "nested_claim_late_kill" {
@@ -512,7 +518,7 @@ async fn exercise_conversation_park_claim_with_late_publication(
                     let dir = std::path::PathBuf::from(
                         std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR").unwrap(),
                     );
-                    std::fs::write(dir.join("ready"), context.operation_id.to_string()).unwrap();
+                    publish_ready_marker(dir.join("ready"), context.operation_id.to_string());
                     std::future::pending::<()>().await;
                 }
             }
@@ -623,7 +629,7 @@ async fn exercise_conversation_park_claim_with_late_publication(
                     context.operation_id
                 );
                 let claim = store.get(key.as_bytes()).unwrap().unwrap();
-                std::fs::write(dir.join("ready"), claim.value).unwrap();
+                publish_ready_marker(dir.join("ready"), claim.value);
                 std::future::pending::<()>().await;
             }
             Ok(())
@@ -1226,8 +1232,7 @@ async fn exercise_conversation_park_claim_with_late_publication(
                 let key =
                     format!("durable/replay-safe-async/{child_id}/conversation-park-cancel-claim");
                 let claim = store.get(key.as_bytes()).unwrap().unwrap();
-                std::fs::write(directory.join("ready.tmp"), claim.value).unwrap();
-                std::fs::rename(directory.join("ready.tmp"), directory.join("ready")).unwrap();
+                publish_ready_marker(directory.join("ready"), claim.value);
                 loop {
                     std::thread::park();
                 }
@@ -1243,7 +1248,7 @@ async fn exercise_conversation_park_claim_with_late_publication(
                 let key =
                     format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
                 let claim = store.get(key.as_bytes()).unwrap().unwrap();
-                std::fs::write(directory.join("ready"), claim.value).unwrap();
+                publish_ready_marker(directory.join("ready"), claim.value);
                 loop {
                     std::thread::park();
                 }
@@ -1830,7 +1835,7 @@ async fn exercise_conversation_park_claim_with_late_publication(
                 let key =
                     format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
                 let claim = store.get(key.as_bytes()).unwrap().unwrap();
-                std::fs::write(before_path.parent().unwrap().join("ready"), claim.value).unwrap();
+                publish_ready_marker(before_path.parent().unwrap().join("ready"), claim.value);
                 loop {
                     std::thread::park();
                 }
@@ -1978,7 +1983,7 @@ async fn exercise_conversation_park_claim_with_late_publication(
                 let key =
                     format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
                 let claim = store.get(key.as_bytes()).unwrap().unwrap();
-                std::fs::write(path.parent().unwrap().join("ready"), claim.value).unwrap();
+                publish_ready_marker(path.parent().unwrap().join("ready"), claim.value);
                 loop {
                     std::thread::park();
                 }
@@ -2995,8 +3000,7 @@ async fn exercise_conversation_park_claim_with_late_publication(
             let store = durable_store::Store::open(claim_path).unwrap();
             let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-claim");
             let claim = store.get(key.as_bytes()).unwrap().expect("claim committed");
-            std::fs::write(directory.join("ready.tmp"), claim.value).unwrap();
-            std::fs::rename(directory.join("ready.tmp"), directory.join("ready")).unwrap();
+            publish_ready_marker(directory.join("ready"), claim.value);
             loop {
                 std::thread::park();
             }
@@ -3097,11 +3101,10 @@ async fn exercise_conversation_park_claim_with_late_publication(
         .await
         .unwrap();
         if let Some(directory) = std::env::var_os("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR") {
-            std::fs::write(
+            publish_ready_marker(
                 std::path::PathBuf::from(directory).join("ready"),
                 serde_json::to_vec(&receipt).unwrap(),
-            )
-            .unwrap();
+            );
             loop {
                 std::thread::park();
             }
