@@ -1730,6 +1730,26 @@ impl Store {
         through: u64,
         limit: usize,
     ) -> Result<Vec<(u64, Vec<KeyedEntry>)>, Error> {
+        self.conversation_commits_including_progress(
+            observer_prefix,
+            None,
+            application_key,
+            after,
+            through,
+            limit,
+        )
+    }
+
+    /// Read observer, progress and application records in database commit order.
+    pub fn conversation_commits_including_progress(
+        &self,
+        observer_prefix: &[u8],
+        progress_prefix: Option<&[u8]>,
+        application_key: &[u8],
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<KeyedEntry>)>, Error> {
         if limit == 0 || limit > 256 || after > through || through > i64::MAX as u64 {
             return Err(Error::InvalidSnapshot);
         }
@@ -1746,7 +1766,7 @@ impl Store {
         let sql = "WITH records AS (
             SELECT c.sequence,e.key,e.value,e.version FROM durable_store_entries e
             JOIN durable_commit_versions c ON c.key=e.key AND c.version=e.version
-            WHERE substr(e.key,1,?1)=?2
+            WHERE substr(e.key,1,?1)=?2 OR (?7 IS NOT NULL AND substr(e.key,1,?8)=?7)
             UNION ALL
             SELECT c.sequence,h.key,h.value,h.version FROM durable_document_history h
             JOIN durable_commit_versions c ON c.key=h.key AND c.version=h.version
@@ -1760,7 +1780,9 @@ impl Store {
             application_key,
             after,
             through,
-            limit as i64
+            limit as i64,
+            progress_prefix,
+            progress_prefix.map(|prefix| prefix.len() as i64)
         ])?;
         let mut result: Vec<(u64, Vec<KeyedEntry>)> = Vec::new();
         while let Some(row) = rows.next()? {
