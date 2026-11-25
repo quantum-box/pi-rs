@@ -472,16 +472,14 @@ impl Tool for ScriptTool {
         };
         let elapsed = started.elapsed();
         let formatter_cancel = format_cancel.clone();
-        let output = tokio::task::spawn_blocking(move || {
-            with_worker_permit(permit, || {
-                sink.lock().expect("codemode output").finish(
-                    success,
-                    elapsed,
-                    error.as_deref(),
-                    options.max_output_tokens,
-                    &formatter_cancel,
-                )
-            })
+        let output = format_output(permit, &format_cancel, move || {
+            sink.lock().expect("codemode output").finish(
+                success,
+                elapsed,
+                error.as_deref(),
+                options.max_output_tokens,
+                &formatter_cancel,
+            )
         })
         .await;
         if format_cancel.is_cancelled() {
@@ -1232,9 +1230,40 @@ impl Drop for Publication {
         }
     }
 }
-fn with_worker_permit<P, T>(permit: P, format: impl FnOnce() -> T) -> T {
-    let _permit = permit;
-    format()
+async fn format_output(
+    permit: WorkerPermit,
+    cancellation: &pi_rs_core::CancellationToken,
+    format: impl FnOnce() -> Option<FormattedOutput> + Send + 'static,
+) -> Result<Option<FormattedOutput>, tokio::task::JoinError> {
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let formatter_cancel = cancellation.clone();
+    let (ready, formatter_ready) = tokio::sync::oneshot::channel();
+    let (start, formatter_start) = tokio::sync::oneshot::channel();
+    let mut formatter = tokio::task::spawn_blocking(move || {
+        ready.send(()).ok()?;
+        let _permit = formatter_start.blocking_recv().ok()?;
+        if formatter_cancel.is_cancelled() {
+            return None;
+        }
+        format()
+    });
+    // Hold the permit here until the blocking job is ready. Cancellation can
+    // release a queued slot immediately, while an active formatter owns its
+    // permit until it exits and drops any unpublished transcript.
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {}
+        output = async {
+            if formatter_ready.await.is_ok() {
+                let _ = start.send(permit);
+            }
+            (&mut formatter).await
+        } => return output,
+    }
+    formatter.abort();
+    Ok(None)
 }
 impl FormattedOutput {
     #[cfg(test)]
@@ -3910,50 +3939,101 @@ mod tests {
         assert!(std::fs::metadata(path).unwrap().len() >= (3 * MAX_OUTPUT) as u64);
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn cancelled_queued_formatter_releases_permit_before_pool_drains() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (occupied, occupied_rx) = tokio::sync::oneshot::channel();
+                let (release, release_rx) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    occupied.send(()).unwrap();
+                    let _ = release_rx.blocking_recv();
+                });
+                occupied_rx.await.unwrap();
+
+                let workers = WorkerPool::new(|| 1);
+                let cancellation = pi_rs_core::CancellationToken::new();
+                let permit = acquire_worker(&workers, &cancellation, None, WORKER_WAIT_LIMIT)
+                    .await
+                    .unwrap();
+                let (ran, mut ran_rx) = tokio::sync::oneshot::channel();
+                let formatter = format_output(permit, &cancellation, move || {
+                    let _ = ran.send(());
+                    None
+                });
+                tokio::pin!(formatter);
+                assert!(futures_util::poll!(&mut formatter).is_pending());
+                assert_eq!(workers.semaphore.available_permits(), 0);
+
+                cancellation.cancel();
+                let output = tokio::time::timeout(Duration::from_secs(2), &mut formatter)
+                    .await
+                    .expect("a cancelled formatter must return while the blocking pool is full")
+                    .unwrap();
+                assert!(output.is_none());
+                assert_eq!(workers.semaphore.available_permits(), 1);
+                assert!(!blocker.is_finished());
+
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                tokio::task::spawn_blocking(|| {}).await.unwrap();
+                assert!(matches!(
+                    ran_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                ));
+            });
+    }
+
     #[tokio::test]
     async fn dropped_formatting_keeps_worker_bounded_and_removes_transcript() {
-        let workers = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = workers.clone().acquire_owned().await.unwrap();
+        let workers = WorkerPool::new(|| 1);
         let cancellation = pi_rs_core::CancellationToken::new();
+        let permit = acquire_worker(&workers, &cancellation, None, WORKER_WAIT_LIMIT)
+            .await
+            .unwrap();
         let (created, path) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel::<()>();
         let task = tokio::spawn({
             let cancellation = cancellation.clone();
             async move {
                 let _cancel_on_drop = cancellation.clone().drop_guard();
-                let output = tokio::task::spawn_blocking(move || {
-                    with_worker_permit(permit, || {
-                        let mut output = Output::default();
-                        output.emit("text", "界".repeat(1000), "").unwrap();
-                        let formatted = output
-                            .finish(true, Duration::ZERO, None, 1, &cancellation)
-                            .unwrap();
-                        created
-                            .send(
-                                formatted.value["full_output_path"]
-                                    .as_str()
-                                    .unwrap()
-                                    .to_owned(),
-                            )
-                            .unwrap();
-                        blocked.recv().unwrap();
-                        formatted
-                    })
+                let formatter_cancel = cancellation.clone();
+                let output = format_output(permit, &cancellation, move || {
+                    let mut output = Output::default();
+                    output.emit("text", "界".repeat(1000), "").unwrap();
+                    let formatted = output
+                        .finish(true, Duration::ZERO, None, 1, &formatter_cancel)
+                        .unwrap();
+                    created
+                        .send(
+                            formatted.value["full_output_path"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned(),
+                        )
+                        .unwrap();
+                    blocked.recv().unwrap();
+                    Some(formatted)
                 })
                 .await
+                .unwrap()
                 .unwrap();
                 output.deliver()
             }
         });
         let path = path.await.unwrap();
         assert!(std::path::Path::new(&path).exists());
-        assert!(workers.clone().try_acquire_owned().is_err());
+        assert_eq!(workers.semaphore.available_permits(), 0);
         task.abort();
         let _ = task.await;
         assert!(cancellation.is_cancelled());
-        assert!(workers.clone().try_acquire_owned().is_err());
+        assert_eq!(workers.semaphore.available_permits(), 0);
         release.send(()).unwrap();
-        let permit = tokio::time::timeout(Duration::from_secs(5), workers.acquire())
+        let permit = tokio::time::timeout(Duration::from_secs(5), workers.semaphore.acquire())
             .await
             .unwrap()
             .unwrap();

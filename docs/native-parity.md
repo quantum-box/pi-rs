@@ -2053,12 +2053,14 @@ deadline when a script times out or the shared worker count when the pool
 stays busy for 60 seconds. The same absolute deadline applies while the
 admitted job is queued in the blocking executor. Expiry at that stage returns
 without waiting for the queue to drain and releases the reserved slot. Once
-execution starts, the worker keeps its slot through shutdown and output
-formatting. A deadline interrupt in QuickJS and a timeout awaiting a tool
-report the effective timeout in milliseconds. Nested calls receive cancellation
-when execution settles, before formatting. Error replies preserve partial
-text and inline images within the output limits and discard uncommitted store
-writes. Text-only errors retain the existing failed outcome. The session
+execution starts, it keeps its slot through shutdown and output formatting.
+Caller cancellation while formatting is queued returns immediately and releases
+the reserved slot. An active formatter keeps the slot until it exits.
+Unpublished transcripts are removed. A deadline interrupt in QuickJS and a
+timeout awaiting a tool report the effective timeout in milliseconds. Nested
+calls receive cancellation when execution settles, before formatting. Error
+replies preserve partial text and inline images within the output limits and
+discard uncommitted store writes. Text-only errors retain the existing failed outcome. The session
 scheduler can still settle a host-wide tool timeout or cancellation before
 Codemode publishes the reply.
 [Pinned Codemode worker deadline](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/codemode/src/runtime/execution.ts)
