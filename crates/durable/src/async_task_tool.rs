@@ -13286,6 +13286,19 @@ mod tests {
                     ))
                     .unwrap();
                 drop(gate);
+                if case == "waits-busy" {
+                    // Observe this wake while the uncertain graph is still
+                    // the only recovery work. The aborts can reserve other
+                    // maintenance and change which wake path runs first.
+                    busy_rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("wake commit did not hit writer busy");
+                    writer_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap()
+                        .join()
+                        .unwrap();
+                }
                 driver.request_abort(abort_parent.id()).unwrap();
                 driver.request_abort(related_abort.id()).unwrap();
                 if case == "waits-abort-conflict" {
@@ -13304,16 +13317,6 @@ mod tests {
                             }],
                             &[durable_store::Mutation::Delete { key: abort_edge }],
                         )
-                        .unwrap();
-                }
-                if case == "waits-busy" {
-                    busy_rx
-                        .recv_timeout(std::time::Duration::from_secs(10))
-                        .expect("wake commit did not hit writer busy");
-                    writer_rx
-                        .recv_timeout(std::time::Duration::from_secs(5))
-                        .unwrap()
-                        .join()
                         .unwrap();
                 }
                 for id in waiters {

@@ -4703,8 +4703,10 @@ fn exercise_claim_recovery_during_maintenance(conflicts: bool) {
     let poll = control.gate.lock().unwrap();
     crate::task_scheduler::set_maintenance_busy_for_test(parent.id(), true);
     let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
     crate::task_driver::on_maintenance_reserved_for_test(parent.id(), move || {
-        reserved_tx.send(()).unwrap()
+        reserved_tx.send(()).unwrap();
+        continue_rx.recv_timeout(Duration::from_secs(30)).unwrap();
     });
     let driver = crate::task_driver::Driver::start_with_harness(task_scheduler, harness.worker());
     busy_rx
@@ -4774,6 +4776,14 @@ fn exercise_claim_recovery_during_maintenance(conflicts: bool) {
                 json!(null),
             ))
             .unwrap();
+    }
+    resume_tx.send(()).unwrap();
+    reserved_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("maintenance was not retained");
+    if conflicts {
+        // The third injected conflict parks the subprocess. Arm the conflicts
+        // only after its driver has reached the maintenance reservation.
         fn install_conflict(
             id: uuid::Uuid,
             conflict_id: uuid::Uuid,
@@ -4813,10 +4823,7 @@ fn exercise_claim_recovery_during_maintenance(conflicts: bool) {
             conflict_count.clone(),
         );
     }
-    resume_tx.send(()).unwrap();
-    reserved_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("maintenance was not retained");
+    continue_tx.send(()).unwrap();
     if conflicts {
         let until = Instant::now() + Duration::from_secs(10);
         loop {
@@ -4913,7 +4920,7 @@ fn claim_recovery_repeated_conflicts_survive_process_kill() {
     let mut process = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "conversation_claim_boundary_tests::repeated_claim_conflicts_yield_to_independent_signal_and_maintenance"])
         .env("PI_TEST_CLAIM_CONFLICT_KILL_DIR", dir.path())
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
     let until = std::time::Instant::now() + Duration::from_secs(30);
     while !dir.path().join("conflict-ready").exists() {
         assert!(
