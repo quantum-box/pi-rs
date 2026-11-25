@@ -45,6 +45,51 @@ fn object(n: i64) -> Map<String, Value> {
 }
 
 #[test]
+fn mutable_drafts_share_staged_edits_and_commit_with_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let conversation = h.create_conversation(config()).unwrap();
+    let address = address();
+    let entry = h
+        .session_transaction(conversation, |tx| {
+            let draft = tx.document_draft(&address, object(1))?;
+            assert_eq!(*draft, object(1));
+            draft.insert("first".into(), json!(true));
+            let entry = tx.append_entry("note", Some(json!("atomic")))?;
+            let draft = tx.document_draft(&address, object(99))?;
+            assert_eq!(draft["first"], true);
+            assert_eq!(draft["n"], 1);
+            draft.insert("n".into(), json!(2));
+            assert_eq!(tx.document(&address)?.unwrap()["n"], 2);
+            Ok(entry)
+        })
+        .unwrap();
+    let store = Store::open(&path).unwrap();
+    let committed = Documents::new(&store).get(&address).unwrap().unwrap();
+    assert_eq!(committed.value["n"], 2);
+    assert_eq!(committed.value["first"], true);
+    assert_eq!(
+        h.conversation(conversation).unwrap().application_writes[0].id,
+        entry
+    );
+
+    h.session_transaction(conversation, |tx| {
+        assert_eq!(*tx.document_draft(&address, object(99))?, committed.value);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        Documents::new(&store)
+            .get(&address)
+            .unwrap()
+            .unwrap()
+            .version,
+        committed.version
+    );
+}
+
+#[test]
 fn entries_and_documents_read_your_writes_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
@@ -110,7 +155,8 @@ fn callback_error_discards_entries_and_documents() {
     let mut h = Harness::open_paused(&path, options()).unwrap();
     let conversation = h.create_conversation(config()).unwrap();
     let result: Result<(), Error> = h.session_transaction(conversation, |tx| {
-        tx.put_document(&address(), object(1))?;
+        tx.document_draft(&address(), object(1))?
+            .insert("discard".into(), json!(true));
         tx.append_entry("note", Some(json!(1)))?;
         Err(DocumentError::InvalidApplicationEntry)
     });
@@ -161,7 +207,8 @@ fn document_conflict_rolls_back_entry_without_replaying_callback() {
         calls += 1;
         assert!(tx.document(&address())?.is_none());
         tx.append_entry("note", Some(json!(1)))?;
-        tx.put_document(&address(), object(1))?;
+        tx.document_draft(&address(), object(1))?
+            .insert("stale".into(), json!(true));
         let mut writer = Transaction::new();
         writer.put(&address(), Expected::Missing, &object(9))?;
         writer.commit(&other)?;

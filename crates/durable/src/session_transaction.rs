@@ -9,7 +9,7 @@ use crate::{
 };
 use durable_store::{Check, Expected, Mutation, Store};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 pub(crate) struct SessionChild {
@@ -64,6 +64,7 @@ pub struct SessionTransaction<'a> {
     pub(crate) entries_allowed: bool,
     reads: HashMap<Address, Option<Map<String, Value>>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
+    drafts: HashSet<Address>,
     task_reads: HashMap<Uuid, (Expected, Option<crate::task_store::StoredTask>)>,
     tasks: Vec<crate::task::Task>,
     signals: crate::document::HostTransaction<'a>,
@@ -93,6 +94,7 @@ impl<'a> SessionTransaction<'a> {
             entries_allowed,
             reads: HashMap::new(),
             writes: HashMap::new(),
+            drafts: HashSet::new(),
             task_reads: HashMap::new(),
             tasks: Vec::new(),
             signals: crate::document::HostTransaction::new(store),
@@ -246,13 +248,39 @@ impl<'a> SessionTransaction<'a> {
         value: Map<String, Value>,
     ) -> Result<(), Error> {
         self.document(address)?;
+        self.drafts.remove(address);
         self.writes.insert(address.clone(), Some(value));
         Ok(())
+    }
+
+    /// Borrow a mutable JSON document draft for this transaction. Repeated
+    /// acquisitions return the staged value. A missing or staged-deleted
+    /// document is initialized from `seed`.
+    ///
+    /// Changes are visible inside this transaction and commit with the other
+    /// session changes. An unchanged existing draft creates no new document
+    /// version, but its original read is still fenced.
+    pub fn document_draft(
+        &mut self,
+        address: &Address,
+        seed: Map<String, Value>,
+    ) -> Result<&mut Map<String, Value>, Error> {
+        if !self.writes.contains_key(address) {
+            let current = self.document(address)?;
+            self.writes.insert(address.clone(), current);
+            self.drafts.insert(address.clone());
+        }
+        Ok(self
+            .writes
+            .get_mut(address)
+            .expect("draft or explicit write staged")
+            .get_or_insert(seed))
     }
 
     /// Delete a document, retaining the original snapshot as a dependency.
     pub fn delete_document(&mut self, address: &Address) -> Result<(), Error> {
         self.document(address)?;
+        self.drafts.remove(address);
         self.writes.insert(address.clone(), None);
         Ok(())
     }
@@ -587,6 +615,9 @@ impl<'a> SessionTransaction<'a> {
     }
 
     pub(crate) fn into_parts(mut self) -> Result<SessionParts, Error> {
+        self.writes.retain(|address, candidate| {
+            !self.drafts.contains(address) || self.reads.get(address) != Some(candidate)
+        });
         if let Some(profile) = self.image_profile_guard {
             let adapter = self
                 .adapter
