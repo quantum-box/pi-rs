@@ -3827,9 +3827,15 @@ When Bash or PowerShell cannot save a full-output file, the native shell
 runner continues draining and preserves the command outcome. Model-facing
 text retains its bounded preview and reports the save error. The tool's
 truncation details use `fullOutputError` instead of a file path, and a
-truncated structured result uses `full_output_error`. User-initiated shell
-execution also retains its bounded output and exit status. Its journal and
-RPC result do not yet expose the separate save error.
+truncated structured result uses `full_output_error`. For the completed
+result, pi-rs uses Rust's checked `File::sync_all` and verifies that the retained
+path identifies the original file at the expected size. Pi waits for Node's
+stream close event and reports errors from that event. Rust's standard file
+drop has no error result. A path in a live progress snapshot refers to a spill
+that is still being written.
+
+User-initiated shell execution also retains its bounded output and exit status.
+Its journal and RPC result do not yet expose the separate save error.
 [Pi shell output accumulator](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/tools/output-accumulator.ts)
 
 ### Grep context and line-limit checkpoint

@@ -1,6 +1,7 @@
 //! Bounded shell output with a recoverable full transcript.
-use std::io::Write;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use encoding_rs::{CoderResult, Decoder, UTF_8};
 use serde_json::{Value, json};
@@ -83,6 +84,7 @@ impl Accumulator {
             && let Err(error) = file.write_all(bytes)
         {
             // Drop the incomplete file and keep collecting bounded output.
+            protect_replacement(file);
             self.file = None;
             self.file_error = Some(error.to_string());
         }
@@ -178,19 +180,16 @@ impl Accumulator {
                 text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()
             }
         };
-        let path = self.file.take().and_then(|mut file| {
-            match file.flush().and_then(|()| {
-                file.keep()
-                    .map(|(_, path)| path)
-                    .map_err(|error| error.error)
-            }) {
+        let path = self
+            .file
+            .take()
+            .and_then(|file| match retain_spill(file, self.bytes) {
                 Ok(path) => Some(path),
                 Err(error) => {
                     self.file_error = Some(error.to_string());
                     None
                 }
-            }
-        });
+            });
         let display_without_notice = display.clone();
         let details = limit.map(|limit| {
             let mut details = json!({
@@ -254,6 +253,67 @@ impl Accumulator {
             details,
         }
     }
+}
+
+fn retain_spill(mut spill: tempfile::NamedTempFile, expected_len: u64) -> io::Result<PathBuf> {
+    // File::flush does not check writeback. Sync while the descriptor is still
+    // open, and verify the name before allowing tempfile to clean up on error.
+    let synced = spill.as_file().sync_all();
+    let len = spill_file_len(spill.as_file(), spill.path()).inspect_err(|_| {
+        spill.disable_cleanup(true);
+    })?;
+    synced?;
+    check_spill_len(len, expected_len)?;
+
+    let (file, path) = spill.keep().map_err(|mut error| {
+        protect_replacement(&mut error.file);
+        error.error
+    })?;
+    let len = spill_file_len(&file, &path)?;
+    if let Err(error) = check_spill_len(len, expected_len) {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+fn protect_replacement(spill: &mut tempfile::NamedTempFile) {
+    if spill_file_len(spill.as_file(), spill.path()).is_err() {
+        spill.disable_cleanup(true);
+    }
+}
+
+fn check_spill_len(len: u64, expected_len: u64) -> io::Result<()> {
+    if len != expected_len {
+        return Err(io::Error::other("full output file size changed"));
+    }
+    Ok(())
+}
+
+fn spill_file_len(file: &File, path: &Path) -> io::Result<u64> {
+    let metadata = path.symlink_metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other(
+            "full output path is no longer a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    let same = {
+        // Compare metadata without opening the path. It may now name a
+        // different file, a symlink, or a special file.
+        use std::os::unix::fs::MetadataExt;
+        let original = file.metadata()?;
+        (original.dev(), original.ino()) == (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let same =
+        same_file::Handle::from_file(file.try_clone()?)? == same_file::Handle::from_path(path)?;
+    if !same {
+        return Err(io::Error::other(
+            "full output path no longer refers to the spill file",
+        ));
+    }
+    Ok(metadata.len())
 }
 
 struct DisplayTail {
@@ -462,6 +522,80 @@ mod tests {
         assert_eq!(std::fs::read(output.path.as_ref().unwrap()).unwrap(), bytes);
         std::fs::remove_file(output.path.unwrap()).unwrap();
     }
+
+    #[test]
+    fn invalid_spill_at_finish_preserves_bounded_output_and_reports_save_error() {
+        enum Change {
+            Remove,
+            Replace,
+            Truncate,
+            #[cfg(unix)]
+            Symlink,
+        }
+
+        for change in [
+            Change::Remove,
+            Change::Replace,
+            Change::Truncate,
+            #[cfg(unix)]
+            Change::Symlink,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let file = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+            let path = file.path().to_owned();
+            let original = directory.path().join("original");
+            let replacement = directory.path().join("replacement");
+            let mut output = Accumulator {
+                file: Some(file),
+                ..Accumulator::default()
+            };
+            output.append(b"start\n");
+            output.append(&vec![b'x'; SCRIPT_BYTES + 1]);
+            output.append(b"\ntail\n");
+
+            match change {
+                Change::Remove => std::fs::remove_file(&path).unwrap(),
+                Change::Replace => {
+                    std::fs::rename(&path, &original).unwrap();
+                    // Preserve the original byte count so only identity can reject it.
+                    std::fs::write(&path, vec![b'z'; output.bytes as usize]).unwrap();
+                }
+                Change::Truncate => output.file.as_ref().unwrap().as_file().set_len(10).unwrap(),
+                #[cfg(unix)]
+                Change::Symlink => {
+                    std::fs::rename(&path, &original).unwrap();
+                    std::fs::write(&replacement, b"unrelated contents").unwrap();
+                    std::os::unix::fs::symlink(&replacement, &path).unwrap();
+                }
+            }
+
+            let output = output.finish();
+            assert!(output.path.is_none());
+            assert!(output.display_without_notice.ends_with("tail\n"));
+            assert!(output.display.contains("Could not save the full output:"));
+            assert!(output.script_truncated);
+            assert!(output.script.starts_with("start\n"));
+            assert!(output.script.ends_with("\ntail\n"));
+            let details = output.details.as_ref().unwrap();
+            assert!(details.get("fullOutputPath").is_none());
+            assert!(details["fullOutputError"].is_string());
+            let mut structured = json!({});
+            output.add_structured_file_details(&mut structured);
+            assert!(structured.get("full_output_path").is_none());
+            assert_eq!(structured["full_output_error"], details["fullOutputError"]);
+
+            match change {
+                Change::Remove | Change::Truncate => assert!(!path.exists()),
+                Change::Replace => assert_eq!(std::fs::read(&path).unwrap()[0], b'z'),
+                #[cfg(unix)]
+                Change::Symlink => {
+                    assert_eq!(path.read_link().unwrap(), replacement);
+                    assert_eq!(std::fs::read(&replacement).unwrap(), b"unrelated contents");
+                }
+            }
+        }
+    }
+
     #[test]
     fn progress_snapshot_is_bounded_and_exposes_complete_output_path() {
         let mut output = Accumulator::default();
