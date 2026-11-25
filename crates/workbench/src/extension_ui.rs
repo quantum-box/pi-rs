@@ -176,7 +176,8 @@ mod tests {
         assert!(rpc.pending.lock().unwrap().is_empty());
     }
 
-    #[cfg(unix)]
+    // The default macOS filesystem rejects non-UTF-8 filenames.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn theme_catalog_omits_paths_with_non_utf8_filenames() {
         use std::os::unix::ffi::OsStrExt;
