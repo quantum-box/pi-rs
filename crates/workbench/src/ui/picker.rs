@@ -266,8 +266,12 @@ impl Picker {
         self.completion_limit.is_some()
     }
 
+    pub fn is_toggle_settings_submenu(&self) -> bool {
+        matches!(self.title.as_str(), "Warnings" | "Notices")
+    }
+
     pub fn paste(&mut self, text: &str) {
-        if self.title == "Warnings" {
+        if self.is_toggle_settings_submenu() {
             return;
         }
         let tree_focus = self.tree_filter_focus();
@@ -829,7 +833,7 @@ impl Picker {
         let cancel = keys.matches("tui.select.cancel", key);
         let confirm = activate
             || keys.matches("tui.select.confirm", key)
-            || (matches!(self.title.as_str(), "Settings" | "Warnings")
+            || ((self.title == "Settings" || self.is_toggle_settings_submenu())
                 && self.query.text.is_empty()
                 && key.code == KeyCode::Char(' ')
                 && key.modifiers == KeyModifiers::NONE)
@@ -1082,7 +1086,7 @@ impl Picker {
             KeyCode::Home if self.title != "Settings" => self.selected = 0,
             KeyCode::End if self.title != "Settings" => self.selected = count.saturating_sub(1),
             KeyCode::Char(character)
-                if self.title != "Warnings"
+                if !self.is_toggle_settings_submenu()
                     && !key.modifiers.intersects(
                         KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                     ) =>
@@ -1270,13 +1274,13 @@ impl Picker {
                 Line::themed(&hint, theme, "dim"),
             ];
         }
-        let settings = matches!(self.title.as_str(), "Settings" | "Warnings");
+        let settings = self.title == "Settings" || self.is_toggle_settings_submenu();
         let prefix = self
             .tree_input_prefix()
             .unwrap_or_else(|| format!("{} · ", self.title));
         let mut lines = vec![match self.title.as_str() {
             "Settings" => self.settings_heading(&prefix, theme, width),
-            "Warnings" => Line::themed(&self.title, theme, "accent"),
+            "Warnings" | "Notices" => Line::themed(&self.title, theme, "accent"),
             _ => Line::themed(&format!("{prefix}{}", self.query.text), theme, "accent"),
         }];
         let items = self.matches();
@@ -1408,14 +1412,15 @@ impl Picker {
             .max()
             .unwrap_or(12)
             .clamp(12, 32);
-        let settings_column = matches!(self.title.as_str(), "Settings" | "Warnings").then(|| {
-            self.items
-                .iter()
-                .map(|item| settings_label_parts(&item.label).0.width())
-                .max()
-                .unwrap_or(0)
-                .min(36)
-        });
+        let settings_column =
+            (self.title == "Settings" || self.is_toggle_settings_submenu()).then(|| {
+                self.items
+                    .iter()
+                    .map(|item| settings_label_parts(&item.label).0.width())
+                    .max()
+                    .unwrap_or(0)
+                    .min(36)
+            });
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
             if let Some(column) = settings_column {
                 lines.push(render_settings_row(
@@ -1634,7 +1639,7 @@ impl Picker {
                 hint("tui.select.confirm"),
                 hint("tui.select.cancel"),
             )
-        } else if self.title == "Warnings" {
+        } else if self.is_toggle_settings_submenu() {
             format!(
                 "{}/Space to change · {} to go back",
                 hint("tui.select.confirm"),
@@ -1713,7 +1718,10 @@ fn render_settings_row(
 // them from the setting they describe.
 fn setting_description(selection: &Selection) -> Option<&'static str> {
     if let Selection::EditSetting(key) = selection
-        && !matches!(key.as_str(), "theme" | "modelThinkingLevels" | "warnings")
+        && !matches!(
+            key.as_str(),
+            "theme" | "modelThinkingLevels" | "warnings" | "notices"
+        )
     {
         return Some("Edit the saved setting as JSON; changes apply on reload or startup.");
     }
@@ -1743,9 +1751,13 @@ fn setting_description(selection: &Selection) -> Option<&'static str> {
         }
         "expandTools" => "Expand or collapse tool output in the transcript.",
         "hideThinkingBlock" => "Hide thinking blocks in assistant responses.",
-        "showCacheMissNotices" => {
-            "Show transcript notices for cache costs and provider recovery diagnostics."
+        "notices" => "Enable or disable individual transcript notices.",
+        "notices.cacheMisses" => {
+            "Show when a response re-bills a significant part of the prompt cache."
         }
+        "notices.cacheWarming" => "Show the cost of cache warming requests.",
+        "notices.compactionCosts" => "Show the cost of compactions and branch summaries.",
+        "notices.reasoningDrops" => "Show when a provider drops reasoning items from a request.",
         "cacheWarming" => {
             "Keep prompt caches warm while streaming, also while idle, or turn cache warming off."
         }
