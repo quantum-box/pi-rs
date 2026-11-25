@@ -544,7 +544,6 @@ mod tests {
             let file = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
             let path = file.path().to_owned();
             let original = directory.path().join("original");
-            let replacement = directory.path().join("replacement");
             let mut output = Accumulator {
                 file: Some(file),
                 ..Accumulator::default()
@@ -563,6 +562,7 @@ mod tests {
                 Change::Truncate => output.file.as_ref().unwrap().as_file().set_len(10).unwrap(),
                 #[cfg(unix)]
                 Change::Symlink => {
+                    let replacement = directory.path().join("replacement");
                     std::fs::rename(&path, &original).unwrap();
                     std::fs::write(&replacement, b"unrelated contents").unwrap();
                     std::os::unix::fs::symlink(&replacement, &path).unwrap();
@@ -589,6 +589,7 @@ mod tests {
                 Change::Replace => assert_eq!(std::fs::read(&path).unwrap()[0], b'z'),
                 #[cfg(unix)]
                 Change::Symlink => {
+                    let replacement = directory.path().join("replacement");
                     assert_eq!(path.read_link().unwrap(), replacement);
                     assert_eq!(std::fs::read(&replacement).unwrap(), b"unrelated contents");
                 }
