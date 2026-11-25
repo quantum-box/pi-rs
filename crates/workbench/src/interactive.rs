@@ -1554,6 +1554,14 @@ impl View {
                     pi_rs::UiResponse::Text(self.editor.text.clone()),
                 )));
             }
+            pi_rs::UiRequest::GetAllThemes => {
+                return Ok(Some((
+                    id,
+                    pi_rs::UiResponse::Themes(Theme::available_for_extension(
+                        &self.resources.themes,
+                    )),
+                )));
+            }
             pi_rs::UiRequest::GetToolsExpanded => {
                 return Ok(Some((id, pi_rs::UiResponse::Confirmed(self.expand_tools))));
             }
@@ -14306,6 +14314,38 @@ exit {exit}
             view.working_status(true, true, started, 80)
                 .starts_with("⠋ 処理中 ")
         );
+    }
+
+    #[test]
+    fn extension_theme_list_uses_loaded_resources_and_preserves_their_precedence() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.json");
+        let ignored = directory.path().join("ignored.json");
+        let later = directory.path().join("later.json");
+        let builtin = directory.path().join("builtin.json");
+        let mut theme: Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        std::fs::write(&builtin, theme.to_string()).unwrap();
+        theme["name"] = json!("fixture");
+        for path in [&first, &later] {
+            std::fs::write(path, theme.to_string()).unwrap();
+        }
+        std::fs::write(&ignored, "invalid theme").unwrap();
+
+        let mut view = View::default();
+        view.resources.themes = vec![ignored, first.clone(), later, builtin];
+        let id = uuid::Uuid::new_v4();
+        let (reply_id, response) = view
+            .ui_request(&json!({"id":id,"method":"getAllThemes"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply_id, id);
+        assert_eq!(
+            json!(response),
+            json!([{"name":"system"},{"name":"dark"},{"name":"fixture","path":first},{"name":"light"}])
+        );
+        assert!(view.dialogs.is_empty());
     }
 
     #[test]

@@ -948,6 +948,16 @@ arbitrary live components and passes a footer data provider to its
 factory. Native extensions supply updated rows through non-blocking host UI
 requests, including in terminal session and selection callbacks.
 
+### Native extension theme discovery
+
+Extensions can send the correlated `getAllThemes` UI request and receive
+`UiResponse::Themes`. The interactive host lists `system` first and includes
+valid themes from its resolved resources, with the first source winning for
+a duplicate name. Native built-ins are embedded and omit the path. The request
+does not select or persist a theme. Native theme objects and theme switching
+through the extension UI remain open.
+[Pi theme listing](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L403-L434)
+
 ### Native extension working indicator
 
 Native extensions can change the working message, hide the working display,
