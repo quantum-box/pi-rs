@@ -26,41 +26,26 @@ fn same_dir(a: &Identity, b: &Identity) -> bool {
 struct Identity {
     // Keep the handle open so Windows cannot reuse its identity while held.
     _handle: std::fs::File,
-    volume: u64,
-    id: [u8; 16],
+    id: crate::windows_file_identity::FileIdentity,
 }
 #[cfg(windows)]
 fn identity(path: &Path) -> std::io::Result<Identity> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
-    };
+    use crate::windows_file_identity::FileIdentity;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
     let handle = std::fs::OpenOptions::new()
         .access_mode(0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
-    let mut info = FILE_ID_INFO::default();
-    // The handle is valid and info is a writable buffer of the specified size.
-    let ok = unsafe {
-        GetFileInformationByHandleEx(
-            handle.as_raw_handle() as _,
-            FileIdInfo,
-            std::ptr::addr_of_mut!(info).cast(),
-            std::mem::size_of::<FILE_ID_INFO>() as u32,
-        )
-    };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let id = FileIdentity::from_file(&handle)?;
     Ok(Identity {
         _handle: handle,
-        volume: info.VolumeSerialNumber,
-        id: info.FileId.Identifier,
+        id,
     })
 }
 #[cfg(windows)]
 fn same_dir(a: &Identity, b: &Identity) -> bool {
-    a.volume == b.volume && a.id == b.id
+    a.id == b.id
 }
 #[cfg(not(any(unix, windows)))]
 type Identity = std::fs::Metadata;

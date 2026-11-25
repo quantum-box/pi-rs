@@ -20,7 +20,7 @@ pub(super) struct Accumulator {
     raw_bytes: u64,
     preserve_bom: bool,
     display: DisplayTail,
-    file: Option<tempfile::NamedTempFile>,
+    file: Option<Spill>,
     file_error: Option<String>,
 }
 
@@ -81,10 +81,9 @@ impl Accumulator {
         self.display.decode(bytes, false);
         self.spill(true);
         if let Some(file) = &mut self.file
-            && let Err(error) = file.write_all(bytes)
+            && let Err(error) = file.file.write_all(bytes)
         {
-            // Drop the incomplete file and keep collecting bounded output.
-            protect_replacement(file);
+            // Close the incomplete file and keep collecting bounded output.
             self.file = None;
             self.file_error = Some(error.to_string());
         }
@@ -111,7 +110,7 @@ impl Accumulator {
     }
 
     /// A bounded, ephemeral view for tool progress subscribers.
-    pub fn partial_result(&self) -> Value {
+    pub fn partial_result(&mut self) -> Value {
         let (display, limit, lines, partial) = self.display.snapshot();
         let mut details = json!({});
         if let Some(limit) = limit {
@@ -128,8 +127,14 @@ impl Accumulator {
                 max_lines: DISPLAY_LINES as u64,
                 max_bytes: DISPLAY_BYTES,
             });
-            if let Some(file) = &self.file {
-                details["fullOutputPath"] = json!(file.path().to_string_lossy());
+            if let Some(spill) = &self.file
+                && let Err(error) = spill.verify(self.bytes)
+            {
+                self.file = None;
+                self.file_error = Some(error.to_string());
+            }
+            if let Some(spill) = &self.file {
+                details["fullOutputPath"] = json!(spill.path.to_string_lossy());
             } else if let Some(error) = &self.file_error {
                 details["fullOutputError"] = json!(error);
             }
@@ -144,14 +149,10 @@ impl Accumulator {
                 || (include_raw && self.raw_bytes > DISPLAY_BYTES as u64 && self.bytes > 0)
                 || self.display.is_truncated())
         {
-            let result = tempfile::Builder::new()
-                .prefix("pi-bash-")
-                .suffix(".log")
-                .tempfile()
-                .and_then(|mut file| {
-                    file.write_all(&self.head)?;
-                    Ok(file)
-                });
+            let result = Spill::create_in(&tempfile::env::temp_dir()).and_then(|mut spill| {
+                spill.file.write_all(&self.head)?;
+                Ok(spill)
+            });
             match result {
                 Ok(file) => self.file = Some(file),
                 Err(error) => self.file_error = Some(error.to_string()),
@@ -183,7 +184,7 @@ impl Accumulator {
         let path = self
             .file
             .take()
-            .and_then(|file| match retain_spill(file, self.bytes) {
+            .and_then(|spill| match spill.finish(self.bytes) {
                 Ok(path) => Some(path),
                 Err(error) => {
                     self.file_error = Some(error.to_string());
@@ -255,59 +256,101 @@ impl Accumulator {
     }
 }
 
-fn retain_spill(mut spill: tempfile::NamedTempFile, expected_len: u64) -> io::Result<PathBuf> {
-    // File::flush does not check writeback. Sync while the descriptor is still
-    // open, and verify the name before allowing tempfile to clean up on error.
-    let synced = spill.as_file().sync_all();
-    let len = spill_file_len(spill.as_file(), spill.path()).inspect_err(|_| {
-        spill.disable_cleanup(true);
-    })?;
-    synced?;
-    check_spill_len(len, expected_len)?;
-
-    let (file, path) = spill.keep().map_err(|mut error| {
-        protect_replacement(&mut error.file);
-        error.error
-    })?;
-    let len = spill_file_len(&file, &path)?;
-    if let Err(error) = check_spill_len(len, expected_len) {
-        let _ = std::fs::remove_file(&path);
-        return Err(error);
-    }
-    Ok(path)
+struct Spill {
+    file: File,
+    path: PathBuf,
 }
 
-fn protect_replacement(spill: &mut tempfile::NamedTempFile) {
-    if spill_file_len(spill.as_file(), spill.path()).is_err() {
-        spill.disable_cleanup(true);
+impl Spill {
+    fn create_in(directory: &Path) -> io::Result<Self> {
+        // Allocate an exclusive name and open an ordinary file. A later unlink
+        // or tempfile keep() by name could affect a replacement, so the name
+        // has no cleanup guard and needs no path-based change on success.
+        let spill = tempfile::Builder::new()
+            .prefix("pi-bash-")
+            .suffix(".log")
+            .disable_cleanup(true)
+            .make_in(directory, |path| {
+                let mut options = File::options();
+                options.read(true).write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                options.open(path)
+            })?;
+        let (file, path) = spill.into_parts();
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn verify(&self, expected_len: u64) -> io::Result<()> {
+        if spill_file_len(&self.file, &self.path)? != expected_len {
+            return Err(io::Error::other("full output file size changed"));
+        }
+        Ok(())
+    }
+
+    fn finish(self, expected_len: u64) -> io::Result<PathBuf> {
+        self.file.sync_all()?;
+        self.verify(expected_len)?;
+        Ok(self.path)
     }
 }
 
-fn check_spill_len(len: u64, expected_len: u64) -> io::Result<()> {
-    if len != expected_len {
-        return Err(io::Error::other("full output file size changed"));
-    }
-    Ok(())
-}
-
+#[cfg(unix)]
 fn spill_file_len(file: &File, path: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let original = file.metadata()?;
     let metadata = path.symlink_metadata()?;
+    checked_spill_len(
+        &metadata,
+        (original.dev(), original.ino()) == (metadata.dev(), metadata.ino()),
+    )
+}
+
+#[cfg(windows)]
+fn spill_file_len(file: &File, path: &Path) -> io::Result<u64> {
+    use crate::windows_file_identity::FileIdentity;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+    let original = FileIdentity::from_file(file)?;
+    // Obtain attributes, size and the full file ID from one open of the
+    // current entry. Opening a reparse point must not resolve its target.
+    let current = File::options()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let metadata = current.metadata()?;
+    if metadata.file_attributes() & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE) != 0 {
+        return Err(io::Error::other(
+            "full output path is no longer a regular file",
+        ));
+    }
+    checked_spill_len(&metadata, original == FileIdentity::from_file(&current)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn spill_file_len(_file: &File, _path: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cannot verify the full output file on this platform",
+    ))
+}
+
+#[cfg(any(unix, windows))]
+fn checked_spill_len(metadata: &std::fs::Metadata, same: bool) -> io::Result<u64> {
     if !metadata.is_file() {
         return Err(io::Error::other(
             "full output path is no longer a regular file",
         ));
     }
-    #[cfg(unix)]
-    let same = {
-        // Compare metadata without opening the path. It may now name a
-        // different file, a symlink, or a special file.
-        use std::os::unix::fs::MetadataExt;
-        let original = file.metadata()?;
-        (original.dev(), original.ino()) == (metadata.dev(), metadata.ino())
-    };
-    #[cfg(not(unix))]
-    let same =
-        same_file::Handle::from_file(file.try_clone()?)? == same_file::Handle::from_path(path)?;
     if !same {
         return Err(io::Error::other(
             "full output path no longer refers to the spill file",
@@ -541,8 +584,8 @@ mod tests {
             Change::Symlink,
         ] {
             let directory = tempfile::tempdir().unwrap();
-            let file = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
-            let path = file.path().to_owned();
+            let file = Spill::create_in(directory.path()).unwrap();
+            let path = file.path.clone();
             let original = directory.path().join("original");
             let mut output = Accumulator {
                 file: Some(file),
@@ -559,7 +602,7 @@ mod tests {
                     // Preserve the original byte count so only identity can reject it.
                     std::fs::write(&path, vec![b'z'; output.bytes as usize]).unwrap();
                 }
-                Change::Truncate => output.file.as_ref().unwrap().as_file().set_len(10).unwrap(),
+                Change::Truncate => output.file.as_ref().unwrap().file.set_len(10).unwrap(),
                 #[cfg(unix)]
                 Change::Symlink => {
                     let replacement = directory.path().join("replacement");
@@ -585,7 +628,8 @@ mod tests {
             assert_eq!(structured["full_output_error"], details["fullOutputError"]);
 
             match change {
-                Change::Remove | Change::Truncate => assert!(!path.exists()),
+                Change::Remove => assert!(!path.exists()),
+                Change::Truncate => assert_eq!(path.metadata().unwrap().len(), 10),
                 Change::Replace => assert_eq!(std::fs::read(&path).unwrap()[0], b'z'),
                 #[cfg(unix)]
                 Change::Symlink => {
@@ -595,6 +639,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dropping_a_verified_spill_leaves_a_later_replacement_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let spill = Spill::create_in(directory.path()).unwrap();
+        spill.verify(0).unwrap();
+        let path = spill.path.clone();
+        std::fs::rename(&path, directory.path().join("original")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        drop(spill);
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn progress_rejects_a_same_length_replacement_and_withdraws_the_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = Spill::create_in(directory.path()).unwrap();
+        let path = file.path.clone();
+        let mut output = Accumulator {
+            file: Some(file),
+            ..Accumulator::default()
+        };
+        let bytes = vec![b'x'; DISPLAY_BYTES + 200];
+        output.append(&bytes);
+        assert!(output.partial_result()["details"]["fullOutputPath"].is_string());
+
+        let original = directory.path().join("original");
+        let replacement = vec![b'z'; bytes.len()];
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::write(&path, &replacement).unwrap();
+        let partial = output.partial_result();
+        assert!(partial["details"].get("fullOutputPath").is_none());
+        assert!(partial["details"]["fullOutputError"].is_string());
+        assert_eq!(
+            partial["content"][0]["text"].as_str().unwrap().len(),
+            DISPLAY_BYTES
+        );
+        output.append(b"tail");
+        let result = output.finish();
+        assert!(result.path.is_none());
+        assert!(result.display_without_notice.ends_with("tail"));
+        assert_eq!(std::fs::read(path).unwrap(), replacement);
+        assert_eq!(std::fs::read(original).unwrap(), bytes);
     }
 
     #[test]
