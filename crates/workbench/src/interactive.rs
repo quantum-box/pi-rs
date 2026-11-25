@@ -4873,7 +4873,8 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     outcome.tool_content()
 }
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug  /changelog\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. See /hotkeys for transcript search and navigation.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug  /changelog  /bug [description]\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. See /hotkeys for transcript search and navigation.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const BUG_REPORT_PICKER_TITLE: &str = "Export bug report ZIP to the launch directory";
 
 fn slash(
     input: &str,
@@ -5046,6 +5047,36 @@ fn slash(
             let session = Session::open(&args.session)?;
             sessions::export(&session, &destination)?;
             view.append(&format!("Exported {}", destination.display()));
+        }
+        "/bug" => {
+            if worker.is_some_and(|worker| is_busy(worker)) {
+                view.append("Wait for the current operation before exporting a bug report");
+                return Ok(None);
+            }
+            view.picker = Some(Picker::new(
+                BUG_REPORT_PICKER_TITLE,
+                vec![
+                    Item {
+                        label: "Metadata and diagnostics only".into(),
+                        selection: Selection::ExportBugReport {
+                            description: rest.into(),
+                            include_transcript: false,
+                        },
+                    },
+                    Item {
+                        label: "Include current-branch transcript (messages and tool output)"
+                            .into(),
+                        selection: Selection::ExportBugReport {
+                            description: rest.into(),
+                            include_transcript: true,
+                        },
+                    },
+                    Item {
+                        label: "Cancel".into(),
+                        selection: Selection::CancelBugReport,
+                    },
+                ],
+            ));
         }
         "/import" => {
             let destination = session_path(&args.workspace, args.session_dir.as_deref());
@@ -7328,6 +7359,10 @@ pub(super) async fn run(
                             view.picker = Some(picker);
                         }
                         Input::Cancel => {
+                            if picker.title == BUG_REPORT_PICKER_TITLE {
+                                view.append("Bug report cancelled");
+                                continue;
+                            }
                             if picker.title == "Warnings"
                                 && let Some(mut parent) = view.warning_settings_parent.take()
                             {
@@ -7966,11 +8001,21 @@ pub(super) async fn run(
                         view.viewport.follow();
                         let auth_command =
                             matches!(input.split_whitespace().next(), Some("/login" | "/logout"));
-                        if !auth_command {
+                        let bug_command = input
+                            .split_once(char::is_whitespace)
+                            .map_or(input.as_str(), |(name, _)| name)
+                            == "/bug";
+                        if !auth_command && !bug_command {
                             view.remember_prompt(&input);
                         }
                         view.history_index = None;
-                        if input.trim() == "/theme" {
+                        if bug_command {
+                            if let Err(error) =
+                                slash(&input, &mut args, &mut view, Some(&mut worker))
+                            {
+                                view.append(&error.to_string());
+                            }
+                        } else if input.trim() == "/theme" {
                             let names = Theme::discover(
                                 &args.theme_paths,
                                 &args.workspace,
@@ -10013,6 +10058,25 @@ fn select(
     worker: &mut Option<Worker>,
 ) -> Result<()> {
     match selection {
+        Selection::ExportBugReport {
+            description,
+            include_transcript,
+        } => {
+            let id = uuid::Uuid::new_v4();
+            let result = (|| {
+                let directory = std::env::current_dir()?;
+                let session = Session::snapshot(&args.session)?;
+                super::bug_report::write(&directory, &session, id, &description, include_transcript)
+            })();
+            match result {
+                Ok(path) => view.append(&format!(
+                    "Bug report exported to: {}\nReport ID: {id}",
+                    path.display()
+                )),
+                Err(error) => view.append(&format!("Failed to export bug report: {error}")),
+            }
+        }
+        Selection::CancelBugReport => view.append("Bug report cancelled"),
         Selection::RenameSession(path, name) => {
             let mut session = Session::open(&path)?;
             if session.host_binding().is_some() {
@@ -11062,6 +11126,7 @@ fn complete_input(args: &Cli, view: &mut View) {
             "/theme",
             "/settings",
             "/debug",
+            "/bug",
             "/changelog",
             "/reload",
         ]

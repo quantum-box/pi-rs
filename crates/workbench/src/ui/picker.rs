@@ -60,6 +60,11 @@ pub enum Selection {
     Setting(String, serde_json::Value),
     SaveDefaultModel,
     EditSetting(String),
+    ExportBugReport {
+        description: String,
+        include_transcript: bool,
+    },
+    CancelBugReport,
 }
 #[derive(Clone)]
 pub enum ThemeSettingsAction {

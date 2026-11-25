@@ -228,6 +228,197 @@ fn auth_login_sigint_exits_while_waiting_for_browser_authorization() {
 }
 
 #[test]
+fn bug_report_completion_consent_and_branch_export_in_both_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            br#"{"relay":{"type":"api_key","key":"test-credential-value"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            br#"{"defaultModel":"test-settings-value"}"#,
+        )
+        .unwrap();
+        let session_path = root.path().join("session.jsonl");
+        let saved_workspace = root.path().join("saved-workspace");
+        std::fs::create_dir(&saved_workspace).unwrap();
+        let mut session = pi_rs::Session::open(&session_path).unwrap();
+        session.set_working_directory(&saved_workspace).unwrap();
+        let anchor = session.head();
+        session
+            .append_user_with_images("inactive branch fixture".into(), vec![], None)
+            .unwrap();
+        session.checkout(anchor).unwrap();
+        session
+            .append_user_with_images("active branch fixture".into(), vec![], None)
+            .unwrap();
+        let session_id = session.session_id();
+        drop(session);
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(size),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let _process = Process(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(root.path())
+                .env("PI_RS_HOME", &home)
+                .env("PI_RS_BUG_TEST_SECRET", "test-environment-value")
+                .env("TERM", "xterm-256color")
+                .args([
+                    "--no-trust",
+                    "--no-mcp",
+                    "--no-extensions",
+                    "--offline",
+                    "--provider",
+                    "ollama",
+                    "--model",
+                    "fixture",
+                    "--tui-mode",
+                    mode,
+                    "--session",
+                ])
+                .arg(&session_path)
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+        let archives = || {
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "zip"))
+                .collect::<Vec<_>>()
+        };
+        output_until(&mut master, |text| text.contains("Enter to send"));
+        let journal = std::fs::read(&session_path).unwrap();
+        master.write_all(b"/bu\t").unwrap();
+        output_until(&mut master, |text| text.contains("/bug"));
+        master.write_all(b" cancelled description\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Metadata and diagnostics only")
+        });
+        assert!(archives().is_empty());
+        master.write_all(b"\x1b").unwrap();
+        output_until(&mut master, |text| text.contains("Bug report cancelled"));
+        assert!(archives().is_empty());
+
+        master.write_all(b"/bug example description\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Include current-branch transcript")
+        });
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| text.contains("Bug report exported to:"));
+        let paths = archives();
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o077, 0);
+        let mut archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 2);
+        assert!(archive.by_name("session.jsonl").is_err());
+        let mut metadata = String::new();
+        archive
+            .by_name("report.json")
+            .unwrap()
+            .read_to_string(&mut metadata)
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(report["description"], "example description");
+        assert_eq!(report["sessionId"], session_id.to_string());
+        assert_eq!(report["transcriptIncluded"], false);
+        let mut diagnostics = String::new();
+        archive
+            .by_name("diagnostics.json")
+            .unwrap()
+            .read_to_string(&mut diagnostics)
+            .unwrap();
+        let details: serde_json::Value = serde_json::from_str(&diagnostics).unwrap();
+        assert_eq!(details["userMessages"], 1);
+        for marker in [
+            "active branch fixture",
+            "inactive branch fixture",
+            "test-credential-value",
+            "test-settings-value",
+            "test-environment-value",
+            "cancelled description",
+        ] {
+            assert!(!metadata.contains(marker) && !diagnostics.contains(marker));
+        }
+        drop(archive);
+        std::fs::remove_file(path).unwrap();
+
+        master.write_all(b"/bug\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Include current-branch transcript")
+        });
+        master.write_all(b"\x1b[B\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Bug report exported to:") && !archives().is_empty()
+        });
+        let paths = archives();
+        assert_eq!(paths.len(), 1);
+        let mut archive = zip::ZipArchive::new(File::open(&paths[0]).unwrap()).unwrap();
+        assert_eq!(archive.len(), 3);
+        let report: serde_json::Value =
+            serde_json::from_reader(archive.by_name("report.json").unwrap()).unwrap();
+        assert!(report["description"].is_null());
+        assert_eq!(report["transcriptIncluded"], true);
+        let mut file = archive.by_name("session.jsonl").unwrap();
+        assert_eq!(file.unix_mode().unwrap() & 0o777, 0o600);
+        let mut transcript = String::new();
+        file.read_to_string(&mut transcript).unwrap();
+        let records = transcript
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let branch = pi_rs::Session::from_serialized_records(records).unwrap();
+        assert_eq!(branch.current_messages().len(), 1);
+        assert!(transcript.contains("active branch fixture"));
+        assert!(!transcript.contains("inactive branch fixture"));
+        assert_eq!(std::fs::read(&session_path).unwrap(), journal);
+        assert!(!saved_workspace.read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "zip")
+        }));
+    }
+}
+
+#[test]
 fn typing_redraws_in_a_synchronized_frame() {
     for mode in ["regular", "fullscreen"] {
         let root = tempfile::tempdir().unwrap();

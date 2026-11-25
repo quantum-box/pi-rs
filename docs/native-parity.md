@@ -5608,6 +5608,32 @@ actions, component updates, cancellation and terminal restoration in
 both display modes, as well as the correlated RPC responses.
 
 
+### Local bug report export
+
+`/bug [description]` opens the same consent picker in regular and fullscreen
+terminals. The first option exports metadata and diagnostics. A separate
+choice adds the current branch's native `session.jsonl`, including messages
+and tool data. Escape or Cancel closes the picker without creating a report.
+The ZIP is written to the directory where Pi was launched as
+`pi-bug-report-<id>.zip`. A resumed session's working directory does not
+redirect the export. The terminal displays the archive path and report ID.
+Publication preserves existing files. On Unix the archive is owner-only.
+
+`report.json` allows the optional user description, report and session IDs,
+creation time, build version, platform, architecture and transcript flag.
+`diagnostics.json` includes branch counts and typed model failures. Configured
+credentials, raw settings and environment values, endpoints, arbitrary error
+text and crash logs are outside that allowlist. A description or explicitly
+included branch can itself contain sensitive text, including command output
+and file contents. Review an archive before sharing it. The export leaves the
+source journal untouched and respects managed-session export boundaries.
+
+Pinned upstream Pi also offers a description editor, a model-generated
+summary when the transcript is omitted, and authenticated upload to its
+developer-report service with ZIP fallback. Upstream records successful
+delivery in session provenance and can clear exported crash records. The
+native command implements the local ZIP option with an inline description.
+
 ### Radius share presentation metadata
 
 Terminal `/share` appends Pi's `pi.share` entry with the session's system prompt
