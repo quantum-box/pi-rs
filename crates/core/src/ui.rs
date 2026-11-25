@@ -261,6 +261,25 @@ pub struct UiThemeInfo {
     pub path: Option<std::path::PathBuf>,
 }
 
+/// A color as used by the native terminal renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiThemeColor {
+    Rgb { r: u8, g: u8, b: u8 },
+    Indexed { index: u8 },
+    Reset,
+}
+
+/// A resolved palette for a named terminal theme.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiThemePalette {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<std::path::PathBuf>,
+    pub colors: std::collections::BTreeMap<String, UiThemeColor>,
+    pub dim: std::collections::BTreeSet<String>,
+}
+
 /// Configure the indicator shown while the interactive agent is working.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -378,6 +397,10 @@ pub enum UiRequest {
     GetEditorText,
     /// List the frontend's built-in and loaded file themes.
     GetAllThemes,
+    /// Look up an exact theme name without selecting the theme.
+    GetTheme {
+        name: String,
+    },
     /// Read the terminal's current tool output expansion state.
     GetToolsExpanded,
     /// Change tool output expansion for the current terminal session.
@@ -489,6 +512,10 @@ impl UiRequest {
             (Self::GetAllThemes, UiResponse::Themes(themes)) => {
                 serde_json::to_vec(themes).is_ok_and(|value| value.len() <= 1024 * 1024)
             }
+            (Self::GetTheme { name }, UiResponse::Theme(theme)) => {
+                theme.name == *name
+                    && serde_json::to_vec(theme).is_ok_and(|value| value.len() <= 1024 * 1024)
+            }
             (Self::Custom { actions, .. }, UiResponse::Text(value)) => {
                 actions.iter().any(|action| &action.value == value)
             }
@@ -509,6 +536,7 @@ impl UiRequest {
                 | Self::Custom { .. }
                 | Self::GetEditorText
                 | Self::GetAllThemes
+                | Self::GetTheme { .. }
                 | Self::GetToolsExpanded
         )
     }
@@ -520,6 +548,7 @@ pub enum UiResponse {
     Text(String),
     Confirmed(bool),
     Themes(Vec<UiThemeInfo>),
+    Theme(UiThemePalette),
     Cancelled,
 }
 
@@ -549,6 +578,41 @@ mod tests {
         assert!(request.accepts_response(&response));
         assert!(!request.accepts_response(&UiResponse::Confirmed(true)));
         assert!(!UiRequest::GetEditorText.accepts_response(&response));
+    }
+
+    #[test]
+    fn named_theme_lookup_uses_a_palette_or_null() {
+        let wire = serde_json::json!({"method":"getTheme","name":"fixture"});
+        let request: UiRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        assert!(request.needs_response());
+
+        let wire = serde_json::json!({
+            "name":"fixture",
+            "path":"themes/fixture.json",
+            "colors":{
+                "accent":{"kind":"rgb","r":18,"g":52,"b":86},
+                "text":{"kind":"reset"},
+                "border":{"kind":"indexed","index":6}
+            },
+            "dim":["border"]
+        });
+        let response: UiResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&response).unwrap(), wire);
+        assert!(request.accepts_response(&response));
+        assert!(request.accepts_response(&UiResponse::Cancelled));
+        assert_eq!(
+            serde_json::to_value(UiResponse::Cancelled).unwrap(),
+            serde_json::Value::Null
+        );
+        assert!(!UiRequest::GetAllThemes.accepts_response(&response));
+        assert!(
+            !UiRequest::GetTheme {
+                name: "other".into()
+            }
+            .accepts_response(&response)
+        );
+        assert!(!request.accepts_response(&UiResponse::Themes(vec![])));
     }
 
     #[test]

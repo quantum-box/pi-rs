@@ -1060,7 +1060,7 @@ fn debug_command_and_global_shortcut_write_session_snapshots() {
 }
 
 #[test]
-fn startup_extension_lists_an_explicit_theme_path() {
+fn startup_extension_lists_and_reads_named_theme_palettes() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().unwrap();
@@ -1068,7 +1068,12 @@ fn startup_extension_lists_an_explicit_theme_path() {
     let mut theme: serde_json::Value =
         serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
     theme["name"] = serde_json::json!("startup-fixture-theme");
+    theme["colors"]["accent"] = serde_json::json!("#123456");
     std::fs::write(&theme_path, format!("\u{feff}{theme}")).unwrap();
+    let project_themes = root.path().join(".pi/themes");
+    std::fs::create_dir_all(&project_themes).unwrap();
+    theme["name"] = serde_json::json!("untrusted-project-theme");
+    std::fs::write(project_themes.join("project.json"), theme.to_string()).unwrap();
     let extension = root.path().join("theme-catalog");
     std::fs::write(&extension, r##"#!/usr/bin/env python3
 import json, os, sys
@@ -1084,7 +1089,20 @@ else:
         assert response[0] == {'name':'system'}, response
         expected = os.path.realpath(os.environ['PI_TEST_THEME_PATH'])
         assert {'name':'startup-fixture-theme','path':expected} in response, response
-        print(json.dumps({'type':'ui','request':{'method':'notify','message':'Startup theme catalog verified'}}), flush=True)
+        def lookup(name):
+            print(json.dumps({'type':'ui','request':{'method':'getTheme','name':name}}), flush=True)
+            return json.loads(sys.stdin.readline())['Ok']
+        selected = lookup('startup-fixture-theme')
+        assert selected['path'] == expected and selected['name'] == 'startup-fixture-theme', selected
+        assert selected['colors']['accent'] == {'kind':'rgb','r':18,'g':52,'b':86}, selected
+        light = lookup('light')
+        assert light['name'] == 'light' and 'path' not in light and light['colors'], light
+        system = lookup('system')
+        assert system['name'] == 'system' and 'path' not in system and system['colors'], system
+        assert lookup('untrusted-project-theme') is None
+        assert lookup(expected) is None
+        assert lookup('light/dark') is None
+        print(json.dumps({'type':'ui','request':{'method':'notify','message':'Startup theme palettes verified'}}), flush=True)
         assert json.loads(sys.stdin.readline()) == {'Ok':None}
     print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
 "##).unwrap();
@@ -1142,7 +1160,7 @@ else:
             .unwrap(),
     );
     output_until(&mut master, |text| {
-        text.contains("Startup theme catalog verified")
+        text.contains("Startup theme palettes verified")
     });
 }
 

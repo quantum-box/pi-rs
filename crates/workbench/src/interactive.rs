@@ -1550,6 +1550,15 @@ impl View {
             }
             pi_rs::UiRequest::PasteToEditor { text } => self.paste_editor_text(&text),
             pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
+            pi_rs::UiRequest::GetTheme { name } => {
+                // Fixed themes are served from the worker's scoped resource snapshot.
+                let response = if name == "system" {
+                    pi_rs::UiResponse::Theme(Theme::system().extension_palette())
+                } else {
+                    pi_rs::UiResponse::Cancelled
+                };
+                return Ok(Some((id, response)));
+            }
             pi_rs::UiRequest::GetEditorText => {
                 return Ok(Some((
                     id,
@@ -15987,7 +15996,7 @@ exit {exit}
     }
 
     #[test]
-    fn resolved_theme_selection_and_extension_catalog_skip_the_same_oversized_duplicate() {
+    fn theme_selection_catalog_and_palette_skip_the_same_oversized_duplicate() {
         use super::*;
 
         let directory = tempfile::tempdir().unwrap();
@@ -16001,10 +16010,18 @@ exit {exit}
 
         let paths = [large, valid.clone()];
         let selected = load_resolved_theme("custom", &paths, directory.path(), false).unwrap();
-        let catalog = pi_rs_workbench::theme_resources::extension_theme_catalog(&paths).unwrap();
-        let listed = catalog.iter().find(|theme| theme.name == "custom").unwrap();
+        let snapshot = pi_rs_workbench::theme_resources::extension_theme_snapshot(&paths).unwrap();
+        let listed = snapshot
+            .catalog()
+            .iter()
+            .find(|theme| theme.name == "custom")
+            .unwrap();
         assert_eq!(selected.path, Some(valid));
         assert_eq!(listed.path, selected.path);
+        assert_eq!(
+            snapshot.palette("custom"),
+            Some(&selected.extension_palette())
+        );
     }
 
     #[test]
@@ -16058,6 +16075,64 @@ exit {exit}
         view.receive(&serde_json::json!({"type":"tool_call_delta","toolCallDelta":{"index":0,"name":"read","arguments":"{\"path\":\"x"}}));
         view.settle();
         assert!(view.streaming_tools.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn extension_system_palette_follows_terminal_reports() {
+        use super::*;
+        use crate::ui::theme::{
+            begin_terminal_palette_query, finish_terminal_colors_pending,
+            mark_terminal_colors_pending, reset_terminal_background, set_terminal_color,
+            set_terminal_palette,
+        };
+        use pi_rs::{UiResponse, UiThemeColor};
+
+        const CHILD: &str = "PI_RS_EXTENSION_SYSTEM_PALETTE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::extension_system_palette_follows_terminal_reports",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let mut view = View::default();
+        let id = uuid::Uuid::nil();
+        let request = json!({"id":id,"method":"getTheme","name":"system"});
+        reset_terminal_background();
+        mark_terminal_colors_pending();
+        let Some((returned_id, UiResponse::Theme(pending))) = view.ui_request(&request).unwrap()
+        else {
+            panic!("missing pending system palette")
+        };
+        assert_eq!(returned_id, id);
+        assert!(pending.path.is_none());
+        assert_eq!(pending.colors["accent"], UiThemeColor::Reset);
+        assert!(pending.dim.contains("muted"));
+
+        set_terminal_color(false, 0, 0, 0);
+        set_terminal_color(true, 255, 255, 255);
+        begin_terminal_palette_query();
+        for index in 0..16 {
+            set_terminal_palette(index, index, 40, 90);
+        }
+        assert!(finish_terminal_colors_pending());
+        let Some((_, UiResponse::Theme(reported))) = view.ui_request(&request).unwrap() else {
+            panic!("missing reported system palette")
+        };
+        assert_eq!(reported, Theme::system().extension_palette());
+        assert!(matches!(
+            reported.colors["accent"],
+            UiThemeColor::Rgb { .. }
+        ));
+        assert!(!reported.dim.contains("muted"));
+        assert!(view.dialogs.is_empty());
     }
 
     #[cfg(any(unix, windows))]

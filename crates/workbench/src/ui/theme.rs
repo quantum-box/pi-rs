@@ -328,6 +328,14 @@ impl Theme {
             dim: BTreeSet::new(),
         })
     }
+    pub fn extension_palette(self) -> pi_rs::UiThemePalette {
+        pi_rs_workbench::theme_resources::ui_theme_palette(
+            self.name,
+            self.path,
+            &self.colors,
+            self.dim,
+        )
+    }
     pub fn color(&self, role: &str) -> Color {
         self.colors.get(role).copied().unwrap_or(Color::Reset)
     }

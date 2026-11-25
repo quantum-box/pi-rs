@@ -420,7 +420,12 @@ impl ToolHost for LifecycleUiHost {
 
     async fn ui(&self, request: crate::UiRequest) -> crate::ExtensionResult<crate::UiResponse> {
         request.validate()?;
-        if request.needs_response() && !matches!(request, crate::UiRequest::GetAllThemes) {
+        if request.needs_response()
+            && !matches!(
+                request,
+                crate::UiRequest::GetAllThemes | crate::UiRequest::GetTheme { .. }
+            )
+        {
             return Err("lifecycle presentation does not support prompts".into());
         }
         tokio::select! {
