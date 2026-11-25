@@ -3,7 +3,8 @@
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -15,9 +16,10 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let (finish_first_tx, finish_first_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         let mut bodies = Vec::new();
-        for answer in ["first answer", "second answer"] {
+        for (index, answer) in ["first answer", "second answer"].into_iter().enumerate() {
             let deadline = Instant::now() + Duration::from_secs(15);
             let mut socket = loop {
                 match listener.accept() {
@@ -62,39 +64,79 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
                     "usage": {"input_tokens": 1, "output_tokens": 1}
                 }
             });
-            let stream = format!("data: {delta}\n\ndata: {completed}\n\n");
+            let partial = format!("data: {delta}\n\n");
+            let final_event = format!("data: {completed}\n\n");
             write!(
                 socket,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{stream}",
-                stream.len(),
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+                partial.len() + final_event.len(),
             ).unwrap();
+            if index == 0 {
+                socket.flush().unwrap();
+                finish_first_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+            socket.write_all(final_event.as_bytes()).unwrap();
         }
         bodies
     });
 
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("durable.sqlite");
-    let run = |url: &str, args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_pi-rs-durable"))
+    let command = |url: &str, args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi-rs-durable"));
+        command
             .env("OPENAI_API_KEY", "fixture-key")
             .arg("--db")
             .arg(&db)
             .args(["--endpoint", url, "--json"])
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        command
     };
-
-    let first = frames(run(&endpoint, &["--model", "fixture", "first request"]));
-    let id = first[0]["id"].as_str().unwrap();
-    assert_eq!(first.last().unwrap()["text"], "first answer");
-    let wrong_route = run(
+    let mut first_run = command(&endpoint, &["--model", "fixture", "first request"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(first_run.stdout.take().unwrap());
+    let mut first_frames = Vec::new();
+    let mut saw_progress = false;
+    loop {
+        let mut line = String::new();
+        if stdout.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        if frame["type"] == "progress" && !saw_progress {
+            assert_eq!(frame["text"], "first answer");
+            saw_progress = true;
+            finish_first_tx.send(()).unwrap();
+        }
+        first_frames.push(frame);
+    }
+    let output = first_run.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(saw_progress);
+    let id = first_frames[0]["id"].as_str().unwrap();
+    assert_eq!(first_frames.last().unwrap()["text"], "first answer");
+    let wrong_route = command(
         "http://127.0.0.1:1/v1/responses",
         &["--conversation", id, "wrong route"],
-    );
+    )
+    .output()
+    .unwrap();
     assert!(!wrong_route.status.success());
     assert!(String::from_utf8_lossy(&wrong_route.stderr).contains("different provider route"));
-    let second = frames(run(&endpoint, &["--conversation", id, "second request"]));
+    let second = frames(
+        command(&endpoint, &["--conversation", id, "second request"])
+            .output()
+            .unwrap(),
+    );
     assert_eq!(second[0]["id"], id);
     assert_eq!(second.last().unwrap()["text"], "second answer");
 
