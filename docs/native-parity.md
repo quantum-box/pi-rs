@@ -7104,6 +7104,15 @@ returns an error rather than the builder default. A busy journal or an
 unreconciled direct journal selection or revoked client binding also returns an
 error. This is a point-in-time check, not a guarantee of later availability.
 
+The Rust SDK exposes `AgentSession::session_id`, `session_file` and
+`session_name` for the same display metadata as
+[Pi's session properties](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L1744-L1757).
+Reopened sessions keep their ID and committed name. Pi imports can retain an
+external ID distinct from the native journal UUID. Forks receive their own ID.
+The file getter reports paths managed by the SDK. Hosts that supply their own
+journal store retain responsibility for its location. ID and name reads return
+an error while the journal is locked.
+
 ### SDK skill commands
 
 `SkillResources::expand_command` renders Pi-style `/skill:name` invocations
