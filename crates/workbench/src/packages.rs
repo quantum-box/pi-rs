@@ -214,10 +214,12 @@ pub async fn prepare(args: &Cli) -> Result<()> {
 }
 
 pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>) -> Result<()> {
+    args.verify_project_workspace()?;
     let mut installed = index()?;
     let mut plan = resource_declarations(args, false)?;
     plan.extend(resource_declarations(args, true)?);
     for declaration in plan {
+        args.verify_project_workspace()?;
         let is_remote = remote(&declaration.source);
         let cached = if is_remote {
             installed.contains_key(&key(&declaration.source))
@@ -247,6 +249,12 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
             continue;
         }
         if declaration.transient || !cached {
+            let restricted = declaration.scope_order == 1 && !args.trusted;
+            // Cargo can read ambient workspace config and transitively build
+            // local dependencies. No automatic remote build is scoped here.
+            if is_remote && restricted {
+                continue;
+            }
             eprintln!(
                 "Preparing native package {}",
                 display_source(&declaration.source)
@@ -255,7 +263,8 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
                 &declaration.source,
                 args.offline,
                 cleanup,
-                &args.trust_registrations,
+                Some(args),
+                restricted,
             )
             .await
             {
@@ -273,6 +282,7 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
             }
         }
     }
+    args.verify_project_workspace()?;
     Ok(())
 }
 
@@ -345,6 +355,15 @@ fn resolve_package_resources(
     let mut prompts = ResourceSelections::default();
     let mut themes = ResourceSelections::default();
     for declaration in resource_declarations(args, transient)? {
+        if declaration.scope_order == 1
+            && !args.trusted
+            && let Some(value) = installed.get(&key(&declaration.source))
+        {
+            let package: Installed = serde_json::from_value(value.clone())?;
+            if !super::project_trust::outside_untrusted_workspace(args, &package.root)? {
+                continue;
+            }
+        }
         let package = if startup {
             startup_package(&declaration, &installed)?
         } else {
@@ -1605,10 +1624,19 @@ fn resource_declarations(args: &Cli, transient: bool) -> Result<Vec<Declaration>
         .filter(|entry| entry.transient)
         .map(|entry| source_identity(&entry.source))
         .collect();
-    let users: Vec<_> = read(&agent)?
-        .into_iter()
-        .filter(|entry| !transient_identities.contains(&source_identity(&entry.source)))
-        .collect();
+    let mut users = Vec::new();
+    for entry in read(&agent)? {
+        if !transient_identities.contains(&source_identity(&entry.source))
+            && (remote(&entry.source)
+                || args.trusted
+                || super::project_trust::outside_untrusted_workspace(
+                    args,
+                    Path::new(&entry.source),
+                )?)
+        {
+            users.push(entry);
+        }
+    }
     let projects = if args.trusted {
         read(&project)?
             .into_iter()
@@ -1885,14 +1913,26 @@ fn remote(source: &str) -> bool {
 }
 
 async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Result<Installed> {
-    install_with_registrations(source, offline, cleanup, &Default::default()).await
+    install_with_registrations(source, offline, cleanup, None, false).await
 }
 
 async fn validate_package_executable(
     executable: &Path,
-    registrations: &super::project_trust::Registrations,
+    activation: Option<&Cli>,
+    restricted: bool,
 ) -> Result<()> {
-    if let Some(registration) = registrations.load(executable) {
+    if let Some(args) = activation {
+        args.verify_project_workspace()?;
+        if restricted && !super::project_trust::outside_untrusted_workspace(args, executable)? {
+            return Err(Error::Config(
+                "package executable is inside the untrusted workspace".into(),
+            ));
+        }
+    }
+    if let Some(registration) = activation.and_then(|args| {
+        args.trust_registrations
+            .load(executable, args.trusted.then_some(args.workspace.as_path()))
+    }) {
         if registration?.is_none() {
             return Err(Error::Config(
                 "native package preflight registration failed".into(),
@@ -1904,12 +1944,39 @@ async fn validate_package_executable(
     Ok(())
 }
 
+fn admit_user_package_preparation(args: &Cli, source: &str) -> Result<()> {
+    let path = Path::new(source);
+    if remote(source) || !super::project_trust::outside_untrusted_workspace(args, path)? {
+        return Err(Error::Config(
+            "package preparation requires a trusted source".into(),
+        ));
+    }
+    if path.is_dir() {
+        match path.join("Cargo.toml").symlink_metadata() {
+            Ok(_) => {
+                return Err(Error::Config(
+                    "automatic Cargo preparation requires project trust".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 async fn install_with_registrations(
     source: &str,
     offline: bool,
     cleanup: Option<&Children>,
-    registrations: &super::project_trust::Registrations,
+    activation: Option<&Cli>,
+    restricted: bool,
 ) -> Result<Installed> {
+    let check_workspace = || activation.map_or(Ok(()), Cli::verify_project_workspace);
+    check_workspace()?;
+    if restricted {
+        admit_user_package_preparation(activation.expect("automatic preparation"), source)?;
+    }
     if offline && remote(source) {
         return Err(Error::Config(format!(
             "cannot install package in offline mode: {}",
@@ -1939,9 +2006,10 @@ async fn install_with_registrations(
         }
     }
     let _lock = lock;
+    check_workspace()?;
     if !remote(source) && Path::new(source).is_file() {
         let executable = PathBuf::from(source);
-        validate_package_executable(&executable, registrations).await?;
+        validate_package_executable(&executable, activation, restricted).await?;
         let root = executable.parent().unwrap_or(Path::new(".")).to_path_buf();
         let package = Installed {
             source: source.into(),
@@ -1964,12 +2032,16 @@ async fn install_with_registrations(
     let mut root = PathBuf::from(source);
     let mut installed_binaries = Vec::new();
     if let Some(specification) = source.strip_prefix("cargo:") {
+        check_workspace()?;
         let (name, version) = specification
             .rsplit_once('@')
             .map_or((specification, None), |(name, version)| {
                 (name, Some(version))
             });
         let mut command = tokio::process::Command::new("cargo");
+        if let Some(args) = activation {
+            command.current_dir(&args.workspace);
+        }
         command
             .args([
                 "install",
@@ -2002,6 +2074,7 @@ async fn install_with_registrations(
             })?;
         installed_binaries = executable_files(&generation.path().join("cargo/bin"))?;
     } else if let Some(specification) = source.strip_prefix("git:") {
+        check_workspace()?;
         if ambiguous_git_reference(specification) {
             eprintln!(
                 "Ambiguous Git package source: using the last @ as the ref separator for compatibility; use #ref to disambiguate"
@@ -2055,6 +2128,13 @@ async fn install_with_registrations(
         installed_binaries.push(root.clone());
         root = root.parent().unwrap_or(Path::new(".")).into();
     }
+    if restricted {
+        admit_user_package_preparation(
+            activation.expect("automatic preparation"),
+            root.to_str()
+                .ok_or_else(|| Error::Config("invalid package directory".into()))?,
+        )?;
+    }
     // Check both files before executable discovery or local/Git Cargo builds.
     // Registry `cargo install` above has already built the crate in order to
     // locate its source; it cannot be prevalidated through this path.
@@ -2070,7 +2150,16 @@ async fn install_with_registrations(
         .and_then(Value::as_str)
         .map(str::to_owned);
     if has_cargo_manifest {
+        if restricted {
+            return Err(Error::Config(
+                "automatic Cargo preparation requires project trust".into(),
+            ));
+        }
+        check_workspace()?;
         let mut metadata = tokio::process::Command::new("cargo");
+        if let Some(args) = activation {
+            metadata.current_dir(&args.workspace);
+        }
         metadata
             .args([
                 "metadata",
@@ -2102,7 +2191,11 @@ async fn install_with_registrations(
             version = package["version"].as_str().map(str::to_owned);
         }
         if !source.starts_with("cargo:") {
+            check_workspace()?;
             let mut build = tokio::process::Command::new("cargo");
+            if let Some(args) = activation {
+                build.current_dir(&args.workspace);
+            }
             build
                 .args([
                     "build",
@@ -2141,8 +2234,9 @@ async fn install_with_registrations(
     let pi = manifest_pi(&manifest)?;
     let resources = collect_package_resources(&root, pi, installed_binaries)?;
     for executable in &resources.extensions {
-        validate_package_executable(executable, registrations).await?;
+        validate_package_executable(executable, activation, restricted).await?;
     }
+    check_workspace()?;
     let retain_generation = root.starts_with(generation.path())
         || resources
             .extensions
@@ -2899,6 +2993,33 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn project_trust_rejects_workspace_package_aliases_before_preparation() {
+        use clap::Parser;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let user_packages = root.path().join("user-packages");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&user_packages).unwrap();
+        let manifest = workspace.join("package");
+        std::fs::create_dir(&manifest).unwrap();
+        let alias = user_packages.join("alias");
+        std::os::unix::fs::symlink(&manifest, &alias).unwrap();
+        let mut args = Cli::parse_from(["pi", "--no-trust"]);
+        args.workspace = workspace;
+        args.project_workspace =
+            Some(super::super::project_trust::WorkspaceIdentity::capture(&args.workspace).unwrap());
+        assert!(admit_user_package_preparation(&args, alias.to_str().unwrap()).is_err());
+        assert!(admit_user_package_preparation(&args, user_packages.to_str().unwrap()).is_ok());
+        std::fs::write(
+            user_packages.join("Cargo.toml"),
+            "[package]\nname = 'fixture'\n",
+        )
+        .unwrap();
+        assert!(admit_user_package_preparation(&args, user_packages.to_str().unwrap()).is_err());
+    }
 
     #[test]
     fn worker_package_discovery_keeps_recovered_scope_after_disk_repair() {

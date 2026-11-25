@@ -8070,6 +8070,7 @@ pub(super) async fn run(
                             view.append("Wait for the shell command to finish");
                             view.editor.replace(input);
                         } else if input.trim() == "/reload" {
+                            args.verify_project_workspace()?;
                             view.cache_warming_status = None;
                             view.dialogs.clear();
                             view.ui_status.clear();
@@ -10313,7 +10314,9 @@ fn select(
             }
         }
         Selection::Trust(decision) => {
-            crate::config::save_trust(&args.workspace, decision)?;
+            crate::config::save_trust_guarded(&args.workspace, decision, || {
+                args.verify_project_workspace()
+            })?;
             args.trusted = decision;
             args.trust_pending = false;
             args.settings = args.settings.reload_latest(&args.workspace, decision)?;
@@ -10452,15 +10455,14 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
 }
 
 async fn prepare_initial_session_async(args: Cli) -> Result<Cli> {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
+    // Runtime shutdown joins started blocking tasks even when the startup
+    // future is dropped after a signal.
+    let mut args = tokio::task::spawn_blocking(move || {
         let mut args = args;
-        let result = restore_workspace_with_trust(&mut args, true).map(|()| args);
-        let _ = sender.send(result);
-    });
-    let mut args = receiver
-        .await
-        .map_err(|_| Error::Config("workspace discovery stopped".into()))??;
+        restore_workspace_with_trust(&mut args, true).map(|()| args)
+    })
+    .await
+    .map_err(|_| Error::Config("workspace discovery stopped".into()))??;
     initialize_session(&mut args)?;
     Ok(args)
 }
@@ -10532,6 +10534,11 @@ fn restore_workspace_with_trust(args: &mut Cli, initial_terminal: bool) -> Resul
         }
         args.workspace = path;
     }
+    if cfg!(target_os = "macos") && (initial_terminal || args.project_workspace.is_some()) {
+        let identity = super::project_trust::WorkspaceIdentity::capture(&args.workspace)?;
+        args.workspace = identity.path().into();
+        args.project_workspace = Some(identity);
+    }
     let decision = if initial_terminal {
         crate::project_trust::resolve_initial(args)?
     } else {
@@ -10539,7 +10546,9 @@ fn restore_workspace_with_trust(args: &mut Cli, initial_terminal: bool) -> Resul
     };
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
+    args.verify_project_workspace()?;
     args.settings = args.settings.reload_latest(&args.workspace, args.trusted)?;
+    args.verify_project_workspace()?;
     args.refresh_workspace_selection();
     args.restore_session_model(&session)?;
     drop(session);

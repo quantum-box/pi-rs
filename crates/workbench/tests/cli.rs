@@ -1318,7 +1318,7 @@ fn malformed_settings_warn_without_blocking_offline_model_listing() {
 #[cfg(unix)]
 #[test]
 fn project_trust_preflight_keeps_denied_rpc_workspaces_isolated() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     let root = tempfile::tempdir().unwrap();
     let agent = root.path().join("agent");
@@ -1345,6 +1345,12 @@ fn project_trust_preflight_keeps_denied_rpc_workspaces_isolated() {
     fixture(&local.join("extensions/automatic"), "project-auto");
     fixture(&local.join("configured"), "project-configured");
     fixture(&local.join("packaged"), "project-package");
+    symlink(local.join("packaged"), agent.join("package-alias")).unwrap();
+    std::fs::write(
+        agent.join("settings.json"),
+        json!({"packages":["./package-alias"]}).to_string(),
+    )
+    .unwrap();
     let mcp = local.join("mcp");
     fixture(&mcp, "project-mcp");
     std::fs::write(

@@ -1501,7 +1501,11 @@ async fn load_configured_extensions(
                 )));
             }
             _ => {
-                let mut extension = match args.trust_registrations.load(Path::new(name)) {
+                args.verify_project_workspace()?;
+                let mut extension = match args.trust_registrations.load(
+                    Path::new(name),
+                    args.trusted.then_some(args.workspace.as_path()),
+                ) {
                     Some(Ok(Some(extension))) => extension,
                     Some(Ok(None)) => continue,
                     Some(Err(error)) => {

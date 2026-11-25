@@ -215,6 +215,7 @@ impl Resources {
     }
 
     fn load_inner(args: &Cli, startup: bool) -> Result<Self> {
+        args.verify_project_workspace()?;
         let mut resources = Self {
             packages: super::packages::resources(args)?,
             ..Self::default()

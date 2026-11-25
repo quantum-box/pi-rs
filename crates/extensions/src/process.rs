@@ -46,6 +46,8 @@ pub fn extension_flag(name: &str) -> Option<ExtensionFlagValue> {
 #[derive(Clone)]
 struct Endpoint {
     path: PathBuf,
+    #[cfg(target_os = "macos")]
+    admitted_bytes: Option<Arc<[u8]>>,
     flags: Option<Arc<str>>,
     pi_lifecycle_fields: bool,
     compaction_overflow_reason_v1: bool,
@@ -75,8 +77,17 @@ impl Endpoint {
             outcome.legacy_text_result()
         }
     }
-    fn command(&self, protocol: &str) -> Command {
-        let mut command = Command::new(&self.path);
+    fn command(&self, protocol: &str) -> ExtensionResult<(Command, Option<tempfile::TempDir>)> {
+        #[cfg(target_os = "macos")]
+        let (mut command, staging) = if let Some(bytes) = &self.admitted_bytes {
+            let (staging, executable) =
+                project_trust::stage(bytes).map_err(|error| error.to_string())?;
+            (Command::new(executable), Some(staging))
+        } else {
+            (Command::new(&self.path), None)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (mut command, staging) = (Command::new(&self.path), None);
         if let Some(flags) = &self.flags {
             command.env(FLAGS_ENV, flags.as_ref());
         } else {
@@ -92,7 +103,7 @@ impl Endpoint {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        command
+        Ok((command, staging))
     }
 }
 
@@ -836,6 +847,8 @@ impl ExecutableExtension {
         }
         Ok(Endpoint {
             path: executable,
+            #[cfg(target_os = "macos")]
+            admitted_bytes: None,
             flags: None,
             pi_lifecycle_fields: false,
             compaction_overflow_reason_v1: false,
@@ -3075,8 +3088,8 @@ fn call_bash_stream(
     cancel: &CancellationToken,
     output: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> ExtensionResult<Option<i32>> {
-    let mut child = ChildGuard::spawn(endpoint.command("--pi-rs-extension-bash-v1"))
-        .map_err(|error| error.to_string())?;
+    let (command, _staging) = endpoint.command("--pi-rs-extension-bash-v1")?;
+    let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
     let (written, writes) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -3187,7 +3200,7 @@ fn call_duplex_inner<T: serde::de::DeserializeOwned>(
             ..
         }
     );
-    let command = endpoint.command("--pi-rs-extension-v2");
+    let (command, _staging) = endpoint.command("--pi-rs-extension-v2")?;
     if cancellation.is_cancelled() {
         return Err("native extension operation cancelled".into());
     }
@@ -3900,8 +3913,9 @@ fn call<T: serde::de::DeserializeOwned>(
                 .map_err(|error| error.to_string())?;
         }
     }
+    let (command, _staging) = endpoint.command("--pi-rs-extension-v1")?;
     call_wire(
-        endpoint.command("--pi-rs-extension-v1"),
+        command,
         &wire,
         response_limit,
         presence_response.then_some(legacy_response_limit),
@@ -4047,11 +4061,66 @@ pub mod project_trust {
 
     /// Reconstitute the normal v1 registration from an earlier Describe.
     #[doc(hidden)]
-    pub fn load_described(path: &Path, description: &Value) -> Result<ExecutableExtension> {
+    #[cfg(target_os = "macos")]
+    pub fn load_described(
+        path: &Path,
+        description: &Value,
+        verified_bytes: Vec<u8>,
+    ) -> Result<ExecutableExtension> {
         ExecutableExtension::from_description(
-            ExecutableExtension::describe_endpoint(path)?,
+            Endpoint {
+                // The source path is provenance only. Every invocation uses
+                // a fresh private copy of the bytes this registration checked.
+                path: path.into(),
+                admitted_bytes: Some(verified_bytes.into()),
+                flags: None,
+                pi_lifecycle_fields: false,
+                compaction_overflow_reason_v1: false,
+                text_result_v2: false,
+                structured_text_result: false,
+            },
             serde_json::from_value(description.clone())?,
         )
+    }
+
+    #[doc(hidden)]
+    #[cfg(target_os = "macos")]
+    pub fn stage(verified_bytes: &[u8]) -> Result<(tempfile::TempDir, PathBuf)> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let root = Path::new("/private/tmp");
+        let metadata = root.symlink_metadata()?;
+        if root.canonicalize()? != root
+            || !metadata.is_dir()
+            || metadata.uid() != 0
+            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
+        {
+            return Err(Error::Config(
+                "native voter scratch root is not protected".into(),
+            ));
+        }
+        let staging = tempfile::Builder::new()
+            .prefix("pi-trust-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(root)?;
+        let metadata = staging.path().symlink_metadata()?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o700
+        {
+            return Err(Error::Config(
+                "native voter scratch is not owner-only".into(),
+            ));
+        }
+        let executable = staging.path().join("voter");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o500)
+            .open(&executable)?;
+        file.write_all(verified_bytes)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o500))?;
+        Ok((staging, executable))
     }
 
     /// The command is already sandboxed and can see only the preflight request.
@@ -5048,6 +5117,38 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn admitted_registration_stages_verified_bytes_for_callbacks() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let verified = b"approved fixture bytes";
+        std::fs::write(&source, verified).unwrap();
+        let extension = project_trust::load_described(
+            &source,
+            &serde_json::json!({"id":"fixture", "dependencies":[], "commands":[], "tools":[]}),
+            verified.to_vec(),
+        )
+        .unwrap();
+        std::fs::write(&source, b"updated fixture bytes").unwrap();
+        for protocol in [
+            "--pi-rs-extension-v1",
+            "--pi-rs-extension-v2",
+            "--pi-rs-extension-bash-v1",
+        ] {
+            let (command, staging) = extension.endpoint.command(protocol).unwrap();
+            let staging = staging.unwrap();
+            let executable = Path::new(command.get_program());
+            assert_eq!(executable.parent(), Some(staging.path()));
+            assert_eq!(std::fs::read(executable).unwrap(), verified);
+            assert_eq!(
+                staging.path().metadata().unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
     #[test]
     fn cancelled_extension_write_returns_with_a_full_queue() {
         let (writer, _reader) = std::sync::mpsc::sync_channel(1);
@@ -5062,6 +5163,8 @@ mod tests {
     fn cancelled_extension_request_does_not_spawn_process() {
         let endpoint = Endpoint {
             path: std::env::temp_dir().join("pi-cancelled-extension-does-not-exist"),
+            #[cfg(target_os = "macos")]
+            admitted_bytes: None,
             flags: None,
             pi_lifecycle_fields: false,
             compaction_overflow_reason_v1: false,
@@ -5588,6 +5691,8 @@ mod tests {
             description,
             endpoint: Endpoint {
                 path: PathBuf::from("nonexistent-pre-summary-executable"),
+                #[cfg(target_os = "macos")]
+                admitted_bytes: None,
                 flags: None,
                 pi_lifecycle_fields: false,
                 compaction_overflow_reason_v1: false,

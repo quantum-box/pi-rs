@@ -23,6 +23,8 @@ pub(super) struct SettingsBootstrap {
         skip_serializing_if = "super::project_trust::Registrations::is_empty"
     )]
     pub trust_registrations: super::project_trust::Registrations,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_workspace: Option<super::project_trust::WorkspaceIdentity>,
 }
 
 pub(super) fn read_settings_bootstrap() -> Result<SettingsBootstrap> {
@@ -225,6 +227,7 @@ impl Worker {
         transition: Option<(SessionStartReason, Option<std::path::PathBuf>)>,
         fallback: Option<&super::config::Settings>,
     ) -> Result<Self> {
+        args.verify_project_workspace()?;
         let history = args.settings.worker_fallback(&args.workspace, args.trusted);
         let settings = args.settings.reload_with_fallback(
             &args.workspace,
@@ -286,6 +289,7 @@ impl Worker {
             let bytes = serde_json::to_vec(&SettingsBootstrap {
                 settings: settings.clone(),
                 trust_registrations: args.trust_registrations.clone(),
+                project_workspace: args.project_workspace.clone(),
             })?;
             if bytes.len() > MAX_SETTINGS_BOOTSTRAP {
                 return Err(Error::Config(
@@ -420,6 +424,7 @@ impl Worker {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        args.verify_project_workspace()?;
         let mut child = command.spawn()?;
         let mut stdin = child.stdin.take();
         if let Some(bytes) = bootstrap {
@@ -522,6 +527,7 @@ impl Worker {
         image_model: &Cli,
         mut request: Value,
     ) -> Result<()> {
+        args.verify_project_workspace()?;
         prepare_images(image_model, &mut request)?;
         if slot
             .as_ref()
@@ -707,6 +713,7 @@ impl Worker {
         slot: &'a mut Option<Self>,
         args: &Cli,
     ) -> Result<Option<&'a mut Self>> {
+        args.verify_project_workspace()?;
         if slot.is_none() {
             let explicit = args
                 .extensions
@@ -724,6 +731,7 @@ impl Worker {
     }
 
     pub(super) fn request_share_context(slot: &mut Option<Self>, args: &Cli) -> Result<uuid::Uuid> {
+        args.verify_project_workspace()?;
         let mut previous = None;
         let mut pending = Vec::new();
         if slot
@@ -864,6 +872,7 @@ impl Worker {
     }
 
     pub(super) fn request(&mut self, args: &Cli, mut request: Value) -> Result<()> {
+        args.verify_project_workspace()?;
         prepare_images(args, &mut request)?;
         if self.bashing && self.session != args.session {
             return Err(Error::Config(
@@ -935,7 +944,7 @@ fn configuration(args: &Cli) -> Value {
         "values": args.extension_flags,
         "order": args.extension_flag_order,
     });
-    json!({
+    let mut configuration = json!({
         "workspace":args.workspace,
         "provider":args.provider.id(),"endpoint":args.model_endpoint_for(&args.provider, Some(&args.model)),"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
         "extension_flags":extension_flags,
@@ -950,7 +959,9 @@ fn configuration(args: &Cli) -> Value {
         "output_budget":args.output_budget,"context_window":args.context_window,
         "model_timeout":args.model_timeout_secs,"http_idle_timeout":args.settings.http_idle_timeout_ms(),"tool_timeout":args.tool_timeout_secs,
         "proxy_fingerprint":args.settings.string("httpProxy").map(|proxy| format!("{:x}", Sha256::digest(proxy.as_bytes())))
-    })
+    });
+    configuration["project_workspace"] = json!(args.project_workspace);
+    configuration
 }
 
 impl Drop for Worker {

@@ -351,6 +351,9 @@ case "$request" in
     printf '%s\n' '{description}' ;;
   *'"type":"command"'*)
     printf 'worker-command\n' >> "$PI_TEST_TRUST_LOG"
+    case "$0" in /private/tmp/pi-trust-*/voter)
+      printf 'worker-staged\n' >> "$PI_TEST_TRUST_LOG" ;;
+    esac
     printf '%s\n' '{{"version":1,"response":{{"Err":"fixture registration reached worker"}}}}' ;;
   *) printf '%s\n' '{{"version":1,"response":{{"Ok":null}}}}' ;;
 esac
@@ -509,8 +512,21 @@ esac
             "{vote}: {log}"
         );
         assert_eq!(log.matches("worker-command").count(), 1, "{vote}: {log}");
+        assert_eq!(
+            log.matches("worker-staged").count(),
+            usize::from(!saved && explicit.is_none()),
+            "{vote}: {log}"
+        );
         assert_eq!(agent.join("packages/index.json").exists(), trusted);
-        if saved || fallback || vote == "no" {
+        if vote == "no" && !saved && !fallback {
+            let native_trust = agent.join("native-project-trust.json");
+            let decisions: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(native_trust).unwrap()).unwrap();
+            let decision = &decisions[canonical.to_string_lossy().as_ref()];
+            assert_eq!(decision["trusted"], false);
+            assert_eq!(decision["workspace"]["path"].as_str(), canonical.to_str());
+            assert!(!trust_path.exists());
+        } else if saved || fallback {
             let decisions: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&trust_path).unwrap()).unwrap();
             assert_eq!(decisions[canonical.to_string_lossy().as_ref()], false);

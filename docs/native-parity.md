@@ -1171,19 +1171,33 @@ the normal configured extension filters. Admission rejects linked files and
 overlapping workspace and agent roots. It never searches project, package,
 transient CLI, or extension-discovered sources. `--no-extensions` and the
 matching `--disable-extension` ID suppress the hook. Enabled candidates run in
-user `extensions` order. With admissions configured, global discovery from
-outside an untrusted workspace also excludes extension aliases into it.
-An error or an undecided vote falls through to the
-next voter. If all abstain or fail, the existing trust selector appears. The
-first yes or no wins, and only a decisive vote with `remember: true` is saved.
-A host decision recorded while a voter is running takes precedence.
+user `extensions` order. Automatic user-layer extension and package discovery
+excludes targets that resolve into an unresolved or denied workspace. Cached
+package roots and candidate executables are checked too. Automatic user-package
+Cargo preparation and uncached remote installs wait for project trust, since
+their dependency graphs and ambient configuration are outside that path check.
+Explicit CLI extension and package requests retain their separate authorization.
 
-The macOS host invokes a verified copy inside the system sandbox, with a private
-working directory and a cleared environment. The child receives the canonical
-workspace path and terminal mode. The sandbox denies workspace and session
-reads, network access, filesystem writes, and subprocess creation. Only the
-copied executable and fixed system startup files are allowed. A platform
-without this sandbox falls back to the existing selector.
+An error or an undecided vote falls through to the next voter. If all abstain
+or fail, the existing trust selector appears. The first yes or no wins, and
+only a decisive vote with `remember: true` is saved. Native remembered votes
+are stored with the directory identity in `native-project-trust.json`. The
+shared `trust.json` keeps its path-based boolean format and takes precedence on
+an identical path. A stale native vote is ignored after directory
+replacement. A host decision recorded while a voter is running takes
+precedence. The terminal uses the canonical workspace and carries its identity
+into settings, package and resource resolution, and worker bootstrap.
+
+The macOS host invokes a verified copy inside the system sandbox with owner-only
+scratch and a cleared environment. The child receives the canonical workspace
+path and terminal mode. The profile denies workspace reads and grants no
+general network or filesystem writes. Its execution allowlist contains the
+copied executable and Bash for script voters. The launch closes inherited
+descriptors on exec and rejects launch when descriptor coverage or scratch
+ownership cannot be established. Startup waits for voter cleanup after
+cancellation. Cancellation is checked under the trust-file lock and again
+before publishing a remembered vote. Platforms without this sandbox use the
+existing selector.
 
 An admitted v1 executable receives its ordinary `describe` request augmented
 with `"project_trust":{"type":"project_trust","cwd":"…","mode":"interactive"}`.
@@ -1197,9 +1211,14 @@ A process or protocol failure preserves the trust fallback and skips the failed
 registration for that terminal launch. No second `Describe` is sent. The host
 reuses valid registrations during package validation and forwards them to the
 terminal worker with the existing settings snapshot and resolved trust flag.
-The worker checks the executable against its pin again before using a cached
-registration. Restart the terminal frontend after changing a voter's executable
-or admission.
+The worker rechecks the pin on the opened source file and retains those verified
+bytes with the registration. Each ordinary callback launches a fresh private
+copy, while the configured path serves as provenance. Voters must be able to run
+from a relocated executable. Ordinary callbacks have the existing native
+extension privileges. The startup guards rely on the OS filesystem and process
+boundary, including trusted ownership of the agent and scratch roots. They
+provide no containment against an actor that can already act as the terminal
+user. Restart the terminal after changing a voter's executable or admission.
 
 As in Pi v1.5.0, the project `.agents/skills` trust check scans ancestors to
 the filesystem root, excluding the global home directory. Discovery stops at the

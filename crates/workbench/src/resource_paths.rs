@@ -325,17 +325,9 @@ pub fn resolve(
     {
         layers.push((project, Vec::new()));
     }
-    let reject_untrusted_aliases = cfg!(target_os = "macos")
-        && kind == Kind::Extension
-        && !args.trusted
-        && args.settings.value()["projectTrustExtensions"]
-            .as_array()
-            .is_some_and(|admissions| !admissions.is_empty());
     let mut seen_prompts = Vec::new();
     for (layer_index, (base, entries)) in layers.into_iter().enumerate().rev() {
         let base = base.canonicalize().unwrap_or(base);
-        let skip_workspace_alias =
-            reject_untrusted_aliases && layer_index == 0 && !base.starts_with(&workspace);
         let (entries, patterns) = configured_entries(kind, entries)?;
         let mut configured = Vec::new();
         for entry in entries {
@@ -359,8 +351,8 @@ pub fn resolve(
         } else if !patterns.is_empty() {
             configured.retain(|path| packages::selected(path, &base, &patterns));
         }
-        if skip_workspace_alias {
-            configured.retain(|path| !path.starts_with(&workspace));
+        if kind == Kind::Extension && !args.trusted {
+            configured = outside_workspace(args, configured)?;
         }
         append(&mut paths, configured);
         let mut roots = vec![(base.join(kind.key()), base.clone())];
@@ -394,10 +386,10 @@ pub fn resolve(
                 Kind::Prompt | Kind::Theme => auto_resources(&root, kind, warnings)?,
                 _ => collect(&root, kind, false, warnings)?,
             };
+            if kind == Kind::Extension && !args.trusted {
+                discovered = outside_workspace(args, discovered)?;
+            }
             discovered.retain(|path| {
-                if skip_workspace_alias && path.starts_with(&workspace) {
-                    return false;
-                }
                 if kind == Kind::Prompt {
                     let previous = seen_prompts.len();
                     append(&mut seen_prompts, vec![path.clone()]);
@@ -410,16 +402,28 @@ pub fn resolve(
             append(&mut paths, discovered);
         }
     }
-    append(
-        &mut paths,
-        packaged
-            .iter()
-            .filter(|path| path.is_file())
-            .cloned()
-            .collect(),
-    );
+    let mut packaged: Vec<_> = packaged
+        .iter()
+        .filter(|path| path.is_file())
+        .cloned()
+        .collect();
+    if kind == Kind::Extension && !args.trusted {
+        packaged = outside_workspace(args, packaged)?;
+    }
+    append(&mut paths, packaged);
     append(&mut paths, additional_prompts);
+    args.verify_project_workspace()?;
     Ok(paths)
+}
+
+fn outside_workspace(args: &Cli, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut allowed = Vec::new();
+    for path in paths {
+        if super::project_trust::outside_untrusted_workspace(args, &path)? {
+            allowed.push(path);
+        }
+    }
+    Ok(allowed)
 }
 fn skill_file_is_markdown(kind: Kind, path: &Path, warnings: &mut Vec<String>) -> bool {
     if kind != Kind::Skill {

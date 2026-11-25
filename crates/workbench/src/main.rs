@@ -109,6 +109,8 @@ struct Cli {
     #[arg(skip)]
     trust_registrations: project_trust::Registrations,
     #[arg(skip)]
+    project_workspace: Option<project_trust::WorkspaceIdentity>,
+    #[arg(skip)]
     model_profiles: model_profiles::Profiles,
     #[arg(skip)]
     model_keys: model_auth::Keys,
@@ -352,6 +354,13 @@ struct InitialSelection {
 }
 
 impl Cli {
+    fn verify_project_workspace(&self) -> Result<()> {
+        if let Some(identity) = &self.project_workspace {
+            identity.verify(&self.workspace)?;
+        }
+        Ok(())
+    }
+
     fn explicit_project_trust(&self) -> Option<bool> {
         if self.no_trust {
             Some(false)
@@ -1649,6 +1658,11 @@ async fn run_cli() -> i32 {
             && args.worker_settings_stdin
         {
             let mut bootstrap = process::read_settings_bootstrap()?;
+            if let Some(identity) = bootstrap.project_workspace {
+                args.project_workspace = Some(identity.reopen(&args.workspace)?);
+            } else if !bootstrap.trust_registrations.is_empty() {
+                return Err(Error::Config("missing worker project workspace identity".into()));
+            }
             bootstrap.settings.validate_worker_snapshot(&args.workspace, args.trusted)?;
             args.trust_registrations = bootstrap.trust_registrations;
             bootstrap.settings
