@@ -8,7 +8,8 @@ use pi_rs_core::{CancellationToken, Message};
 use pi_rs_durable::images::{BuiltinImageProcessor, UserImageAdmission};
 use pi_rs_durable::progress;
 use pi_rs_durable::runtime::{
-    AdmissionOptions, Conversation, InputMode, OnAbort, QueueMode, Scheduler, Status, Submission,
+    AdmissionError, AdmissionOptions, Conversation, Error, InputMode, OnAbort, QueueMode,
+    Scheduler, Status, Submission,
 };
 use pi_rs_durable::worker_activity::WorkerKind;
 use serde_json::{Value, json};
@@ -205,17 +206,7 @@ pub(super) async fn run(
     id: Uuid,
     model: &RoutedModel,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = scheduler.conversation(id)?;
-    if model.has_image_adapter
-        && state.provider_adapter.is_none()
-        && !state
-            .submissions
-            .iter()
-            .any(|input| input.status == Status::Running)
-    {
-        scheduler.select_provider_adapter(id, true)?;
-        state = scheduler.conversation(id)?;
-    }
+    let state = prepare_input_adapter(scheduler, id, model.has_image_adapter)?;
     let provider_model = model.provider_model(&state.config.model)?.to_owned();
     let mut seen = state
         .submissions
@@ -246,7 +237,7 @@ pub(super) async fn run(
             received = input.recv(), if input_open => {
                 match received {
                     Some(request) => {
-                        watching |= respond(scheduler, id, &provider_model, &mut active, &mut seen, request).await?;
+                        watching |= respond(scheduler, id, &provider_model, model.has_image_adapter, &mut active, &mut seen, request).await?;
                     }
                     None => input_open = false,
                 }
@@ -295,6 +286,7 @@ async fn respond(
     scheduler: &mut Scheduler,
     id: Uuid,
     model: &str,
+    has_image_adapter: bool,
     active: &mut Option<Turn>,
     seen: &mut HashSet<Uuid>,
     request: Result<Value, String>,
@@ -310,11 +302,23 @@ async fn respond(
     let mut admitted = false;
     let result = match command {
         "prompt" | "steer" | "follow_up" => {
-            let state = scheduler.conversation(id).map_err(io::Error::other)?;
-            // Admit against the same observation used to deliver an earlier failure.
-            // A concurrent transition must not let a queued request start an idle run.
+            let state = prepare_input_adapter(scheduler, id, has_image_adapter)
+                .map_err(io::Error::other)?;
             publish_turns(&state, active, seen, None, true, None)?;
-            submit_input(scheduler, &state, command, &request).await.map(|started| {
+            let mut result = submit_input(scheduler, &state, command, &request, false).await;
+            if matches!(result, Err(Error::Admission(AdmissionError::Idle)))
+                && state.input_run_active()
+                && request["images"].as_array().is_some_and(|images| !images.is_empty())
+            {
+                // The previous run settled during fitting. Publish its result
+                // before admission can clear its persisted failure record.
+                let settled = prepare_input_adapter(scheduler, id, has_image_adapter)
+                    .map_err(io::Error::other)?;
+                publish_turns(&settled, active, seen, None, true, None)?;
+                result = submit_input(scheduler, &settled, command, &request, true)
+                    .await.map(|_| false);
+            }
+            result.map_err(|error| error.to_string()).map(|started| {
                 admitted = true;
                 Some(json!({"disposition": if started { "started" } else { "queued" }}))
             })
@@ -376,39 +380,59 @@ async fn respond(
     Ok(admitted)
 }
 
+fn prepare_input_adapter(
+    scheduler: &mut Scheduler,
+    id: Uuid,
+    has_image_adapter: bool,
+) -> Result<Conversation, Error> {
+    let state = scheduler.conversation(id)?;
+    if has_image_adapter && state.provider_adapter.is_none() && !state.input_run_active() {
+        scheduler.select_provider_adapter(id, true)?;
+        return scheduler.conversation(id);
+    }
+    Ok(state)
+}
+
 async fn submit_input(
     scheduler: &mut Scheduler,
     state: &Conversation,
     command: &str,
     request: &Value,
-) -> Result<bool, String> {
+    continue_after_settlement: bool,
+) -> Result<bool, Error> {
     let attachments = match request.get("images") {
         Some(value) => value
             .as_array()
-            .ok_or("images must be an array")?
+            .ok_or_else(|| Error::Invalid("images must be an array".into()))?
             .as_slice(),
         None => &[],
     };
     let message = request["message"]
         .as_str()
-        .ok_or("input message must be text")?;
+        .ok_or_else(|| Error::Invalid("input message must be text".into()))?;
     let behavior = match (command, request.get("streamingBehavior")) {
         ("steer", _) => Some(InputMode::Steer),
         ("follow_up", _) => Some(InputMode::FollowUp),
         (_, None) => None,
         (_, Some(value)) if value == "steer" => Some(InputMode::Steer),
         (_, Some(value)) if value == "followUp" => Some(InputMode::FollowUp),
-        _ => return Err("streamingBehavior must be steer or followUp".into()),
+        _ => {
+            return Err(Error::Invalid(
+                "streamingBehavior must be steer or followUp".into(),
+            ));
+        }
     };
     let running = state.input_run_active();
     let queued = command != "prompt" || running;
     if queued && behavior.is_none() {
-        return Err("a running prompt needs streamingBehavior".into());
+        return Err(Error::Invalid(
+            "a running prompt needs streamingBehavior".into(),
+        ));
     }
     let options = AdmissionOptions {
         mode: behavior.unwrap_or(InputMode::FollowUp),
         reject_when_busy: !queued,
-        reject_when_idle: queued,
+        reject_when_idle: queued && !continue_after_settlement,
         on_abort: OnAbort::Keep,
     };
     let submission = if attachments.is_empty() {
@@ -417,7 +441,9 @@ async fn submit_input(
         if attachments.iter().any(|image| {
             image["type"] != "image" || !image["data"].is_string() || !image["mimeType"].is_string()
         }) {
-            return Err("images must contain image blocks with data and mimeType".into());
+            return Err(Error::Invalid(
+                "images must contain image blocks with data and mimeType".into(),
+            ));
         }
         let mut blocks = vec![json!({"type": "text", "text": message})];
         blocks.extend_from_slice(attachments);
@@ -434,9 +460,7 @@ async fn submit_input(
             .await
             .map(|input| input.submission_id)
     };
-    submission
-        .map(|_| !queued)
-        .map_err(|error| error.to_string())
+    submission.map(|_| !queued)
 }
 
 fn set_queue_mode(
