@@ -3606,7 +3606,8 @@ impl CodingTool {
         let is_path_pattern = pattern.contains('/');
         let relative_find_pattern =
             self.unrestricted && is_path_pattern && !Path::new(pattern).has_root();
-        let glob = if is_find {
+        // fd treats an empty pattern as a search with no pattern filter.
+        let glob = if is_find && (!self.unrestricted || !pattern.is_empty()) {
             let pattern = if !self.unrestricted
                 && is_path_pattern
                 && !pattern.starts_with('/')
@@ -8100,6 +8101,64 @@ mod tests {
                 &pi_rs::CancellationToken::new()
             )
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unrestricted_find_treats_empty_patterns_as_match_all() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let subdirectory = root.join("src");
+        std::fs::create_dir(&subdirectory).unwrap();
+        std::fs::write(root.join(".fdignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.join(".hidden"), "").unwrap();
+        std::fs::write(subdirectory.join("included.txt"), "").unwrap();
+        std::fs::write(subdirectory.join("ignored.txt"), "").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        for pattern in ["", "././"] {
+            let result = tool.invoke(json!({"pattern":pattern}), context()).await;
+            assert!(
+                matches!(result, Outcome::Succeeded(ref output)
+                if output == ".fdignore\n.hidden\nsrc/\nsrc/included.txt"),
+                "pattern {pattern:?}: {result:?}"
+            );
+        }
+        let result = tool
+            .invoke(json!({"pattern":"", "path":"src", "limit":1}), context())
+            .await;
+        assert!(matches!(result, Outcome::Succeeded(output) if output == "included.txt"));
+        let result = tool
+            .invoke(json!({"pattern":"", "limit":3}), context())
+            .await;
+        assert!(
+            matches!(result, Outcome::SucceededWithDetails { output, details }
+                if output == ".fdignore\n.hidden\nsrc/\n\n[3 results limit reached. Use limit=6 for more, or refine pattern]"
+                    && details["resultLimitReached"].as_f64() == Some(3.0)
+            )
+        );
+
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let result = scoped.invoke(json!({"pattern":""}), context()).await;
+        assert!(
+            matches!(result, Outcome::Succeeded(output) if output == "No files found matching pattern")
+        );
+        let result = scoped
+            .invoke(json!({"pattern":"", "path":".."}), context())
+            .await;
+        assert!(
+            matches!(result, Outcome::Failed(message) if message.contains("parent traversal is not supported"))
         );
     }
 

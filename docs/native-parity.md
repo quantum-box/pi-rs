@@ -2553,6 +2553,12 @@ labels empty directories. Head truncation preserves complete lines where they
 fit. Fixtures cover large-file search, Unicode and literal patterns, context,
 empty directory output and continuation notices.
 
+Unrestricted local `find` matches all eligible entries when `pattern` is empty,
+including when removing leading `./` segments leaves it empty. It uses the same
+ignore rules, search root, and output limits as an explicit `*` pattern. Scoped
+`find` continues to treat the empty pattern as a glob that matches no entries.
+[Pi's local find implementation](https://github.com/earendil-works/pi/blob/c11a73bfba1310dc4075ad836254ea87003f409b/packages/coding-agent/src/core/tools/find.ts#L205-L248)
+
 Single-file `grep` preserves the requested file name in its output when the
 path is a symbolic link, while workspace boundary checks still use the resolved
 target. For explicitly named binary files, NUL bytes are treated as line
