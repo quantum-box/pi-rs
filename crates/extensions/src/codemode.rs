@@ -343,11 +343,20 @@ impl Tool for ScriptTool {
         if previous.is_some_and(|state| state.version != 1 || !state.data.is_object()) {
             return Outcome::Failed("invalid codemode store state".into()).into();
         }
+        let deadline = match options
+            .timeout
+            .map(|timeout| ScriptDeadline::new(started, timeout))
+            .transpose()
+        {
+            Ok(deadline) => deadline,
+            Err(error) => return Outcome::Failed(error).into(),
+        };
         static WORKERS: OnceLock<Arc<WorkerPool>> = OnceLock::new();
         let workers = WORKERS.get_or_init(|| WorkerPool::new(worker_limit));
-        let admission_deadline = match options.timeout {
-            Some(timeout) => match timeout
-                .checked_sub(started.elapsed())
+        let admission_deadline = match deadline {
+            Some(deadline) => match deadline
+                .at
+                .checked_duration_since(Instant::now())
                 .filter(|time| !time.is_zero())
             {
                 Some(remaining) => Some(remaining),
@@ -392,31 +401,13 @@ impl Tool for ScriptTool {
         };
         let source = source.to_owned();
         let handle = tokio::runtime::Handle::current();
-        let timeout = options.timeout;
         let worker = tokio::task::spawn_blocking(move || {
-            let remaining = match timeout {
-                Some(timeout) => {
-                    match timeout
-                        .checked_sub(started.elapsed())
-                        .filter(|time| !time.is_zero())
-                    {
-                        Some(remaining) => Some(remaining),
-                        None => {
-                            return (
-                                Err("Script deadline elapsed before execution".into()),
-                                permit,
-                            );
-                        }
-                    }
-                }
-                None => None,
-            };
             let result = handle.block_on(evaluate(
                 &source,
                 store,
                 host,
                 worker_context,
-                remaining,
+                deadline,
                 worker_sink,
             ));
             (result, permit)
@@ -612,29 +603,50 @@ struct Completion {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct ScriptDeadline {
+    at: Instant,
+    timeout: Duration,
+}
+
+impl ScriptDeadline {
+    fn new(started: Instant, timeout: Duration) -> Result<Self, String> {
+        let at = started
+            .checked_add(timeout)
+            .ok_or("Invalid script deadline")?;
+        Ok(Self { at, timeout })
+    }
+
+    fn elapsed(self) -> bool {
+        Instant::now() >= self.at
+    }
+
+    fn error(self) -> String {
+        format!(
+            "Script timed out: Execution timed out after {} ms",
+            self.timeout.as_millis()
+        )
+    }
+}
+
 async fn evaluate(
     source: &str,
     store: Value,
     host: Arc<dyn ToolHost>,
     context: ToolContext,
-    timeout: Option<Duration>,
+    deadline: Option<ScriptDeadline>,
     sink: Arc<Mutex<Output>>,
 ) -> Result<Completion, String> {
+    if let Some(deadline) = deadline.filter(|deadline| deadline.elapsed()) {
+        return Err(deadline.error());
+    }
     let runtime = AsyncRuntime::new().map_err(|error| error.to_string())?;
     runtime.set_memory_limit(256 * 1024 * 1024).await;
     runtime.set_max_stack_size(512 * 1024).await;
-    let deadline = timeout
-        .map(|timeout| {
-            Instant::now()
-                .checked_add(timeout)
-                .ok_or("Invalid script deadline")
-        })
-        .transpose()?;
     let cancellation = context.cancellation.clone();
     runtime
         .set_interrupt_handler(Some(Box::new(move || {
-            cancellation.is_cancelled()
-                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            cancellation.is_cancelled() || deadline.is_some_and(ScriptDeadline::elapsed)
         })))
         .await;
     let javascript = AsyncContext::full(&runtime)
@@ -697,16 +709,30 @@ async fn evaluate(
         }
     });
     let result = tokio::select! {
+        biased;
         _ = context.cancellation.cancelled() => return Err("Script cancelled".into()),
         result = async {
-            match timeout {
-                Some(timeout) => tokio::time::timeout(timeout, operation).await.map_err(|_| "Script timed out".to_owned())?,
-                None => operation.await,
+            let Some(deadline) = deadline else {
+                return operation.await;
+            };
+            // Runtime setup may have consumed the rest of the same budget.
+            if deadline.elapsed() {
+                return Err(deadline.error());
+            }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline.at.into()) => Err(deadline.error()),
+                result = operation => result,
             }
         } => result,
     };
     if context.cancellation.is_cancelled() {
         return Err("Script cancelled".into());
+    }
+    // QuickJS can return an interrupt exception before the async timer gets
+    // polled. CPU work and awaited host calls share the same timeout outcome.
+    if let Some(deadline) = deadline.filter(|deadline| deadline.elapsed()) {
+        return Err(deadline.error());
     }
     let result = result?;
     serde_json::from_str(&result).map_err(|error| error.to_string())
@@ -2752,6 +2778,38 @@ mod tests {
         watchdog.join().unwrap();
     }
     #[tokio::test]
+    async fn script_deadline_reports_timeout_for_compute_and_host_waits() {
+        let host = Arc::new(StartedHost {
+            started: Arc::new(tokio::sync::Notify::new()),
+            wait_for_cancellation: true,
+        });
+        for operation in ["while (true) {}", "await tools.started({});"] {
+            let reply = ScriptTool { timeout: None }
+                .invoke_transaction(
+                    json!({"code":format!(
+                        "// @options: {{\"timeout_ms\":250}}\ntext('partial'); store('discard', true); {operation}",
+                    )}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: Default::default(),
+                    },
+                    None,
+                    host.clone(),
+                )
+                .await;
+            let Outcome::Failed(message) = reply.outcome else {
+                panic!("expected a deadline failure for {operation}");
+            };
+            assert!(message.contains("partial"), "{operation}: {message}");
+            assert!(
+                message.contains("Script timed out: Execution timed out after 250 ms"),
+                "{operation}: {message}"
+            );
+            assert!(reply.state.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_host_deadline_interrupts_busy_script() {
         let reply = ScriptTool { timeout: None }
             .invoke_transaction_with_timeout(
@@ -3565,7 +3623,7 @@ mod tests {
                     operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                     cancellation: Default::default(),
                 },
-                Some(Duration::from_secs(10)),
+                Some(ScriptDeadline::new(Instant::now(), Duration::from_secs(10)).unwrap()),
                 sink.clone(),
             )
             .await;
@@ -3591,7 +3649,7 @@ mod tests {
                 operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 cancellation: Default::default(),
             },
-            Some(Duration::from_secs(10)),
+            Some(ScriptDeadline::new(Instant::now(), Duration::from_secs(10)).unwrap()),
             sink.clone(),
         )
         .await
@@ -3615,7 +3673,7 @@ mod tests {
                 operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 cancellation: Default::default(),
             },
-            Some(Duration::from_secs(30)),
+            Some(ScriptDeadline::new(Instant::now(), Duration::from_secs(30)).unwrap()),
             sink.clone(),
         )
         .await

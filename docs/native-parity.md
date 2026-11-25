@@ -2050,7 +2050,17 @@ when execution has no deadline; a shorter script or host deadline and
 cancellation stop the wait sooner. An admission failure reports the wall time
 and that the script did not start. As in Pi 1.6.0, it reports the configured
 deadline when a script times out or the shared worker count when the pool
-stays busy for 60 seconds. `PI_CODEMODE_MAX_WORKERS` is re-read when
+stays busy for 60 seconds. An admitted script uses the same absolute deadline
+for worker startup, QuickJS computation and nested tool waits. Both a
+deadline interrupt during computation and a timeout while awaiting a tool
+report the effective timeout in milliseconds, retain partial output and
+discard uncommitted store writes when Codemode publishes the reply. The session
+scheduler can still settle a host-wide tool timeout or cancellation before that
+reply is published.
+[Pinned Codemode worker deadline](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/codemode/src/runtime/execution.ts)
+[Pinned coding-agent result formatting](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/extensions/codemode/execute.ts)
+
+`PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
 running. Positive integer values accept Pi's numeric forms, including
 JavaScript whitespace, decimal notation and radix prefixes. Reducing the limit does not interrupt
