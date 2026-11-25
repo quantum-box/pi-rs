@@ -64,6 +64,12 @@ pub struct Address {
     pub key: String,
 }
 impl Address {
+    pub(crate) fn conversation_scope_prefix(conversation: uuid::Uuid) -> Vec<u8> {
+        let mut prefix = PREFIX.to_vec();
+        prefix.extend_from_slice(format!("[\"{conversation}\",").as_bytes());
+        prefix
+    }
+
     pub(crate) fn storage_key(&self) -> Result<Vec<u8>, Error> {
         let mut result = PREFIX.to_vec();
         result.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
@@ -545,42 +551,14 @@ impl DocumentWatch<'_> {
         };
         for (revision, entry) in changes {
             let document = Documents::decode(entry)?;
-            let recorded = match (&address, &previous, &document) {
-                (Some(address), Some(old), Some(new)) => {
-                    match self.store.document_commit_sequence(revision)? {
-                        Some(sequence)
-                            if self.store.commit_for_version(&self.key, new.version)?
-                                == Some(sequence) =>
-                        {
-                            committed_operations(self.store, address, old, new, sequence)?
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
-            let actual = recorded.is_some();
-            let ops = if let Some(ops) = recorded {
-                ops
-            } else {
-                match (&previous, &document) {
-                    (Some(old), Some(new)) => crate::chord_ops::diff(
-                        &Value::Object(old.value.clone()),
-                        &Value::Object(new.value.clone()),
-                    ),
-                    (None, Some(new)) => {
-                        crate::chord_ops::replacement(&Value::Object(new.value.clone()))
-                    }
-                    (_, None) => Vec::new(),
-                }
-            };
-            frames.push(DocumentOperationFrame {
+            frames.push(document_operation_frame(
+                self.store,
+                &self.key,
+                address.as_ref(),
                 revision,
-                retired: document.is_none(),
-                document: document.clone(),
-                ops,
-                actual,
-            });
+                previous.as_ref(),
+                document.clone(),
+            )?);
             previous = document;
         }
         if let Some(last) = frames.last() {
@@ -607,6 +585,75 @@ impl DocumentWatch<'_> {
         }
         Ok(result)
     }
+}
+
+fn document_operation_frame(
+    store: &Store,
+    key: &[u8],
+    address: Option<&Address>,
+    revision: u64,
+    previous: Option<&Document>,
+    document: Option<Document>,
+) -> Result<DocumentOperationFrame, Error> {
+    let recorded = match (address, previous, &document) {
+        (Some(address), Some(old), Some(new)) => match store.document_commit_sequence(revision)? {
+            Some(sequence) if store.commit_for_version(key, new.version)? == Some(sequence) => {
+                committed_operations(store, address, old, new, sequence)?
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let actual = recorded.is_some();
+    let ops = recorded.unwrap_or_else(|| match (previous, &document) {
+        (Some(old), Some(new)) => crate::chord_ops::diff(
+            &Value::Object(old.value.clone()),
+            &Value::Object(new.value.clone()),
+        ),
+        (None, Some(new)) => crate::chord_ops::replacement(&Value::Object(new.value.clone())),
+        (_, None) => Vec::new(),
+    });
+    Ok(DocumentOperationFrame {
+        revision,
+        retired: document.is_none(),
+        document,
+        ops,
+        actual,
+    })
+}
+
+pub(crate) fn scoped_document_operations(
+    store: &Store,
+    conversation: uuid::Uuid,
+    revision: u64,
+    changes: Vec<durable_store::DocumentChange>,
+) -> Result<Vec<(Address, DocumentOperationFrame)>, Error> {
+    let scope = conversation.to_string();
+    let before = revision.checked_sub(1).ok_or(Error::InvalidDocument)?;
+    changes
+        .into_iter()
+        .map(|(key, entry)| {
+            let address = Address::from_storage_key(&key)?;
+            if address.scope != scope {
+                return Err(Error::InvalidDocument);
+            }
+            let previous = Documents::decode(store.document_at_bounded(
+                &key,
+                before,
+                durable_store::MAX_SCOPED_DOCUMENT_FRAME_BYTES,
+            )?)?;
+            let document = Documents::decode(entry)?;
+            let operations = document_operation_frame(
+                store,
+                &key,
+                Some(&address),
+                revision,
+                previous.as_ref(),
+                document,
+            )?;
+            Ok((address, operations))
+        })
+        .collect()
 }
 
 /// Pull watch for an explicitly acquired task document. It ends after the
