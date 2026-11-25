@@ -1612,7 +1612,8 @@ appending `/messages` to the model base URL. The model file's declared base URL
 selects the grant. Both host credential kinds and explicitly granted file keys
 use the bearer scheme. SDK clients share the CLI's transcript encoding,
 SSE decoding and endpoint-scoped replay. SDK construction and preparation are
-offline. Inference uses the granted endpoint directly with redirects and
+offline and do not use the CLI's on-disk context fingerprint key. Inference
+uses the granted endpoint directly with redirects and
 implicit proxies disabled. The host supplies any refreshed credential and
 catalog metadata. Radius account discovery, OAuth refresh and environment
 defaults belong to the CLI. Loopback coverage exercises both credential

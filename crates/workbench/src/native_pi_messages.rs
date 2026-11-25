@@ -54,19 +54,7 @@ impl Transport {
     pub fn new(provider: &str, endpoint: &str) -> Result<Self> {
         let endpoint = Url::parse(endpoint)
             .map_err(|_| Error::Config("Invalid Pi Messages endpoint".into()))?;
-        let loopback = matches!(
-            endpoint.host_str(),
-            Some("127.0.0.1" | "localhost" | "[::1]")
-        );
-        if !(endpoint.scheme() == "https" || endpoint.scheme() == "http" && loopback)
-            || endpoint.host().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(Error::Config("Pi Messages requires HTTPS or loopback HTTP without credentials, query or fragment".into()));
-        }
+        validate_endpoint(&endpoint)?;
         Ok(Self {
             client: http_client(None, &[])?,
             origin_hash: endpoint_hash(&endpoint),
@@ -88,10 +76,12 @@ impl Transport {
         &self.client
     }
 
-    /// Apply a route already validated by the CLI's Radius catalog loader.
-    pub fn set_endpoint(&mut self, endpoint: Url) {
+    /// Apply a Radius catalog route subject to the same rules as the original route.
+    pub fn set_endpoint(&mut self, endpoint: Url) -> Result<()> {
+        validate_endpoint(&endpoint)?;
         self.origin_hash = endpoint_hash(&endpoint);
         self.endpoint = endpoint;
+        Ok(())
     }
 
     pub fn context_identity(
@@ -493,6 +483,26 @@ fn http_client(timeout: Option<Duration>, proxies: &[reqwest::Proxy]) -> Result<
         .map_err(|_| Error::Config("Could not initialize the Pi Messages client".into()))
 }
 
+fn validate_endpoint(endpoint: &Url) -> Result<()> {
+    let loopback = matches!(
+        endpoint.host_str(),
+        Some("127.0.0.1" | "localhost" | "[::1]")
+    );
+    if !(endpoint.scheme() == "https" || endpoint.scheme() == "http" && loopback)
+        || endpoint.host().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(Error::Config(
+            "Pi Messages requires HTTPS or loopback HTTP without credentials, query or fragment"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn endpoint_hash(endpoint: &Url) -> String {
     format!("{:x}", Sha256::digest(endpoint.as_str()))
 }
@@ -513,11 +523,6 @@ impl HostModel {
 
 #[async_trait::async_trait]
 impl Model for HostModel {
-    fn context_identity(&self) -> Option<String> {
-        self.transport
-            .context_identity(Some(&self.token), &HeaderMap::new(), None, false)
-    }
-
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
         self.transport.estimate_message_tokens(request, message)
     }
@@ -711,6 +716,26 @@ pub fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_endpoint_changes_leave_the_original_route_intact() {
+        let original = "https://fixture.example/v1/messages";
+        let mut transport = Transport::new("fixture", original).unwrap();
+        for invalid in [
+            "http://public.example/v1/messages",
+            "https://fixture.example/v1/messages?query=1",
+            "https://some-user@fixture.example/v1/messages",
+        ] {
+            assert!(Transport::new("fixture", invalid).is_err());
+            assert!(
+                transport
+                    .set_endpoint(Url::parse(invalid).unwrap())
+                    .is_err()
+            );
+            assert_eq!(transport.endpoint.as_str(), original);
+            assert_eq!(transport.origin_hash, endpoint_hash(&transport.endpoint));
+        }
+    }
 
     #[test]
     fn request_resize_preserves_replay_and_resizes_user_and_tool_images() {

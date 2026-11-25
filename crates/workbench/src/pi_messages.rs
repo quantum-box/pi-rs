@@ -233,7 +233,7 @@ impl PiMessages {
             .and_then(|catalog| catalog.models.iter().find(|item| item.id == model))
             .map(|item| item.details());
         if let Some(catalog) = catalog {
-            prepared.transport.set_endpoint(catalog.endpoint.clone());
+            prepared.transport.set_endpoint(catalog.endpoint.clone())?;
             prepared.prepared_image_resize = self.catalog_image_resize(&catalog, model);
         }
         prepared.prepared_limits = Some((
@@ -411,7 +411,7 @@ impl Model for PiMessages {
             Err(error) => return Err(error),
         };
         if let Some(catalog) = catalog {
-            transport.set_endpoint(catalog.endpoint.clone());
+            transport.set_endpoint(catalog.endpoint.clone())?;
             image_resize = self.catalog_image_resize(&catalog, &request.model);
             if let Some(model) = catalog
                 .models

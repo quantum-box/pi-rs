@@ -1171,8 +1171,10 @@ async fn configured_model_key_requires_exact_opt_in_and_yields_to_saved_auth() {
 
 #[test]
 fn pi_messages_ignores_ambient_sdk_configuration() {
+    let ambient_home = tempfile::tempdir().unwrap();
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "pi_messages_streams_on_explicit_sdk_routes"])
+        .env("PI_RS_HOME", ambient_home.path())
         .env("PI_RADIUS_GATEWAY", "invalid-gateway")
         .env("RADIUS_API_KEY", "ambient-radius-key")
         .env("PI_CACHE_RETENTION", "long")
@@ -1187,6 +1189,12 @@ fn pi_messages_ignores_ambient_sdk_configuration() {
         "{}\n{}",
         String::from_utf8_lossy(&child.stdout),
         String::from_utf8_lossy(&child.stderr),
+    );
+    assert!(
+        std::fs::read_dir(ambient_home.path())
+            .unwrap()
+            .next()
+            .is_none()
     );
 }
 
@@ -1213,6 +1221,13 @@ async fn pi_messages_streams_on_explicit_sdk_routes() {
     )
     .unwrap();
     let factory = ModelClientFactory::new(auth.build());
+    assert!(
+        factory
+            .client(api, provider, &endpoint)
+            .unwrap()
+            .context_identity()
+            .is_none()
+    );
     for (provider, endpoint) in [
         ("Radius", endpoint.clone()),
         ("relay", endpoint.clone()),
