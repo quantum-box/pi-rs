@@ -988,6 +988,21 @@ impl Agent<'_> {
             .resolve_prior_turn_end(session, run_id, cancel, observer)
             .await;
         session.set_run_id(Some(run_id));
+        if prior_result.is_ok() && recovered.is_none() {
+            prior_result = crate::before_agent_start::prepare(
+                self.registry,
+                session,
+                run_id,
+                effective_input
+                    .as_ref()
+                    .map(|(_, content)| content.as_str()),
+                self.system_prompt,
+                self.limits.model_timeout,
+                cancel,
+                observer,
+            )
+            .await;
+        }
         let mut check_turn_continuation =
             matches!(recovered, Some(RecoveredBoundary::TurnContinue));
         let mut force_request = matches!(recovered, Some(RecoveredBoundary::Continue { .. }));
@@ -1739,6 +1754,30 @@ impl Agent<'_> {
                             .await?;
                     }
                 }
+            }
+        }
+        if !in_process_continuation
+            && !recovering_compaction
+            && let Some(plan) = crate::before_agent_start::plan(session, run_id)?
+        {
+            let delivered: HashSet<_> = session
+                .branch()
+                .iter()
+                .filter_map(|record| match record.event {
+                    Event::CustomMessageDelivered { id, .. } => Some(id),
+                    _ => None,
+                })
+                .collect();
+            for (id, message) in plan.messages {
+                if delivered.contains(&id) {
+                    continue;
+                }
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                let event = Event::CustomMessageDelivered { id, message };
+                let event = self.edit_input_event(session, event, observer).await;
+                commit(session, event, observer)?;
             }
         }
         let mut pending = pending_reply(session, run_id);
@@ -3069,8 +3108,12 @@ impl Agent<'_> {
             self.system_prompt,
             self.registry.active_tool_specs(),
         );
+        let run_override = session
+            .current_run_id()
+            .and_then(|id| crate::before_agent_start::prompt_override(history, id));
+        let preserve_system_transcript = run_override.is_none();
         let mut messages = vec![Message::System {
-            content: system_prompt,
+            content: run_override.unwrap_or(system_prompt),
         }];
         if let Some(summary) = summary {
             // Compaction content has the authority of conversation history.
@@ -3088,7 +3131,7 @@ impl Agent<'_> {
                 keep_group
             });
         }
-        let transcript = if purpose == RequestPurpose::Turn {
+        let transcript = if purpose == RequestPurpose::Turn && preserve_system_transcript {
             crate::journal::system_transcript(
                 history,
                 &conversation,

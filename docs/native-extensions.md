@@ -334,6 +334,18 @@ event; the existing synchronous `set_model` does not invoke asynchronous hooks.
 Pi v1.5.0 declares a `restore` source but its session restoration path does not
 emit a model selection event.
 
+To run an extension callback for a submitted user prompt or an idle custom
+trigger, opt into `handles_before_agent_start` and implement
+`before_agent_start`. Executable extensions advertise `before_agent_start_hook`
+and receive the `before_agent_start` protocol request. The event identifies
+the starting message and carries the resolved system prompt. Each handler
+sees the latest prompt override in extension load order, and can return an
+exact prompt for the current run and a custom message. Returning an empty
+prompt explicitly clears the prompt text. Returned messages follow the
+starting input and already queued next-turn messages. Handler failures are
+reported while subsequent handlers can still contribute. A journaled plan
+is reused when an interrupted run resumes.
+
 Extensions that implement `handles_lifecycle` also receive `agent_settled`
 after `agent_end` when a run has finished its retries and automatic compaction.
 Its `aborted` field distinguishes cancellation from completion or failure.

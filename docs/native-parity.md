@@ -5533,6 +5533,20 @@ both immediate and delivered queued messages appear live and on session reopen.
 Hidden messages and their details remain undisplayed. Native additionally keeps
 its existing inline-image display for image blocks when graphics are enabled.
 
+### Native extension run preflight
+
+Native and executable `before_agent_start` handlers get the initial user
+prompt and its images or the idle custom trigger, in extension load order.
+The current system prompt reflects earlier handlers' full-prompt replacements.
+Returned custom messages enter the run after the initial message and the
+existing next-turn queue. A recorded preparation plan retains the run-local
+prompt and deduplicates its appended messages when the run resumes.
+
+This API accepts a full text override. Upstream also exposes mutable prompt
+sections, including the tool loadout, and does its incoming-prompt compaction
+before invoking the hook. The native hook currently runs before the existing
+agent loop's automatic compaction checks.
+
 ### Rust extension lifecycle observation
 
 Rust extensions can opt into `agent_start`, `agent_end`, `turn_start`
