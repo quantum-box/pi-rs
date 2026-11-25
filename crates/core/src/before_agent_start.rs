@@ -7,8 +7,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    AgentStartTrigger, BeforeAgentStartEvent, CancellationToken, CustomMessage, Error, Event,
-    Notification, Observer, Record, Registry, Result, Session,
+    Agent, AgentStartTrigger, BeforeAgentStartEvent, CancellationToken, CustomMessage, Error,
+    Event, Notification, Observer, Record, Result, Session,
 };
 
 const PLAN_FORMAT: &str = "pi-rs:before-agent-start-v1";
@@ -84,16 +84,15 @@ fn starting_input(
 }
 
 pub(crate) async fn prepare(
-    registry: &Registry,
+    agent: &Agent<'_>,
     session: &mut Session,
     run_id: Uuid,
     effective_input: Option<&str>,
-    fallback_prompt: &str,
-    timeout: Duration,
     cancel: &CancellationToken,
     observer: &mut Observer<'_>,
 ) -> Result<()> {
-    if !registry
+    if !agent
+        .registry
         .extensions
         .iter()
         .any(|extension| extension.handles_before_agent_start())
@@ -113,12 +112,13 @@ pub(crate) async fn prepare(
     };
     let mut event = BeforeAgentStartEvent {
         trigger,
-        system_prompt: crate::journal::system_context(&branch, fallback_prompt, Vec::new()).0,
+        system_prompt: crate::journal::system_context(&branch, agent.system_prompt, Vec::new()).0,
     };
     let states = session.extension_states();
     let mut plan = Plan::default();
-    let deadline = crate::runtime::time::Instant::now() + timeout.min(Duration::from_secs(10));
-    for extension in &registry.extensions {
+    let deadline = crate::runtime::time::Instant::now()
+        + agent.limits.model_timeout.min(Duration::from_secs(10));
+    for extension in &agent.registry.extensions {
         if !extension.handles_before_agent_start() {
             continue;
         }
@@ -180,7 +180,7 @@ mod tests {
     use super::*;
     use crate::{
         ContextContent, Extension, ExtensionResult, ExtensionState, Message, Model, ModelEvent,
-        ModelRequest, ModelStream, SessionBuilder,
+        ModelRequest, ModelStream, Registry, SessionBuilder,
     };
     use std::sync::{Arc, Mutex};
 
@@ -330,13 +330,20 @@ mod tests {
                 initial: Some("question".into()),
             })
             .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Capture(requests.clone());
+        let agent = crate::Agent {
+            registry: &registry,
+            model: &model,
+            model_name: "fixture",
+            system_prompt: "host prompt",
+            limits: crate::Limits::default(),
+        };
         prepare(
-            &registry,
+            &agent,
             &mut session,
             run_id,
             Some("question"),
-            "host prompt",
-            Duration::from_secs(1),
             &cancel,
             &mut |_| {},
         )
@@ -355,15 +362,6 @@ mod tests {
         drop(session);
 
         let mut session = Session::open(&path).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let model = Capture(requests.clone());
-        let agent = crate::Agent {
-            registry: &registry,
-            model: &model,
-            model_name: "fixture",
-            system_prompt: "host prompt",
-            limits: crate::Limits::default(),
-        };
         let (_send, mut inputs) = tokio::sync::mpsc::channel::<crate::AgentInput>(1);
         agent
             .run_correlated(

@@ -990,14 +990,12 @@ impl Agent<'_> {
         session.set_run_id(Some(run_id));
         if prior_result.is_ok() && recovered.is_none() {
             prior_result = crate::before_agent_start::prepare(
-                self.registry,
+                self,
                 session,
                 run_id,
                 effective_input
                     .as_ref()
                     .map(|(_, content)| content.as_str()),
-                self.system_prompt,
-                self.limits.model_timeout,
                 cancel,
                 observer,
             )
