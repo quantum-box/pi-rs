@@ -1554,6 +1554,15 @@ impl View {
                     pi_rs::UiResponse::Text(self.editor.text.clone()),
                 )));
             }
+            pi_rs::UiRequest::GetToolsExpanded => {
+                return Ok(Some((id, pi_rs::UiResponse::Confirmed(self.expand_tools))));
+            }
+            pi_rs::UiRequest::SetToolsExpanded { expanded } => {
+                if expanded != self.expand_tools {
+                    self.set_expand_tools(expanded);
+                    self.regular.redraw = true;
+                }
+            }
             request => {
                 self.search = None;
                 self.dialogs
@@ -6374,6 +6383,7 @@ pub(super) async fn run(
                     continue;
                 }
                 if value["type"] == "extension_ui_request" {
+                    let was_expanded = view.expand_tools;
                     match view.ui_request(&value) {
                         Ok(Some((id, value))) => active
                             .send(json!({"type":"extension_ui_response","id":id,"value":value}))?,
@@ -6382,6 +6392,14 @@ pub(super) async fn run(
                             view.append(&error.to_string());
                             active.send(json!({"type":"extension_ui_response","id":value["id"],"value":null}))?;
                         }
+                    }
+                    if view.expand_tools != was_expanded {
+                        let state = if view.expand_tools {
+                            "expanded"
+                        } else {
+                            "collapsed"
+                        };
+                        view.show_status(args.tui_mode, format!("Tool output: {state}"));
                     }
                     dirty = true;
                     continue;
@@ -11275,6 +11293,38 @@ mod tests {
         assert_eq!(args.model, "after");
         assert!(view.live_model_choices.is_empty());
     }
+    #[test]
+    fn extension_controls_tool_expansion_without_opening_a_dialog() {
+        use pi_rs::{UiRequest, UiResponse};
+        use serde_json::json;
+
+        let mut view = super::View::default();
+        let id = uuid::Uuid::new_v4();
+        let get = json!({"id": id, "method": "getToolsExpanded"});
+        let request: UiRequest = serde_json::from_value(get.clone()).unwrap();
+        assert!(request.needs_response());
+        assert!(request.accepts_response(&UiResponse::Confirmed(false)));
+        assert!(!request.accepts_response(&UiResponse::Text("false".into())));
+        assert_eq!(
+            view.ui_request(&get).unwrap(),
+            Some((id, UiResponse::Confirmed(false)))
+        );
+
+        for expanded in [true, false] {
+            view.regular.redraw = false;
+            let set = json!({"id": id, "method": "setToolsExpanded", "expanded": expanded});
+            let request: UiRequest = serde_json::from_value(set.clone()).unwrap();
+            assert!(!request.needs_response());
+            assert!(view.ui_request(&set).unwrap().is_none());
+            assert!(view.regular.redraw);
+            assert_eq!(
+                view.ui_request(&get).unwrap(),
+                Some((id, UiResponse::Confirmed(expanded)))
+            );
+            assert!(view.dialog().is_none());
+        }
+    }
+
     #[test]
     fn copilot_login_prompts_before_starting_device_authorization() {
         use super::{Cli, KeyCode, KeyEvent, KeyModifiers, Keys, LocalEditor, View};

@@ -966,6 +966,11 @@ limited to 16 rendered rows.
 
 ### Native extension editor paste
 
+The native terminal handles Pi's `getToolsExpanded` and `setToolsExpanded` UI
+methods. The getter returns the current session's boolean state. Changing it
+applies the same rendering and status update as the terminal shortcut and does
+not save a setting. An embedded SDK host supplies its own UI implementation.
+
 Native `pasteToEditor` inserts literal text into the prompt draft without
 dispatching key events. The main editor applies the same behavior to
 extension, terminal, and text clipboard pastes. Pastes over ten lines or 1000
