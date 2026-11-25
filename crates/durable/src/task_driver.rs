@@ -2580,16 +2580,13 @@ mod tests {
             |_: &Task| Ok(task_scheduler::Step::Succeed(json!("ok"))),
             move |task: &Task| {
                 use std::io::Write;
-                writeln!(
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&abort_log)
-                        .map_err(|e| e.to_string())?,
-                    "{}",
-                    task.id()
-                )
-                .map_err(|e| e.to_string())?;
+                let line = format!("{}\n", task.id());
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&abort_log)
+                    .and_then(|mut log| log.write_all(line.as_bytes()))
+                    .map_err(|e| e.to_string())?;
                 Ok(task_scheduler::Step::Succeed(json!("cancelled")))
             },
         );

@@ -10637,7 +10637,9 @@ impl DurableAsyncTool for NestedWokenFixture {
                 }
                 let read = host.child_result_with_after(&call).await;
                 if read.is_err() {
-                    std::fs::write(self.directory.join("observed-child"), format!("{read:?}"))
+                    let temporary = self.directory.join("observed-child.tmp");
+                    std::fs::write(&temporary, format!("{read:?}")).map_err(|e| e.to_string())?;
+                    std::fs::rename(temporary, self.directory.join("observed-child"))
                         .map_err(|e| e.to_string())?;
                 }
                 let result = read?;
@@ -10649,7 +10651,9 @@ impl DurableAsyncTool for NestedWokenFixture {
                     std::fs::write(self.directory.join("read-twice-ok"), b"yes")
                         .map_err(|e| e.to_string())?;
                 }
-                std::fs::write(self.directory.join("observed-child"), format!("{result:?}"))
+                let temporary = self.directory.join("observed-child.tmp");
+                std::fs::write(&temporary, format!("{result:?}")).map_err(|e| e.to_string())?;
+                std::fs::rename(temporary, self.directory.join("observed-child"))
                     .map_err(|e| e.to_string())?;
                 if self.directory.join("finish-observed").exists() {
                     while !self.directory.join("release-parent").exists() {

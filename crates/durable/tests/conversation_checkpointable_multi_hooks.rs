@@ -1106,6 +1106,9 @@ async fn signal_sleep_reopens_and_handles_two_distinct_keys_once() {
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
+    // Initialize before spawning so the observation loop cannot race the
+    // worker to the ownership lock used by the experimental store migration.
+    drop(durable_store::Store::open(&path).unwrap());
     let mut child = Kill(
         std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "signal_sleep_worker"])

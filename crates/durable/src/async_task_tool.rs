@@ -13499,10 +13499,11 @@ mod tests {
                     .is_none()
             );
             std::fs::write(
-                root.join("pending-kill"),
+                root.join("pending-kill.tmp"),
                 serde_json::to_vec(&(child, edge)).unwrap(),
             )
             .unwrap();
+            std::fs::rename(root.join("pending-kill.tmp"), root.join("pending-kill")).unwrap();
             loop {
                 std::thread::park();
             }
