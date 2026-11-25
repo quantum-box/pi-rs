@@ -4810,7 +4810,7 @@ impl crate::session_transaction::SessionTransaction<'_> {
 }
 
 const TASK_INPUT_WAKE_PREFIX: &[u8] = b"runtime/task-input-wake/";
-fn task_input_wake_key(id: Uuid) -> Vec<u8> {
+pub(crate) fn task_input_wake_key(id: Uuid) -> Vec<u8> {
     format!("runtime/task-input-wake/{id}").into_bytes()
 }
 
