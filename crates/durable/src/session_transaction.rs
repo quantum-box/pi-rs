@@ -281,6 +281,40 @@ impl<'a> SessionTransaction<'a> {
             .get_or_insert(seed))
     }
 
+    /// Edit a typed JSON-object document inside this transaction. The
+    /// initializer runs only for a missing document. Existing values must
+    /// round-trip through the type without losing stored fields.
+    pub fn edit_document<T, R>(
+        &mut self,
+        address: &Address,
+        initialize: impl FnOnce() -> T,
+        edit: impl FnOnce(&mut T) -> Result<R, Error>,
+    ) -> Result<R, Error>
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize,
+    {
+        let original = self.document(address)?.map(Value::Object);
+        let mut draft = match &original {
+            Some(value) => {
+                let draft: T = serde::Deserialize::deserialize(value)?;
+                if serde_json::to_value(&draft)? != *value {
+                    return Err(Error::InvalidDocument);
+                }
+                draft
+            }
+            None => initialize(),
+        };
+        let result = edit(&mut draft)?;
+        let candidate = serde_json::to_value(draft)?;
+        if original.as_ref() != Some(&candidate) {
+            let Value::Object(value) = candidate else {
+                return Err(Error::InvalidDocument);
+            };
+            self.put_document(address, value)?;
+        }
+        Ok(result)
+    }
+
     /// Delete a document, retaining the original snapshot as a dependency.
     pub fn delete_document(&mut self, address: &Address) -> Result<(), Error> {
         self.document(address)?;

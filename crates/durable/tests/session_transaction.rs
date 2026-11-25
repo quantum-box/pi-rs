@@ -101,6 +101,65 @@ fn mutable_drafts_share_staged_edits_and_commit_with_entries() {
 }
 
 #[test]
+fn typed_document_edits_keep_fields_and_commit_with_entries() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Settings {
+        n: i64,
+        #[serde(flatten)]
+        extra: Map<String, Value>,
+    }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct PartialSettings {
+        n: i64,
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    let address = address();
+    let entry = h
+        .session_transaction(id, |tx| {
+            tx.edit_document(
+                &address,
+                || Settings {
+                    n: 1,
+                    extra: Map::new(),
+                },
+                |draft| {
+                    draft.extra.insert("olderField".into(), json!("retained"));
+                    Ok(())
+                },
+            )?;
+            assert!(matches!(
+                tx.edit_document(
+                    &address,
+                    || PartialSettings { n: 9 },
+                    |_| -> Result<(), DocumentError> { panic!("losing fields must be rejected") }
+                ),
+                Err(DocumentError::InvalidDocument)
+            ));
+            let n = tx.edit_document(
+                &address,
+                || panic!("the draft already exists"),
+                |draft: &mut Settings| {
+                    draft.n += 1;
+                    Ok(draft.n)
+                },
+            )?;
+            let entry = tx.append_entry("note", Some(json!(n)))?;
+            Ok(entry)
+        })
+        .unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let document = h.document(&address).unwrap().unwrap();
+    assert_eq!(document.value["n"], 2);
+    assert_eq!(document.value["olderField"], "retained");
+    assert_eq!(h.conversation(id).unwrap().application_writes[0].id, entry);
+}
+
+#[test]
 fn entries_and_documents_read_your_writes_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
