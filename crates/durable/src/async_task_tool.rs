@@ -6192,7 +6192,10 @@ mod tests {
             scheduler.submit(&parent).unwrap();
             let driver = crate::task_driver::Driver::start(scheduler);
             let (_, _, leaf) = production_chain_parked(&driver, parent.id());
-            std::fs::write(root.join("parked"), format!("{} {}", parent.id(), leaf)).unwrap();
+            let marker = root.join("parked.tmp");
+            std::fs::write(&marker, format!("{} {}", parent.id(), leaf)).unwrap();
+            // The parent kills this process as soon as it sees the marker.
+            std::fs::rename(marker, root.join("parked")).unwrap();
             loop {
                 std::thread::park();
             }
