@@ -287,6 +287,270 @@ fn typing_redraws_in_a_synchronized_frame() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn terminal_project_trust_dispatch_reuses_the_sandboxed_registration() {
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for (vote, explicit, saved, fallback, trusted) in [
+        ("yes", None, false, false, true),
+        ("no", None, false, false, false),
+        ("undecided", None, false, true, false),
+        ("error", None, false, true, false),
+        ("yes", Some("--no-trust"), false, false, false),
+        ("yes", None, true, false, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("workspace");
+        let local = workspace.join(".pi");
+        let log = root.path().join("launches");
+        let session = root.path().join("session.jsonl");
+        let private = root.path().join("private-session-probe");
+        std::fs::create_dir_all(agent.join("extensions")).unwrap();
+        std::fs::create_dir_all(local.join("extensions")).unwrap();
+        std::fs::write(&log, "").unwrap();
+        std::fs::write(&private, "private session data\n").unwrap();
+        std::fs::write(local.join("input"), "workspace file\n").unwrap();
+        let canonical = workspace.canonicalize().unwrap();
+        let trust_path = agent.join("trust.json");
+        if saved {
+            std::fs::write(
+                &trust_path,
+                json!({(canonical.to_string_lossy()): false}).to_string(),
+            )
+            .unwrap();
+        }
+        let voter = agent.join("extensions/voter");
+        let voter_description = json!({
+            "id":"voter", "dependencies":[], "commands":["confirm"], "tools":[]
+        });
+        let mut vote_response = voter_description.clone();
+        if vote == "error" {
+            vote_response["project_trust_error"] = json!("fixture runtime error");
+        } else {
+            vote_response["project_trust"] = json!({"trusted":vote, "remember":vote == "no"});
+        }
+        let envelope = |value| json!({"version":1, "response":{"Ok":value}});
+        let bytes = format!(
+            r#"#!/bin/bash
+IFS= read -r request || :
+case "$request" in
+  *'"project_trust":{{'*)
+    [[ -z "$PI_TEST_TRUST_LOG" ]] || exit 10
+    case "$request" in *'"session"'*) exit 11 ;; esac
+    case "$request" in *'{workspace}'*) ;; *) exit 12 ;; esac
+    if IFS= read -r _ < '{private}'; then exit 13; fi
+    if IFS= read -r _ < '{input}'; then exit 14; fi
+    if IFS= read -r _ <&9; then exit 15; fi
+    printf '%s\n' '{vote_response}' ;;
+  *'"type":"describe"'*)
+    printf 'voter-describe\n' >> "$PI_TEST_TRUST_LOG"
+    printf '%s\n' '{description}' ;;
+  *'"type":"command"'*)
+    printf 'worker-command\n' >> "$PI_TEST_TRUST_LOG"
+    printf '%s\n' '{{"version":1,"response":{{"Err":"fixture registration reached worker"}}}}' ;;
+  *) printf '%s\n' '{{"version":1,"response":{{"Ok":null}}}}' ;;
+esac
+"#,
+            workspace = canonical.display(),
+            private = private.display(),
+            input = local.join("input").display(),
+            vote_response = envelope(vote_response),
+            description = envelope(voter_description),
+        );
+        let digest = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+        std::fs::write(&voter, bytes).unwrap();
+        std::fs::set_permissions(&voter, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let project = local.join("extensions/project");
+        let project_description =
+            json!({"id":"project", "dependencies":[], "commands":[], "tools":[]});
+        let mut project_vote = project_description.clone();
+        project_vote["project_trust"] = json!({"trusted":"yes", "remember":true});
+        let project_bytes = format!(
+            r#"#!/bin/bash
+IFS= read -r request || :
+case "$request" in
+  *'"project_trust":{{'*) printf '%s\n' '{project_vote}' ;;
+  *'"type":"describe"'*)
+    printf 'project-describe\n' >> "$PI_TEST_TRUST_LOG"
+    printf '%s\n' '{project_description}' ;;
+  *) printf '%s\n' '{{"version":1,"response":{{"Ok":null}}}}' ;;
+esac
+"#,
+            project_vote = envelope(project_vote),
+            project_description = envelope(project_description),
+        );
+        let project_digest = format!("{:x}", Sha256::digest(project_bytes.as_bytes()));
+        std::fs::write(&project, project_bytes).unwrap();
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&project, agent.join("extensions/workspace-alias")).unwrap();
+        let mcp = local.join("mcp");
+        std::fs::write(
+            &mcp,
+            "#!/bin/bash\nprintf 'project-mcp\\n' >> \"$PI_TEST_TRUST_LOG\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&mcp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            local.join("mcp.json"),
+            json!({"mcpServers":{"fixture":{"command":mcp}}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            local.join("settings.json"),
+            json!({"packages":[voter]}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({
+                "extensions":["extensions/workspace-alias", "extensions/voter"],
+                "projectTrustExtensions":[
+                    {"path":"extensions/voter","id":"voter","sha256":digest},
+                    {"path":"extensions/workspace-alias","id":"project","sha256":project_digest}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 110,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size,
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        assert_eq!(
+            unsafe { libc::fcntl(master_fd, libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let inherited = File::open(&private).unwrap();
+        let inherited_fd = inherited.as_raw_fd();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(inherited_fd, 9) < 0 || libc::fcntl(9, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let _process = Process(
+            command
+                .current_dir(&workspace)
+                .env("PI_RS_HOME", &agent)
+                .env("PI_TEST_TRUST_LOG", &log)
+                .env("TERM", "xterm-256color")
+                .args(["--offline", "--tui-mode", "fullscreen", "--session"])
+                .arg(&session)
+                .args(explicit)
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+        output_until(&mut master, |text| {
+            if fallback {
+                text.contains("Load project configuration?")
+                    && (vote != "error" || text.contains("fixture runtime error"))
+            } else {
+                assert!(
+                    !text.contains("Load project configuration?"),
+                    "unexpected fallback for {vote}: {text}"
+                );
+                text.contains("Enter to send")
+            }
+        });
+        if fallback {
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+            master.write_all(b"\x1b[B\r").unwrap();
+            output_until(&mut master, |text| {
+                text.contains("Project configuration skipped")
+            });
+        }
+        master.write_all(b"/extension voter confirm\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("fixture registration reached worker")
+        });
+        let log = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log.matches("voter-describe").count(),
+            usize::from(saved || explicit.is_some()),
+            "{vote}: {log}"
+        );
+        assert_eq!(
+            log.matches("project-describe").count(),
+            usize::from(trusted),
+            "{vote}: {log}"
+        );
+        assert_eq!(
+            log.matches("project-mcp").count(),
+            usize::from(trusted),
+            "{vote}: {log}"
+        );
+        assert_eq!(log.matches("worker-command").count(), 1, "{vote}: {log}");
+        assert_eq!(agent.join("packages/index.json").exists(), trusted);
+        if saved || fallback || vote == "no" {
+            let decisions: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&trust_path).unwrap()).unwrap();
+            assert_eq!(decisions[canonical.to_string_lossy().as_ref()], false);
+        } else {
+            assert!(!trust_path.exists());
+        }
+        if trusted {
+            let rpc_log = root.path().join("rpc-launches");
+            let mut rpc = Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(&workspace)
+                .env("PI_RS_HOME", &agent)
+                .env("PI_TEST_TRUST_LOG", &rpc_log)
+                .args(["--offline", "--no-session", "--mode", "rpc"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            writeln!(
+                rpc.stdin.take().unwrap(),
+                "{}",
+                json!({"id":"fixture","type":"get_commands"})
+            )
+            .unwrap();
+            let rpc = rpc.wait_with_output().unwrap();
+            assert!(
+                rpc.status.success(),
+                "{}",
+                String::from_utf8_lossy(&rpc.stderr)
+            );
+            assert!(String::from_utf8_lossy(&rpc.stdout).contains(r#""id":"fixture""#));
+            assert_eq!(
+                std::fs::read_to_string(rpc_log).unwrap(),
+                "voter-describe\n"
+            );
+            assert!(!trust_path.exists());
+        }
+    }
+}
+
 #[test]
 fn terminal_appearance_notifications_follow_the_saved_theme_selection() {
     let root = tempfile::tempdir().unwrap();

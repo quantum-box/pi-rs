@@ -3900,11 +3900,28 @@ fn call<T: serde::de::DeserializeOwned>(
                 .map_err(|error| error.to_string())?;
         }
     }
-    let bytes = serde_json::to_vec(&wire).map_err(|error| error.to_string())?;
+    call_wire(
+        endpoint.command("--pi-rs-extension-v1"),
+        &wire,
+        response_limit,
+        presence_response.then_some(legacy_response_limit),
+        Duration::from_secs(30),
+        cancel,
+    )
+}
+
+fn call_wire<T: serde::de::DeserializeOwned>(
+    command: Command,
+    wire: &Value,
+    response_limit: u64,
+    presence_limit: Option<u64>,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> ExtensionResult<T> {
+    let bytes = serde_json::to_vec(wire).map_err(|error| error.to_string())?;
     if bytes.len() as u64 > MAX_REQUEST {
         return Err("extension request exceeds 64 MiB".into());
     }
-    let command = endpoint.command("--pi-rs-extension-v1");
     if cancel.is_some_and(CancellationToken::is_cancelled) {
         return Err("native extension operation cancelled".into());
     }
@@ -3927,7 +3944,7 @@ fn call<T: serde::de::DeserializeOwned>(
             .map(|_| bytes);
         let _ = reader.send(result);
     });
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
     let mut completed_write = false;
     let mut completed_read = None;
     let status = loop {
@@ -3937,9 +3954,10 @@ fn call<T: serde::de::DeserializeOwned>(
             );
         }
         if Instant::now() >= deadline {
-            return Err(
-                "native extension exceeded 30 seconds; outcome requires reconciliation".into(),
-            );
+            return Err(format!(
+                "native extension exceeded {} seconds; outcome requires reconciliation",
+                timeout.as_secs()
+            ));
         }
         if completed_read.is_none()
             && let Ok(result) = read.try_recv()
@@ -3981,16 +3999,90 @@ fn call<T: serde::de::DeserializeOwned>(
     if envelope.version != PROTOCOL {
         return Err("unsupported native extension protocol version".into());
     }
-    if presence_response {
+    if let Some(presence_limit) = presence_limit {
         check_presence_response(
             &envelope.response,
-            legacy_response_limit,
+            presence_limit,
             false,
             bytes.ends_with(b"\n"),
         )?;
     }
     serde_json::from_value(envelope.response?)
         .map_err(|error| format!("invalid native extension result: {error}"))
+}
+
+/// Startup trust hook for explicitly admitted native executables.
+pub mod project_trust {
+    use super::*;
+
+    #[derive(Deserialize)]
+    pub struct Event {
+        pub cwd: PathBuf,
+        pub mode: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Decision {
+        Yes,
+        No,
+        Undecided,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Vote {
+        pub trusted: Decision,
+        #[serde(default)]
+        pub remember: bool,
+    }
+
+    /// Serve the normal native protocol and optionally vote during Describe.
+    /// The hook receives no session or tool host.
+    pub fn serve(
+        extension: Arc<dyn Extension>,
+        hook: impl Fn(&Event) -> ExtensionResult<Vote>,
+    ) -> Result<()> {
+        super::serve_extension_inner(extension, Some(&hook))
+    }
+
+    /// Reconstitute the normal v1 registration from an earlier Describe.
+    #[doc(hidden)]
+    pub fn load_described(path: &Path, description: &Value) -> Result<ExecutableExtension> {
+        ExecutableExtension::from_description(
+            ExecutableExtension::describe_endpoint(path)?,
+            serde_json::from_value(description.clone())?,
+        )
+    }
+
+    /// The command is already sandboxed and can see only the preflight request.
+    #[doc(hidden)]
+    #[cfg(target_os = "macos")]
+    pub fn describe(
+        mut command: Command,
+        cwd: &Path,
+        cancel: &CancellationToken,
+    ) -> ExtensionResult<Value> {
+        use std::os::unix::process::CommandExt;
+        let cwd = cwd
+            .to_str()
+            .ok_or("project_trust requires a UTF-8 workspace path")?;
+        command
+            .arg("--pi-rs-extension-v1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0);
+        call_wire(
+            command,
+            &serde_json::json!({"type":"describe", "project_trust":{
+                "type":"project_trust", "cwd":cwd, "mode":"interactive"
+            }}),
+            1024 * 1024,
+            None,
+            Duration::from_secs(3),
+            Some(cancel),
+        )
+    }
 }
 #[cfg(windows)]
 type NativeChild = Box<dyn process_wrap::std::ChildWrapper>;
@@ -4059,6 +4151,16 @@ impl Drop for ChildGuard {
 /// Entry point for a native extension binary. Its stdout is reserved for the
 /// protocol response. Diagnostic output belongs on stderr.
 pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
+    serve_extension_inner(extension, None)
+}
+
+type ProjectTrustHook<'a> =
+    dyn Fn(&project_trust::Event) -> ExtensionResult<project_trust::Vote> + 'a;
+
+fn serve_extension_inner(
+    extension: Arc<dyn Extension>,
+    trust_hook: Option<&ProjectTrustHook<'_>>,
+) -> Result<()> {
     if std::env::args().any(|argument| argument == "--pi-rs-extension-bash-v1") {
         return serve_bash_stream(extension);
     }
@@ -4076,6 +4178,10 @@ pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
             Ok(raw) => {
                 let legacy_tree_response =
                     raw["type"] == "before_tree" && raw["lifecycleFieldNames"] != "camelCase";
+                let trust_event = trust_hook
+                    .zip(raw.get("project_trust"))
+                    .filter(|_| raw["type"] == "describe")
+                    .map(|(hook, event)| (hook, event.clone()));
                 match serde_json::from_value(raw) {
                     Ok(request) => {
                         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4084,6 +4190,19 @@ pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
                         runtime
                             .block_on(dispatch(extension, request))
                             .map(|mut response| {
+                                if let Some((hook, event)) = trust_event {
+                                    let vote = serde_json::from_value(event)
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|event| hook(&event));
+                                    match vote {
+                                        Ok(vote) => {
+                                            response["project_trust"] = serde_json::json!(vote)
+                                        }
+                                        Err(error) => {
+                                            response["project_trust_error"] = Value::String(error)
+                                        }
+                                    }
+                                }
                                 if legacy_tree_response {
                                     legacy_tree_decision(&mut response);
                                 }

@@ -1135,53 +1135,71 @@ trust selector and explicit `--trust` / `--no-trust` overrides. Context files
 remain readable independently of project trust. `/skills`, `/prompts`,
 `/skill:name`, prompt argument expansion and `/reload` are available.
 
-Native executables do not currently receive `project_trust`. Upstream calls its
-handlers before reading saved decisions when a folder has trust-requiring
-resources and the CLI has supplied no override. pi-rs treats the closest saved
-decision as a host decision, including a denial inherited from an ancestor.
-Explicit host overrides take precedence over saved decisions, which take
-precedence over the user-level `defaultProjectTrust` policy. Only an unresolved
-`ask` for a folder with trust-requiring resources is eligible for a future
-preflight. The host decision code tests candidates in order and accepts the
-first decisive vote. Errors and undecided votes leave subsequent candidates
-eligible, and an exhausted list falls back to the existing selector or the
-noninteractive untrusted state. A preflight vote writes the canonical workspace
-entry only when it is decisive and requests persistence. Startup currently
-supplies an empty candidate list.
+On macOS, the initial terminal startup can dispatch `project_trust` to
+explicitly admitted native extensions. The closest saved decision, including an
+ancestor's denial, is a host decision. Explicit host overrides take precedence
+over saved decisions, followed by user-level `defaultProjectTrust`. Upstream
+commit `b882d08f` dispatches its handlers before reading stored decisions. pi-rs
+reserves the event for an unresolved `ask` in a workspace with trust-requiring
+resources. CLI help and model listing, print and RPC, package commands, terminal
+session switches, and managed workers use their existing trust paths. Initial
+terminal launches with extension CLI flags also skip preflight because flag
+discovery may already have started a registration.
 
-`Resources::load` combines CLI, user, project, and package paths into a flat
-extension list. Its untrusted form still includes transient CLI inputs, and
-configured paths and discovery walks can follow links into the workspace.
-Package preparation can build or run executables, and `ExecutableExtension::load`
-runs `Describe` before it exposes extension metadata. Preflight therefore needs
-provenance in the shared resource resolver before it expands or opens a source.
-It must verify both the user authorization and the resolved source and executable
-locations, excluding workspace-controlled paths and inputs. Use already eligible
-user/global candidates, with no package preparation, project settings, CLI or
-transient sources, MCP startup, or extension-discovered resources in preflight.
-The candidate must have a host-known identity if an ID-based disable rule can
-apply. Starting it to learn its ID would bypass that rule during preflight.
+Add the executable's literal relative path to `extensions` in the user
+`settings.json` and admit the same path, registered ID, and lowercase SHA-256
+under `projectTrustExtensions`. For example, a voter at
+`$PI_RS_HOME/extensions/company-policy` uses this settings shape:
 
-Before enabling the event, wire that resolver into startup after the host has
-selected the effective workspace and before it consumes project settings or
-prepares packages. Carry each preflight `Describe` result into runtime assembly
-by executable identity, while applying the final resource ordering and filters.
-The current per-request process protocol would also need a way to negotiate and
-run the hook in the same startup invocation. Give it only the workspace path and
-host-selected mode, with no session state, session paths, registry host calls, or
-MCP services. Use a host-controlled working directory and environment. Native
-executables currently run with the user's filesystem permissions, so omitting
-session data from the request alone cannot enforce filesystem isolation. Enabling
-the preflight requires a host that can deny access to session storage and prevent
-the executable from loading workspace-controlled code. Recheck host policy if
-it can change while a vote is in flight. Limit initial activation to the
-interactive host. CLI metadata, RPC, other noninteractive invocations, and
-package commands retain their existing trust paths. Managed workers use the
-explicit decision and validated settings snapshot from their parent. A terminal
-worker must be able to reuse a preflight registration without describing the
-same executable again or running the hook itself. Early CLI flag discovery can
-already describe executables, so it needs to share a verified registration for
-an eligible candidate or that candidate must skip preflight.
+```json
+{
+  "extensions": ["extensions/company-policy"],
+  "projectTrustExtensions": [
+    {
+      "path": "extensions/company-policy",
+      "id": "company-policy",
+      "sha256": "<64 lowercase hex digits of the executable>"
+    }
+  ]
+}
+```
+
+Replace the placeholder with the digest from `shasum -a 256` for that file.
+Each admitted executable is a regular, user-owned file directly in the user
+extension directory. The source must be executable, match the pin, and pass
+the normal configured extension filters. Admission rejects linked files and
+overlapping workspace and agent roots. It never searches project, package,
+transient CLI, or extension-discovered sources. `--no-extensions` and the
+matching `--disable-extension` ID suppress the hook. Enabled candidates run in
+user `extensions` order. With admissions configured, global discovery from
+outside an untrusted workspace also excludes extension aliases into it.
+An error or an undecided vote falls through to the
+next voter. If all abstain or fail, the existing trust selector appears. The
+first yes or no wins, and only a decisive vote with `remember: true` is saved.
+A host decision recorded while a voter is running takes precedence.
+
+The macOS host invokes a verified copy inside the system sandbox, with a private
+working directory and a cleared environment. The child receives the canonical
+workspace path and terminal mode. The sandbox denies workspace and session
+reads, network access, filesystem writes, and subprocess creation. Only the
+copied executable and fixed system startup files are allowed. A platform
+without this sandbox falls back to the existing selector.
+
+An admitted v1 executable receives its ordinary `describe` request augmented
+with `"project_trust":{"type":"project_trust","cwd":"…","mode":"interactive"}`.
+Rust extensions can use `pi_rs_extensions::project_trust::serve` to register
+the callback and keep the regular native protocol.
+Its ordinary `Describe` result may include
+`"project_trust":{"trusted":"yes","remember":true}`. Supported votes are
+`"yes"`, `"no"`, and `"undecided"`. Omitting the field also abstains.
+`"project_trust_error":"…"` reports a hook error alongside a valid registration.
+A process or protocol failure preserves the trust fallback and skips the failed
+registration for that terminal launch. No second `Describe` is sent. The host
+reuses valid registrations during package validation and forwards them to the
+terminal worker with the existing settings snapshot and resolved trust flag.
+The worker checks the executable against its pin again before using a cached
+registration. Restart the terminal frontend after changing a voter's executable
+or admission.
 
 As in Pi v1.5.0, the project `.agents/skills` trust check scans ancestors to
 the filesystem root, excluding the global home directory. Discovery stops at the

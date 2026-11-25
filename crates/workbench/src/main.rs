@@ -49,6 +49,7 @@ mod operation_models;
 mod packages;
 mod pi_messages;
 mod process;
+mod project_trust;
 mod providers;
 mod vertex_auth;
 mod xai_auth;
@@ -105,6 +106,8 @@ struct Cli {
     session_transition: Option<pi_rs::SessionStartReason>,
     #[arg(skip)]
     settings: config::Settings,
+    #[arg(skip)]
+    trust_registrations: project_trust::Registrations,
     #[arg(skip)]
     model_profiles: model_profiles::Profiles,
     #[arg(skip)]
@@ -349,6 +352,16 @@ struct InitialSelection {
 }
 
 impl Cli {
+    fn explicit_project_trust(&self) -> Option<bool> {
+        if self.no_trust {
+            Some(false)
+        } else if self.trust || self.project.is_some() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     fn theme_setting(&self) -> Option<&str> {
         self.use_theme
             .as_deref()
@@ -1635,9 +1648,10 @@ async fn run_cli() -> i32 {
             && args.stdin_control
             && args.worker_settings_stdin
         {
-            let mut settings = process::read_settings_bootstrap()?;
-            settings.validate_worker_snapshot(&args.workspace, args.trusted)?;
-            settings
+            let mut bootstrap = process::read_settings_bootstrap()?;
+            bootstrap.settings.validate_worker_snapshot(&args.workspace, args.trusted)?;
+            args.trust_registrations = bootstrap.trust_registrations;
+            bootstrap.settings
         } else {
             config::Settings::load(&args.workspace, args.trusted)?
         };

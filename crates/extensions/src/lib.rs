@@ -10,6 +10,7 @@ pub mod tool_search;
 pub use event_bus::{EventSubscription, ExtensionEventBus};
 pub use exec::{ExecOptions, ExecResult, exec_command};
 pub use loader::{NativeExtensionLoader, NativeExtensionSource};
+pub use process::project_trust;
 pub use process::{ExecutableExtension, extension_flag, serve_extension};
 use std::sync::Arc;
 

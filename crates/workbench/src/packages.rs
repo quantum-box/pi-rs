@@ -251,7 +251,14 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
                 "Preparing native package {}",
                 display_source(&declaration.source)
             );
-            match install(&declaration.source, args.offline, cleanup).await {
+            match install_with_registrations(
+                &declaration.source,
+                args.offline,
+                cleanup,
+                &args.trust_registrations,
+            )
+            .await
+            {
                 Ok(package) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
                 }
@@ -1878,6 +1885,31 @@ fn remote(source: &str) -> bool {
 }
 
 async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Result<Installed> {
+    install_with_registrations(source, offline, cleanup, &Default::default()).await
+}
+
+async fn validate_package_executable(
+    executable: &Path,
+    registrations: &super::project_trust::Registrations,
+) -> Result<()> {
+    if let Some(registration) = registrations.load(executable) {
+        if registration?.is_none() {
+            return Err(Error::Config(
+                "native package preflight registration failed".into(),
+            ));
+        }
+    } else {
+        pi_rs_extensions::ExecutableExtension::load_async(executable).await?;
+    }
+    Ok(())
+}
+
+async fn install_with_registrations(
+    source: &str,
+    offline: bool,
+    cleanup: Option<&Children>,
+    registrations: &super::project_trust::Registrations,
+) -> Result<Installed> {
     if offline && remote(source) {
         return Err(Error::Config(format!(
             "cannot install package in offline mode: {}",
@@ -1909,7 +1941,7 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
     let _lock = lock;
     if !remote(source) && Path::new(source).is_file() {
         let executable = PathBuf::from(source);
-        pi_rs_extensions::ExecutableExtension::load_async(&executable).await?;
+        validate_package_executable(&executable, registrations).await?;
         let root = executable.parent().unwrap_or(Path::new(".")).to_path_buf();
         let package = Installed {
             source: source.into(),
@@ -2109,7 +2141,7 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
     let pi = manifest_pi(&manifest)?;
     let resources = collect_package_resources(&root, pi, installed_binaries)?;
     for executable in &resources.extensions {
-        pi_rs_extensions::ExecutableExtension::load_async(executable).await?;
+        validate_package_executable(executable, registrations).await?;
     }
     let retain_generation = root.starts_with(generation.path())
         || resources

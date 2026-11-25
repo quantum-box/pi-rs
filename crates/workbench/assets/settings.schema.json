@@ -208,6 +208,20 @@
         "never"
       ]
     },
+    "projectTrustExtensions": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["path", "id", "sha256"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string", "pattern": "^extensions/[A-Za-z0-9_-][A-Za-z0-9._-]*$"},
+          "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"},
+          "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        }
+      }
+    },
     "codemode": {
       "type": "object",
       "properties": {

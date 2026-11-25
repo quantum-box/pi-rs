@@ -279,6 +279,7 @@ impl Settings {
             migrate_legacy_settings(&mut project);
             let user_only = project.as_object_mut().expect("object");
             user_only.remove("defaultProjectTrust");
+            user_only.remove("projectTrustExtensions");
             user_only.remove("cacheWarming");
             validate_settings(&project, &project_path)?;
             resource_layers.push((workspace.join(".pi"), project.clone()));
@@ -858,18 +859,17 @@ fn migrate_legacy_settings(value: &mut Value) {
 }
 
 pub fn project_trust(workspace: &Path, explicit: Option<bool>) -> Result<Option<bool>> {
-    // Native discovery does not yet provide preflight-safe candidates.
     resolve_project_trust(workspace, explicit, &agent_dir(), |_| [], |_| {})
 }
 
-struct ProjectTrustVote {
-    trusted: bool,
-    remember: bool,
+pub(super) struct ProjectTrustVote {
+    pub trusted: bool,
+    pub remember: bool,
 }
 
 // The host must authorize the source of each vote before invoking it. Keep
 // this iterator lazy so skipped callbacks cannot start executable processes.
-fn resolve_project_trust<I>(
+pub(super) fn resolve_project_trust<I>(
     workspace: &Path,
     explicit: Option<bool>,
     agent: &Path,
@@ -883,38 +883,53 @@ where
         return Ok(explicit);
     }
     let workspace = workspace.canonicalize()?;
-    let decisions = read_object(&agent.join("trust.json"))?;
-    for directory in workspace.ancestors() {
-        if let Some(decision) = decisions
-            .get(directory.to_string_lossy().as_ref())
-            .and_then(Value::as_bool)
-        {
-            return Ok(Some(decision));
-        }
+    if let Some(decision) = existing_project_trust(&workspace, agent)? {
+        return Ok(Some(decision));
     }
-    // Settings::load reports a broken file. The trust gate must still choose
-    // the conservative default instead of failing before that diagnostic.
-    let settings =
-        read_object(&agent.join("settings.json")).unwrap_or_else(|_| Value::Object(Map::new()));
-    match settings["defaultProjectTrust"].as_str() {
-        Some("always") => return Ok(Some(true)),
-        Some("never") => return Ok(Some(false)),
-        _ if !has_trust_requiring_project_resources(&workspace) => return Ok(Some(true)),
-        _ => {}
+    if !has_trust_requiring_project_resources(&workspace) {
+        return Ok(Some(true));
     }
     for vote in preflight(&workspace) {
+        if let Some(decision) = existing_project_trust(&workspace, agent)? {
+            return Ok(Some(decision));
+        }
         match vote {
             Ok(Some(vote)) => {
-                if vote.remember {
-                    save_canonical_trust(agent, &workspace, vote.trusted)?;
-                }
-                return Ok(Some(vote.trusted));
+                return if vote.remember {
+                    record_canonical_trust(agent, &workspace, vote.trusted, true).map(Some)
+                } else {
+                    Ok(Some(vote.trusted))
+                };
             }
             Ok(None) => {}
             Err(error) => warn(error),
         }
     }
     Ok(None)
+}
+
+fn stored_project_trust(workspace: &Path, decisions: &Value) -> Option<bool> {
+    workspace.ancestors().find_map(|directory| {
+        decisions
+            .get(directory.to_string_lossy().as_ref())
+            .and_then(Value::as_bool)
+    })
+}
+
+fn existing_project_trust(workspace: &Path, agent: &Path) -> Result<Option<bool>> {
+    let decisions = read_object(&agent.join("trust.json"))?;
+    if let Some(decision) = stored_project_trust(workspace, &decisions) {
+        return Ok(Some(decision));
+    }
+    // Settings::load reports a broken file. The trust gate must still choose
+    // the conservative default instead of failing before that diagnostic.
+    let settings =
+        read_object(&agent.join("settings.json")).unwrap_or_else(|_| Value::Object(Map::new()));
+    Ok(match settings["defaultProjectTrust"].as_str() {
+        Some("always") => Some(true),
+        Some("never") => Some(false),
+        _ => None,
+    })
 }
 
 // Match Pi's trust gate for ancestor .agents/skills, while keeping the
@@ -964,6 +979,15 @@ pub fn save_trust(workspace: &Path, decision: bool) -> Result<()> {
 }
 
 fn save_canonical_trust(agent: &Path, workspace: &Path, decision: bool) -> Result<()> {
+    record_canonical_trust(agent, workspace, decision, false).map(|_| ())
+}
+
+fn record_canonical_trust(
+    agent: &Path,
+    workspace: &Path,
+    decision: bool,
+    preserve_saved: bool,
+) -> Result<bool> {
     let path = agent.join("trust.json");
     std::fs::create_dir_all(agent)?;
     let lock = std::fs::OpenOptions::new()
@@ -974,11 +998,15 @@ fn save_canonical_trust(agent: &Path, workspace: &Path, decision: bool) -> Resul
         .open(path.with_extension("lock"))?;
     lock.lock()?;
     let mut value = read_object(&path)?;
+    if preserve_saved && let Some(saved) = stored_project_trust(workspace, &value) {
+        return Ok(saved);
+    }
     value.as_object_mut().expect("object").insert(
         workspace.to_string_lossy().into_owned(),
         Value::Bool(decision),
     );
-    write_json(&path, &value)
+    write_json(&path, &value)?;
+    Ok(decision)
 }
 
 pub fn update_object(
@@ -1585,6 +1613,32 @@ mod tests {
                 .unwrap(),
             Some(false)
         );
+    }
+
+    #[test]
+    fn project_trust_preflight_preserves_a_denial_saved_while_the_vote_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        for remember in [false, true] {
+            let decision = super::resolve_project_trust(
+                &workspace,
+                None,
+                &agent,
+                |canonical| {
+                    super::save_canonical_trust(&agent, canonical, false).unwrap();
+                    [Ok(Some(super::ProjectTrustVote {
+                        trusted: true,
+                        remember,
+                    }))]
+                },
+                |_| unreachable!(),
+            )
+            .unwrap();
+            assert_eq!(decision, Some(false));
+            std::fs::remove_file(agent.join("trust.json")).unwrap();
+        }
     }
 
     #[test]

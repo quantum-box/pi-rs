@@ -14,11 +14,22 @@ pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
 const MAX_SETTINGS_BOOTSTRAP: usize = 16 * 1024 * 1024;
 
-pub(super) fn read_settings_bootstrap() -> Result<super::config::Settings> {
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct SettingsBootstrap {
+    #[serde(flatten)]
+    pub settings: super::config::Settings,
+    #[serde(
+        default,
+        skip_serializing_if = "super::project_trust::Registrations::is_empty"
+    )]
+    pub trust_registrations: super::project_trust::Registrations,
+}
+
+pub(super) fn read_settings_bootstrap() -> Result<SettingsBootstrap> {
     read_settings_frame(&mut std::io::stdin().lock())
 }
 
-fn read_settings_frame(input: &mut impl std::io::Read) -> Result<super::config::Settings> {
+fn read_settings_frame(input: &mut impl std::io::Read) -> Result<SettingsBootstrap> {
     let mut length = [0_u8; 8];
     input.read_exact(&mut length)?;
     let length = usize::try_from(u64::from_be_bytes(length))
@@ -272,7 +283,10 @@ impl Worker {
                     .filter(|warning| !args.settings.diagnostics().contains(warning))
                     .map(|warning| json!({"type":"warning", "message":warning})),
             );
-            let bytes = serde_json::to_vec(&settings)?;
+            let bytes = serde_json::to_vec(&SettingsBootstrap {
+                settings: settings.clone(),
+                trust_registrations: args.trust_registrations.clone(),
+            })?;
             if bytes.len() > MAX_SETTINGS_BOOTSTRAP {
                 return Err(Error::Config(
                     "worker settings snapshot is too large".into(),

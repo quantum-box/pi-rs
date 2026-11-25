@@ -7,6 +7,7 @@ use pi_rs::{
 use pi_rs_workbench::coding::{CodingTools, ReadImageModel, ShellConfig, ShellContext};
 use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1500,7 +1501,15 @@ async fn load_configured_extensions(
                 )));
             }
             _ => {
-                let mut extension = pi_rs_extensions::ExecutableExtension::load_async(name).await?;
+                let mut extension = match args.trust_registrations.load(Path::new(name)) {
+                    Some(Ok(Some(extension))) => extension,
+                    Some(Ok(None)) => continue,
+                    Some(Err(error)) => {
+                        eprintln!("Warning: could not reuse project_trust registration: {error}");
+                        continue;
+                    }
+                    None => pi_rs_extensions::ExecutableExtension::load_async(name).await?,
+                };
                 if !args.disable_extension.iter().any(|id| id == extension.id()) {
                     for flag in extension.cli_flags() {
                         if !flag_names.insert(flag.name.clone()) {

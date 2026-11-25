@@ -10443,7 +10443,7 @@ async fn prepare_initial_session_async(args: Cli) -> Result<Cli> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let mut args = args;
-        let result = restore_workspace(&mut args).map(|()| args);
+        let result = restore_workspace_with_trust(&mut args, true).map(|()| args);
         let _ = sender.send(result);
     });
     let mut args = receiver
@@ -10506,6 +10506,10 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     Ok(())
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
+    restore_workspace_with_trust(args, false)
+}
+
+fn restore_workspace_with_trust(args: &mut Cli, initial_terminal: bool) -> Result<()> {
     let session = Session::open(&args.session)?;
     if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);
@@ -10516,16 +10520,11 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
         }
         args.workspace = path;
     }
-    let decision = crate::config::project_trust(
-        &args.workspace,
-        if args.no_trust {
-            Some(false)
-        } else if args.trust || args.project.is_some() {
-            Some(true)
-        } else {
-            None
-        },
-    )?;
+    let decision = if initial_terminal {
+        crate::project_trust::resolve_initial(args)?
+    } else {
+        crate::config::project_trust(&args.workspace, args.explicit_project_trust())?
+    };
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
     args.settings = args.settings.reload_latest(&args.workspace, args.trusted)?;
