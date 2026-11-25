@@ -3428,10 +3428,10 @@ Konsole 25.04.2 also displayed the iTerm2 OSC 1337 protocol in both modes.
 Screenshots of the macOS pi-rs process relayed to Konsole in an isolated Linux
 display matched the visible bands of the 320×480 pasteboard PNG. Fullscreen
 sent a 320×208 crop and regular mode sent the full image for viewport
-clipping. Visual acceptance in the iTerm2 application remains open. The
-remaining check is to paste an image taller than the viewport, scroll it
-through both edges in fullscreen and regular mode, and verify that the image
-does not cover the editor or leave pixels behind after redraw and resize.
+clipping. In iTerm2 itself, fullscreen clipping at both viewport edges and
+regular-mode display of the full image were confirmed. Regular-mode edge
+clipping and visual cleanup after narrowing, widening, shortening, and
+restoring the window remain unverified in the iTerm2 application.
 
 ### Image cell-sizing checkpoint
 
@@ -7103,6 +7103,15 @@ Provider-less legacy selections return `None`; an unavailable historical model
 returns an error rather than the builder default. A busy journal or an
 unreconciled direct journal selection or revoked client binding also returns an
 error. This is a point-in-time check, not a guarantee of later availability.
+
+The Rust SDK exposes `AgentSession::session_id`, `session_file` and
+`session_name` for the same display metadata as
+[Pi's session properties](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L1744-L1757).
+Reopened sessions keep their ID and committed name. Pi imports can retain an
+external ID distinct from the native journal UUID. Forks receive their own ID.
+The file getter reports paths managed by the SDK. Hosts that supply their own
+journal store retain responsibility for its location. ID and name reads return
+an error while the journal is locked.
 
 ### SDK skill commands
 
