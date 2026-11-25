@@ -1605,6 +1605,22 @@ The SDK defaults to SSE and uses a host-supplied OAuth access token on the
 exact `openai-codex` route. The typed client lets hosts select another Codex
 transport. ChatGPT plan clients use the separate `openai-responses` API.
 
+The native SDK supports `NativeModelApi::PiMessages` and `api: "pi-messages"`
+model declarations, including a host-authorized `radius` route. The SDK grant
+contains the complete Messages request URL, which upstream derives by
+appending `/messages` to the model base URL. The model file's declared base URL
+selects the grant. Both host credential kinds and explicitly granted file keys
+use the bearer scheme. SDK clients share the CLI's transcript encoding,
+SSE decoding and endpoint-scoped replay. SDK construction and preparation are
+offline and do not use the CLI's on-disk context fingerprint key. Inference
+uses the granted endpoint directly with redirects and
+implicit proxies disabled. The host supplies any refreshed credential and
+catalog metadata. Radius account discovery, OAuth refresh and environment
+defaults belong to the CLI. Loopback coverage exercises both credential
+kinds, ambient configuration isolation and redirect rejection.
+[Pinned Pi Messages API](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/ai/src/api/pi-messages.ts)
+[Pinned Radius provider](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/ai/src/providers/radius.ts)
+
 Hosts may resolve saved key variables with
 `AuthFileReadGrants::load_with_variables`. The resolver receives the exact
 route and variable name after checking saved inline values, and the loader
@@ -2930,7 +2946,27 @@ The first launch records a baseline without displaying notes, and `/changelog`
 always shows the full bundled notes. The parser accepts a version heading on
 the first line, including files with a UTF-8 BOM. The native version marker lives in
 `pi-rs-changelog.json` in the agent directory, separate from upstream Pi's
-version marker. Extension package changelogs remain outside this feature.
+version marker.
+
+The terminal also shows **Extension Updates** when it starts with no session
+messages and successfully loads an updated native package. Each package records
+a silent baseline on first launch. Later notices show version headings above
+the last seen version and up to the installed package version. The numeric
+major, minor and patch determine ordering, so a prerelease suffix or a Git
+revision alone does not repeat a notice. Packages are tracked by source and
+scope, with project baselines kept per workspace. The same native marker file
+stores the package baselines. `collapseChangelog` shows one line per changed
+package, and `/changelog` displays the bundled pi-rs notes.
+
+Native packages can put `CHANGELOG.md` at the package root or set a relative
+`changelogPath` in the package's `pi` metadata, including
+`[package.metadata.pi]` in Cargo.toml. An empty path opts out. A usable
+changelog must be a UTF-8 regular file of at most 1 MiB whose resolved path is
+inside the package root. The installed version comes from the native package
+index, which uses Cargo metadata for Cargo builds and the manifest version for
+other packages. A package needs at least one enabled executable in the
+terminal worker's registry. Standalone executables and packages that only
+supply skills, prompts or themes do not produce these notices.
 pi-rs preserves the upstream `enableInstallTelemetry` key in shared settings
 files. Native pi-rs sends no install or update reports to `pi.dev` and never
 adds upstream Pi attribution headers as a side effect of that setting.
@@ -7108,6 +7144,15 @@ Provider-less legacy selections return `None`; an unavailable historical model
 returns an error rather than the builder default. A busy journal or an
 unreconciled direct journal selection or revoked client binding also returns an
 error. This is a point-in-time check, not a guarantee of later availability.
+
+The Rust SDK exposes `AgentSession::session_id`, `session_file` and
+`session_name` for the same display metadata as
+[Pi's session properties](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L1744-L1757).
+Reopened sessions keep their ID and committed name. Pi imports can retain an
+external ID distinct from the native journal UUID. Forks receive their own ID.
+The file getter reports paths managed by the SDK. Hosts that supply their own
+journal store retain responsibility for its location. ID and name reads return
+an error while the journal is locked.
 
 ### SDK skill commands
 

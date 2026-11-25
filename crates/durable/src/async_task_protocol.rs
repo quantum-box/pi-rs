@@ -2037,32 +2037,21 @@ mod tests {
             driver
                 .get(child)
                 .expect("uncertain graph must not stop driver");
-            release_tx.send(()).unwrap();
-            let until = Instant::now() + Duration::from_secs(10);
-            loop {
-                let gate = owner.task_gate().lock().unwrap();
-                if TaskStore::new(owner.store())
-                    .load(child)
-                    .unwrap()
-                    .unwrap()
-                    .task
-                    .state()
-                    == &TaskState::Ready
-                {
-                    assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
-                    std::fs::write(
-                        path.join("ids"),
-                        serde_json::to_vec(&(parent, child, edge)).unwrap(),
-                    )
-                    .unwrap();
-                    let _gate = gate;
-                    loop {
-                        std::thread::park();
-                    }
+            crate::task_scheduler::after_ready_for_test(child, move || {
+                let temporary = path.join("ids.tmp");
+                std::fs::write(
+                    &temporary,
+                    serde_json::to_vec(&(parent, child, edge)).unwrap(),
+                )
+                .unwrap();
+                std::fs::rename(temporary, path.join("ids")).unwrap();
+                loop {
+                    std::thread::park();
                 }
-                drop(gate);
-                assert!(Instant::now() < until, "child did not defer");
-                std::thread::sleep(Duration::from_millis(5));
+            });
+            release_tx.send(()).unwrap();
+            loop {
+                std::thread::park();
             }
         }
         let dir = tempfile::tempdir().unwrap();

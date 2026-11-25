@@ -5956,18 +5956,21 @@ pub(super) async fn run(
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
         ..View::default()
     };
-    {
+    let changelog_path = super::config::agent_dir().join("pi-rs-changelog.json");
+    let mut extension_changelog_session = {
         let session = Session::open(&args.session)?;
         view.restore_session(&args, &session)?;
-        if session.current_messages().is_empty()
+        let empty = session.current_messages().is_empty();
+        if empty
             && let Ok(Some(notice)) = changelog::startup(
-                &super::config::agent_dir().join("pi-rs-changelog.json"),
+                &changelog_path,
                 args.settings.boolean("collapseChangelog").unwrap_or(false),
             )
         {
             view.append_entry(Entry::Changelog(notice));
         }
-    }
+        empty.then(|| args.session.clone())
+    };
     view.resources = initial_resources;
     if args.trust_pending {
         slash("/trust", &mut args, &mut view, None)?;
@@ -6353,8 +6356,19 @@ pub(super) async fn run(
                 view.request_started = Some(Instant::now());
             }
             let events: Vec<_> = active.drain_events();
-            for value in events {
+            for mut value in events {
                 if value["type"] == "backend_ready" {
+                    if extension_changelog_session.take().as_ref() == Some(&args.session)
+                        && let Ok(packages) =
+                            serde_json::from_value::<Vec<_>>(value["extension_packages"].take())
+                        && let Ok(Some(notice)) = changelog::startup_extensions(
+                            &changelog_path,
+                            &packages,
+                            args.settings.boolean("collapseChangelog").unwrap_or(false),
+                        )
+                    {
+                        view.append_entry(Entry::Changelog(notice));
+                    }
                     active.message_renderer_types =
                         serde_json::from_value(value["custom_message_renderers"].clone())
                             .unwrap_or_default();
