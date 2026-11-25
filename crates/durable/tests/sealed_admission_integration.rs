@@ -126,7 +126,9 @@ impl Handler for Parent {
                 return Err("different raw input was accepted".into());
             }
             if let Some(marker) = &self.marker {
-                std::fs::write(marker, format!("{} {}", task.id(), call.task_id()))
+                let staged = marker.with_extension("tmp");
+                std::fs::write(&staged, format!("{} {}", task.id(), call.task_id()))
+                    .and_then(|_| std::fs::rename(staged, marker))
                     .map_err(|e| e.to_string())?;
                 while !self.release.load(Ordering::SeqCst) {
                     std::thread::park_timeout(Duration::from_millis(5));
