@@ -2925,7 +2925,27 @@ The first launch records a baseline without displaying notes, and `/changelog`
 always shows the full bundled notes. The parser accepts a version heading on
 the first line, including files with a UTF-8 BOM. The native version marker lives in
 `pi-rs-changelog.json` in the agent directory, separate from upstream Pi's
-version marker. Extension package changelogs remain outside this feature.
+version marker.
+
+The terminal also shows **Extension Updates** when it starts with no session
+messages and successfully loads an updated native package. Each package records
+a silent baseline on first launch. Later notices show version headings above
+the last seen version and up to the installed package version. The numeric
+major, minor and patch determine ordering, so a prerelease suffix or a Git
+revision alone does not repeat a notice. Packages are tracked by source and
+scope, with project baselines kept per workspace. The same native marker file
+stores the package baselines. `collapseChangelog` shows one line per changed
+package, and `/changelog` displays the bundled pi-rs notes.
+
+Native packages can put `CHANGELOG.md` at the package root or set a relative
+`changelogPath` in the package's `pi` metadata, including
+`[package.metadata.pi]` in Cargo.toml. An empty path opts out. A usable
+changelog must be a UTF-8 regular file of at most 1 MiB whose resolved path is
+inside the package root. The installed version comes from the native package
+index, which uses Cargo metadata for Cargo builds and the manifest version for
+other packages. A package needs at least one enabled executable in the
+terminal worker's registry. Standalone executables and packages that only
+supply skills, prompts or themes do not produce these notices.
 pi-rs preserves the upstream `enableInstallTelemetry` key in shared settings
 files. Native pi-rs sends no install or update reports to `pi.dev` and never
 adds upstream Pi attribution headers as a side effect of that setting.
