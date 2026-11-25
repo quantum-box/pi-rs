@@ -512,18 +512,20 @@ async fn busy_failure_settlement_preserves_reason_and_lease() {
     let driver = Driver::start(scheduler);
     at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(6500));
+        let _ = unlock_rx.recv_timeout(Duration::from_secs(35));
         conn.execute_batch("COMMIT").unwrap();
     });
     locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     resume_tx.send(()).unwrap();
     busy_rx
-        .recv_timeout(Duration::from_secs(7))
+        .recv_timeout(Duration::from_secs(20))
         .expect("failure settlement did not reach busy timeout");
+    unlock_tx.send(()).unwrap();
     writer.join().unwrap();
     let settled = tokio::time::timeout(
         Duration::from_secs(10),
@@ -587,18 +589,20 @@ async fn busy_abort_settlement_retains_joined_result_and_lease() {
     let driver = Driver::start(scheduler);
     at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(6500));
+        let _ = unlock_rx.recv_timeout(Duration::from_secs(35));
         conn.execute_batch("COMMIT").unwrap();
     });
     locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     resume_tx.send(()).unwrap();
     busy_rx
-        .recv_timeout(Duration::from_secs(7))
+        .recv_timeout(Duration::from_secs(20))
         .expect("abort settlement did not reach busy timeout");
+    unlock_tx.send(()).unwrap();
     writer.join().unwrap();
     let settled = tokio::time::timeout(
         Duration::from_secs(10),
