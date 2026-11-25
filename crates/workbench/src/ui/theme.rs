@@ -4,6 +4,7 @@ use palette::Srgb;
 use pi_rs::{Error, Result};
 #[cfg(test)]
 use pi_rs_workbench::theme_parser::resolve;
+use pi_rs_workbench::theme_resources::read_theme_file;
 #[cfg(test)]
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -188,7 +189,7 @@ pub struct Theme {
 /// Watches the selected custom file while retaining the last valid theme.
 pub struct ThemeWatcher {
     path: Option<PathBuf>,
-    fingerprint: Option<Vec<u8>>,
+    fingerprint: Option<String>,
 }
 impl ThemeWatcher {
     pub fn new(theme: &Theme) -> Self {
@@ -197,7 +198,7 @@ impl ThemeWatcher {
             fingerprint: theme
                 .path
                 .as_ref()
-                .and_then(|path| std::fs::read(path).ok()),
+                .and_then(|path| read_theme_file(path).ok().flatten()),
         }
     }
     pub fn poll(&mut self, theme: &mut Theme) -> Result<bool> {
@@ -208,15 +209,15 @@ impl ThemeWatcher {
         let Some(path) = &self.path else {
             return Ok(false);
         };
-        let contents = std::fs::read(path);
+        let contents = read_theme_file(path).and_then(|text| {
+            text.ok_or_else(|| Error::Config(format!("theme file is missing: {}", path.display())))
+        });
         let fingerprint = contents.as_ref().ok().cloned();
         if fingerprint == self.fingerprint {
             return Ok(false);
         }
         self.fingerprint = fingerprint;
-        let text =
-            String::from_utf8(contents?).map_err(|error| Error::Config(error.to_string()))?;
-        let next = Theme::parse(&text, Some(path.clone()))?;
+        let next = Theme::parse(&contents?, Some(path.clone()))?;
         *theme = next;
         Ok(true)
     }
@@ -268,8 +269,7 @@ impl Theme {
                     });
                 }
                 for path in paths {
-                    if path.is_file() {
-                        let text = std::fs::read_to_string(&path)?;
+                    if let Some(text) = read_theme_file(&path)? {
                         let theme = Self::parse(&text, Some(path))?;
                         if theme.name == name {
                             return Ok(theme);
@@ -307,7 +307,7 @@ impl Theme {
                 vec![path]
             };
             for file in files {
-                if let Ok(text) = std::fs::read_to_string(&file)
+                if let Ok(Some(text)) = read_theme_file(&file)
                     && let Ok(theme) = Self::parse(&text, Some(file))
                 {
                     names.push(theme.name);

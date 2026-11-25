@@ -7,6 +7,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+const MAX_VARIABLE_DEPTH: usize = 128;
+
 #[derive(Deserialize)]
 struct Definition {
     name: String,
@@ -25,6 +27,7 @@ pub struct ParsedTheme {
 #[doc(hidden)]
 pub fn parse_theme(text: &str) -> Result<ParsedTheme> {
     let value: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))?;
+    validate_variable_depth(&value)?;
     let schema: Value = serde_json::from_str(include_str!("../assets/theme.schema.json"))?;
     let validator =
         jsonschema::validator_for(&schema).map_err(|error| Error::Config(error.to_string()))?;
@@ -198,4 +201,37 @@ fn parse_function_color(text: &str, is_hsl: bool) -> Result<Color> {
         g: rgb.green,
         b: rgb.blue,
     })
+}
+
+// Bound variable recursion for every caller before resolving theme colors.
+fn validate_variable_depth(value: &Value) -> Result<()> {
+    let Some(vars) = value.get("vars").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for key in vars.keys() {
+        let mut next = key.as_str();
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(next) {
+                break;
+            } // The shared parser reports referenced cycles.
+            if seen.len() > MAX_VARIABLE_DEPTH {
+                return Err(Error::Config(
+                    "theme variable chain exceeds depth limit".into(),
+                ));
+            }
+            let Some(value) = vars.get(next).and_then(Value::as_str) else {
+                break;
+            };
+            if value.is_empty()
+                || value.starts_with('#')
+                || value.to_ascii_lowercase().starts_with("okhsl(")
+                || value.to_ascii_lowercase().starts_with("oklch(")
+            {
+                break;
+            }
+            next = value;
+        }
+    }
+    Ok(())
 }

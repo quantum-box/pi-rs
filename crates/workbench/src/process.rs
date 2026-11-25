@@ -924,7 +924,12 @@ fn configuration(args: &Cli) -> Value {
         "values": args.extension_flags,
         "order": args.extension_flag_order,
     });
-    let theme_inputs = json!({"disabled":args.no_themes,"paths":args.themes});
+    let theme_paths = args
+        .themes
+        .iter()
+        .map(|path| path.as_os_str().as_encoded_bytes())
+        .collect::<Vec<_>>();
+    let theme_inputs = json!({"disabled":args.no_themes,"paths":theme_paths});
     json!({
         "workspace":args.workspace,
         "provider":args.provider.id(),"endpoint":args.model_endpoint_for(&args.provider, Some(&args.model)),"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
@@ -1000,6 +1005,25 @@ fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: I
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn worker_theme_identity_preserves_distinct_non_utf8_arguments() {
+        use clap::Parser;
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStrExt;
+
+        let args_for = |path: &[u8]| {
+            super::super::Cli::parse_from([
+                OsString::from("pi"),
+                OsString::from("--theme"),
+                OsStr::from_bytes(path).to_owned(),
+            ])
+        };
+        let first = super::configuration(&args_for(b"theme-\xff.json"));
+        let second = super::configuration(&args_for(b"theme-\xfe.json"));
+        assert_ne!(first["theme_inputs"], second["theme_inputs"]);
+    }
+
     #[test]
     fn settings_bootstrap_frame_preserves_following_input_and_rejects_invalid_lengths() {
         use std::io::Read;
