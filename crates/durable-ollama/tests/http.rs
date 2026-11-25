@@ -257,6 +257,7 @@ async fn incomplete_calls_and_partial_usage_fail() {
         r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read"}}]},"finish_reason":"tool_calls"}]}"#,
         r#"{"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3}}"#,
         r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"a","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"{"}}]},"finish_reason":"length"}]}"#,
     ] {
         let response = http(&format!("data: {data}\n\ndata: [DONE]\n\n"));
         let (url, rx, thread) = server(response, false);
@@ -276,6 +277,35 @@ async fn incomplete_calls_and_partial_usage_fail() {
         rx.recv().unwrap();
         thread.join().unwrap();
     }
+}
+
+#[tokio::test]
+async fn token_limit_retains_identifiable_calls_and_usage() {
+    let events = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"working\",\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}},{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"read\"}}]},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (url, rx, thread) = server(http(events), false);
+    let adapter = OllamaAdapter::new(&url).unwrap();
+    let a = attempt();
+    let r = request();
+    let body = adapter.prepare(&a, &r).await.unwrap();
+    let result = collect_generation(
+        adapter.dispatch(&a, &r, body),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(result.is_truncated());
+    assert_eq!(result.content, "working");
+    let usage = result.usage.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (3, 4));
+    assert_eq!(result.calls.len(), 2);
+    assert_eq!(result.calls[0].arguments, r#"{"path":"#);
+    assert!(result.calls[1].arguments.is_empty());
+    rx.recv().unwrap();
+    thread.join().unwrap();
 }
 
 #[tokio::test]

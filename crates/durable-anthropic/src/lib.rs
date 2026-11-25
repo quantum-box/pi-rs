@@ -407,7 +407,48 @@ impl ProviderAdapter for AnthropicAdapter {
                     Some("content_block_delta") if started && stop.is_none() => { let i=index(&v)?; let d=&v["delta"]; match (blocks.get_mut(&i), d["type"].as_str()) { (Some(Block::Text { done:false }), Some("text_delta")) => { let t=field(d,"text")?; yield ModelEvent::Text(t.into()); }, (Some(Block::Tool { initial, fragments, done:false,.. }), Some("input_json_delta")) => { let t=field(d,"partial_json")?; if !t.is_empty() && initial.as_object().is_some_and(|v| !v.is_empty()) { Err(invalid())?; } fragments.push_str(t); yield ModelEvent::ToolCallDelta(ToolCallDelta { index:i,id:String::new(),name:String::new(),arguments:t.into() }); }, _ => Err(invalid())? } }
                     Some("content_block_stop") if started && stop.is_none() => { let b=blocks.get_mut(&index(&v)?).ok_or_else(invalid)?; match b { Block::Text {done} | Block::Tool {done,..} if !*done => *done=true, _ => Err(invalid())? } }
                     Some("message_delta") if started && stop.is_none() => { output=v["usage"]["output_tokens"].as_u64().or(output); if let Some(s)=v["delta"]["stop_reason"].as_str() { stop=Some(s.to_owned()); } }
-                    Some("message_stop") if started => { let reason=match stop.as_deref() { Some("end_turn"|"stop_sequence")=>"stop", Some("max_tokens")=>"length", Some("tool_use")=>"tool_calls", _=>Err(invalid())? }; let mut calls=Vec::new(); for (_,b) in blocks { match b { Block::Text {done:true} => {}, Block::Tool {id,name,initial,fragments,done:true} => { let value=if fragments.is_empty(){ initial }else{ serde_json::from_str(&fragments).map_err(|_| invalid())? }; if !value.is_object() || calls.iter().any(|c: &ToolCall| c.id==id) || calls.len()>=64 { Err(invalid())?; } calls.push(ToolCall { id,name,arguments:value.to_string() }); }, _=>Err(invalid())? } } if (reason=="tool_calls") != !calls.is_empty() && reason!="length" { Err(invalid())?; } metadata.finish_reason=Some(reason.into()); metadata.provider_prompt_tokens=input.map(|n| n.saturating_add(cached).saturating_add(written)); yield ModelEvent::Metadata(metadata.clone()); yield ModelEvent::Complete { calls, usage:metadata.provider_prompt_tokens.zip(output).map(|(input_tokens,output_tokens)| Usage {input_tokens,output_tokens}) }; return; }
+                    Some("message_stop") if started => {
+                        let reason = match stop.as_deref() {
+                            Some("end_turn" | "stop_sequence") => "stop",
+                            Some("max_tokens") => "length",
+                            Some("tool_use") => "tool_calls",
+                            _ => Err(invalid())?,
+                        };
+                        let mut calls = Vec::new();
+                        for (_, block) in blocks {
+                            match block {
+                                Block::Text { done: true } => {}
+                                Block::Tool { id, name, initial, fragments, done: true } => {
+                                    if calls.len() >= 64 || calls.iter().any(|c: &ToolCall| c.id == id) {
+                                        Err(invalid())?;
+                                    }
+                                    let arguments = if fragments.is_empty() {
+                                        initial.to_string()
+                                    } else if reason == "length" {
+                                        // The runtime records but never dispatches these calls.
+                                        fragments
+                                    } else {
+                                        let value: Value = serde_json::from_str(&fragments).map_err(|_| invalid())?;
+                                        if !value.is_object() { Err(invalid())?; }
+                                        value.to_string()
+                                    };
+                                    calls.push(ToolCall { id, name, arguments });
+                                }
+                                _ => Err(invalid())?,
+                            }
+                        }
+                        if (reason == "tool_calls") != !calls.is_empty() && reason != "length" {
+                            Err(invalid())?;
+                        }
+                        metadata.finish_reason = Some(reason.into());
+                        metadata.provider_prompt_tokens = input.map(|n| n.saturating_add(cached).saturating_add(written));
+                        yield ModelEvent::Metadata(metadata.clone());
+                        yield ModelEvent::Complete {
+                            calls,
+                            usage: metadata.provider_prompt_tokens.zip(output).map(|(input_tokens, output_tokens)| Usage { input_tokens, output_tokens }),
+                        };
+                        return;
+                    }
                     Some("error") => { let transient=matches!(v["error"]["type"].as_str(),Some("overloaded_error"|"api_error"|"rate_limit_error")); Err(if transient { Error::RetryableModel("Anthropic stream error".into()) } else { Error::Model("Anthropic stream error".into()) })?; }
                     Some("ping") => {}, _ => Err(invalid())?,
                 }

@@ -270,9 +270,18 @@ impl ProviderAdapter for OllamaAdapter {
             while let Some(event) = events.next().await {
                 let event = event.map_err(|e| match e { eventsource_stream::EventStreamError::Transport(e) => e, _ => Error::RetryableModel("broken SSE stream".into()) })?;
                 if event.data == "[DONE]" {
-                    match metadata.finish_reason.as_deref() { Some("stop" | "length") if calls.is_empty() => {}, Some("tool_calls") if !calls.is_empty() => {}, _ => Err(Error::Model("model response did not finish successfully".into()))? }
+                    let reason = metadata.finish_reason.as_deref();
+                    match reason {
+                        Some("length") => {}
+                        Some("stop") if calls.is_empty() => {}
+                        Some("tool_calls") if !calls.is_empty() => {}
+                        _ => Err(Error::Model("model response did not finish successfully".into()))?,
+                    }
                     let mut ids = std::collections::HashSet::new();
-                    if calls.values().any(|c| c.id.is_empty() || c.name.is_empty() || !c.has_arguments || !ids.insert(&c.id)) {
+                    if calls.values().any(|call| {
+                        call.id.is_empty() || call.name.is_empty() || !ids.insert(&call.id)
+                            || (!call.has_arguments && reason != Some("length"))
+                    }) {
                         Err(Error::Model("incomplete or duplicate tool call".into()))?;
                     }
                     if !reasoning.is_empty() { metadata.reasoning = Some(reasoning); yield ModelEvent::Metadata(metadata); }

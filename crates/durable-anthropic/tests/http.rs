@@ -354,30 +354,44 @@ async fn rejects_mixed_initial_and_streamed_tool_input() {
 }
 
 #[tokio::test]
-async fn truncated_tool_call_is_marked_for_runtime_to_skip() {
+async fn partial_tool_arguments_are_kept_only_for_truncated_completion() {
     let events = concat!(
-        "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
-        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c\",\"name\":\"read\",\"input\":{\"path\":\"a\"}}}\n\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"working\"}}\n\n",
         "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c\",\"name\":\"read\",\"input\":{}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":4}}\n\n",
         "data: {\"type\":\"message_stop\"}\n\n"
     );
-    let (url, rx, thread) = server(http(events), false);
-    let adapter = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
-    let a = attempt();
-    let r = request();
-    let body = adapter.prepare(&a, &r).await.unwrap();
-    let result = collect_generation(
-        adapter.dispatch(&a, &r, body),
-        &CancellationToken::new(),
-        |_| {},
-    )
-    .await
-    .unwrap();
-    assert!(result.is_truncated());
-    assert_eq!(result.calls.len(), 1);
-    rx.recv().unwrap();
-    thread.join().unwrap();
+    for reason in ["max_tokens", "tool_use"] {
+        let events = events.replace("max_tokens", reason);
+        let (url, rx, thread) = server(http(&events), false);
+        let adapter = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+        let a = attempt();
+        let r = request();
+        let body = adapter.prepare(&a, &r).await.unwrap();
+        let result = collect_generation(
+            adapter.dispatch(&a, &r, body),
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await;
+        if reason == "max_tokens" {
+            let result = result.unwrap();
+            assert!(result.is_truncated());
+            assert_eq!(result.content, "working");
+            let usage = result.usage.unwrap();
+            assert_eq!((usage.input_tokens, usage.output_tokens), (3, 4));
+            assert_eq!(result.calls.len(), 1);
+            assert_eq!(result.calls[0].arguments, r#"{"path":"#);
+        } else {
+            assert!(result.is_err());
+        }
+        rx.recv().unwrap();
+        thread.join().unwrap();
+    }
 }
 
 fn ordered_tool_request() -> pi_rs_durable::model::DurableToolRequest {
