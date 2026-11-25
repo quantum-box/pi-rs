@@ -1070,18 +1070,36 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
             let id = scheduler.fork(id).unwrap();
             (id, scheduler.conversation(id).unwrap().messages)
         });
-        let mut deleted = 0;
-        loop {
-            let count = scheduler
-                .prune_finished_checkpointable_progress(task, NonZeroUsize::MIN)
+        if mode == "bounded" {
+            scheduler
+                .start_checkpointable_progress_retention(
+                    Duration::from_millis(75),
+                    Duration::from_millis(10),
+                )
                 .unwrap();
-            if count == 0 {
-                break;
+            let prefix = format!("durable/checkpointable-progress/{task}/");
+            assert_eq!(store.list(prefix.as_bytes()).unwrap().len(), 1);
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !store.list(prefix.as_bytes()).unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("automatic retention removed the terminal attempt checkpoint");
+        } else {
+            let mut deleted = 0;
+            loop {
+                let count = scheduler
+                    .prune_finished_checkpointable_progress(task, NonZeroUsize::MIN)
+                    .unwrap();
+                if count == 0 {
+                    break;
+                }
+                assert_eq!(count, 1);
+                deleted += count;
             }
-            assert_eq!(count, 1);
-            deleted += count;
+            assert_eq!(deleted, if mode == "wake" { 2 } else { 1 });
         }
-        assert_eq!(deleted, if mode == "wake" { 2 } else { 1 });
         let recorded: Vec<_> = scheduler
             .progress_history(&progress_cursor, NonZeroUsize::new(100).unwrap())
             .unwrap()

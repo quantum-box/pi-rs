@@ -14351,6 +14351,19 @@ impl Harness {
                 key: key.clone(),
                 expected: Expected::Version(entry.version),
             });
+            let observation = crate::progress_retention::observation_key(&key);
+            if let Some(entry) = store.get(&observation)? {
+                checks.push(Check {
+                    key: observation.clone(),
+                    expected: Expected::Version(entry.version),
+                });
+                mutations.push(Mutation::Delete { key: observation });
+            } else {
+                checks.push(Check {
+                    key: observation,
+                    expected: Expected::Missing,
+                });
+            }
             mutations.push(Mutation::Delete { key });
         }
         store.commit(&checks, &mutations)?;
@@ -23162,6 +23175,7 @@ pub struct Scheduler {
     reporter_cancel: CancellationToken,
     reporter: Option<tokio::task::JoinHandle<()>>,
     foreground_worker: Option<tokio::task::JoinHandle<()>>,
+    progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
     worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
     summary_tasks: HashMap<Uuid, SummaryTask>,
@@ -23986,6 +24000,7 @@ impl Scheduler {
             reporter_cancel: CancellationToken::new(),
             reporter: None,
             foreground_worker: None,
+            progress_retention: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -25593,6 +25608,44 @@ impl Scheduler {
         }
         Error::Invalid(format!("summary: {error}"))
     }
+    /// Periodically expire unpublished tool progress after the same terminal task
+    /// and progress versions have been observed for at least `retain_for`.
+    /// Reattach after reopening to resume the persisted retention clocks.
+    pub fn start_checkpointable_progress_retention(
+        &mut self,
+        retain_for: Duration,
+        interval: Duration,
+    ) -> Result<(), Error> {
+        let retain_ms = u64::try_from(retain_for.as_millis())
+            .ok()
+            .filter(|time| *time > 0)
+            .ok_or_else(|| Error::Invalid("invalid checkpointable progress retention".into()))?;
+        if interval.is_zero() || self.progress_retention.is_some() {
+            return Err(Error::Invalid(
+                "checkpointable progress retention needs a nonzero interval and one worker".into(),
+            ));
+        }
+        let reader = self.harness.worker();
+        let cancel = self.reporter_cancel.clone();
+        self.progress_retention = Some(tokio::spawn(async move {
+            let mut after = Vec::new();
+            while !cancel.is_cancelled() {
+                crate::progress_retention::sweep(
+                    reader.owner.store(),
+                    &mut after,
+                    unix_ms(),
+                    retain_ms,
+                )?;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => (),
+                }
+            }
+            Ok(())
+        }));
+        Ok(())
+    }
+
     /// Most recent background reporter failure, if any. Reopen after storage errors.
     pub fn reporter_error(&self) -> Option<String> {
         self.reporter_error
@@ -25878,6 +25931,17 @@ impl Scheduler {
             && let Err(e) = worker.await
         {
             error.get_or_insert(Error::Invalid(format!("foreground scheduler task: {e}")));
+        }
+        if let Some(worker) = self.progress_retention.take() {
+            match worker.await {
+                Ok(Ok(())) => (),
+                Ok(Err(e)) => {
+                    error.get_or_insert(e);
+                }
+                Err(e) => {
+                    error.get_or_insert(Error::Invalid(format!("progress retention: {e}")));
+                }
+            }
         }
         if let Some(reporter) = self.reporter.take()
             && let Err(e) = reporter.await
