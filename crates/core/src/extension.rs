@@ -700,6 +700,13 @@ pub trait Tool: Send + Sync {
     fn use_default_timeout(&self) -> bool {
         true
     }
+    /// Opt in to a bounded reply window after the host execution deadline.
+    /// The tool must enforce the supplied budget in
+    /// `invoke_transaction_with_timeout`. The scheduler still bounds settlement
+    /// and handles caller cancellation. This applies to direct calls.
+    fn settles_host_timeout(&self) -> bool {
+        false
+    }
     fn execution(&self) -> ToolExecution {
         ToolExecution::Sequential
     }

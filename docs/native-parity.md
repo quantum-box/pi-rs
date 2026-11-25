@@ -2104,9 +2104,13 @@ Unpublished transcripts are removed. A deadline interrupt in QuickJS and a
 timeout awaiting a tool report the effective timeout in milliseconds. Nested
 calls receive cancellation when execution settles, before formatting. Error
 replies preserve partial text and inline images within the output limits and
-discard uncommitted store writes. Text-only errors retain the existing failed outcome. The session
-scheduler can still settle a host-wide tool timeout or cancellation before
-Codemode publishes the reply.
+discard uncommitted store writes. Text-only errors retain the existing failed
+outcome. An explicit host timeout remains the Codemode execution budget. The
+native session scheduler gives direct Codemode calls up to 250 ms after that
+budget to finish shutdown and publish a reply. If the reply remains pending,
+the scheduler records an unknown outcome for reconciliation. Caller
+cancellation still takes priority. Other tools and programmatic calls retain
+their existing scheduler deadlines.
 [Pinned Codemode worker deadline](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/codemode/src/runtime/execution.ts)
 [Pinned coding-agent result formatting](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/extensions/codemode/execute.ts)
 
