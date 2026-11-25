@@ -559,10 +559,18 @@ fn options(code: &str, maximum: Option<Duration>) -> Result<(Options, &str), Str
     let fields = value
         .as_object()
         .ok_or_else(|| format!("@options must be a JSON object with supported fields {FIELDS}"))?;
-    for key in fields.keys() {
-        if key != "max_output_tokens" && key != "timeout_ms" {
-            return Err(format!("@options only supports {FIELDS}; got `{key}`"));
-        }
+    // Object.keys lists canonical array indices in numeric order before other keys.
+    let unknown_key = fields
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "max_output_tokens" | "timeout_ms"))
+        .min_by_key(|key| {
+            key.parse::<u32>()
+                .ok()
+                .filter(|index| *index != u32::MAX && index.to_string() == key.as_str())
+                .unwrap_or(u32::MAX)
+        });
+    if let Some(key) = unknown_key {
+        return Err(format!("@options only supports {FIELDS}; got `{key}`"));
     }
     let integer = |name: &str, limit: u64| -> Result<Option<u64>, String> {
         let Some(value) = fields.get(name) else {
@@ -2506,6 +2514,19 @@ mod tests {
         assert_eq!(syntax, pi_rs_core::ToolGrammarSyntax::Lark);
         assert_eq!(definition, SOURCE_GRAMMAR);
         assert_eq!(property, "code");
+    }
+
+    #[test]
+    fn options_report_unknown_fields_in_javascript_key_order() {
+        for (directive, first) in [
+            (r#"{"other":0,"42":0,"7":0}"#, "7"),
+            (r#"{"other":0,"01":0,"4294967295":0}"#, "other"),
+            (r#"{"other":0,"01":0,"0":0}"#, "0"),
+        ] {
+            let code = format!("// @options: {directive}\ntext(1)");
+            let error = options(&code, None).err().expect("unknown option");
+            assert!(error.ends_with(&format!("got `{first}`")), "{error}");
+        }
     }
 
     #[test]
