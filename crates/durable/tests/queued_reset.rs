@@ -700,6 +700,26 @@ async fn queued_block_reset_places_handoff_blocks_and_steer_atomically() {
     assert_eq!(snapshot.content_blocks[&1].message_id, ids[0]);
     assert_eq!(snapshot.content_blocks[&1].blocks, first);
     assert_eq!(snapshot.content_blocks[&2].message_id, ids[1]);
+    let limit = std::num::NonZeroUsize::new(64).unwrap();
+    let cursor = s.session_messages_start(id).unwrap();
+    let history = s.session_messages(&cursor, limit).unwrap();
+    let known = [ids2[0], ids[1], ids[0], old];
+    let order: Vec<_> = history
+        .entries
+        .iter()
+        .map(|entry| entry.history.id)
+        .filter(|id| known.contains(id))
+        .collect();
+    assert_eq!(order, known);
+    let cursor = s.session_messages_start(intermediate).unwrap();
+    let history = s.session_messages(&cursor, limit).unwrap();
+    assert_eq!(history.entries.first().unwrap().history.id, ids[1]);
+    assert!(
+        !history
+            .entries
+            .iter()
+            .any(|entry| entry.history.id == ids2[0])
+    );
     model.release.add_permits(1);
     s.wait(id).await.unwrap();
     let historical = s.fork_by_entry_id(id, old).unwrap();

@@ -2761,6 +2761,34 @@ pub struct MessageHistory {
     pub commit_boundary: bool,
 }
 
+/// A paged position in one captured session message history. Persist it with
+/// the results in the same database; a new capture sees later commits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMessageCursor {
+    conversation: Uuid,
+    source: Uuid,
+    observation: u64,
+    consumed: usize,
+    cutoff: Option<Uuid>,
+}
+
+/// One original message, including messages replaced in active model context.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionMessageEntry {
+    pub history: MessageHistory,
+    pub message: Message,
+    /// The original ordered blocks for a block-aware message.
+    pub blocks: Option<Vec<serde_json::Value>>,
+    /// Posted as part of a context replacement instead of an ordinary append.
+    pub context_replacement: bool,
+}
+
+pub struct SessionMessagePage {
+    /// Most recent first, including within an atomic message batch.
+    pub entries: Vec<SessionMessageEntry>,
+    pub older: Option<SessionMessageCursor>,
+}
+
 pub struct PositionedViewPage {
     /// Newest first, including within a transcript batch.
     pub entries: Vec<PositionedMessage>,
@@ -10418,10 +10446,204 @@ impl Harness {
         })
     }
 
+    /// Capture the committed session message history, including earlier contexts.
+    pub fn session_messages_start(&self, id: Uuid) -> Result<SessionMessageCursor, Error> {
+        let store = self.subagent_store()?;
+        if store.get(&Self::key(id))?.is_none() {
+            return Err(Error::NotFound);
+        }
+        let observation = crate::observer::Observer::new(store, id).head()?.0;
+        Ok(SessionMessageCursor {
+            conversation: id,
+            source: id,
+            observation,
+            consumed: 0,
+            cutoff: None,
+        })
+    }
+
+    /// Page original message occurrences, following recorded fork cuts.
+    /// Legacy messages without identity evidence are left to the transcript view.
+    pub fn session_messages(
+        &self,
+        cursor: &SessionMessageCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<SessionMessagePage, Error> {
+        if limit.get() > 256 {
+            return Err(Error::Invalid(
+                "session message page limit exceeds 256".into(),
+            ));
+        }
+        let store = self.subagent_store()?;
+        if store.get(&Self::key(cursor.conversation))?.is_none() {
+            return Err(Error::NotFound);
+        }
+        let mut position = cursor.clone();
+        let mut entries = Vec::new();
+        loop {
+            if position.observation == 0 {
+                if position.consumed != 0 || position.cutoff.is_some() {
+                    return Err(crate::fork::Error::InvalidCursor.into());
+                }
+                let Some(parent) = self.fork_parent(position.source)? else {
+                    return Ok(SessionMessagePage {
+                        entries,
+                        older: None,
+                    });
+                };
+                position.source = parent.source;
+                position.observation = parent.source_observation;
+                position.cutoff = match parent.boundary {
+                    ForkBoundary::Message { entry_id } => Some(entry_id),
+                    _ => None,
+                };
+            }
+            let mut messages =
+                self.session_messages_in_observation(position.source, position.observation)?;
+            if let Some(cutoff) = position.cutoff {
+                let index = messages
+                    .iter()
+                    .position(|entry| entry.history.id == cutoff)
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                messages.truncate(index + 1);
+            }
+            let remaining = messages
+                .len()
+                .checked_sub(position.consumed)
+                .ok_or(crate::fork::Error::InvalidCursor)?;
+            if remaining == 0 {
+                position.observation -= 1;
+                position.consumed = 0;
+                position.cutoff = None;
+                continue;
+            }
+            // The next distinct entry determines whether there is another
+            // page without handing back an empty tail of non-message commits.
+            if entries.len() == limit.get() {
+                return Ok(SessionMessagePage {
+                    entries,
+                    older: Some(position),
+                });
+            }
+            let count = remaining.min(limit.get() - entries.len());
+            entries.extend(messages.drain(remaining - count..remaining).rev());
+            position.consumed += count;
+        }
+    }
+
+    fn session_messages_in_observation(
+        &self,
+        source: Uuid,
+        observation: u64,
+    ) -> Result<Vec<SessionMessageEntry>, Error> {
+        // A fork's initial observer record is its inherited context seed. Some
+        // text cuts stored that seed in a fresh batch with local message IDs.
+        // Read the selected source instead of publishing copied occurrences.
+        if observation == 1 && self.fork_parent(source)?.is_some() {
+            return Ok(Vec::new());
+        }
+        let store = self.owner.store();
+        let observer = crate::observer::Observer::new(store, source);
+        let page = observer.read_through(
+            crate::observer::Cursor(observation - 1),
+            crate::observer::Cursor(observation),
+            std::num::NonZeroUsize::MIN,
+        )?;
+        let record = page
+            .records
+            .first()
+            .filter(|record| record.cursor.0 == observation)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let Some(transcript) = record.value.get("_transcript") else {
+            return Ok(Vec::new());
+        };
+        let Some(mut position): Option<crate::transcript::Cursor> =
+            serde_json::from_value(transcript.clone())?
+        else {
+            return Ok(Vec::new());
+        };
+        let transcript = crate::transcript::Transcript::new(store, source);
+        let mut batches = Vec::new();
+        loop {
+            let page = transcript.read_with_blocks(&position, std::num::NonZeroUsize::MIN)?;
+            let record = page
+                .records
+                .first()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+            let blocks_for = |id| {
+                record
+                    .content_blocks
+                    .iter()
+                    .flatten()
+                    .find(|binding| binding.message_id == id)
+                    .map(|binding| binding.blocks.clone())
+            };
+            let entries = if let TranscriptChange::ReplaceCompacted {
+                messages,
+                system_end,
+                summary_id,
+                commit,
+                origin,
+                ..
+            } = &change
+            {
+                if *commit != observation || *origin != source {
+                    break;
+                }
+                let histories = change
+                    .compacted_histories()?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                vec![SessionMessageEntry {
+                    history: histories[*system_end]
+                        .clone()
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?,
+                    message: messages[*system_end].clone(),
+                    blocks: blocks_for(*summary_id),
+                    context_replacement: true,
+                }]
+            } else {
+                let (messages, base, metadata) = change.parts()?;
+                let Some((ids, commit, origin)) = metadata else {
+                    break;
+                };
+                if commit != observation || origin != source {
+                    break;
+                }
+                let len = messages.len();
+                messages
+                    .into_iter()
+                    .zip(ids)
+                    .enumerate()
+                    .map(|(index, (message, id))| SessionMessageEntry {
+                        history: MessageHistory {
+                            id,
+                            commit,
+                            origin,
+                            commit_boundary: index + 1 == len,
+                        },
+                        message,
+                        blocks: blocks_for(id),
+                        context_replacement: base,
+                    })
+                    .collect()
+            };
+            batches.push(entries);
+            if !page.has_more {
+                break;
+            }
+            position = page.next;
+        }
+        if !batches.is_empty() {
+            self.authenticate_fork_anchor(source, observation)?;
+        }
+        Ok(batches.into_iter().rev().flatten().collect())
+    }
+
     /// Fork at the exact committed boundary of a message occurrence.
     /// Interior messages require a proven safe append. Inherited entries must
-    /// be visible in the captured shared chain and have an origin snapshot.
-    /// Local retained observations are scanned across resets.
+    /// be visible in the shared chain or recorded session ancestry and have a
+    /// verified origin snapshot. Local observations are scanned across resets.
     pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
         let membership = self.fork_membership_proof(id)?;
         let _proof_scope = ResetProofScope::enter();
@@ -10660,6 +10882,27 @@ impl Harness {
             }
             (None, Some((origin, position))) => {
                 self.fork_at_position_with_membership(origin, position, &membership)
+            }
+            (None, None) if self.fork_parent(id)?.is_some() => {
+                // A replacement can hide inherited messages from the model
+                // projection without removing them from the session history.
+                let mut cursor = Some(self.session_messages_start(id)?);
+                let mut archived = None;
+                while let Some(position) = cursor {
+                    let page = self.session_messages(
+                        &position,
+                        std::num::NonZeroUsize::new(64).expect("nonzero"),
+                    )?;
+                    for entry in page.entries {
+                        if entry.history.id == entry_id && archived.replace(entry).is_some() {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                    }
+                    cursor = page.older;
+                }
+                let entry = archived.ok_or(crate::fork::Error::InvalidCursor)?;
+                let original = self.original_occurrence_position(&entry.history, &entry.message)?;
+                self.fork_at_position_with_membership(entry.history.origin, original, &membership)
             }
             _ => Err(crate::fork::Error::InvalidCursor.into()),
         }
@@ -24221,6 +24464,16 @@ impl Scheduler {
     pub fn fork_parent(&self, id: Uuid) -> Result<Option<ForkParent>, Error> {
         self.harness.fork_parent(id)
     }
+    pub fn session_messages_start(&self, id: Uuid) -> Result<SessionMessageCursor, Error> {
+        self.harness.session_messages_start(id)
+    }
+    pub fn session_messages(
+        &self,
+        cursor: &SessionMessageCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<SessionMessagePage, Error> {
+        self.harness.session_messages(cursor, limit)
+    }
     pub fn fork_at(&mut self, id: Uuid, cursor: crate::observer::Cursor) -> Result<Uuid, Error> {
         self.harness.fork_at(id, cursor)
     }
@@ -32506,6 +32759,41 @@ mod scheduler_tests {
         assert!(h.conversation(child).is_err());
         drop(h);
         assert!(Harness::open_paused(&path, options(placement_model())).is_err());
+    }
+
+    #[test]
+    fn session_message_history_omits_the_copied_text_seed_of_an_interior_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        state.messages = vec![
+            Message::User {
+                content: "first".into(),
+            },
+            Message::User {
+                content: "excluded".into(),
+            },
+        ];
+        h.save(&state, Expected::Version(version)).unwrap();
+        let original = h
+            .view_positioned(id, std::num::NonZeroUsize::new(2).unwrap())
+            .unwrap();
+        let first = original.entries.last().unwrap();
+        let child = h.fork_at_position(id, first.position.clone()).unwrap();
+        let history = h.session_messages_start(child).unwrap();
+        let mut page = h
+            .session_messages(&history, std::num::NonZeroUsize::MIN)
+            .unwrap();
+        assert!(page.older.is_none());
+        let inherited = page.entries.pop().unwrap();
+        assert_eq!(&inherited.history, first.history.as_ref().unwrap());
+        assert_eq!(&inherited.message, &first.message);
+        assert!(
+            h.fork_by_entry_id(child, original.entries[0].history.as_ref().unwrap().id)
+                .is_err()
+        );
     }
 
     #[test]

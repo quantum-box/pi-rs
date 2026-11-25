@@ -176,6 +176,29 @@ async fn public_block_summary_hook_reopens_and_preserves_retained_occurrence() {
     let c = s.conversation(id).unwrap();
     assert_eq!(c.content_blocks.len(), 1);
     assert_eq!(c.content_blocks[&1].message_id, kept);
+    let cursor = s.session_messages_start(id).unwrap();
+    let page = s
+        .session_messages(&cursor, std::num::NonZeroUsize::new(32).unwrap())
+        .unwrap();
+    let old_entry = page
+        .entries
+        .iter()
+        .find(|entry| entry.history.id == old)
+        .unwrap();
+    let old_blocks = old_entry.blocks.as_ref().unwrap();
+    assert_eq!(
+        old_blocks[1],
+        json!({"type":"image","data":"aGk=","mimeType":"image/png"})
+    );
+    let kept_entry = page
+        .entries
+        .iter()
+        .find(|entry| entry.history.id == kept)
+        .unwrap();
+    assert_eq!(
+        kept_entry.blocks.as_ref().unwrap(),
+        &c.content_blocks[&1].blocks
+    );
     let fork = s.fork_by_entry_id(id, kept).unwrap();
     assert!(
         s.conversation(fork)
