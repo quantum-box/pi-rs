@@ -3428,10 +3428,10 @@ Konsole 25.04.2 also displayed the iTerm2 OSC 1337 protocol in both modes.
 Screenshots of the macOS pi-rs process relayed to Konsole in an isolated Linux
 display matched the visible bands of the 320×480 pasteboard PNG. Fullscreen
 sent a 320×208 crop and regular mode sent the full image for viewport
-clipping. In iTerm2 itself, fullscreen clipping at both viewport edges and
-regular-mode display of the full image were confirmed. Regular-mode edge
-clipping and visual cleanup after narrowing, widening, shortening, and
-restoring the window remain unverified in the iTerm2 application.
+clipping. Visual acceptance in the iTerm2 application remains open. The
+remaining check is to paste an image taller than the viewport, scroll it
+through both edges in fullscreen and regular mode, and verify that the image
+does not cover the editor or leave pixels behind after redraw and resize.
 
 ### Image cell-sizing checkpoint
 
