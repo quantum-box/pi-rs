@@ -909,6 +909,12 @@ pub enum WithdrawResult {
 pub struct AbortedGeneration {
     pub request_id: Uuid,
     pub text: String,
+    /// Submission that owned this model attempt, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<Uuid>,
+    /// Whether this partial belongs to the attempt that ended the submission.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2501,6 +2507,16 @@ impl Conversation {
     /// predate answer IDs and return None.
     pub fn answer_id(&self, submission: Uuid) -> Option<Uuid> {
         self.answer_ids.get(&submission).copied()
+    }
+
+    /// Current model request identity for a submission placed in this run.
+    pub fn model_request_id(&self, submission: Uuid) -> Option<Uuid> {
+        match self.phase {
+            Phase::ModelRunning { request_id, .. } if self.active == Some(submission) => {
+                Some(request_id)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -16738,6 +16754,8 @@ impl Harness {
                         c.aborted_generations.push(AbortedGeneration {
                             request_id,
                             text: partial.text.clone(),
+                            submission: c.active,
+                            terminal: false,
                         });
                     }
                     let n = restarts.saturating_add(1);
@@ -18074,6 +18092,14 @@ impl Harness {
                 c.aborted_generations.push(AbortedGeneration {
                     request_id,
                     text: partial.text.clone(),
+                    submission: match c.phase {
+                        Phase::ModelRunning { .. }
+                        | Phase::AbandonedModel { .. }
+                        | Phase::FailedModel { .. }
+                        | Phase::Accounting { .. } => c.active,
+                        _ => None,
+                    },
+                    terminal: true,
                 });
             }
             let settlement = async {
@@ -19689,6 +19715,11 @@ impl Harness {
                                 self.failed = true;
                                 return Err(Error::Interrupted);
                             }
+                            let decision =
+                                Failure::from_error(&e).map_or(Decision::Stop, |failure| {
+                                    c.retry_state
+                                        .failed(RetryPolicy::default(), failure, unix_ms())
+                                });
                             let partial =
                                 crate::progress::Snapshot::load(self.owner.store(), request_id)?;
                             if let crate::progress::State::Running(progress) = partial.state()
@@ -19701,13 +19732,10 @@ impl Harness {
                                 c.aborted_generations.push(AbortedGeneration {
                                     request_id,
                                     text: progress.text.clone(),
+                                    submission: c.active,
+                                    terminal: matches!(decision, Decision::Stop),
                                 });
                             }
-                            let decision =
-                                Failure::from_error(&e).map_or(Decision::Stop, |failure| {
-                                    c.retry_state
-                                        .failed(RetryPolicy::default(), failure, unix_ms())
-                                });
                             c.phase = Phase::FailedModel {
                                 turns,
                                 request_id,

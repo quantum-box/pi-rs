@@ -1,4 +1,5 @@
 //! Text-only subset of the line-delimited Pi RPC protocol.
+use std::collections::HashSet;
 use std::io::{self, BufRead, Read};
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -18,6 +19,9 @@ struct Turn {
     submission: Uuid,
     user: Value,
     partial: String,
+    attempt: Option<Uuid>,
+    assistant_open: bool,
+    emitted_failures: HashSet<Uuid>,
 }
 
 impl Turn {
@@ -26,16 +30,30 @@ impl Turn {
         emit(&json!({"type":"agent_start"}))?;
         emit(&json!({"type":"message_start","message":user}))?;
         emit(&json!({"type":"message_end","message":user}))?;
-        emit(&json!({"type":"turn_start"}))?;
-        emit(&json!({"type":"message_start","message":text_message("assistant", "")}))?;
         Ok(Self {
             submission,
             user,
             partial: String::new(),
+            attempt: None,
+            assistant_open: false,
+            emitted_failures: HashSet::new(),
         })
     }
 
-    fn update(&mut self, text: String) -> io::Result<()> {
+    fn begin_attempt(&mut self, attempt: Option<Uuid>) -> io::Result<()> {
+        if self.assistant_open && attempt != self.attempt {
+            self.end_attempt(&self.partial.clone(), Some("model attempt was interrupted"))?;
+        }
+        if !self.assistant_open {
+            emit(&json!({"type":"turn_start"}))?;
+            emit(&json!({"type":"message_start","message":text_message("assistant", "")}))?;
+            self.assistant_open = true;
+            self.attempt = attempt;
+        }
+        Ok(())
+    }
+
+    fn update(&mut self, text: &str) -> io::Result<()> {
         if self.partial == text {
             return Ok(());
         }
@@ -47,19 +65,24 @@ impl Turn {
                 }),
             )?;
         }
-        let delta = text.strip_prefix(&self.partial).unwrap_or_default();
+        let delta = text.strip_prefix(&self.partial).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "model partial changed within an attempt",
+            )
+        })?;
         message_update(
-            text_message("assistant", &text),
+            text_message("assistant", text),
             json!({
                 "type":"text_delta", "contentIndex":0, "delta":delta
             }),
         )?;
-        self.partial = text;
+        self.partial = text.to_owned();
         Ok(())
     }
 
-    fn end(&mut self, text: &str, failure: Option<&str>) -> io::Result<()> {
-        self.update(text.to_owned())?;
+    fn end_attempt(&mut self, text: &str, failure: Option<&str>) -> io::Result<Value> {
+        self.update(text)?;
         let mut message = text_message("assistant", text);
         if !text.is_empty() {
             message_update(
@@ -79,6 +102,30 @@ impl Turn {
         }
         emit(&json!({"type":"message_end","message":message}))?;
         emit(&json!({"type":"turn_end","message":message,"toolResults":[]}))?;
+        self.partial.clear();
+        self.assistant_open = false;
+        self.attempt = None;
+        Ok(message)
+    }
+
+    fn emit_retried_attempts(&mut self, state: &Conversation) -> io::Result<()> {
+        for partial in &state.aborted_generations {
+            if partial.submission == Some(self.submission)
+                && !partial.terminal
+                && self.emitted_failures.insert(partial.request_id)
+            {
+                self.begin_attempt(Some(partial.request_id))?;
+                self.end_attempt(&partial.text, Some("model attempt was interrupted"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn end(&mut self, text: &str, failure: Option<&str>) -> io::Result<()> {
+        if !self.assistant_open || !text.starts_with(&self.partial) {
+            self.begin_attempt(None)?;
+        }
+        let message = self.end_attempt(text, failure)?;
         emit(&json!({
             "type":"agent_end",
             "success":failure.is_none(),
@@ -88,6 +135,7 @@ impl Turn {
     }
 
     fn settle(&mut self, state: &Conversation, failure: Option<String>) -> io::Result<()> {
+        self.emit_retried_attempts(state)?;
         let status = state
             .submissions
             .iter()
@@ -95,7 +143,18 @@ impl Turn {
             .map(|input| &input.status);
         match status {
             Some(Status::Done { answer }) => self.end(answer, None),
-            Some(Status::Unanswered { reason }) => self.end(&self.partial.clone(), Some(reason)),
+            Some(Status::Unanswered { reason }) => {
+                if let Some(partial) =
+                    state.aborted_generations.iter().rev().find(|partial| {
+                        partial.submission == Some(self.submission) && partial.terminal
+                    })
+                {
+                    self.begin_attempt(Some(partial.request_id))?;
+                    self.end(&partial.text, Some(reason))
+                } else {
+                    self.end(&self.partial.clone(), Some(reason))
+                }
+            }
             _ => self.end(
                 &self.partial.clone(),
                 Some(failure.as_deref().unwrap_or("submission is still pending")),
@@ -281,14 +340,12 @@ async fn advance(
         .any(|worker| worker.kind == WorkerKind::Conversation && worker.id == id)
     {
         let view = scheduler.view(id, NonZeroUsize::MIN)?;
-        if view
-            .state
-            .submissions
-            .iter()
-            .any(|input| input.id == turn.submission && matches!(input.status, Status::Running))
+        turn.emit_retried_attempts(&view.state)?;
+        if let Some(request_id) = view.state.model_request_id(turn.submission)
             && let Some(progress::State::Running(partial)) = view.live
         {
-            turn.update(partial.text)?;
+            turn.begin_attempt(Some(request_id))?;
+            turn.update(&partial.text)?;
         }
         return Ok(false);
     }

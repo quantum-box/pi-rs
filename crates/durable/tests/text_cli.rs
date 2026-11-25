@@ -24,6 +24,9 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             "second answer",
             "third answer",
             "partial before abort",
+            "first attempt only",
+            "replacement answer",
+            "saved before failure",
         ]
         .into_iter()
         .enumerate()
@@ -73,13 +76,18 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
                 }
             });
             let partial = format!("data: {delta}\n\n");
-            let final_event = format!("data: {completed}\n\n");
+            let final_frame = match index {
+                4 => serde_json::json!({"type":"error","status":503}),
+                6 => serde_json::json!({"type":"error","status":400}),
+                _ => completed,
+            };
+            let final_event = format!("data: {final_frame}\n\n");
             write!(
                 socket,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
                 partial.len() + final_event.len(),
             ).unwrap();
-            if index != 1 {
+            if matches!(index, 0 | 2 | 3 | 4) {
                 socket.flush().unwrap();
                 finish_first_rx
                     .recv_timeout(Duration::from_secs(10))
@@ -249,6 +257,72 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(sent_abort && ended && acknowledged);
+
+    let mut rpc = command(&endpoint, &["--conversation", id, "--rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = rpc.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"type":"prompt","message":"retry this request"}}"#
+    )
+    .unwrap();
+    let stdout = BufReader::new(rpc.stdout.take().unwrap());
+    let mut reason_and_text = Vec::new();
+    let mut saw_completion = false;
+    let mut observed = String::new();
+    for line in stdout.lines() {
+        let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if frame["type"] == "message_start" && frame["message"]["role"] == "assistant" {
+            observed.clear();
+        }
+        let event = &frame["assistantMessageEvent"];
+        if event["type"] == "text_delta" {
+            let delta = event["delta"].as_str().unwrap();
+            if delta == "first attempt only" {
+                finish_first_tx.send(()).unwrap();
+            }
+            observed.push_str(delta);
+        }
+        if frame["type"] == "message_end" && frame["message"]["role"] == "assistant" {
+            assert_eq!(frame["message"]["content"][0]["text"], observed);
+            reason_and_text.push((
+                frame["message"]["stopReason"].as_str().unwrap().to_owned(),
+                observed.clone(),
+            ));
+        }
+        if frame["type"] == "agent_end" {
+            if saw_completion {
+                assert_eq!(frame["success"], false);
+                break;
+            }
+            assert_eq!(frame["success"], true);
+            saw_completion = true;
+            writeln!(
+                stdin,
+                r#"{{"type":"prompt","message":"fail this request"}}"#
+            )
+            .unwrap();
+        }
+    }
+    drop(stdin);
+    let output = rpc.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        reason_and_text,
+        [
+            ("error".into(), "first attempt only".into()),
+            ("stop".into(), "replacement answer".into()),
+            ("error".into(), "saved before failure".into()),
+        ]
+    );
 
     let bodies = worker.join().unwrap();
     assert_eq!(bodies[0]["model"], "fixture");
