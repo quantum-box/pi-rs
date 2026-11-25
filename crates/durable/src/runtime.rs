@@ -13626,12 +13626,10 @@ impl Harness {
             return Err(Error::Invalid("history page limit exceeds 255".into()));
         }
         self.load(cursor.conversation)?;
-        let mut prefix = b"durable/observer/".to_vec();
-        prefix.extend_from_slice(cursor.conversation.as_bytes());
-        prefix.extend_from_slice(b"/r");
-        let mut progress_prefix = b"durable/progress-history/".to_vec();
-        progress_prefix.extend_from_slice(cursor.conversation.as_bytes());
-        progress_prefix.extend_from_slice(b"/r");
+        let store = self.owner.store();
+        let prefix = crate::observer::Observer::new(store, cursor.conversation).record_prefix();
+        let progress_prefix =
+            crate::observer::Observer::progress_history(store, cursor.conversation).record_prefix();
         let app_key = crate::application_entry::key(cursor.conversation);
         let mut frames = self.owner.store().conversation_commits_including_progress(
             &prefix,
@@ -14355,17 +14353,14 @@ impl Harness {
             ));
         }
         self.load(cursor.conversation)?;
-        let page =
-            crate::observer::Observer::progress_history(self.owner.store(), cursor.conversation)
-                .read(crate::observer::Cursor(cursor.position), limit)?;
+        let observer =
+            crate::observer::Observer::progress_history(self.owner.store(), cursor.conversation);
+        let page = observer.read(crate::observer::Cursor(cursor.position), limit)?;
         let records = page
             .records
             .into_iter()
             .map(|record| -> Result<_, Error> {
-                let mut key = b"durable/progress-history/".to_vec();
-                key.extend_from_slice(cursor.conversation.as_bytes());
-                key.extend_from_slice(b"/r");
-                key.extend_from_slice(&record.cursor.0.to_be_bytes());
+                let key = observer.record_key(record.cursor);
                 let entry = self
                     .owner
                     .store()
