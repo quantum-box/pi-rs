@@ -170,11 +170,11 @@ pub(crate) enum HookFenceError {
     #[error("{0}")]
     Other(String),
 }
-enum CheckpointableFence {
+enum CheckpointableFence<'a> {
     CreateIntent,
     Undispatched,
     Hook,
-    Progress,
+    Progress(&'a crate::async_task_tool::DurableToolProgress),
 }
 
 impl From<String> for HookFenceError {
@@ -8019,27 +8019,12 @@ impl AdmissionHandle<'_> {
             value,
         };
         for _ in 0..8 {
-            let (checks, mutations) = match task.owner() {
-                TaskOwner::Conversation(conversation) if self.validator.is_some() => {
-                    let mut append = crate::runtime::prepare_checkpointable_progress_history(
-                        self.lease.attachment.owner.store(),
-                        *conversation,
-                        task.id(),
-                        attempt,
-                        progress,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    append.mutations.push(mutation.clone());
-                    (append.checks, append.mutations)
-                }
-                _ => (Vec::new(), vec![mutation.clone()]),
-            };
             match self.replay_safe_durable_fence(
                 false,
                 task.replay_safe(),
                 Some(cancellation),
-                CheckpointableFence::Progress,
-                (&checks, &mutations),
+                CheckpointableFence::Progress(progress),
+                (&[], std::slice::from_ref(&mutation)),
             ) {
                 Err(HookFenceError::Conflict) => continue,
                 result => return result.map(|_| ()).map_err(|error| error.to_string()),
@@ -8066,12 +8051,17 @@ impl AdmissionHandle<'_> {
         test_namespace: bool,
         expected_replay_safe: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
-        phase: CheckpointableFence,
+        phase: CheckpointableFence<'_>,
         extra: (&[durable_store::Check], &[durable_store::Mutation]),
     ) -> Result<Vec<u8>, HookFenceError> {
         let write_intent = matches!(phase, CheckpointableFence::CreateIntent);
         let hook_phase = matches!(phase, CheckpointableFence::Hook);
-        let progress = matches!(phase, CheckpointableFence::Progress);
+        let reported = if let CheckpointableFence::Progress(reported) = phase {
+            Some(reported)
+        } else {
+            None
+        };
+        let progress = reported.is_some();
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         if (!self.standalone && (test_namespace || self.validator.is_none()))
             || self.abort
@@ -8176,6 +8166,7 @@ impl AdmissionHandle<'_> {
             }
         }
         let tasks = TaskStore::new(owner.store());
+        let mut history = None;
         let mut ancestor = current.task.clone();
         let mut seen = std::collections::HashSet::new();
         loop {
@@ -8240,6 +8231,18 @@ impl AdmissionHandle<'_> {
                                 checks.push(check);
                             }
                         }
+                        if let Some(reported) = reported {
+                            history = Some(
+                                crate::runtime::prepare_checkpointable_progress_history(
+                                    owner.store(),
+                                    *id,
+                                    current.task.id(),
+                                    attempt,
+                                    reported,
+                                )
+                                .map_err(|error| error.to_string())?,
+                            );
+                        }
                         break;
                     }
                     let conversation = format!("runtime/conversation/{id}").into_bytes();
@@ -8290,6 +8293,10 @@ impl AdmissionHandle<'_> {
             vec![]
         };
         mutations.extend_from_slice(extra.1);
+        if let Some(history) = history {
+            checks.extend(history.checks);
+            mutations.extend(history.mutations);
+        }
         #[cfg(test)]
         if !progress {
             let hook = INTENT_COMMIT_HOOK

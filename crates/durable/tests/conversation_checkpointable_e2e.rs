@@ -748,8 +748,7 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
                     progress,
                 } = change
                 {
-                    assert_eq!(reported, task);
-                    Some((attempt, progress))
+                    Some((reported, attempt, progress))
                 } else {
                     None
                 }
@@ -758,11 +757,14 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
         assert!(
             recorded
                 .iter()
-                .any(|(_, progress)| progress.text == "first")
+                .any(|(reported, _, progress)| *reported == task && progress.text == "first")
         );
         if mode == "wake" {
-            assert_ne!(recorded.first().unwrap().0, recorded.last().unwrap().0);
-            assert_eq!(recorded.last().unwrap().1.text, "second attempt");
+            assert!(recorded.iter().any(|(reported, _, progress)| {
+                *reported != task && progress.text == "nested output"
+            }));
+            assert_ne!(recorded.first().unwrap().1, recorded.last().unwrap().1);
+            assert_eq!(recorded.last().unwrap().2.text, "second attempt");
         }
         assert_eq!(scheduler.conversation(id).unwrap().messages, published);
         watch.close();
