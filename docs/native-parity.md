@@ -3909,9 +3909,21 @@ stream close event and reports errors from that event. Rust's standard file
 drop has no error result. A path in a live progress snapshot refers to a spill
 that is still being written.
 
-User-initiated shell execution also retains its bounded output and exit status.
-Its journal and RPC result do not yet expose the separate save error.
+User-initiated shell execution keeps its bounded output and exit status and exposes
+`fullOutputError` in the RPC completion and shell history when truncated
+output could not be saved. Native execution, extension streaming operations,
+and extension-supplied results use the same projection. Successful spills
+provide the file path. Small output has no save error, including when raw
+terminal control bytes triggered an unsuccessful spill attempt.
+
+Native journal metadata stores up to 4 KiB of save failure detail. Older
+stores without metadata support still record the original shell execution,
+and imported Pi history can read the detail from its source entry. The Rust
+`BashExecution` and `UserBashResult` fields retain their existing shape.
 [Pi shell output accumulator](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/tools/output-accumulator.ts)
+[Pi user shell executor](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/bash-executor.ts)
+[Pi session recording](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts)
+[Pi RPC shell completion](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/rpc/rpc-mode.ts)
 
 ### Grep context and line-limit checkpoint
 

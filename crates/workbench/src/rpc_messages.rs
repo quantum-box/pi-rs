@@ -238,7 +238,11 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                     .unwrap_or_else(|| {
                         system_value(record, content, sections, tools_added, tools_removed)
                     }),
-                _ => shell_message(record)?,
+                _ => shell_message(
+                    session.records(),
+                    record,
+                    Some(MetadataSource::Session(session)),
+                )?,
             };
             Some((record.id, value))
         })
@@ -587,7 +591,7 @@ impl Projection {
                 is_error: outcome.is_error(),
                 is_structured: Some(outcome.is_structured()),
             },
-            Event::BashExecution { .. } => return shell_message(record),
+            Event::BashExecution { .. } => return shell_message(records, record, metadata),
             Event::SystemCheckpoint { content, .. } => Message::System {
                 content: content.clone(),
             },
@@ -637,7 +641,9 @@ impl Projection {
                 json!({"role":"system","content":content,"timestamp":timestamp})
             }
             Message::User { content } => match &record.event {
-                Event::BashExecution { .. } => shell_message(record).expect("shell record"),
+                Event::BashExecution { .. } => {
+                    shell_message(records, record, metadata).expect("shell record")
+                }
                 Event::BranchSummary { summary, from, .. } => {
                     json!({"role":"branchSummary","summary":summary,"fromId":from.map(|id| id.to_string()),"timestamp":timestamp})
                 }
@@ -911,13 +917,34 @@ fn imported_message(
     Some(message)
 }
 
-fn shell_message(record: &Record) -> Option<Value> {
+fn shell_message(
+    records: &[Record],
+    record: &Record,
+    metadata: Option<MetadataSource<'_>>,
+) -> Option<Value> {
     let Event::BashExecution { execution } = &record.event else {
         return None;
     };
     let mut value = serde_json::to_value(execution).ok()?;
     value["role"] = json!("bashExecution");
     value["timestamp"] = json!(record.timestamp_millis().unwrap_or_default());
+    let error = metadata
+        .and_then(|source| source.get(record.id))
+        .and_then(|value| value["fullOutputError"].as_str())
+        .or_else(|| {
+            let parent = records.get(record.parent?.checked_sub(1)? as usize)?;
+            match &parent.event {
+                Event::SourceEntry { format, entry }
+                    if format == "pi" && entry["message"]["role"] == "bashExecution" =>
+                {
+                    entry["message"]["fullOutputError"].as_str()
+                }
+                _ => None,
+            }
+        });
+    if let Some(error) = execution.output_save_error(error) {
+        value["fullOutputError"] = json!(error);
+    }
     Some(value)
 }
 
@@ -965,6 +992,30 @@ pub(super) fn compaction_tokens(session: &Session, record: &Record) -> u64 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn imported_shell_save_error_is_projected_from_its_legacy_source_entry() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{
+                "role":"bashExecution","command":"fixture","output":"tail","exitCode":19,
+                "truncated":true,"fullOutputError":"disk full"
+            }}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(fixture.path()).unwrap();
+        let (messages, _) = snapshot(&session);
+        let result = messages
+            .iter()
+            .find(|message| message["role"] == "bashExecution")
+            .unwrap();
+        assert_eq!(result["output"], "tail");
+        assert_eq!(result["exitCode"], 19);
+        assert_eq!(result["fullOutputError"], "disk full");
+        assert!(result["fullOutputPath"].is_null());
+    }
 
     #[test]
     fn last_assistant_text_skips_nonfinal_messages_without_visible_text() {
