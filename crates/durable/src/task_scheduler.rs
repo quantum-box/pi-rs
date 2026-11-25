@@ -8010,6 +8010,7 @@ impl AdmissionHandle<'_> {
         &self,
         cancellation: &pi_rs_core::CancellationToken,
         value: Vec<u8>,
+        progress: &crate::async_task_tool::DurableToolProgress,
     ) -> Result<(), String> {
         let task = &self.running.task;
         let attempt = task.attempt_id().ok_or("missing progress attempt")?;
@@ -8018,12 +8019,27 @@ impl AdmissionHandle<'_> {
             value,
         };
         for _ in 0..8 {
+            let (checks, mutations) = match task.owner() {
+                TaskOwner::Conversation(conversation) if self.validator.is_some() => {
+                    let mut append = crate::runtime::prepare_checkpointable_progress_history(
+                        self.lease.attachment.owner.store(),
+                        *conversation,
+                        task.id(),
+                        attempt,
+                        progress,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    append.mutations.push(mutation.clone());
+                    (append.checks, append.mutations)
+                }
+                _ => (Vec::new(), vec![mutation.clone()]),
+            };
             match self.replay_safe_durable_fence(
                 false,
                 task.replay_safe(),
                 Some(cancellation),
                 CheckpointableFence::Progress,
-                (&[], std::slice::from_ref(&mutation)),
+                (&checks, &mutations),
             ) {
                 Err(HookFenceError::Conflict) => continue,
                 result => return result.map(|_| ()).map_err(|error| error.to_string()),

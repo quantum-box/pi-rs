@@ -3201,6 +3201,13 @@ pub enum ProgressHistoryChange {
         state: crate::tool_progress::State,
         partial_is_null: bool,
     },
+    /// A committed checkpointable tool report. A park or wake may end the
+    /// live attempt without producing another report.
+    CheckpointableTool {
+        task: Uuid,
+        attempt: Uuid,
+        progress: Box<crate::async_task_tool::DurableToolProgress>,
+    },
 }
 fn same_progress_identity(a: &ProgressHistoryChange, b: &ProgressHistoryChange) -> bool {
     match (a, b) {
@@ -3644,6 +3651,25 @@ fn prepare_progress_history(
         ));
     }
     Ok(crate::observer::Observer::progress_history(store, conversation).prepare_append(&value)?)
+}
+
+/// Stage a report in the same commit as its attempt-local snapshot.
+pub(crate) fn prepare_checkpointable_progress_history(
+    store: &durable_store::Store,
+    conversation: Uuid,
+    task: Uuid,
+    attempt: Uuid,
+    progress: &crate::async_task_tool::DurableToolProgress,
+) -> Result<crate::observer::Append, Error> {
+    prepare_progress_history(
+        store,
+        conversation,
+        vec![ProgressHistoryChange::CheckpointableTool {
+            task,
+            attempt,
+            progress: Box::new(progress.clone()),
+        }],
+    )
 }
 
 /// Trusted cursor for a finite database-local unified history capture.
@@ -13833,7 +13859,10 @@ impl Harness {
                             ProgressHistoryChange::Tool {
                                 state: crate::tool_progress::State::Running(_),
                                 ..
-                            } => Some(matching[0].clone()),
+                            }
+                            | ProgressHistoryChange::CheckpointableTool { .. } => {
+                                Some(matching[0].clone())
+                            }
                             _ => None,
                         }
                     } else {

@@ -487,6 +487,7 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
         let mut watch = scheduler
             .watch_view(id, NonZeroUsize::MIN, Duration::from_millis(5))
             .unwrap();
+        let progress_cursor = scheduler.progress_history_from_now(id).unwrap();
         scheduler.submit(id, None, "work".into()).unwrap();
         let first = wait_for_stream_text(&mut watch, |p| p.text == "first").await;
         let store = durable_store::Store::open(&path).unwrap();
@@ -629,6 +630,35 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
             deleted += count;
         }
         assert_eq!(deleted, if mode == "wake" { 2 } else { 1 });
+        let recorded: Vec<_> = scheduler
+            .progress_history(&progress_cursor, NonZeroUsize::new(100).unwrap())
+            .unwrap()
+            .records
+            .into_iter()
+            .flat_map(|record| record.changes)
+            .filter_map(|change| {
+                if let pi_rs_durable::runtime::ProgressHistoryChange::CheckpointableTool {
+                    task: reported,
+                    attempt,
+                    progress,
+                } = change
+                {
+                    assert_eq!(reported, task);
+                    Some((attempt, progress))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            recorded
+                .iter()
+                .any(|(_, progress)| progress.text == "first")
+        );
+        if mode == "wake" {
+            assert_ne!(recorded.first().unwrap().0, recorded.last().unwrap().0);
+            assert_eq!(recorded.last().unwrap().1.text, "second attempt");
+        }
         assert_eq!(scheduler.conversation(id).unwrap().messages, published);
         watch.close();
         driver.shutdown().unwrap();

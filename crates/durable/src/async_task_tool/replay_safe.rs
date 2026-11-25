@@ -1133,7 +1133,7 @@ impl Host<'_, '_> {
         let encoded = serde_json::to_vec(progress).map_err(|error| error.to_string())?;
         validate_durable_progress(progress, encoded.len())?;
         self.admission
-            .report_checkpointable_progress(self.cancellation, encoded)
+            .report_checkpointable_progress(self.cancellation, encoded, progress)
     }
 }
 
