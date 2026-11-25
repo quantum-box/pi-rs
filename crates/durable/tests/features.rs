@@ -2495,16 +2495,17 @@ async fn paused_scheduler_resumes_only_explicitly_scheduled_conversations() {
     drop(h);
 
     let mut scheduler = Scheduler::open_paused(&path, opts()).unwrap();
+    let unrelated = serde_json::to_value(scheduler.conversation(queued[1]).unwrap()).unwrap();
     scheduler.schedule(queued[0]);
     scheduler.wait(queued[0]).await.unwrap();
     assert!(matches!(
         scheduler.conversation(queued[0]).unwrap().submissions[0].status,
         Status::Done { .. }
     ));
-    assert!(matches!(
-        scheduler.conversation(queued[1]).unwrap().submissions[0].status,
-        Status::Queued
-    ));
+    assert_eq!(
+        serde_json::to_value(scheduler.conversation(queued[1]).unwrap()).unwrap(),
+        unrelated
+    );
     scheduler.shutdown().await.unwrap();
 }
 
