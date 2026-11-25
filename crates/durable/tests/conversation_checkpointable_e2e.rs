@@ -126,6 +126,7 @@ fn live_children_setup(
     journal: Option<std::path::PathBuf>,
     hold_after_results: bool,
     unsafe_children: bool,
+    unsafe_parent: bool,
     expect_uncertain_child: bool,
 ) -> (Options, Registry) {
     let mut registry = Registry::default();
@@ -141,7 +142,7 @@ fn live_children_setup(
             expect_uncertain_child,
             expected_outputs: ["left".into(), "right".into()],
         });
-        let adapter = if name == "leaf" && unsafe_children {
+        let adapter = if (name == "leaf" && unsafe_children) || (name == "root" && unsafe_parent) {
             register_conversation_unsafe_durable_tool(
                 &mut registry,
                 tool,
@@ -180,17 +181,17 @@ fn live_children_setup(
 
 #[tokio::test]
 async fn immediately_admitted_siblings_run_and_settle_while_parent_is_running() {
-    exercise_immediately_admitted_siblings(false, false).await;
+    exercise_immediately_admitted_siblings(false, false, false).await;
 }
 
 #[tokio::test]
 async fn immediately_admitted_siblings_are_cancelled_with_their_parent() {
-    exercise_immediately_admitted_siblings(true, false).await;
+    exercise_immediately_admitted_siblings(true, false, false).await;
 }
 
 #[tokio::test]
 async fn immediately_admitted_unsafe_siblings_publish_committed_results() {
-    exercise_immediately_admitted_siblings(false, true).await;
+    exercise_immediately_admitted_siblings(false, true, false).await;
 }
 
 #[tokio::test]
@@ -389,7 +390,21 @@ async fn exercise_registered_leaf(
     scheduler.shutdown().await.unwrap();
 }
 
-async fn exercise_immediately_admitted_siblings(abort: bool, unsafe_children: bool) {
+#[tokio::test]
+async fn immediately_admitted_children_can_settle_under_an_unsafe_parent() {
+    exercise_immediately_admitted_siblings(false, true, true).await;
+}
+
+#[tokio::test]
+async fn aborting_an_unsafe_parent_cancels_immediately_admitted_children() {
+    exercise_immediately_admitted_siblings(true, true, true).await;
+}
+
+async fn exercise_immediately_admitted_siblings(
+    abort: bool,
+    unsafe_children: bool,
+    unsafe_parent: bool,
+) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
@@ -400,6 +415,7 @@ async fn exercise_immediately_admitted_siblings(abort: bool, unsafe_children: bo
         None,
         false,
         unsafe_children,
+        unsafe_parent,
         false,
     );
     let mut scheduler = Scheduler::open(&path, options).unwrap();
@@ -442,13 +458,28 @@ async fn exercise_immediately_admitted_siblings(abort: bool, unsafe_children: bo
         2
     );
     if abort {
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             Duration::from_secs(15),
             scheduler.abort_and_wait(conversation),
         )
         .await
-        .unwrap()
         .unwrap();
+        if unsafe_parent {
+            assert!(matches!(
+                result,
+                Err(pi_rs_durable::runtime::Error::Invalid(reason))
+                    if reason.contains("abort cleanup remains pending")
+            ));
+            assert!(
+                scheduler
+                    .conversation(conversation)
+                    .unwrap()
+                    .tool_results
+                    .is_empty()
+            );
+        } else {
+            result.unwrap();
+        }
         let store = pi_rs_durable::task_store::TaskStore::new(&store);
         for child in tasks.iter().filter(|entry| {
             entry.task.owner() == &pi_rs_durable::task::TaskOwner::Task(root.task.id())
@@ -477,16 +508,20 @@ async fn immediately_admitted_siblings_crash_worker() {
     };
     let dir = std::path::PathBuf::from(dir);
     let unsafe_children = std::env::var_os("PI_IMMEDIATE_CHILD_UNSAFE").is_some();
+    let unsafe_parent = std::env::var_os("PI_IMMEDIATE_PARENT_UNSAFE").is_some();
     let (options, registry) = live_children_setup(
         Arc::new(tokio::sync::Semaphore::new(0)),
-        Arc::new(tokio::sync::Semaphore::new(if unsafe_children {
-            0
-        } else {
-            2
-        })),
+        Arc::new(tokio::sync::Semaphore::new(
+            if unsafe_children || unsafe_parent {
+                0
+            } else {
+                2
+            },
+        )),
         Some(dir.clone()),
         true,
         unsafe_children,
+        unsafe_parent,
         false,
     );
     let mut scheduler = Scheduler::open(dir.join("db"), options).unwrap();
@@ -505,15 +540,20 @@ async fn immediately_admitted_siblings_crash_worker() {
 
 #[tokio::test]
 async fn immediately_admitted_siblings_reuse_results_after_process_loss() {
-    exercise_live_children_recovery(false).await;
+    exercise_live_children_recovery(false, false).await;
 }
 
 #[tokio::test]
 async fn interrupted_unsafe_live_children_are_never_replayed() {
-    exercise_live_children_recovery(true).await;
+    exercise_live_children_recovery(true, false).await;
 }
 
-async fn exercise_live_children_recovery(unsafe_children: bool) {
+#[tokio::test]
+async fn interrupted_unsafe_parent_does_not_restart_its_immediate_children() {
+    exercise_live_children_recovery(false, true).await;
+}
+
+async fn exercise_live_children_recovery(unsafe_children: bool, unsafe_parent: bool) {
     use std::process::{Child, Command};
     struct Kill(Child);
     impl Drop for Kill {
@@ -530,9 +570,12 @@ async fn exercise_live_children_recovery(unsafe_children: bool) {
     if unsafe_children {
         command.env("PI_IMMEDIATE_CHILD_UNSAFE", "1");
     }
+    if unsafe_parent {
+        command.env("PI_IMMEDIATE_PARENT_UNSAFE", "1");
+    }
     let mut worker = Kill(command.spawn().unwrap());
     let reached_boundary = || {
-        if unsafe_children {
+        if unsafe_children || unsafe_parent {
             ["left", "right"].iter().all(|key| {
                 std::fs::metadata(dir.path().join(key)).is_ok_and(|file| file.len() == 1)
             })
@@ -560,6 +603,7 @@ async fn exercise_live_children_recovery(unsafe_children: bool) {
         Some(dir.path().to_owned()),
         false,
         unsafe_children,
+        unsafe_parent,
         unsafe_children,
     );
     let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
@@ -570,7 +614,23 @@ async fn exercise_live_children_recovery(unsafe_children: bool) {
         .unwrap()
         .unwrap();
     let state = scheduler.conversation(conversation).unwrap();
-    if unsafe_children {
+    if unsafe_parent {
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let records = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap();
+        assert_eq!(records.len(), 3);
+        for record in records {
+            if record.task.replay_safe() {
+                assert_eq!(record.task.state(), &TaskState::Cancelled);
+            } else {
+                assert!(
+                    matches!(record.task.state(), TaskState::Failed(reason) if reason.contains("requires reconciliation"))
+                );
+            }
+        }
+        assert!(state.tool_results.is_empty());
+    } else if unsafe_children {
         let store = durable_store::Store::open(dir.path().join("db")).unwrap();
         let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
             .list()
