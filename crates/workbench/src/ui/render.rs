@@ -314,6 +314,10 @@ impl TranscriptMarkdown {
 #[derive(Clone)]
 pub enum Entry {
     Notice(String),
+    TranscriptNotice {
+        kind: crate::config::NoticeKind,
+        text: String,
+    },
     Changelog(crate::changelog::Notice),
     Status(String),
     Warning(String),
@@ -364,6 +368,7 @@ pub enum Entry {
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranscriptOptions<'a> {
+    pub notices: crate::config::NoticeSettings,
     pub image_width: Option<usize>,
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
@@ -430,6 +435,17 @@ impl Entry {
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
             Self::Notice(text) => return wrap(&[Span::themed(text, theme, "muted")], width),
+            Self::TranscriptNotice { kind, text } => {
+                if !options.notices.shows(*kind) {
+                    return Vec::new();
+                }
+                let role = if *kind == crate::config::NoticeKind::CacheWarming {
+                    "muted"
+                } else {
+                    "warning"
+                };
+                return wrap(&[Span::themed(text, theme, role)], width);
+            }
             Self::Changelog(notice) => {
                 let border = Line::themed(&"─".repeat(inner), theme, "border");
                 let mut lines = vec![Line::default(), border.clone()];
