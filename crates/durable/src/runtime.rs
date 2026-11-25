@@ -23556,10 +23556,30 @@ impl Scheduler {
     /// Recover persisted phases and wait for explicit conversation admission
     /// or scheduling before starting their workers.
     pub fn open_paused(path: impl AsRef<Path>, options: Options) -> Result<Self, Error> {
+        Self::open_paused_configured(path, options, None)
+    }
+
+    /// Install the adapter before workers or reporters can observe recovered state.
+    pub fn open_paused_with_provider_adapter(
+        path: impl AsRef<Path>,
+        options: Options,
+        adapter: Arc<dyn crate::model::ProviderAdapter>,
+    ) -> Result<Self, Error> {
+        Self::open_paused_configured(path, options, Some(adapter))
+    }
+
+    fn open_paused_configured(
+        path: impl AsRef<Path>,
+        options: Options,
+        adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
+    ) -> Result<Self, Error> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
-        let mut scheduler =
-            Self::with_harness(Harness::open_paused(path, options)?, None, Vec::new());
+        let mut harness = Harness::open_paused(path, options)?;
+        if let Some(adapter) = adapter {
+            harness.install_provider_adapter(adapter)?;
+        }
+        let mut scheduler = Self::with_harness(harness, None, Vec::new());
         scheduler.start_reporter();
         Ok(scheduler)
     }

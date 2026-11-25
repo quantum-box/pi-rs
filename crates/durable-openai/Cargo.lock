@@ -1118,14 +1118,17 @@ dependencies = [
 name = "pi-rs-durable"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "base64 0.22.1",
  "durable-store",
  "durable-task-schema",
+ "eventsource-stream",
  "futures-util",
  "jsonschema",
  "pi-rs-core",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -1140,14 +1143,9 @@ dependencies = [
 name = "pi-rs-durable-openai"
 version = "0.1.0"
 dependencies = [
- "async-stream",
  "async-trait",
- "eventsource-stream",
- "futures-util",
  "pi-rs-core",
  "pi-rs-durable",
- "reqwest",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",

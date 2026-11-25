@@ -31,6 +31,8 @@ pub mod nested_identity;
 #[allow(dead_code)] // Storage protocol only; no scheduler or executor handoff.
 mod nested_suspension;
 pub mod observer;
+#[cfg(feature = "openai-responses")]
+pub mod openai_responses;
 pub mod output;
 pub mod owned_subagent;
 pub mod ownership_edge;

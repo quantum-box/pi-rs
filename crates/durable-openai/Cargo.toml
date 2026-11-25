@@ -9,17 +9,12 @@ description = "Opt-in OpenAI Responses adapter for pi-rs durable"
 [workspace]
 
 [dependencies]
-async-stream = "0.3"
-async-trait = "0.1"
-eventsource-stream = "0.2"
-futures-util = "0.3"
-pi-rs-core = { path = "../core" }
-pi-rs-durable = { path = "../durable" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+pi-rs-durable = { path = "../durable", features = ["openai-responses"] }
 
 [dev-dependencies]
+async-trait = "0.1"
+pi-rs-core = { path = "../core" }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "net", "io-util", "time", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"

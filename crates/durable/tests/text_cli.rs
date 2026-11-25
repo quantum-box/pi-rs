@@ -1,7 +1,7 @@
 #![cfg(feature = "text-cli")]
 
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Cursor, Read, Write},
     net::TcpListener,
     process::{Command, Output, Stdio},
     sync::mpsc,
@@ -9,7 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::Value;
+use base64::Engine;
+use serde_json::{Value, json};
 
 #[test]
 fn persists_text_conversation_and_rejects_a_changed_provider_route() {
@@ -29,6 +30,7 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             "saved before failure",
             "queue base answer",
             "follow-up answer",
+            "image prompt answer",
         ]
         .into_iter()
         .enumerate()
@@ -334,6 +336,12 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         .unwrap();
     let mut stdin = rpc.stdin.take().unwrap();
     writeln!(stdin, r#"{{"type":"prompt","message":"queue base"}}"#).unwrap();
+    let mut png = Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let image_data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+    let image = json!({"type":"image", "mimeType":"image/png", "data":image_data});
     let mut ends = Vec::new();
     let mut sent = false;
     let mut released = false;
@@ -347,10 +355,12 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
                 r#"{"type":"clear_queue","id":"clear"}"#,
                 r#"{"type":"set_follow_up_mode","id":"mode","mode":"all"}"#,
                 r#"{"type":"get_state","id":"modes"}"#,
-                r#"{"type":"follow_up","id":"after","message":"deliver after base"}"#,
             ] {
                 writeln!(stdin, "{request}").unwrap();
             }
+            writeln!(stdin, "{}", json!({
+                "type":"follow_up", "id":"after", "message":"deliver after base", "images":[image],
+            })).unwrap();
             sent = true;
         }
         match frame["id"].as_str() {
@@ -382,6 +392,9 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         }
         if frame["type"] == "agent_end" {
             assert_eq!(frame["success"], true);
+            if !ends.is_empty() {
+                assert_eq!(frame["messages"][0]["content"][1], image);
+            }
             ends.push(
                 frame["messages"][1]["content"][0]["text"]
                     .as_str()
@@ -403,6 +416,36 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     assert!(sent && released);
     assert_eq!(ends, ["queue base answer", "follow-up answer"]);
 
+    let mut rpc = command(&endpoint, &["--conversation", id, "--rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = rpc.stdin.take().unwrap();
+    writeln!(stdin, "{}", json!({"type":"get_messages","id":"reopen"})).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "type":"prompt","id":"image-prompt","message":"inspect PNG","images":[image]
+        })
+    )
+    .unwrap();
+    drop(stdin);
+    let frames = frames(rpc.wait_with_output().unwrap());
+    let saved = frames[0]["data"]["messages"].as_array().unwrap();
+    assert!(saved.iter().any(|entry| {
+        entry["content"][0]["text"] == "deliver after base" && entry["content"][1] == image
+    }));
+    assert_eq!(frames[1]["data"]["disposition"], "started");
+    let end = frames.last().unwrap();
+    assert_eq!(end["messages"][0]["content"][1], image);
+    assert_eq!(
+        end["messages"][1]["content"][0]["text"],
+        "image prompt answer"
+    );
+
     let bodies = worker.join().unwrap();
     assert_eq!(bodies[0]["model"], "fixture");
     let input = bodies[1]["input"].to_string();
@@ -417,6 +460,15 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     assert!(follow_up.contains("deliver after base"));
     assert!(!follow_up.contains("discard steer"));
     assert!(!follow_up.contains("discard follow-up"));
+    let image_url = format!("data:image/png;base64,{image_data}");
+    for index in [8, 9] {
+        let wire = bodies[index]["input"].as_array().unwrap();
+        assert!(wire.iter().any(|message| {
+            message["content"][1]["type"] == "input_image"
+                && message["content"][1]["image_url"] == image_url
+        }));
+    }
+    assert_eq!(bodies[9]["model"], "fixture");
 }
 
 fn frames(output: Output) -> Vec<Value> {

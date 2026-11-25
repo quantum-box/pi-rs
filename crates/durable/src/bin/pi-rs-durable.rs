@@ -11,6 +11,7 @@ use pi_rs_core::{
     HostAuthBuilder, HostCredential, HostCredentialKind, Model, ModelRequest, ModelStream,
 };
 use pi_rs_durable::{
+    openai_responses::OpenAiResponsesAdapter,
     progress,
     recovery::UncertainPolicy,
     runtime::{Config, Options, Scheduler, Status},
@@ -46,7 +47,7 @@ struct Args {
     /// Emit newline-delimited conversation, progress and result objects.
     #[arg(long, conflicts_with = "rpc")]
     json: bool,
-    /// Accept text RPC commands over stdin and return session events on stdout.
+    /// Accept RPC commands over stdin and return session events on stdout.
     #[arg(long, conflicts_with_all = ["prompt", "request_id"])]
     rpc: bool,
     #[arg(required_unless_present = "rpc")]
@@ -56,6 +57,7 @@ struct Args {
 struct RoutedModel {
     client: Arc<dyn Model>,
     suffix: String,
+    has_image_adapter: bool,
 }
 
 impl RoutedModel {
@@ -87,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     credentials.register(
         "openai",
         &args.endpoint,
-        HostCredential::new(HostCredentialKind::ApiKey, key)?,
+        HostCredential::new(HostCredentialKind::ApiKey, key.clone())?,
     )?;
     let client = ModelClientFactory::new(credentials.build()).client(
         NativeModelApi::OpenAiResponses,
@@ -100,17 +102,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "|openai-responses:{:x}",
         Sha256::digest(args.endpoint.as_bytes())
     );
-    let model = Arc::new(RoutedModel { client, suffix });
-    let mut scheduler = Scheduler::open_paused(
-        &args.db,
-        Options {
-            model: model.clone(),
-            tools: Vec::new(),
-            restart_limit: 3,
-            max_turns: 1,
-            uncertain_policy: UncertainPolicy::RequireReconciliation,
-        },
-    )?;
+    let adapter = OpenAiResponsesAdapter::new(&args.endpoint, key)
+        .ok()
+        .map(|adapter| Arc::new(adapter.with_model_route_suffix(suffix.clone())));
+    let model = Arc::new(RoutedModel {
+        client,
+        suffix,
+        has_image_adapter: adapter.is_some(),
+    });
+    let options = Options {
+        model: model.clone(),
+        tools: Vec::new(),
+        restart_limit: 3,
+        max_turns: 1,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = match adapter {
+        Some(adapter) => Scheduler::open_paused_with_provider_adapter(&args.db, options, adapter)?,
+        None => Scheduler::open_paused(&args.db, options)?,
+    };
 
     let result = run(&mut scheduler, &model, args).await;
     let shutdown = scheduler.shutdown().await;
