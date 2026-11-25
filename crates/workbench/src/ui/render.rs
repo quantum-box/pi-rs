@@ -250,6 +250,7 @@ impl Line {
 pub enum ToolPart {
     Text(String),
     Warning(String),
+    TruncationNotice(String),
     Image(std::sync::Arc<super::images::InlineImage>),
 }
 
@@ -800,13 +801,13 @@ impl Entry {
                     if expand_tools
                         && parts
                             .iter()
-                            .any(|part| !matches!(part, ToolPart::Warning(_)))
+                            .any(|part| matches!(part, ToolPart::Text(_) | ToolPart::Image(_)))
                         && let Some(limit) = options.image_width
                     {
                         for part in parts {
                             match part {
                                 ToolPart::Text(text) => render_text(text, &mut lines),
-                                ToolPart::Warning(_) => {}
+                                ToolPart::Warning(_) | ToolPart::TruncationNotice(_) => {}
                                 ToolPart::Image(image) => {
                                     lines.extend(image.lines(width, limit, padding))
                                 }
@@ -835,7 +836,7 @@ impl Entry {
                     }
                 }
                 for part in parts {
-                    if let ToolPart::Warning(warning) = part {
+                    if let ToolPart::Warning(warning) | ToolPart::TruncationNotice(warning) = part {
                         lines.extend(wrap(&[Span::themed(warning, theme, "warning")], inner));
                     }
                 }
