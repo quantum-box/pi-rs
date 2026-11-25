@@ -238,6 +238,7 @@ async fn replay_safe_checkpointable_parent_awaits_live_generic_task_tools() {
             payload("unknown").to_string(),
         ],
         false,
+        None,
     )
     .await;
 }
@@ -296,7 +297,91 @@ async fn replay_safe_checkpointable_parent_calls_an_ordinary_registered_leaf() {
         UnsafeDurableAuthorization::interruption_requires_reconciliation(),
     )
     .unwrap();
-    exercise_registered_leaf(registry, leaf, ["left".into(), "right".into()], true).await;
+    exercise_registered_leaf(registry, leaf, ["left".into(), "right".into()], true, None).await;
+}
+
+#[tokio::test]
+async fn ordinary_tool_host_calls_registered_children_in_order() {
+    struct OrdinaryParent;
+    #[async_trait]
+    impl Tool for OrdinaryParent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "root".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            panic!("the ordinary adapter must pass a host")
+        }
+
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: Arc<dyn pi_rs_core::ToolHost>,
+        ) -> Outcome {
+            assert_eq!(
+                host.tools()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect::<Vec<_>>(),
+                ["leaf"]
+            );
+            assert!(matches!(
+                host.call("other", json!({})).await,
+                Outcome::Skipped(_)
+            ));
+            let results = host
+                .call_batch(vec![
+                    ("leaf".into(), json!({"value":"left"})),
+                    ("leaf".into(), json!({"value":"right"})),
+                ])
+                .await;
+            assert_eq!(
+                results,
+                [
+                    Outcome::Succeeded("left".into()),
+                    Outcome::Succeeded("right".into())
+                ]
+            );
+            Outcome::Succeeded("left+right".into())
+        }
+    }
+
+    let mut registry = Registry::default();
+    let leaf = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(LiveChildrenTool {
+            name: "leaf",
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(2)),
+            journal: None,
+            hold_after_results: false,
+            expect_uncertain_child: false,
+            expected_outputs: ["left".into(), "right".into()],
+        }),
+        "ordinary-host-child",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let parent = pi_rs_durable::async_task_tool::checkpointable_tool(
+        Arc::new(OrdinaryParent),
+        Duration::from_secs(10),
+    );
+    exercise_registered_leaf(
+        registry,
+        leaf,
+        ["left".into(), "right".into()],
+        false,
+        Some(parent),
+    )
+    .await;
 }
 
 async fn exercise_registered_leaf(
@@ -304,19 +389,22 @@ async fn exercise_registered_leaf(
     leaf: Arc<pi_rs_durable::task_tool::TaskTool>,
     expected_outputs: [String; 2],
     reports_progress: bool,
+    parent: Option<Arc<dyn DurableAsyncTool>>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let leaf_registration = leaf.register();
     let parent = register_conversation_replay_safe_durable_tool(
         &mut registry,
-        Arc::new(LiveChildrenTool {
-            name: "root",
-            entered: Arc::new(tokio::sync::Semaphore::new(0)),
-            release: Arc::new(tokio::sync::Semaphore::new(0)),
-            journal: None,
-            hold_after_results: false,
-            expect_uncertain_child: false,
-            expected_outputs,
+        parent.unwrap_or_else(|| {
+            Arc::new(LiveChildrenTool {
+                name: "root",
+                entered: Arc::new(tokio::sync::Semaphore::new(0)),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+                journal: None,
+                hold_after_results: false,
+                expect_uncertain_child: false,
+                expected_outputs,
+            })
         }),
         "live-generic-parent",
         1,
