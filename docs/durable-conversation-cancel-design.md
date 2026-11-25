@@ -130,22 +130,36 @@ with the tool name. When no progress was reported, pi-rs supplies a text block
 with the same message for legacy text hooks. It retains the existing diagnostic
 marker in the receipt for compatibility.
 
-For these selected cancellation registrations, `DurableTaskHost::report_progress`
-writes a replacement snapshot of retained text, details, diagnostics and
+For checkpointable tools, `DurableTaskHost::report_progress` writes a
+replacement snapshot of retained text, details, diagnostics and
 truncation counts. Calls commit synchronously and should report meaningful
 updates. Each snapshot is limited to 32 KiB encoded and 30 diagnostics. The
 write checks the original dispatch intent and active invocation lease,
 registration, ownership and abort state. A cancelled attempt cannot change
 the snapshot used by cleanup.
 
-The after hook receives the last committed snapshot of the interrupted wake,
+The selected cancellation after hook receives the last committed snapshot of the interrupted wake,
 or the committed park's snapshot when that wake never reported. A parked
 cancellation uses its own committed park. As in upstream's `fromSlot` path,
 the host appends the truncation diagnostic after running the hook. The partial
 result is supplemental output and leaves the original interrupted execution
 uncertain. Tools with existing stores may report without a schema migration.
-Unlike upstream's live streaming, reports are explicit snapshots with no
-automatic append, live display, or success-result fallback.
+`DurableTaskHost::append_output` appends text to the current attempt and
+publishes the retained head immediately, up to 4 KiB and 2,000 lines. The
+combined snapshot still has the 32 KiB encoded limit. `Scheduler::view` and
+`Scheduler::watch_view` show the running conversation tool's latest
+committed snapshot. `Driver::checkpointable_tool_progress` polls an
+individual task, including a nested task. Changing attempts clears the live
+output until the new attempt reports. Watches can coalesce intermediate
+updates, and the retained park still supplies cancellation evidence.
+
+Use `DurableTaskHost::complete_from_progress` to return the current
+attempt's committed text and details through the ordinary result, receipt,
+and hook path. `DurableToolStep::Complete` preserves explicit final output,
+including empty text. Progress diagnostics and truncation counts remain
+metadata of the live or cancellation snapshots. Upstream additionally has
+per-tool retention limits, throttled publication, and success-result
+diagnostics sourced from progress.
 
 The claim, start-marker and receipt transactions hold the selection gate
 from validation through commit. A per-name, nonblocking selection start lease

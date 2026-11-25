@@ -8017,15 +8017,19 @@ impl AdmissionHandle<'_> {
             key: crate::async_task_tool::durable_progress_key(task.id(), attempt),
             value,
         };
-        self.replay_safe_durable_fence(
-            false,
-            task.replay_safe(),
-            Some(cancellation),
-            CheckpointableFence::Progress,
-            (&[], std::slice::from_ref(&mutation)),
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        for _ in 0..8 {
+            match self.replay_safe_durable_fence(
+                false,
+                task.replay_safe(),
+                Some(cancellation),
+                CheckpointableFence::Progress,
+                (&[], std::slice::from_ref(&mutation)),
+            ) {
+                Err(HookFenceError::Conflict) => continue,
+                result => return result.map(|_| ()).map_err(|error| error.to_string()),
+            }
+        }
+        Err("checkpointable progress conflicted with concurrent changes".into())
     }
 
     pub(crate) fn read_checkpointable_progress(
@@ -9620,7 +9624,7 @@ pub mod hook_fence_test_hook {
             .unwrap()
             .insert((task, phase), Box::new(hook));
     }
-    pub(super) fn run(task: Uuid, phase: &'static str) {
+    pub(crate) fn run(task: Uuid, phase: &'static str) {
         let hook = HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()

@@ -126,7 +126,9 @@ impl Handler for Parent {
                 return Err("different raw input was accepted".into());
             }
             if let Some(marker) = &self.marker {
-                std::fs::write(marker, format!("{} {}", task.id(), call.task_id()))
+                let staged = marker.with_extension("tmp");
+                std::fs::write(&staged, format!("{} {}", task.id(), call.task_id()))
+                    .and_then(|_| std::fs::rename(staged, marker))
                     .map_err(|e| e.to_string())?;
                 while !self.release.load(Ordering::SeqCst) {
                     std::thread::park_timeout(Duration::from_millis(5));
@@ -995,18 +997,20 @@ fn sealed_receipt_busy_retains_outcome_and_revalidates_lease() {
     release.store(true, Ordering::SeqCst);
     at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(6500));
+        let _ = unlock_rx.recv_timeout(Duration::from_secs(35));
         conn.execute_batch("COMMIT").unwrap();
     });
     locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     resume_tx.send(()).unwrap();
     busy_rx
-        .recv_timeout(Duration::from_secs(7))
+        .recv_timeout(Duration::from_secs(20))
         .expect("receipt capture did not reach busy timeout");
+    unlock_tx.send(()).unwrap();
     writer.join().unwrap();
     until(|| {
         driver

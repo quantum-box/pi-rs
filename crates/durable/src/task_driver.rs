@@ -749,6 +749,18 @@ impl Driver {
             .map_err(task_scheduler::Error::from)?
             .map(|snapshot| snapshot.task))
     }
+
+    /// Poll the current checkpointable execution attempt's committed output.
+    /// This also supports nested tasks. Waiting, aborted, and finished
+    /// attempts have no live output.
+    pub fn checkpointable_tool_progress(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::async_task_tool::DurableToolProgress>, Error> {
+        crate::async_task_tool::live_checkpointable_progress(self.shared.owner.store(), id)
+            .map_err(task_scheduler::Error::Handler)
+            .map_err(Error::from)
+    }
     /// Wait for a persisted terminal task. Cancelling or dropping this future
     /// stops only the wait, not the task. The driver must remain running.
     /// Live records are polled at most every 100 ms, including after reopen.
@@ -1872,14 +1884,18 @@ impl Shared {
             #[cfg(test)]
             Err(SettlementError::Yielded { pending }) => (*pending, None),
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let pending_task = pending.task_id();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let is_prepared = matches!(pending, PendingSettlement::Prepared { .. });
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(pending);
+        #[cfg(feature = "test-hooks")]
+        if is_prepared && failure.is_none() {
+            crate::task_scheduler::hook_fence_test_hook::run(pending_task, "settlement-deferred");
+        }
         #[cfg(test)]
         if is_prepared {
             let hook = prepared_enqueue_hooks()
@@ -2938,7 +2954,7 @@ mod tests {
                     let db = rusqlite::Connection::open(path).unwrap();
                     db.execute_batch("BEGIN IMMEDIATE").unwrap();
                     locked_tx.send(()).unwrap();
-                    unlock_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                    unlock_rx.recv_timeout(Duration::from_secs(45)).unwrap();
                     db.execute_batch("COMMIT").unwrap();
                 });
                 locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -2992,14 +3008,13 @@ mod tests {
             crate::task_scheduler::set_maintenance_busy_for_test(parent_id, false);
         }
         if writer_busy {
+            let writer = writer_handle_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("maintenance writer did not acquire the lock");
             writer_busy_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("maintenance writer busy was not observed");
-            writer_handle_rx
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .join()
-                .unwrap();
+            writer.join().unwrap();
         }
         if hold_first && merge_graphs {
             overlap_rx

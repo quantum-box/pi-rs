@@ -37,13 +37,22 @@ fn hold_writer_at_settlement(
     phase: &'static str,
 ) -> std::sync::mpsc::Receiver<std::thread::JoinHandle<()>> {
     let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+    let busy_phase = match phase {
+        "settlement" => "settlement-busy",
+        "failure-settlement" => "failure-busy",
+        _ => panic!("invalid settlement phase"),
+    };
+    let (unlock_tx, unlock_rx) = std::sync::mpsc::channel();
+    hook_fence_test_hook::install(id, busy_phase, move || {
+        unlock_tx.send(()).unwrap();
+    });
     hook_fence_test_hook::install(id, phase, move || {
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
             let conn = rusqlite::Connection::open(path).unwrap();
             conn.execute_batch("BEGIN IMMEDIATE").unwrap();
             locked_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(6500));
+            let _ = unlock_rx.recv_timeout(Duration::from_secs(35));
             conn.execute_batch("COMMIT").unwrap();
         });
         locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();

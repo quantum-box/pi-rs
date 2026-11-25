@@ -162,7 +162,8 @@ struct Chunk {
 
 /// Incremental bounded output with the slice and sanitization rules of upstream
 /// `OutputBuffer`. Byte chunks use streaming UTF-8 replacement decoding.
-/// Memory is bounded by the window plus the largest chunk since compaction.
+/// Head retention saves at most one UTF-8 character past its byte window.
+/// Tail retention can retain the largest incoming chunk until compaction.
 #[derive(Clone)]
 pub struct OutputBuffer {
     limits: OutputLimits,
@@ -337,11 +338,32 @@ impl OutputBuffer {
         if self.full {
             return;
         }
-        self.stored_bytes += text.len();
-        self.stored_newlines += newlines;
+        // Keep one character past the byte limit so head retention can still
+        // distinguish an exact fit from a cut at the last whole line.
+        let retained = if self.limits.retain == Retain::Head {
+            let mut end = self
+                .limits
+                .max_bytes
+                .saturating_sub(self.stored_bytes)
+                .saturating_add(1)
+                .min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            &text[..end]
+        } else {
+            text
+        };
+        let retained_newlines = if retained.len() == text.len() {
+            newlines
+        } else {
+            retained.bytes().filter(|&byte| byte == b'\n').count()
+        };
+        self.stored_bytes += retained.len();
+        self.stored_newlines += retained_newlines;
         self.chunks.push_back(Chunk {
-            text: text.to_owned(),
-            newlines,
+            text: retained.to_owned(),
+            newlines: retained_newlines,
         });
         if self.limits.retain == Retain::Head {
             self.full = self.stored_bytes > self.limits.max_bytes

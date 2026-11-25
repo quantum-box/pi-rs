@@ -7,16 +7,298 @@ use pi_rs_core::{
 use pi_rs_durable::task::TaskState;
 use pi_rs_durable::{
     async_task_tool::{
-        AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableToolResume,
-        DurableToolStep, DurableWait, ReplaySafeAuthorization, UnsafeDurableAuthorization,
-        register_conversation_replay_safe_durable_tool, register_conversation_unsafe_durable_tool,
+        AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableToolProgress,
+        DurableToolResume, DurableToolStep, DurableWait, ReplaySafeAuthorization,
+        UnsafeDurableAuthorization, register_conversation_replay_safe_durable_tool,
+        register_conversation_unsafe_durable_tool,
     },
     recovery::UncertainPolicy,
     runtime::{Config, Options, Scheduler},
     task_scheduler::Registry,
 };
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+
+struct StreamingTool {
+    name: &'static str,
+    advance: Arc<tokio::sync::Semaphore>,
+    rejected_late: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Tool for StreamingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        panic!("ordinary invoke")
+    }
+}
+
+#[async_trait]
+impl DurableAsyncTool for StreamingTool {
+    async fn execute_durable(
+        &self,
+        args: Value,
+        context: ToolContext,
+        resume: DurableToolResume,
+        host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        if args["mode"] == "nested" {
+            host.append_output("nested output").await?;
+            self.advance.acquire().await.unwrap().forget();
+            return host.complete_from_progress().await;
+        }
+        if let Some(checkpoint) = resume.checkpoint {
+            let child: AsyncTaskCall =
+                serde_json::from_value(checkpoint).map_err(|error| error.to_string())?;
+            assert!(resume.ended.contains(&child.task_id()));
+            self.advance.acquire().await.unwrap().forget();
+            host.append_output("second attempt").await?;
+            self.advance.acquire().await.unwrap().forget();
+            return host.complete_from_progress().await;
+        }
+        host.report_progress(DurableToolProgress {
+            details: Some(json!({"source":"stream"})),
+            ..Default::default()
+        })
+        .await?;
+        host.append_output("first").await?;
+        if args["mode"] == "abort" {
+            context.cancellation.cancelled().await;
+            self.rejected_late.store(
+                host.append_output("late").await.is_err(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            return Err("aborted".into());
+        }
+        self.advance.acquire().await.unwrap().forget();
+        if args["mode"] == "wake" {
+            let child = host
+                .start_child("child", "leaf", json!({"mode":"nested"}))
+                .await?;
+            return Ok(DurableToolStep::Park {
+                checkpoint: serde_json::to_value(&child).unwrap(),
+                wait: DurableWait::All(vec![child]),
+            });
+        }
+        host.append_output(" second").await?;
+        if args["mode"] == "bounded" {
+            host.append_output(&"猫".repeat(2_000)).await?;
+            host.append_output(" after limit").await?;
+        }
+        self.advance.acquire().await.unwrap().forget();
+        if args["mode"] == "explicit" {
+            Ok(DurableToolStep::Complete(Outcome::Succeeded(String::new())))
+        } else {
+            host.complete_from_progress().await
+        }
+    }
+}
+
+async fn wait_for_stream_text(
+    watch: &mut pi_rs_durable::runtime::ViewWatch,
+    predicate: impl Fn(&DurableToolProgress) -> bool,
+) -> DurableToolProgress {
+    use pi_rs_durable::tool_progress::State;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let view = watch.next().await.unwrap().unwrap();
+            if let Some(State::Running(Some(value))) = view.tool_progress {
+                let progress: DurableToolProgress = serde_json::from_value(value).unwrap();
+                if predicate(&progress) {
+                    return progress;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the live view did not show the expected committed output")
+}
+
+#[tokio::test]
+async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
+    for mode in ["inherited", "explicit", "bounded", "abort", "wake"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let advance = Arc::new(tokio::sync::Semaphore::new(0));
+        let rejected_late = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = Registry::default();
+        let leaf = register_conversation_replay_safe_durable_tool(
+            &mut registry,
+            Arc::new(StreamingTool {
+                name: "leaf",
+                advance: advance.clone(),
+                rejected_late: rejected_late.clone(),
+            }),
+            "leaf",
+            1,
+            vec![],
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+        )
+        .unwrap();
+        let adapter = register_conversation_replay_safe_durable_tool(
+            &mut registry,
+            Arc::new(StreamingTool {
+                name: "root",
+                advance: advance.clone(),
+                rejected_late: rejected_late.clone(),
+            }),
+            "root",
+            1,
+            vec![leaf.clone()],
+            ReplaySafeAuthorization::host_attests_replay_safe(),
+        )
+        .unwrap();
+        let options = Options {
+            model: Arc::new(ModelStub {
+                arguments: json!({"mode":mode}).to_string(),
+            }),
+            tools: vec![adapter.register(), leaf.register()],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let mut scheduler = Scheduler::open(&path, options).unwrap();
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let mut watch = scheduler
+            .watch_view(id, NonZeroUsize::MIN, Duration::from_millis(5))
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        let first = wait_for_stream_text(&mut watch, |p| p.text == "first").await;
+        let store = durable_store::Store::open(&path).unwrap();
+        let task = pi_rs_durable::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|stored| stored.task.state() == &TaskState::Running)
+            .unwrap()
+            .task
+            .id();
+        assert_eq!(
+            driver.checkpointable_tool_progress(task).unwrap(),
+            Some(first)
+        );
+        if mode == "abort" {
+            tokio::time::timeout(Duration::from_secs(15), scheduler.abort_and_wait(id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(rejected_late.load(std::sync::atomic::Ordering::SeqCst));
+        } else {
+            advance.add_permits(1);
+            if mode == "wake" {
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        let tasks = pi_rs_durable::task_store::TaskStore::new(&store);
+                        let child = tasks.list().unwrap().into_iter().find(|stored| {
+                            stored.task.owner() == &pi_rs_durable::task::TaskOwner::Task(task)
+                        });
+                        if let Some(child) = child
+                            && let Some(progress) = driver
+                                .checkpointable_tool_progress(child.task.id())
+                                .unwrap()
+                        {
+                            assert_eq!(progress.text, "nested output");
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("nested progress did not become visible");
+                assert!(driver.checkpointable_tool_progress(task).unwrap().is_none());
+                advance.add_permits(1);
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        let current = driver.get(task).unwrap().unwrap();
+                        if current.state() == &TaskState::Running
+                            && current.checkpoint().phase == "replay-safe-async-wait"
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(driver.checkpointable_tool_progress(task).unwrap().is_none());
+                assert!(
+                    scheduler
+                        .view(id, NonZeroUsize::MIN)
+                        .unwrap()
+                        .tool_progress
+                        .is_none()
+                );
+                advance.add_permits(1);
+            }
+            let second = wait_for_stream_text(&mut watch, |p| {
+                if mode == "bounded" {
+                    p.text.len() as u64 + p.dropped_bytes
+                        == ("first second".len() + "猫".len() * 2_000 + " after limit".len()) as u64
+                } else if mode == "wake" {
+                    p.text == "second attempt"
+                } else {
+                    p.text == "first second"
+                }
+            })
+            .await;
+            if mode == "wake" {
+                assert_eq!(second.details, None);
+            } else {
+                assert_eq!(second.details, Some(json!({"source":"stream"})));
+            }
+            if mode == "bounded" {
+                assert!(second.text.starts_with("first second猫"));
+                assert!(second.text.len() <= 4_096);
+                assert!(!second.text.contains("after limit"));
+            }
+            advance.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(15), scheduler.wait(id))
+                .await
+                .unwrap()
+                .unwrap();
+            let conversation = scheduler.conversation(id).unwrap();
+            let content = conversation
+                .messages
+                .iter()
+                .find_map(|message| match message {
+                    Message::Tool { content, .. } => Some(content.as_str()),
+                    _ => None,
+                })
+                .unwrap();
+            if mode == "explicit" {
+                assert_eq!(content, "");
+            } else {
+                assert_eq!(content, second.text);
+                assert_eq!(conversation.tool_results[0].details, second.details);
+            }
+        }
+        assert!(driver.checkpointable_tool_progress(task).unwrap().is_none());
+        assert!(
+            scheduler
+                .view(id, NonZeroUsize::MIN)
+                .unwrap()
+                .tool_progress
+                .is_none()
+        );
+        watch.close();
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+}
 
 struct ModelStub {
     arguments: String,

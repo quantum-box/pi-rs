@@ -4037,18 +4037,20 @@ async fn unsafe_initial_memo_busy_retries_without_dispatching_early() {
     at_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let writer_path = path.clone();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let conn = rusqlite::Connection::open(writer_path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(6500));
+        let _ = release_rx.recv_timeout(Duration::from_secs(25));
         conn.execute_batch("COMMIT").unwrap();
     });
     locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     resume_tx.send(()).unwrap();
     busy_rx
-        .recv_timeout(Duration::from_secs(7))
+        .recv_timeout(Duration::from_secs(20))
         .expect("unsafe initial memo did not reach busy timeout");
+    release_tx.send(()).unwrap();
     writer.join().unwrap();
     tokio::time::timeout(Duration::from_secs(15), async {
         while gate.load(Ordering::SeqCst) != 1 {
