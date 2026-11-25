@@ -962,6 +962,54 @@ pub trait DurableAsyncTool: Tool {
     ) -> Result<DurableToolStep, String>;
 }
 
+/// Wrap a tool's ordinary invocation as a durable leaf. Register the returned
+/// tool with the real replay policy for its effects before exposing it to a
+/// parent. The leaf forwards argument preparation and invocation. Use a
+/// native `DurableAsyncTool` when the tool needs the durable child or progress
+/// host, or when it must persist a park.
+pub fn checkpointable_leaf(tool: Arc<dyn Tool>) -> Arc<dyn DurableAsyncTool> {
+    Arc::new(CheckpointableLeaf(tool))
+}
+
+struct CheckpointableLeaf(Arc<dyn Tool>);
+
+#[async_trait::async_trait]
+impl Tool for CheckpointableLeaf {
+    fn spec(&self) -> ToolSpec {
+        self.0.spec()
+    }
+
+    async fn prepare_arguments(
+        &self,
+        arguments: serde_json::Value,
+    ) -> pi_rs_core::ExtensionResult<serde_json::Value> {
+        self.0.prepare_arguments(arguments).await
+    }
+
+    async fn invoke(
+        &self,
+        arguments: serde_json::Value,
+        context: pi_rs_core::ToolContext,
+    ) -> Outcome {
+        self.0.invoke(arguments, context).await
+    }
+}
+
+#[async_trait::async_trait]
+impl DurableAsyncTool for CheckpointableLeaf {
+    async fn execute_durable(
+        &self,
+        arguments: serde_json::Value,
+        context: pi_rs_core::ToolContext,
+        _resume: DurableToolResume,
+        _host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        Ok(DurableToolStep::Complete(
+            self.invoke(arguments, context).await,
+        ))
+    }
+}
+
 /// Persisted callback replay policy. The initial protocol only permits a
 /// single dispatch; a claimed callback is never automatically retried.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

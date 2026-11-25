@@ -205,7 +205,6 @@ async fn replay_safe_checkpointable_parent_awaits_live_generic_task_tools() {
         }
     }
 
-    let dir = tempfile::tempdir().unwrap();
     let mut registry = Registry::default();
     let generic = Arc::new(Generic);
     assert!(registry.register_shared("test.generic", true, generic.clone()));
@@ -220,6 +219,55 @@ async fn replay_safe_checkpointable_parent_awaits_live_generic_task_tools() {
         1,
         generic,
     ));
+    exercise_registered_leaf(registry, leaf).await;
+}
+
+#[tokio::test]
+async fn replay_safe_checkpointable_parent_calls_an_ordinary_registered_leaf() {
+    struct Plain;
+    #[async_trait]
+    impl Tool for Plain {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "leaf".into(),
+                description: String::new(),
+                parameters: json!({"type":"object","required":["value","normalized"]}),
+            }
+        }
+
+        async fn prepare_arguments(
+            &self,
+            mut arguments: Value,
+        ) -> pi_rs_core::ExtensionResult<Value> {
+            arguments["normalized"] = json!(true);
+            Ok(arguments)
+        }
+
+        async fn invoke(&self, arguments: Value, _: ToolContext) -> Outcome {
+            assert_eq!(arguments["normalized"], true);
+            Outcome::Succeeded(arguments["value"].as_str().unwrap().to_owned())
+        }
+    }
+
+    let mut registry = Registry::default();
+    let leaf = register_conversation_unsafe_durable_tool(
+        &mut registry,
+        pi_rs_durable::async_task_tool::checkpointable_leaf(Arc::new(Plain)),
+        "live-ordinary-leaf",
+        1,
+        Vec::new(),
+        UnsafeDurableAuthorization::interruption_requires_reconciliation(),
+    )
+    .unwrap();
+    exercise_registered_leaf(registry, leaf).await;
+}
+
+async fn exercise_registered_leaf(
+    mut registry: Registry,
+    leaf: Arc<pi_rs_durable::task_tool::TaskTool>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let leaf_registration = leaf.register();
     let parent = register_conversation_replay_safe_durable_tool(
         &mut registry,
         Arc::new(LiveChildrenTool {
@@ -242,7 +290,7 @@ async fn replay_safe_checkpointable_parent_awaits_live_generic_task_tools() {
             model: Arc::new(ModelStub {
                 arguments: "{}".into(),
             }),
-            tools: vec![parent.register()],
+            tools: vec![parent.register(), leaf_registration],
             restart_limit: 4,
             max_turns: 4,
             uncertain_policy: UncertainPolicy::RequireReconciliation,
