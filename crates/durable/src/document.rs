@@ -31,6 +31,8 @@ pub enum Error {
     InvalidOperations,
     #[error("stored document is not a JSON object")]
     InvalidDocument,
+    #[error("stored conversation document does not match its definition")]
+    InvalidDocumentDefinition,
     #[error("a batch has duplicate checks or writes, or an unchecked write")]
     InvalidBatch,
     #[error("read is not permitted after this write")]
@@ -338,6 +340,73 @@ pub enum ForkPolicy {
     Current,
     /// Start each fork with this stored initial JSON object.
     Initial { value: Map<String, Value> },
+}
+
+/// How a defined conversation document is initialized in a fork.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefinedDocumentFork {
+    Initial,
+    Current,
+    AsOf,
+}
+
+/// A typed document family owned by the session transaction's conversation.
+/// The kind, schema version, initial value, and fork policy are bound on creation.
+pub struct ConversationDocument<T> {
+    pub kind: String,
+    pub version: std::num::NonZeroU32,
+    pub initial: T,
+    pub fork: DefinedDocumentFork,
+}
+
+/// A live typed document. Recreating a retired address creates a new identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefinedDocumentValue<T> {
+    pub incarnation: uuid::Uuid,
+    pub value: T,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredDocumentPolicy {
+    #[serde(flatten)]
+    pub policy: ForkPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<StoredDocumentDefinition>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredDocumentDefinition {
+    pub schema: std::num::NonZeroU32,
+    pub initial_digest: String,
+    pub incarnation: Option<uuid::Uuid>,
+}
+
+impl<T: serde::Serialize> ConversationDocument<T> {
+    pub(crate) fn binding(&self) -> Result<StoredDocumentPolicy, Error> {
+        use sha2::{Digest, Sha256};
+        if self.kind.trim().is_empty() || self.kind.starts_with("pi.") {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        let mut initial = serde_json::to_value(&self.initial)?;
+        initial.sort_all_objects();
+        let Value::Object(initial) = initial else {
+            return Err(Error::InvalidDocumentDefinition);
+        };
+        let initial_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&initial)?));
+        let policy = match self.fork {
+            DefinedDocumentFork::Initial => ForkPolicy::Initial { value: initial },
+            DefinedDocumentFork::Current => ForkPolicy::Current,
+            DefinedDocumentFork::AsOf => ForkPolicy::Copy,
+        };
+        Ok(StoredDocumentPolicy {
+            policy,
+            definition: Some(StoredDocumentDefinition {
+                schema: self.version,
+                initial_digest,
+                incarnation: None,
+            }),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1079,14 +1148,23 @@ impl<'a> Documents<'a> {
             }
             if let Some(entry) = policy_entry {
                 let target = target_address.policy_key()?;
+                let mut stored: StoredDocumentPolicy = serde_json::from_slice(&entry.value)?;
+                let value = if let Some(definition) = &mut stored.definition {
+                    if doc.is_some() != definition.incarnation.is_some() {
+                        return Err(Error::InvalidDocumentDefinition);
+                    }
+                    if doc.is_some() {
+                        definition.incarnation = Some(uuid::Uuid::new_v4());
+                    }
+                    serde_json::to_vec(&stored)?
+                } else {
+                    entry.value.clone()
+                };
                 batch.checks.push(Check {
                     key: target.clone(),
                     expected: Expected::Missing,
                 });
-                batch.mutations.push(Mutation::Put {
-                    key: target,
-                    value: entry.value.clone(),
-                });
+                batch.mutations.push(Mutation::Put { key: target, value });
             }
         }
         Ok(batch)
