@@ -177,10 +177,7 @@ fn respond(
     let request = match request {
         Ok(request) if request.is_object() => request,
         Ok(_) => {
-            return Ok(reply(
-                &Value::Null,
-                Err("RPC request must be an object".into()),
-            )?);
+            return reply(&Value::Null, Err("RPC request must be an object".into()));
         }
         Err(error) => return reply(&Value::Null, Err(error)),
     };
