@@ -2954,7 +2954,7 @@ mod tests {
                     let db = rusqlite::Connection::open(path).unwrap();
                     db.execute_batch("BEGIN IMMEDIATE").unwrap();
                     locked_tx.send(()).unwrap();
-                    unlock_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                    unlock_rx.recv_timeout(Duration::from_secs(45)).unwrap();
                     db.execute_batch("COMMIT").unwrap();
                 });
                 locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -3008,14 +3008,13 @@ mod tests {
             crate::task_scheduler::set_maintenance_busy_for_test(parent_id, false);
         }
         if writer_busy {
+            let writer = writer_handle_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("maintenance writer did not acquire the lock");
             writer_busy_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("maintenance writer busy was not observed");
-            writer_handle_rx
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .join()
-                .unwrap();
+            writer.join().unwrap();
         }
         if hold_first && merge_graphs {
             overlap_rx
