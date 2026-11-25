@@ -24,7 +24,7 @@ pub struct ParsedTheme {
 /// Parse and resolve a Pi theme without filesystem or terminal access.
 #[doc(hidden)]
 pub fn parse_theme(text: &str) -> Result<ParsedTheme> {
-    let value: Value = serde_json::from_str(text)?;
+    let value: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))?;
     let schema: Value = serde_json::from_str(include_str!("../assets/theme.schema.json"))?;
     let validator =
         jsonschema::validator_for(&schema).map_err(|error| Error::Config(error.to_string()))?;

@@ -489,6 +489,9 @@ mod tests {
             include_str!("../../assets/themes/light.json"),
         ] {
             let theme = Theme::parse(source, None).unwrap();
+            let with_bom = Theme::parse(&format!("\u{feff}{source}"), None).unwrap();
+            assert_eq!(with_bom.name, theme.name);
+            assert_eq!(with_bom.colors, theme.colors);
             assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
             assert_ne!(theme.color("toolErrorBg"), theme.color("toolSuccessBg"));
         }

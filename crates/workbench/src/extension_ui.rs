@@ -143,9 +143,8 @@ mod tests {
             serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
         std::fs::write(&shadow, theme.to_string()).unwrap();
         theme["name"] = serde_json::json!("fixture");
-        for path in [&first, &later] {
-            std::fs::write(path, theme.to_string()).unwrap();
-        }
+        std::fs::write(&first, format!("\u{feff}{theme}")).unwrap();
+        std::fs::write(&later, theme.to_string()).unwrap();
         std::fs::write(&invalid, "invalid theme").unwrap();
         std::fs::create_dir(&replaced).unwrap();
         theme["name"] = serde_json::json!("unresolved");

@@ -354,6 +354,9 @@ impl Worker {
                 command.arg(flag);
             }
         }
+        for path in &args.themes {
+            command.arg("--theme").arg(path);
+        }
         for path in &args.prompt_template {
             command.arg("--prompt-template").arg(path);
         }
@@ -930,7 +933,7 @@ fn configuration(args: &Cli) -> Value {
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
         "system_prompt":args.system_prompt,"append_system_prompt":args.append_system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
         "tools":args.tools,"exclude_tools":args.exclude_tools,"no_tools":args.no_tools,"no_builtin_tools":args.no_builtin_tools,
-        "no_extensions":args.no_extensions,"no_themes":args.no_themes,"no_skills":args.no_skills,"no_prompt_templates":args.no_prompt_templates,
+        "no_extensions":args.no_extensions,"no_themes":args.no_themes,"themes":args.themes,"no_skills":args.no_skills,"no_prompt_templates":args.no_prompt_templates,
         "no_context_files":args.no_context_files,"no_mcp":args.no_mcp,"prompt_templates":args.prompt_template,
         "coding_tools":args.coding_tools,"requests":args.max_requests,"output_tokens":args.max_output_tokens,
         "output_budget":args.output_budget,"context_window":args.context_window,
