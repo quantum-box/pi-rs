@@ -33,6 +33,7 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             "queued partial before failure",
             "retained after failure",
             "new prompt answer",
+            "transient rate limit",
             "image prompt answer",
         ]
         .into_iter()
@@ -68,6 +69,11 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             bodies.push(serde_json::from_slice::<Value>(&body).unwrap());
+            if index == 12 {
+                let rate_limit = r#"{"error":{"code":"rate_limit_exceeded"}}"#;
+                write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{rate_limit}", rate_limit.len()).unwrap();
+                continue;
+            }
             let delta = serde_json::json!({
                 "type": "response.output_text.delta", "output_index": 0, "delta": answer
             });
@@ -517,7 +523,7 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             .contains("new prompt resumes queue")
     );
     let image_url = format!("data:image/png;base64,{image_data}");
-    for index in [8, 12] {
+    for index in [8, 12, 13] {
         let wire = bodies[index]["input"].as_array().unwrap();
         assert!(wire.iter().any(|message| {
             message["content"][1]["type"] == "input_image"

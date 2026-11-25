@@ -15236,170 +15236,182 @@ impl Harness {
                 "reserved subagent reporter request ID".into(),
             ));
         }
-        let (mut state, version) = self.load(id)?;
-        if let Some(key) = request_id.as_ref() {
-            if state
-                .application_writes
-                .iter()
-                .any(|w| w.request_id.as_ref() == Some(key))
-            {
-                return Err(Error::Invalid(
-                    "request ID identifies a write submission".into(),
-                ));
-            }
-            if let Some(existing) = state
-                .submissions
-                .iter()
-                .find(|s| s.request_id.as_ref() == Some(key))
-            {
-                if existing.kind != SubmissionKind::Input {
+        // Decode once, then admit against the current phase. A model or
+        // profile change invalidates the fitted bytes.
+        let mut prepared = None;
+        loop {
+            let (mut state, version) = self.load(id)?;
+            if let Some(key) = request_id.as_ref() {
+                if state
+                    .application_writes
+                    .iter()
+                    .any(|w| w.request_id.as_ref() == Some(key))
+                {
                     return Err(Error::Invalid(
-                        "request ID identifies a continue submission".into(),
+                        "request ID identifies a write submission".into(),
                     ));
                 }
-                return Ok(crate::images::ImageAdmissionResult {
-                    submission_id: existing.id,
-                    notes: existing.image_notes.clone(),
+                if let Some(existing) = state
+                    .submissions
+                    .iter()
+                    .find(|s| s.request_id.as_ref() == Some(key))
+                {
+                    if existing.kind != SubmissionKind::Input {
+                        return Err(Error::Invalid(
+                            "request ID identifies a continue submission".into(),
+                        ));
+                    }
+                    return Ok(crate::images::ImageAdmissionResult {
+                        submission_id: existing.id,
+                        notes: existing.image_notes.clone(),
+                    });
+                }
+            }
+            if notify.as_ref().is_some_and(|n| n.key.is_empty()) {
+                return Err(Error::Invalid("empty submission notification key".into()));
+            }
+            let busy = state.input_run_active();
+            if busy && options.reject_when_busy {
+                return Err(AdmissionError::Busy.into());
+            }
+            if !busy && options.reject_when_idle {
+                return Err(AdmissionError::Idle.into());
+            }
+            if state.abort_requested {
+                return Err(Error::Invalid("abort in progress".into()));
+            }
+            let place_now = matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+                && state.active.is_none()
+                && state.pending_independent_summary.is_none()
+                && !state
+                    .application_writes
+                    .iter()
+                    .any(|w| !w.placed && !w.withdrawn)
+                && state.pending_resets.is_empty()
+                && !state.submissions.iter().any(|s| s.status == Status::Queued);
+            let adapter = self
+                .provider_adapter
+                .as_ref()
+                .filter(|a| {
+                    state.provider_adapter.as_deref() == Some(a.id()) && a.supports_durable_blocks()
+                })
+                .ok_or_else(|| {
+                    Error::Invalid("image admission requires a selected block-aware adapter".into())
+                })?;
+            if !self.supports_context_blocks(&state) {
+                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+            }
+            let profile = adapter.image_profile(&state.config.model);
+            let (fitted_model, fitted_profile, output, notes) = if let Some(prepared) = &prepared {
+                prepared
+            } else {
+                if blocks.is_empty()
+                    || crate::content::UserContent::from_yield(
+                        serde_json::Value::Array(blocks.clone()),
+                        false,
+                    )
+                    .is_none()
+                {
+                    return Err(Error::Invalid(
+                        "invalid or empty user content blocks".into(),
+                    ));
+                }
+                let limits = profile.map(|p| p.limits).unwrap_or_default();
+                let fitted = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Interrupted),
+                    result = admission.fit(&blocks, limits) => result.map_err(Error::Invalid)?,
+                };
+                if cancel.is_cancelled() {
+                    return Err(Error::Interrupted);
+                }
+                let (mut output, notes) = match fitted {
+                    crate::images::FittedImages::Unchanged => (blocks.clone(), Vec::new()),
+                    crate::images::FittedImages::Fitted { content, notes } => (content, notes),
+                };
+                if !notes.is_empty() {
+                    output.push(serde_json::json!({"type":"text", "text":notes.join(" ")}));
+                }
+                if output.is_empty() {
+                    return Err(Error::Invalid(
+                        "image admission produced empty content".into(),
+                    ));
+                }
+                prepared = Some((state.config.model.clone(), profile, output, notes));
+                continue;
+            };
+            if fitted_model != &state.config.model || *fitted_profile != profile {
+                return Err(Error::Invalid(
+                    "model image profile changed during admission".into(),
+                ));
+            }
+            if cancel.is_cancelled() {
+                return Err(Error::Interrupted);
+            }
+            let sid = Uuid::new_v4();
+            state.submissions.push(Submission {
+                kind: SubmissionKind::Input,
+                id: sid,
+                request_id: request_id.clone(),
+                content: String::new(),
+                image_notes: notes.clone(),
+                input_blocks: Some(crate::transcript::MessageContentBlocks {
+                    message_id: Uuid::new_v4(),
+                    blocks: output.clone(),
+                }),
+                on_abort: options.on_abort,
+                status: if place_now {
+                    Status::Running
+                } else {
+                    Status::Queued
+                },
+            });
+            if let Some(notify) = &notify {
+                state.submission_notifications.insert(sid, notify.clone());
+            }
+            state.input_modes.insert(sid, options.mode);
+            if place_now {
+                state.run_failure = None;
+                state.failure_continuation_inputs.clear();
+                state.active = Some(sid);
+                let binding = state
+                    .submissions
+                    .last()
+                    .unwrap()
+                    .input_blocks
+                    .clone()
+                    .unwrap();
+                let index = state.messages.len();
+                state.messages.push(Message::User {
+                    content: String::new(),
                 });
+                state.content_blocks.insert(index, binding);
+                state.auto_compaction_attempted = false;
+                state.retry_state = RetryState::default();
+                state.overflow_compaction_attempted = false;
+                state.phase = Phase::ModelReady { turns: 0 };
+            } else if matches!(state.phase, Phase::FailedIdle) {
+                state.phase = Phase::Idle;
+            }
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let saved = self.save(&state, Expected::Version(version));
+            self.merge_admissions = merge;
+            match saved {
+                Err(Error::Storage(durable_store::Error::Conflict { key }))
+                    if key == Self::key(id) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+                Ok(()) => {
+                    return Ok(crate::images::ImageAdmissionResult {
+                        submission_id: sid,
+                        notes: notes.clone(),
+                    });
+                }
             }
         }
-        if notify.as_ref().is_some_and(|n| n.key.is_empty()) {
-            return Err(Error::Invalid("empty submission notification key".into()));
-        }
-        let busy = state.active.is_some()
-            || pending_failure_continuation(&state)
-            || matches!(
-                state.phase,
-                Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
-            );
-        if busy && options.reject_when_busy {
-            return Err(AdmissionError::Busy.into());
-        }
-        if !busy && options.reject_when_idle {
-            return Err(AdmissionError::Idle.into());
-        }
-        if state.abort_requested {
-            return Err(Error::Invalid("abort in progress".into()));
-        }
-        let place_now = matches!(state.phase, Phase::Idle | Phase::FailedIdle)
-            && state.active.is_none()
-            && state.pending_independent_summary.is_none()
-            && !state
-                .application_writes
-                .iter()
-                .any(|w| !w.placed && !w.withdrawn)
-            && state.pending_resets.is_empty()
-            && !state.submissions.iter().any(|s| s.status == Status::Queued);
-        let adapter = self
-            .provider_adapter
-            .as_ref()
-            .filter(|a| {
-                state.provider_adapter.as_deref() == Some(a.id()) && a.supports_durable_blocks()
-            })
-            .ok_or_else(|| {
-                Error::Invalid("image admission requires a selected block-aware adapter".into())
-            })?;
-        if !self.supports_context_blocks(&state) {
-            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
-        }
-        if blocks.is_empty()
-            || crate::content::UserContent::from_yield(
-                serde_json::Value::Array(blocks.clone()),
-                false,
-            )
-            .is_none()
-        {
-            return Err(Error::Invalid(
-                "invalid or empty user content blocks".into(),
-            ));
-        }
-        let profile = adapter.image_profile(&state.config.model);
-        let limits = profile.map(|p| p.limits).unwrap_or_default();
-        let fitted = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Error::Interrupted),
-            result = admission.fit(&blocks, limits) => result.map_err(Error::Invalid)?,
-        };
-        if cancel.is_cancelled() {
-            return Err(Error::Interrupted);
-        }
-        if self
-            .provider_adapter
-            .as_ref()
-            .filter(|a| state.provider_adapter.as_deref() == Some(a.id()))
-            .and_then(|a| a.image_profile(&state.config.model))
-            != profile
-        {
-            return Err(Error::Invalid(
-                "model image profile changed during admission".into(),
-            ));
-        }
-        let (mut output, notes) = match fitted {
-            crate::images::FittedImages::Unchanged => (blocks, Vec::new()),
-            crate::images::FittedImages::Fitted { content, notes } => (content, notes),
-        };
-        if !notes.is_empty() {
-            output.push(serde_json::json!({"type":"text", "text":notes.join(" ")}));
-        }
-        if output.is_empty() {
-            return Err(Error::Invalid(
-                "image admission produced empty content".into(),
-            ));
-        }
-        let sid = Uuid::new_v4();
-        state.submissions.push(Submission {
-            kind: SubmissionKind::Input,
-            id: sid,
-            request_id,
-            content: String::new(),
-            image_notes: notes.clone(),
-            input_blocks: Some(crate::transcript::MessageContentBlocks {
-                message_id: Uuid::new_v4(),
-                blocks: output.clone(),
-            }),
-            on_abort: options.on_abort,
-            status: if place_now {
-                Status::Running
-            } else {
-                Status::Queued
-            },
-        });
-        if let Some(notify) = notify {
-            state.submission_notifications.insert(sid, notify);
-        }
-        state.input_modes.insert(sid, options.mode);
-        if place_now {
-            state.run_failure = None;
-            state.failure_continuation_inputs.clear();
-            state.active = Some(sid);
-            let binding = state
-                .submissions
-                .last()
-                .unwrap()
-                .input_blocks
-                .clone()
-                .unwrap();
-            let index = state.messages.len();
-            state.messages.push(Message::User {
-                content: String::new(),
-            });
-            state.content_blocks.insert(index, binding);
-            state.auto_compaction_attempted = false;
-            state.retry_state = RetryState::default();
-            state.overflow_compaction_attempted = false;
-            state.phase = Phase::ModelReady { turns: 0 };
-        } else if matches!(state.phase, Phase::FailedIdle) {
-            state.phase = Phase::Idle;
-        }
-        let merge = self.merge_admissions;
-        self.merge_admissions = false;
-        let saved = self.save(&state, Expected::Version(version));
-        self.merge_admissions = merge;
-        saved?;
-        Ok(crate::images::ImageAdmissionResult {
-            submission_id: sid,
-            notes,
-        })
     }
 
     /// Append an ordered user block occurrence to an idle conversation.

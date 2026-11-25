@@ -530,6 +530,72 @@ async fn busy_fitted_inputs_queue_dedupe_and_survive_reopen() {
     assert_eq!(h.conversation(id).unwrap().content_blocks, expected);
 }
 
+#[tokio::test]
+async fn fitted_input_is_admitted_after_the_previous_run_advances() {
+    use pi_rs_durable::runtime::{AdmissionOptions, Scheduler, Status};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(GatedAdapter::new());
+    let mut scheduler = Scheduler::open_with_provider_adapter(
+        &path,
+        options(),
+        Default::default(),
+        adapter.clone(),
+    )
+    .unwrap();
+    let id = scheduler.create_conversation(config("first")).unwrap();
+    scheduler.select_provider_adapter(id, true).unwrap();
+    scheduler.submit(id, None, "first run".into()).unwrap();
+    adapter.started.acquire().await.unwrap().forget();
+
+    let (ready, started) = std::sync::mpsc::channel();
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let fit = UserImageAdmission::new(Arc::new(GateProcessor {
+        ready: Mutex::new(Some(ready)),
+        wake: wake.clone(),
+    }));
+    let store = durable_store::Store::open(&path).unwrap();
+    let conversation_key = format!("runtime/conversation/{id}");
+    let cancel = CancellationToken::new();
+    let (admitted, ()) = tokio::join!(
+        scheduler.submit_fitted_user_blocks_with_options(
+            id,
+            None,
+            vec![image_block()],
+            &fit,
+            AdmissionOptions::default(),
+            &cancel,
+        ),
+        async {
+            tokio::task::spawn_blocking(move || started.recv().unwrap())
+                .await
+                .unwrap();
+            adapter.release.add_permits(1);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let entry = store.get(conversation_key.as_bytes()).unwrap().unwrap();
+                    let state: Value = serde_json::from_slice(&entry.value).unwrap();
+                    if state["phase"] == "Idle" {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            wake.notify_one();
+        },
+    );
+    let admitted = admitted.unwrap().submission_id;
+    scheduler.wait(id).await.unwrap();
+    let state = scheduler.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 2);
+    assert_eq!(state.submissions[1].id, admitted);
+    assert!(matches!(state.submissions[1].status, Status::Done { .. }));
+    assert_eq!(state.content_blocks.len(), 1);
+    scheduler.shutdown().await.unwrap();
+}
+
 struct ContinueFit {
     admission: UserImageAdmission,
     fired: std::sync::atomic::AtomicBool,

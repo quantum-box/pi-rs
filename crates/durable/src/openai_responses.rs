@@ -316,6 +316,9 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
         Some("subscription_sharing_usage_unavailable") => {
             Error::RetryableModel("ChatGPT plan usage is temporarily unavailable".into())
         }
+        _ if status == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => {
+            Error::RetryableModel("OpenAI rate limit reached".into())
+        }
         _ if status.is_some_and(|status| status.is_server_error()) => {
             Error::RetryableModel("OpenAI service temporarily unavailable".into())
         }
@@ -480,7 +483,30 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(response_error(None, Some(status)));
+            let info =
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                    Some(
+                        pi_rs_core::provider_limit_info(
+                            response.bytes_stream(),
+                            std::slice::from_ref(&self.token),
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+            if info
+                .as_ref()
+                .is_some_and(|limit| limit.permanent && limit.recognized_code.is_none())
+            {
+                return Err(Error::Model(
+                    "OpenAI account quota or billing limit reached".into(),
+                ));
+            }
+            return Err(response_error(
+                info.and_then(|limit| limit.recognized_code),
+                Some(status),
+            ));
         }
         if !response
             .headers()
