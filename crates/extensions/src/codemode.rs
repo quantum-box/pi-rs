@@ -145,6 +145,7 @@ fn parse_worker_limit(value: &str) -> Option<usize> {
 enum WorkerAdmissionError {
     Cancelled,
     Deadline,
+    StartupDeadline,
     Busy,
     Closed,
 }
@@ -157,6 +158,12 @@ impl WorkerAdmissionError {
                 "Script timed out: Execution timed out after {} ms while waiting for a free codemode worker",
                 timeout
                     .expect("admission deadline requires a timeout")
+                    .as_millis()
+            ),
+            Self::StartupDeadline => format!(
+                "Script timed out: Execution timed out after {} ms while waiting for codemode worker startup",
+                timeout
+                    .expect("startup deadline requires a timeout")
                     .as_millis()
             ),
             Self::Busy => format!(
@@ -391,9 +398,7 @@ impl Tool for ScriptTool {
         let worker_cancel = context.cancellation.child_token();
         let format_cancel = context.cancellation.child_token();
         let _cancel_format_on_drop = format_cancel.clone().drop_guard();
-        // The caller may drop this future on timeout or cancellation. Keep the
-        // permit in the worker until QuickJS has actually stopped, and wake its
-        // interrupt handler even when nobody remains to await the join handle.
+        // Keep the interrupt armed if the caller drops the invocation after startup.
         let _cancel_on_drop = worker_cancel.clone().drop_guard();
         let worker_context = ToolContext {
             operation_id: context.operation_id,
@@ -401,7 +406,18 @@ impl Tool for ScriptTool {
         };
         let source = source.to_owned();
         let handle = tokio::runtime::Handle::current();
+        let (ready, worker_ready) = tokio::sync::oneshot::channel();
+        let (start, worker_start) = tokio::sync::oneshot::channel();
         let worker = tokio::task::spawn_blocking(move || {
+            ready.send(()).map_err(|_| "Codemode startup cancelled")?;
+            // The caller keeps the permit while this job is in Tokio's queue.
+            // Once handed off, it stays with execution through worker shutdown.
+            let permit = worker_start
+                .blocking_recv()
+                .map_err(|_| "Codemode startup cancelled")?;
+            // Stop nested calls when execution settles, before any output
+            // formatting, and also if the worker unwinds.
+            let _cancel_nested_calls = worker_context.cancellation.clone().drop_guard();
             let result = handle.block_on(evaluate(
                 &source,
                 store,
@@ -410,11 +426,35 @@ impl Tool for ScriptTool {
                 deadline,
                 worker_sink,
             ));
-            (result, permit)
-        })
-        .await;
-        let (result, permit) = match worker {
-            Ok(result) => result,
+            Ok::<_, &str>((result, permit))
+        });
+        let startup = tokio::select! {
+            biased;
+            _ = context.cancellation.cancelled() => Err(WorkerAdmissionError::Cancelled),
+            () = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline.at.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => Err(WorkerAdmissionError::StartupDeadline),
+            result = worker_ready => {
+                if deadline.is_some_and(ScriptDeadline::elapsed) {
+                    Err(WorkerAdmissionError::StartupDeadline)
+                } else {
+                    result.map_err(|_| WorkerAdmissionError::Closed)
+                }
+            }
+        };
+        if let Err(error) = startup {
+            worker.abort();
+            return error.reply(started.elapsed(), options.timeout, (workers.limit)());
+        }
+        if start.send(permit).is_err() {
+            return Outcome::Failed("Codemode worker stopped before startup".into()).into();
+        }
+        let (result, permit) = match worker.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => return Outcome::Failed(error.into()).into(),
             Err(error) => {
                 return Outcome::Failed(format!("Codemode worker failed: {error}")).into();
             }
@@ -461,17 +501,16 @@ impl Tool for ScriptTool {
             }
         };
         let output = std::mem::take(&mut publication.value);
-        let outcome = if success {
+        let content = output["content"].as_array().into_iter().flatten();
+        let has_image = content.clone().any(|block| block["type"] == "image");
+        let outcome = if success || has_image {
             Outcome::Structured {
                 data: output,
                 attachments: vec![],
             }
         } else {
             Outcome::Failed(
-                output["content"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
+                content
                     .filter_map(|block| block["text"].as_str())
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -637,6 +676,9 @@ async fn evaluate(
     deadline: Option<ScriptDeadline>,
     sink: Arc<Mutex<Output>>,
 ) -> Result<Completion, String> {
+    if context.cancellation.is_cancelled() {
+        return Err("Script cancelled".into());
+    }
     if let Some(deadline) = deadline.filter(|deadline| deadline.elapsed()) {
         return Err(deadline.error());
     }
@@ -2777,6 +2819,169 @@ mod tests {
         let _ = stop_watchdog.send(());
         watchdog.join().unwrap();
     }
+    #[test]
+    fn deadline_expires_while_blocking_worker_startup_is_queued() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (occupied, occupied_rx) = tokio::sync::oneshot::channel();
+                let (release, release_rx) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    occupied.send(()).unwrap();
+                    let _ = release_rx.blocking_recv();
+                });
+                occupied_rx.await.unwrap();
+                let started = Arc::new(tokio::sync::Notify::new());
+                let host = Arc::new(StartedHost {
+                    started: started.clone(),
+                    wait_for_cancellation: false,
+                });
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ScriptTool { timeout: None }.invoke_transaction(
+                        json!({"code":"// @options: {\"timeout_ms\":100}\nawait tools.started({}); store('discard', true);"}),
+                        ToolContext {
+                            operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                            cancellation: Default::default(),
+                        },
+                        None,
+                        host,
+                    ),
+                )
+                .await
+                .expect("timeout reply must not wait for the blocking pool");
+                assert!(matches!(
+                    reply.outcome,
+                    Outcome::Failed(message)
+                        if message.contains("after 100 ms while waiting for codemode worker startup")
+                            && message.contains("The script did not start.")
+                ));
+                assert!(reply.state.is_none());
+                assert!(!blocker.is_finished());
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                // Let Tokio process the aborted job from the queue.
+                tokio::task::spawn_blocking(|| {}).await.unwrap();
+                assert!(tokio::time::timeout(Duration::ZERO, started.notified()).await.is_err());
+            });
+    }
+
+    struct RecordingHost {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<pi_rs_core::CancellationToken>>>,
+        release_formatter: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolHost for RecordingHost {
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "started".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }]
+        }
+
+        async fn call(&self, _: &str, _: Value) -> Outcome {
+            unreachable!("expected a scoped nested call");
+        }
+
+        async fn call_with_cancellation(
+            &self,
+            _: &str,
+            _: Value,
+            cancellation: pi_rs_core::CancellationToken,
+        ) -> Outcome {
+            // Queue ahead of the formatter while the only blocking thread
+            // still belongs to the script worker.
+            let release = self.release_formatter.lock().unwrap().take().unwrap();
+            tokio::task::spawn_blocking(move || {
+                let _ = release.blocking_recv();
+            });
+            self.started
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(cancellation)
+                .unwrap();
+            std::future::pending().await
+        }
+    }
+
+    #[test]
+    fn deadline_cancels_nested_call_before_formatting_and_keeps_partial_image() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (started, started_rx) = tokio::sync::oneshot::channel();
+                let (release, release_rx) = tokio::sync::oneshot::channel();
+                let host = Arc::new(RecordingHost {
+                    started: Mutex::new(Some(started)),
+                    release_formatter: Mutex::new(Some(release_rx)),
+                });
+                let script = tokio::spawn(async move {
+                    ScriptTool { timeout: None }
+                        .invoke_transaction(
+                            json!({"code": concat!(
+                                "// @options: {\"timeout_ms\":1000}\n",
+                                "text('partial'); ",
+                                "image({type:'image', mimeType:'image/png', data:'iVBORw0KGgo='}); ",
+                                "store('discard', true); await tools.started({});"
+                            )}),
+                            ToolContext {
+                                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                                cancellation: Default::default(),
+                            },
+                            None,
+                            host,
+                        )
+                        .await
+                });
+                let nested = tokio::time::timeout(Duration::from_secs(5), started_rx)
+                    .await
+                    .expect("nested call did not start")
+                    .unwrap();
+
+                tokio::time::timeout(Duration::from_secs(5), nested.cancelled())
+                    .await
+                    .expect("nested call must receive cancellation before formatting");
+                assert!(!script.is_finished());
+                release.send(()).unwrap();
+
+                let reply = tokio::time::timeout(Duration::from_secs(5), script)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(reply.state.is_none());
+                assert!(reply.outcome.is_error());
+                let Outcome::Structured { data, .. } = reply.outcome else {
+                    panic!("a timed-out image should remain structured");
+                };
+                let content = data["content"].as_array().unwrap();
+                let text = content
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for line in text.lines() {
+                    if let Some(path) = line.strip_prefix("Image saved to ") {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+                assert!(text.contains("partial"));
+                assert!(text.contains("Script timed out: Execution timed out after 1000 ms"));
+                assert!(content.iter().any(|block| *block == json!({
+                    "type":"image","mimeType":"image/png","data":"iVBORw0KGgo="
+                })));
+            });
+    }
+
     #[tokio::test]
     async fn script_deadline_reports_timeout_for_compute_and_host_waits() {
         let host = Arc::new(StartedHost {
@@ -2807,6 +3012,9 @@ mod tests {
             );
             assert!(reply.state.is_none());
         }
+        tokio::time::timeout(Duration::ZERO, host.started.notified())
+            .await
+            .expect("the host-wait case must reach the nested call");
     }
 
     #[tokio::test]
