@@ -13353,6 +13353,18 @@ impl Harness {
         })
     }
 
+    /// Start watching after the current store commit. A live cursor reads only
+    /// tracked commits published after this boundary, including on migrated stores.
+    pub fn unified_history_from_now(&self, id: Uuid) -> Result<UnifiedHistoryCursor, Error> {
+        self.load(id)?;
+        let sequence = self.owner.store().commit_sequence()?;
+        Ok(UnifiedHistoryCursor {
+            conversation: id,
+            after: sequence,
+            through: sequence,
+        })
+    }
+
     /// Read at most `limit` complete commits in the captured range. Each model
     /// record is an expanded observation snapshot; application records are full
     /// log snapshots, not individually ordered transcript events.
@@ -13420,6 +13432,36 @@ impl Harness {
             next,
             has_more,
         })
+    }
+
+    /// Wait for the next nonempty page of complete commits. Drain any finite
+    /// capture first, then continue past its boundary. Persist the returned
+    /// cursor after processing the page to resume the watch after reopening.
+    pub async fn watch_unified_history(
+        &self,
+        cursor: &UnifiedHistoryCursor,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<UnifiedHistoryPage, Error> {
+        if interval.is_zero() {
+            return Err(Error::Invalid(
+                "unified history watch interval must be nonzero".into(),
+            ));
+        }
+        let mut cursor = cursor.clone();
+        loop {
+            let page = self.unified_history(&cursor, limit)?;
+            if !page.commits.is_empty() {
+                return Ok(page);
+            }
+            let through = self.owner.store().commit_sequence()?;
+            if through == cursor.through {
+                tokio::time::sleep(interval).await;
+            } else {
+                cursor.after = cursor.through;
+                cursor.through = through;
+            }
+        }
     }
 
     fn merged_observation(
@@ -23769,6 +23811,34 @@ impl Scheduler {
     ) -> Result<MergedProgressPage, Error> {
         self.harness
             .watch_merged_progress(cursor, limit, interval)
+            .await
+    }
+    pub fn unified_history_start(
+        &self,
+        id: Uuid,
+        allow_legacy_boundary: bool,
+    ) -> Result<UnifiedHistoryCursor, Error> {
+        self.harness
+            .unified_history_start(id, allow_legacy_boundary)
+    }
+    pub fn unified_history_from_now(&self, id: Uuid) -> Result<UnifiedHistoryCursor, Error> {
+        self.harness.unified_history_from_now(id)
+    }
+    pub fn unified_history(
+        &self,
+        cursor: &UnifiedHistoryCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<UnifiedHistoryPage, Error> {
+        self.harness.unified_history(cursor, limit)
+    }
+    pub async fn watch_unified_history(
+        &self,
+        cursor: &UnifiedHistoryCursor,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<UnifiedHistoryPage, Error> {
+        self.harness
+            .watch_unified_history(cursor, limit, interval)
             .await
     }
     pub fn progress_history_from_now(

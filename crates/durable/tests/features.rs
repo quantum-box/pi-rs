@@ -2583,6 +2583,41 @@ async fn unified_history_pages_survive_reopen_and_show_fork_snapshots() {
             .flat_map(|f| &f.snapshots)
             .any(|s| s.value.to_string().contains("after capture"))
     );
+    let interval = std::time::Duration::from_millis(2);
+    let live_page = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.watch_unified_history(&cursor, NonZeroUsize::MIN, interval),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(live_page.commits[0].sequence > frames.last().unwrap().sequence);
+    assert!(
+        live_page.commits[0]
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.value.to_string().contains("after capture"))
+    );
+    let from_now = h.unified_history_from_now(parent).unwrap();
+    assert!(
+        h.unified_history(&from_now, NonZeroUsize::MIN)
+            .unwrap()
+            .commits
+            .is_empty()
+    );
+    assert!(
+        tokio::time::timeout(
+            interval * 2,
+            h.watch_unified_history(&from_now, NonZeroUsize::MIN, interval),
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        h.watch_unified_history(&from_now, NonZeroUsize::MIN, std::time::Duration::ZERO)
+            .await
+            .is_err()
+    );
     let child_page = h
         .unified_history(
             &h.unified_history_start(child, false).unwrap(),
