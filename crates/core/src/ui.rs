@@ -368,6 +368,12 @@ pub enum UiRequest {
         text: String,
     },
     GetEditorText,
+    /// Read the terminal's current tool output expansion state.
+    GetToolsExpanded,
+    /// Change tool output expansion for the current terminal session.
+    SetToolsExpanded {
+        expanded: bool,
+    },
 }
 impl UiRequest {
     pub fn timeout(&self) -> Option<u64> {
@@ -469,7 +475,7 @@ impl UiRequest {
         match (self, response) {
             (_, UiResponse::Cancelled) => true,
             (Self::Select { options, .. }, UiResponse::Text(value)) => options.contains(value),
-            (Self::Confirm { .. }, UiResponse::Confirmed(_)) => true,
+            (Self::Confirm { .. } | Self::GetToolsExpanded, UiResponse::Confirmed(_)) => true,
             (Self::Custom { actions, .. }, UiResponse::Text(value)) => {
                 actions.iter().any(|action| &action.value == value)
             }
@@ -489,6 +495,7 @@ impl UiRequest {
                 | Self::Editor { .. }
                 | Self::Custom { .. }
                 | Self::GetEditorText
+                | Self::GetToolsExpanded
         )
     }
 }

@@ -490,9 +490,10 @@ A replay-unsafe conversation checkpointable parent can also start a registered
 checkpointable child immediately. A live parent lease authorizes only the
 explicitly admitted child tree until the parent parks or settles. After a
 process loss, children of the interrupted parent cannot resume under that
-lease, even if the children themselves are replay-safe. Standalone immediate
-checkpointable admission still requires replay-safe tools. An interrupted
-unsafe parent without a receipt remains subject to reconciliation.
+lease, even if the children themselves are replay-safe. Standalone
+checkpointable tools use the same lease check and require standalone
+registrations for both tools. An interrupted unsafe parent without a receipt
+remains subject to reconciliation.
 
 Replay-safe conversation checkpointable tools can also call
 `start_foreground_subagent` and `wait_foreground_subagent`. The live parent lease

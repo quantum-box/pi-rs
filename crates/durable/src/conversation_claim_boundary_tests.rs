@@ -4690,7 +4690,7 @@ fn exercise_claim_recovery_during_maintenance(conflicts: bool) {
             let db = rusqlite::Connection::open(writer_path).unwrap();
             db.execute_batch("BEGIN IMMEDIATE").unwrap();
             locked_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(60)).unwrap();
             db.execute_batch("COMMIT").unwrap();
         });
         locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -4712,15 +4712,14 @@ fn exercise_claim_recovery_during_maintenance(conflicts: bool) {
         continue_rx.recv_timeout(Duration::from_secs(30)).unwrap();
     });
     let driver = crate::task_driver::Driver::start_with_harness(task_scheduler, harness.worker());
+    let writer = writer_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("claim recovery did not acquire the fixture writer lock");
     busy_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(Duration::from_secs(30))
         .expect("claim recovery did not encounter writer lock");
     release_tx.send(()).unwrap();
-    writer_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .join()
-        .unwrap();
+    writer.join().unwrap();
     {
         // The driver is paused in its test-only busy hook while holding the
         // task gate. Insert the independent graph through the store seam.

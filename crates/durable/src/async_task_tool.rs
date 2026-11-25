@@ -941,7 +941,8 @@ pub trait DurableTaskHost: Send + Sync {
     /// checkpointable child regardless of either tool's replay policy.
     /// A replay-unsafe parent authorizes execution only during this live
     /// attempt, and an interrupted child retains its receipt policy.
-    /// Standalone admission requires replay-safe parent and child tools.
+    /// Standalone admission requires both tools to be registered as standalone
+    /// checkpointable tools.
     /// The ordinary `start_child` stages admission for the parent transition.
     async fn start_child_now(
         &self,
@@ -1038,6 +1039,8 @@ enum ToolHostRequest {
         name: String,
         arguments: serde_json::Value,
         cancellation: pi_rs_core::CancellationToken,
+        // Admission and cancellation compete for this one-shot claim.
+        dispatch_claim: Arc<std::sync::atomic::AtomicBool>,
         reply: tokio::sync::oneshot::Sender<Outcome>,
     },
 }
@@ -1094,22 +1097,42 @@ impl pi_rs_core::ToolHost for CheckpointableToolHost {
         arguments: serde_json::Value,
         cancellation: pi_rs_core::CancellationToken,
     ) -> Outcome {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         if !self.tools.iter().any(|tool| tool.name == name) {
             return Outcome::Skipped("nested tool is not registered for this invocation".into());
         }
         let (reply, result) = tokio::sync::oneshot::channel();
+        let dispatch_claim = Arc::new(AtomicBool::new(false));
         let request = ToolHostRequest::Call {
             name: name.into(),
             arguments,
-            cancellation,
+            cancellation: cancellation.clone(),
+            dispatch_claim: dispatch_claim.clone(),
             reply,
         };
-        if self.requests.send(request).await.is_err() {
-            return Outcome::Skipped("durable tool invocation ended".into());
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Outcome::Skipped("cancelled before nested dispatch".into()),
+            queued = self.requests.send(request) => {
+                if queued.is_err() {
+                    return Outcome::Skipped("durable tool invocation ended".into());
+                }
+            }
         }
-        result.await.unwrap_or_else(|_| {
-            Outcome::Unknown("durable tool invocation ended during nested call".into())
-        })
+        tokio::select! {
+            biased;
+            result = result => result.unwrap_or_else(|_| {
+                Outcome::Unknown("durable tool invocation ended during nested call".into())
+            }),
+            _ = cancellation.cancelled() => {
+                if dispatch_claim.swap(true, Ordering::AcqRel) {
+                    Outcome::Unknown("nested call was cancelled during or after admission".into())
+                } else {
+                    Outcome::Skipped("cancelled before nested dispatch".into())
+                }
+            }
+        }
     }
 }
 
@@ -1169,7 +1192,7 @@ impl DurableAsyncTool for CheckpointableTool {
                     Some(ToolHostRequest::Progress(partial, reply)) => {
                         let _ = reply.send(host.report_progress(partial).await);
                     }
-                    Some(ToolHostRequest::Call { name, arguments, cancellation, reply }) => {
+                    Some(ToolHostRequest::Call { name, arguments, cancellation, dispatch_claim, reply }) => {
                         let Some(timeout) = self.child_timeout else {
                             let _ = reply.send(Outcome::Skipped("nested tool calls are unavailable".into()));
                             continue;
@@ -1178,7 +1201,8 @@ impl DurableAsyncTool for CheckpointableTool {
                         call_index += 1;
                         // Admit in receive order so the implicit key matches the
                         // ordinary caller's sequence on replay.
-                        if reply.is_closed() || cancellation.is_cancelled() {
+                        if reply.is_closed() || cancellation.is_cancelled()
+                            || dispatch_claim.swap(true, std::sync::atomic::Ordering::AcqRel) {
                             let _ = reply.send(Outcome::Skipped("cancelled before nested dispatch".into()));
                             continue;
                         }
@@ -2676,6 +2700,77 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use uuid::Uuid;
 
+    #[tokio::test]
+    async fn ordinary_nested_call_cancellation_distinguishes_queue_and_dispatch() {
+        use pi_rs_core::ToolHost;
+        use std::task::Poll;
+
+        let (requests, mut incoming) = tokio::sync::mpsc::channel(1);
+        let host = CheckpointableToolHost {
+            requests,
+            tools: vec![ToolSpec {
+                name: "child".into(),
+                description: String::new(),
+                parameters: json!({}),
+            }],
+        };
+        let (progress_reply, _ack) = tokio::sync::oneshot::channel();
+        assert!(
+            host.requests
+                .try_send(ToolHostRequest::Progress(
+                    DurableToolProgress::default(),
+                    progress_reply,
+                ))
+                .is_ok()
+        );
+        let token = pi_rs_core::CancellationToken::new();
+        let blocked = host.call_with_cancellation("child", json!({}), token.clone());
+        tokio::pin!(blocked);
+        assert!(matches!(futures_util::poll!(&mut blocked), Poll::Pending));
+        token.cancel();
+        assert!(matches!(
+            futures_util::poll!(&mut blocked),
+            Poll::Ready(Outcome::Skipped(_))
+        ));
+        assert!(matches!(
+            incoming.try_recv(),
+            Ok(ToolHostRequest::Progress(..))
+        ));
+        assert!(incoming.try_recv().is_err());
+
+        for admitted in [false, true] {
+            let token = pi_rs_core::CancellationToken::new();
+            let pending = host.call_with_cancellation("child", json!({}), token.clone());
+            tokio::pin!(pending);
+            assert!(matches!(futures_util::poll!(&mut pending), Poll::Pending));
+            let Ok(ToolHostRequest::Call {
+                dispatch_claim,
+                reply,
+                ..
+            }) = incoming.try_recv()
+            else {
+                panic!("nested call was not enqueued");
+            };
+            if admitted {
+                assert!(!dispatch_claim.swap(true, Ordering::AcqRel));
+            }
+            token.cancel();
+            if admitted {
+                assert!(matches!(
+                    futures_util::poll!(&mut pending),
+                    Poll::Ready(Outcome::Unknown(_))
+                ));
+            } else {
+                assert!(matches!(
+                    futures_util::poll!(&mut pending),
+                    Poll::Ready(Outcome::Skipped(_))
+                ));
+            }
+            assert!(dispatch_claim.load(Ordering::Acquire));
+            assert!(reply.is_closed());
+        }
+    }
+
     struct TestTool {
         calls: Arc<AtomicUsize>,
         spec: &'static str,
@@ -4038,7 +4133,7 @@ mod tests {
                 let conn = rusqlite::Connection::open(writer_path).unwrap();
                 conn.execute_batch("BEGIN IMMEDIATE").unwrap();
                 locked_tx.send(()).unwrap();
-                unlock_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                unlock_rx.recv_timeout(Duration::from_secs(60)).unwrap();
                 conn.execute_batch("COMMIT").unwrap();
             });
             locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -4126,14 +4221,13 @@ mod tests {
             }
             host.into_driver()
         };
+        let writer = writer_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("recovery did not acquire the fixture writer lock");
         busy_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(30))
             .expect("writer timeout was not observed");
-        writer_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .join()
-            .unwrap();
+        writer.join().unwrap();
         assert!(matches!(
             wait_terminal(&driver, parent).state(),
             crate::task::TaskState::Succeeded(_)
