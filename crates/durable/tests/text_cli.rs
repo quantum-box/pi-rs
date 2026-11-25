@@ -27,6 +27,8 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             "first attempt only",
             "replacement answer",
             "saved before failure",
+            "queue base answer",
+            "follow-up answer",
         ]
         .into_iter()
         .enumerate()
@@ -87,7 +89,7 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
                 partial.len() + final_event.len(),
             ).unwrap();
-            if matches!(index, 0 | 2 | 3 | 4) {
+            if matches!(index, 0 | 2 | 3 | 4 | 7) {
                 socket.flush().unwrap();
                 finish_first_rx
                     .recv_timeout(Duration::from_secs(10))
@@ -324,6 +326,83 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         ]
     );
 
+    let mut rpc = command(&endpoint, &["--conversation", id, "--rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = rpc.stdin.take().unwrap();
+    writeln!(stdin, r#"{{"type":"prompt","message":"queue base"}}"#).unwrap();
+    let mut ends = Vec::new();
+    let mut sent = false;
+    let mut released = false;
+    for line in BufReader::new(rpc.stdout.take().unwrap()).lines() {
+        let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if !sent && frame["assistantMessageEvent"]["delta"] == "queue base answer" {
+            for request in [
+                r#"{"type":"steer","id":"steer","message":"discard steer"}"#,
+                r#"{"type":"prompt","id":"original-follow","message":"discard follow-up","streamingBehavior":"followUp"}"#,
+                r#"{"type":"get_state","id":"pending"}"#,
+                r#"{"type":"clear_queue","id":"clear"}"#,
+                r#"{"type":"set_follow_up_mode","id":"mode","mode":"all"}"#,
+                r#"{"type":"get_state","id":"modes"}"#,
+                r#"{"type":"follow_up","id":"after","message":"deliver after base"}"#,
+            ] {
+                writeln!(stdin, "{request}").unwrap();
+            }
+            sent = true;
+        }
+        match frame["id"].as_str() {
+            Some("steer" | "original-follow") => {
+                assert_eq!(frame["data"]["disposition"], "queued");
+            }
+            Some("pending") => assert_eq!(frame["data"]["pendingMessageCount"], 2),
+            Some("clear") => {
+                assert_eq!(
+                    frame["data"]["steering"],
+                    serde_json::json!(["discard steer"])
+                );
+                assert_eq!(
+                    frame["data"]["followUp"],
+                    serde_json::json!(["discard follow-up"])
+                );
+            }
+            Some("mode") => assert_eq!(frame["success"], true),
+            Some("modes") => {
+                assert_eq!(frame["data"]["followUpMode"], "all");
+                assert_eq!(frame["data"]["pendingMessageCount"], 0);
+            }
+            Some("after") => {
+                assert_eq!(frame["data"]["disposition"], "queued");
+                finish_first_tx.send(()).unwrap();
+                released = true;
+            }
+            _ => {}
+        }
+        if frame["type"] == "agent_end" {
+            assert_eq!(frame["success"], true);
+            ends.push(
+                frame["messages"][1]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+            if ends.len() == 2 {
+                break;
+            }
+        }
+    }
+    drop(stdin);
+    let status = rpc.wait_with_output().unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(sent && released);
+    assert_eq!(ends, ["queue base answer", "follow-up answer"]);
+
     let bodies = worker.join().unwrap();
     assert_eq!(bodies[0]["model"], "fixture");
     let input = bodies[1]["input"].to_string();
@@ -334,6 +413,10 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     let third = bodies[2]["input"].to_string();
     assert!(third.contains("second answer"));
     assert!(third.contains("third request"));
+    let follow_up = bodies[8]["input"].to_string();
+    assert!(follow_up.contains("deliver after base"));
+    assert!(!follow_up.contains("discard steer"));
+    assert!(!follow_up.contains("discard follow-up"));
 }
 
 fn frames(output: Output) -> Vec<Value> {
