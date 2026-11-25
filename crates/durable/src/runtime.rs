@@ -3273,6 +3273,32 @@ pub struct ProgressHistoryFrame {
     pub commit_sequence: u64,
     pub changes: Vec<ProgressHistoryChange>,
 }
+
+fn decode_progress_history_frame(
+    record: serde_json::Value,
+    conversation: Uuid,
+    position: u64,
+    commit_sequence: u64,
+) -> Result<ProgressHistoryFrame, Error> {
+    let event: ProgressHistoryRecord = serde_json::from_value(record)?;
+    if event.version != 1
+        || event.conversation != conversation
+        || event.changes.is_empty()
+        || event.changes.len() > 2
+        || position == 0
+    {
+        return Err(Error::Invalid("invalid progress history record".into()));
+    }
+    Ok(ProgressHistoryFrame {
+        cursor: ProgressHistoryCursor {
+            version: 1,
+            conversation,
+            position,
+        },
+        commit_sequence,
+        changes: event.changes,
+    })
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProgressHistoryPage {
     pub records: Vec<ProgressHistoryFrame>,
@@ -3723,6 +3749,8 @@ pub struct UnifiedHistoryCommit {
     pub snapshots: Vec<crate::observer::Record>,
     /// Full application log at this commit, including inherited fork entries.
     pub applications: Option<Vec<crate::application_entry::ApplicationEntry>>,
+    /// Generation and tool progress committed alongside any other records.
+    pub progress: Vec<ProgressHistoryFrame>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -13429,9 +13457,9 @@ impl Harness {
         })
     }
 
-    /// Read at most `limit` complete commits in the captured range. Each model
-    /// record is an expanded observation snapshot; application records are full
-    /// log snapshots, not individually ordered transcript events.
+    /// Read at most `limit` complete commits in the captured range. Observation
+    /// and application records are snapshots. Progress-only commits also
+    /// advance the cursor in the same order as all other commits.
     pub fn unified_history(
         &self,
         cursor: &UnifiedHistoryCursor,
@@ -13444,9 +13472,13 @@ impl Harness {
         let mut prefix = b"durable/observer/".to_vec();
         prefix.extend_from_slice(cursor.conversation.as_bytes());
         prefix.extend_from_slice(b"/r");
+        let mut progress_prefix = b"durable/progress-history/".to_vec();
+        progress_prefix.extend_from_slice(cursor.conversation.as_bytes());
+        progress_prefix.extend_from_slice(b"/r");
         let app_key = crate::application_entry::key(cursor.conversation);
-        let mut frames = self.owner.store().conversation_commits(
+        let mut frames = self.owner.store().conversation_commits_including_progress(
             &prefix,
+            Some(&progress_prefix),
             &app_key,
             cursor.after,
             cursor.through,
@@ -13458,12 +13490,30 @@ impl Harness {
         for (sequence, records) in frames {
             let mut snapshots = Vec::new();
             let mut applications = None;
+            let mut progress = Vec::new();
             for (key, entry) in records {
                 if key == app_key {
                     if applications.is_some() {
                         return Err(Error::Invalid("duplicate application snapshot".into()));
                     }
                     applications = Some(serde_json::from_slice(&entry.value)?);
+                } else if let Some(suffix) = key.strip_prefix(progress_prefix.as_slice()) {
+                    if entry.value.len() > MAX_PROGRESS_HISTORY_BYTES {
+                        return Err(Error::Invalid(
+                            "progress history event exceeds size limit".into(),
+                        ));
+                    }
+                    let position = u64::from_be_bytes(
+                        suffix
+                            .try_into()
+                            .map_err(|_| Error::Invalid("invalid progress history key".into()))?,
+                    );
+                    progress.push(decode_progress_history_frame(
+                        serde_json::from_slice(&entry.value)?,
+                        cursor.conversation,
+                        position,
+                        sequence,
+                    )?);
                 } else {
                     let suffix = key
                         .strip_prefix(prefix.as_slice())
@@ -13485,6 +13535,7 @@ impl Harness {
                 sequence,
                 snapshots,
                 applications,
+                progress,
             });
         }
         let mut next = cursor.clone();
@@ -14177,23 +14228,12 @@ impl Harness {
                     .store()
                     .commit_for_version(&key, entry.version)?
                     .ok_or_else(|| Error::Invalid("untracked progress history record".into()))?;
-                let event: ProgressHistoryRecord = serde_json::from_value(persisted)?;
-                if event.version != 1
-                    || event.conversation != cursor.conversation
-                    || event.changes.is_empty()
-                    || event.changes.len() > 2
-                {
-                    return Err(Error::Invalid("invalid progress history record".into()));
-                }
-                Ok(ProgressHistoryFrame {
-                    cursor: ProgressHistoryCursor {
-                        version: 1,
-                        conversation: cursor.conversation,
-                        position: record.cursor.0,
-                    },
+                decode_progress_history_frame(
+                    persisted,
+                    cursor.conversation,
+                    record.cursor.0,
                     commit_sequence,
-                    changes: event.changes,
-                })
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ProgressHistoryPage {
