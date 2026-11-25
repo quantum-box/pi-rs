@@ -28,11 +28,18 @@ fn version(text: &str) -> Option<Version> {
 }
 
 fn entries(markdown: &str) -> impl Iterator<Item = (Version, &str)> {
-    // The bundled file starts with its title, followed by version headings.
-    markdown.split("\n## ").skip(1).filter_map(|entry| {
-        let heading = entry.lines().next()?;
-        Some((version(heading.trim_start_matches('['))?, entry.trim_end()))
-    })
+    let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
+    let (markdown, skip_preamble) = match markdown.strip_prefix("## ") {
+        Some(entries) => (entries, 0),
+        None => (markdown, 1),
+    };
+    markdown
+        .split("\n## ")
+        .skip(skip_preamble)
+        .filter_map(|entry| {
+            let heading = entry.lines().next()?;
+            Some((version(heading.trim_start_matches('['))?, entry.trim_end()))
+        })
 }
 
 fn markdown<'a>(entries: impl Iterator<Item = (Version, &'a str)>) -> String {
@@ -123,6 +130,19 @@ mod tests {
             assert_eq!(
                 super::super::config::read_object(&path).unwrap()["version"],
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn changelog_reads_a_version_at_the_start_of_the_file() {
+        for prefix in ["", "\u{feff}"] {
+            let notes =
+                format!("{prefix}## [1.10.0]\nFirst release\n\n## 1.9.0\nEarlier release\n");
+            let rendered = markdown(entries(&notes));
+            assert_eq!(
+                rendered,
+                "## [1.10.0]\nFirst release\n\n## 1.9.0\nEarlier release"
             );
         }
     }

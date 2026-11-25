@@ -2909,7 +2909,8 @@ requests in the running session, including Codemode classifier and image calls,
 without interrupting an active turn. `collapseChangelog` controls how native
 release notes appear when starting with no session messages after an update.
 The first launch records a baseline without displaying notes, and `/changelog`
-always shows the full bundled notes. The native version marker lives in
+always shows the full bundled notes. The parser accepts a version heading on
+the first line, including files with a UTF-8 BOM. The native version marker lives in
 `pi-rs-changelog.json` in the agent directory, separate from upstream Pi's
 version marker. Extension package changelogs remain outside this feature.
 pi-rs preserves the upstream `enableInstallTelemetry` key in shared settings
