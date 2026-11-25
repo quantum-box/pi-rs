@@ -166,8 +166,8 @@ pub fn conversion_count_hint(entry: &Value) -> Option<u64> {
 }
 
 /// Compare an imported conversion with a replay of the same source entry.
-/// Only importer-generated request and operation UUIDs may be renamed; the
-/// mapping is bijective and is shared across the whole replay.
+/// Importer-generated request and operation UUIDs use a bijective mapping
+/// shared across the whole replay. Older imports may omit OpenAI diagnostics.
 fn conversion_equal(
     expected: &Event,
     actual: &Event,
@@ -223,6 +223,26 @@ fn conversion_equal(
             }
             (None, None) => {}
             _ => return Ok(false),
+        }
+    }
+    if kind == "model_finished"
+        && let Some(diagnostics) = expected
+            .pointer_mut("/metadata/diagnostics")
+            .and_then(Value::as_array_mut)
+        && !actual["metadata"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["type"] == "openai_input_transformations")
+            })
+    {
+        diagnostics.retain(|item| item["type"] != "openai_input_transformations");
+        if diagnostics.is_empty() {
+            expected["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove("diagnostics");
         }
     }
     Ok(expected == actual)
@@ -1771,6 +1791,83 @@ pub fn convert(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn openai_reasoning_removal_diagnostics_roundtrip_and_validate_old_pi_conversions() {
+        let removal = json!({
+            "type":"reasoning", "id":"rs_edited", "action":"removed", "reason":"prefix_mismatch"
+        });
+        let mut entry = json!({"type":"message","message":{
+            "role":"assistant", "content":[{"type":"text","text":"answer"}],
+            "api":"openai-responses", "provider":"openai", "model":"gpt-6.2-sol",
+            "diagnostics":[{
+                "type":"openai_input_transformations", "timestamp":42,
+                "details":{"transformations":[
+                    removal,
+                    {"type":"reasoning", "id":"rs_old", "action":"removed", "reason":"turn_boundary"},
+                    {"type":"reasoning", "id":"rs_changed", "action":"changed"},
+                    {"type":"reasoning", "id":"rs_private\ntext", "action":"removed",
+                     "reason":"private reason", "encrypted_content":"private content"}
+                ]}
+            }]
+        }});
+        let current = convert(&entry, &mut Branch::default(), &BTreeMap::new()).unwrap();
+        let serialized = serde_json::to_value(&current[0]).unwrap();
+        assert_eq!(
+            serialized["metadata"]["diagnostics"],
+            json!([{
+                "type":"openai_input_transformations", "timestamp":42,
+                "details":{"transformations":[removal, {"type":"reasoning", "action":"removed"}]}
+            }])
+        );
+        let from_journal: Event = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(serialized, serde_json::to_value(&from_journal).unwrap());
+        assert!(
+            conversion_equal(
+                &current[0],
+                &from_journal,
+                &mut Default::default(),
+                &mut Default::default()
+            )
+            .unwrap()
+        );
+        // A pre-upgrade conversion retained the original source but omitted this typed diagnostic.
+        let mut old = serialized.clone();
+        old["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("diagnostics");
+        let old: Event = serde_json::from_value(old).unwrap();
+        assert!(
+            conversion_equal(
+                &current[0],
+                &old,
+                &mut Default::default(),
+                &mut Default::default()
+            )
+            .unwrap()
+        );
+        let mut changed = serialized;
+        changed["metadata"]["diagnostics"][0]["timestamp"] = json!(43);
+        let changed: Event = serde_json::from_value(changed).unwrap();
+        assert!(
+            !conversion_equal(
+                &current[0],
+                &changed,
+                &mut Default::default(),
+                &mut Default::default()
+            )
+            .unwrap()
+        );
+
+        let many = &mut entry["message"]["diagnostics"][0]["details"]["transformations"];
+        *many = json!(vec![removal; 300]);
+        let bounded = convert(&entry, &mut Branch::default(), &BTreeMap::new()).unwrap();
+        assert!(matches!(&bounded[0], Event::ModelFinished { metadata, .. }
+            if matches!(&metadata.diagnostics[..],
+                [crate::AssistantDiagnostic::OpenAiInputTransformations { details, .. }]
+                    if details.removed_reasoning_items() == 256)));
+    }
 
     #[test]
     fn keeps_the_provider_and_mapped_effort_from_openai_responses() {

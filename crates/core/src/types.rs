@@ -576,6 +576,11 @@ pub enum AssistantDiagnostic {
         timestamp: i64,
         details: AnthropicThreadFallbackDetails,
     },
+    #[serde(rename = "openai_input_transformations")]
+    OpenAiInputTransformations {
+        timestamp: i64,
+        details: OpenAiInputTransformations,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -601,6 +606,12 @@ impl AssistantDiagnostic {
                             )?,
                         })
                     }
+                    "openai_input_transformations" => Some(Self::OpenAiInputTransformations {
+                        timestamp,
+                        details: OpenAiInputTransformations::from_value(
+                            &diagnostic["details"]["transformations"],
+                        )?,
+                    }),
                     "anthropic_thread_fallback" => {
                         let reason = diagnostic["details"]["reason"].as_str()?;
                         if reason.len() > 64
@@ -631,7 +642,7 @@ impl AssistantDiagnostic {
                 .iter()
                 .filter(|transformation| transformation.kind == "thinking_dropped")
                 .count(),
-            Self::AnthropicThreadFallback { .. } => 0,
+            Self::AnthropicThreadFallback { .. } | Self::OpenAiInputTransformations { .. } => 0,
         }
     }
 }
@@ -642,6 +653,20 @@ pub struct AnthropicInputTransformations {
 }
 
 impl AnthropicInputTransformations {
+    pub fn thinking_drop_reasons(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.transformations.iter().filter_map(|transformation| {
+            match (
+                transformation.kind.as_str(),
+                transformation.reason.as_deref(),
+            ) {
+                ("thinking_dropped", Some("prefix_binding_mismatch")) => {
+                    Some("prefix_binding_mismatch")
+                }
+                _ => None,
+            }
+        })
+    }
+
     pub fn from_value(value: &Value) -> Option<Self> {
         let transformations: Vec<_> = value
             .as_array()?
@@ -673,6 +698,118 @@ struct AnthropicInputTransformation {
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+}
+
+/// Bounded metadata about replayed reasoning items withheld by OpenAI Responses.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct OpenAiInputTransformations {
+    transformations: Vec<OpenAiReasoningRemoval>,
+}
+
+impl OpenAiInputTransformations {
+    /// Accepts the Responses API array and the identical array in Pi diagnostics.
+    pub fn from_value(value: &Value) -> Option<Self> {
+        let details = Self::parse(value);
+        (!details.transformations.is_empty()).then_some(details)
+    }
+
+    pub fn removed_reasoning_items(&self) -> usize {
+        self.transformations.len()
+    }
+
+    pub fn reasons(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.transformations.iter().filter_map(|removal| {
+            Some(match removal.reason? {
+                OpenAiRemovalReason::OrganizationMismatch => "organization_mismatch",
+                OpenAiRemovalReason::EndUserMismatch => "end_user_mismatch",
+                OpenAiRemovalReason::ModelMismatch => "model_mismatch",
+                OpenAiRemovalReason::PrefixMismatch => "prefix_mismatch",
+            })
+        })
+    }
+
+    fn parse(value: &Value) -> Self {
+        let transformations = value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                if entry["type"] != "reasoning"
+                    || entry["action"] != "removed"
+                    || entry["reason"] == "turn_boundary"
+                {
+                    return None;
+                }
+                let id = entry["id"].as_str().filter(|id| {
+                    id.len() <= 128
+                        && id.strip_prefix("rs_").is_some_and(|suffix| {
+                            !suffix.is_empty()
+                                && suffix.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+                                })
+                        })
+                });
+                let reason = match entry["reason"].as_str() {
+                    Some("organization_mismatch") => {
+                        Some(OpenAiRemovalReason::OrganizationMismatch)
+                    }
+                    Some("end_user_mismatch") => Some(OpenAiRemovalReason::EndUserMismatch),
+                    Some("model_mismatch") => Some(OpenAiRemovalReason::ModelMismatch),
+                    Some("prefix_mismatch") => Some(OpenAiRemovalReason::PrefixMismatch),
+                    _ => None,
+                };
+                Some(OpenAiReasoningRemoval {
+                    kind: OpenAiTransformationKind::Reasoning,
+                    action: OpenAiTransformationAction::Removed,
+                    id: id.map(str::to_owned),
+                    reason,
+                })
+            })
+            .take(256)
+            .collect();
+        Self { transformations }
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenAiInputTransformations {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Ok(Self::parse(&value["transformations"]))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct OpenAiReasoningRemoval {
+    #[serde(rename = "type")]
+    kind: OpenAiTransformationKind,
+    action: OpenAiTransformationAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<OpenAiRemovalReason>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OpenAiTransformationKind {
+    Reasoning,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OpenAiTransformationAction {
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OpenAiRemovalReason {
+    OrganizationMismatch,
+    EndUserMismatch,
+    ModelMismatch,
+    PrefixMismatch,
 }
 
 /// Canonical provider and model names reported by the host adapter.

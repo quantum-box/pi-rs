@@ -6708,16 +6708,30 @@ context size, and imported sessions retain Pi's `tokensBefore`.
 Loopback and PTY checks covered live compaction and branch summaries,
 imported journals, custom bindings, individual clicks, and billing.
 
-### Anthropic input transformation diagnostics checkpoint
+### Reasoning-drop diagnostics and notices
 
 Anthropic Messages responses retain bounded input transformation diagnostics
 in the assistant's journal metadata and RPC message. A final SSE array
 supersedes the initial array, including when it is empty. Pi JSONL imports
 retain the diagnostic timestamp and transformation type, path, and reason.
-With `notices.reasoningDrops` enabled, both terminal modes warn during a
-live run when the number of dropped thinking blocks increases compared
-to the previous assistant response on the active branch. Reopening
-restores that baseline.
+
+OpenAI Responses, Azure OpenAI Responses, and OpenAI Codex over SSE or
+WebSocket read `response.input_transformations` on successful terminal
+events, matching the [pinned Pi Responses parser](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/ai/src/api/openai-responses-shared.ts).
+The journal and RPC messages retain up to 256 removed reasoning items per
+diagnostic. Routine `turn_boundary` removals are ignored. Each entry can
+retain a bounded reasoning item ID and a reason from Pi's pinned OpenAI SDK
+(7.59.0). An unrecognized reason still counts toward the notice.
+Pi JSONL import and share support the diagnostic. Earlier native imports
+remain readable, and reimporting the original Pi transcript populates the
+typed OpenAI metadata.
+
+With `notices.reasoningDrops` enabled, both terminal modes show live notices
+with the provider, count, and distinct approved reason labels. A notice is
+suppressed when the preceding assistant response on the active branch had
+the same diagnostic type and at least as many drops. A different type or a
+response without drops starts a new comparison. Reopening or changing
+branches restores the baseline from history.
 
 ### Tool-result extension hooks
 
