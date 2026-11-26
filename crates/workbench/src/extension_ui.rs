@@ -1,7 +1,11 @@
 //! Correlated extension interactions between the worker and its frontend.
-use pi_rs::{CancellationToken, ExtensionResult, ExtensionUi, UiRequest, UiResponse};
+use pi_rs::{
+    CancellationToken, ExtensionResult, ExtensionUi, UiRequest, UiResponse, UiThemePalette,
+    UiThemeSelection,
+};
 use pi_rs_workbench::theme_resources::{ExtensionThemeSnapshot, extension_theme_snapshot};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -14,8 +18,25 @@ struct PendingResponse {
 }
 
 enum ThemeClaim {
-    Unclaimed(CancellationToken),
+    Unclaimed(CancellationToken, PreparedTheme),
     Claimed,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum PreparedTheme {
+    System,
+    Named {
+        palette: UiThemePalette,
+        // Keep the native watch path even when the public palette cannot expose it.
+        path: Option<OsString>,
+    },
+    Palette {
+        palette: UiThemePalette,
+    },
+    Unavailable {
+        error: String,
+    },
 }
 
 #[derive(Default)]
@@ -92,27 +113,56 @@ impl Broker {
         }
     }
 
-    pub fn claim_theme(&self, id: Uuid) -> bool {
-        let mut requests = self.pending.lock().expect("extension UI requests");
-        let Some(request) = requests.get_mut(&id) else {
-            return false;
-        };
-        match &request.theme_claim {
-            // Checking the token under the pending-request lock authorizes the mutation.
-            // Cancellation after this point can stop the waiter while the frontend finishes.
-            Some(ThemeClaim::Unclaimed(token)) if !token.is_cancelled() => {
-                request.theme_claim = Some(ThemeClaim::Claimed);
-                true
+    fn prepare_theme(&self, selection: &UiThemeSelection) -> PreparedTheme {
+        let name = match selection {
+            UiThemeSelection::Palette(palette) => {
+                return PreparedTheme::Palette {
+                    palette: palette.clone(),
+                };
             }
-            _ => false,
+            UiThemeSelection::Name(name) if name == "system" => return PreparedTheme::System,
+            UiThemeSelection::Name(name) => name,
+        };
+        let snapshot = self
+            .themes
+            .as_ref()
+            .expect("terminal theme snapshot")
+            .lock()
+            .expect("extension theme snapshot");
+        match snapshot.as_ref() {
+            Ok(snapshot) => match snapshot.palette(name) {
+                Some(palette) => PreparedTheme::Named {
+                    palette: palette.clone(),
+                    path: snapshot.path(name).map(|path| path.as_os_str().to_owned()),
+                },
+                None => PreparedTheme::Unavailable {
+                    error: format!("theme {name:?} was not found"),
+                },
+            },
+            Err(error) => PreparedTheme::Unavailable {
+                error: error.clone(),
+            },
         }
+    }
+
+    pub(super) fn claim_theme(&self, id: Uuid) -> Option<PreparedTheme> {
+        let mut requests = self.pending.lock().expect("extension UI requests");
+        let claim = &mut requests.get_mut(&id)?.theme_claim;
+        // Checking the token under the pending-request lock authorizes the mutation.
+        // Cancellation after this point can stop the waiter while the frontend finishes.
+        if matches!(claim, Some(ThemeClaim::Unclaimed(token, _)) if !token.is_cancelled())
+            && let Some(ThemeClaim::Unclaimed(_, selection)) = claim.replace(ThemeClaim::Claimed)
+        {
+            return Some(selection);
+        }
+        None
     }
 
     pub fn resolve(&self, id: Uuid, value: UiResponse) {
         let mut requests = self.pending.lock().expect("extension UI requests");
         if requests
             .get(&id)
-            .is_some_and(|request| !matches!(request.theme_claim, Some(ThemeClaim::Unclaimed(_))))
+            .is_some_and(|request| !matches!(request.theme_claim, Some(ThemeClaim::Unclaimed(..))))
             && let Some(request) = requests.remove(&id)
         {
             drop(requests);
@@ -147,13 +197,18 @@ impl ExtensionUi for Broker {
         }
         let id = Uuid::new_v4();
         let response = if request.needs_response() {
+            let theme_claim = match &request {
+                UiRequest::SetTheme { theme } => Some(ThemeClaim::Unclaimed(
+                    cancellation.clone(),
+                    self.prepare_theme(theme),
+                )),
+                _ => None,
+            };
             let (sender, receiver) = oneshot::channel();
             let mut requests = self.pending.lock().expect("extension UI requests");
             if requests.len() >= 16 {
                 return Err("too many pending extension UI requests".into());
             }
-            let theme_claim = matches!(request, UiRequest::SetTheme { .. })
-                .then(|| ThemeClaim::Unclaimed(cancellation.clone()));
             requests.insert(
                 id,
                 PendingResponse {
@@ -226,9 +281,9 @@ mod tests {
         let id = pending_id();
         token.cancel();
         // The cancellation token wins even before the waiter is polled again.
-        assert!(!broker.claim_theme(id));
+        assert!(broker.claim_theme(id).is_none());
         assert!(request.await.is_err());
-        assert!(!broker.claim_theme(id));
+        assert!(broker.claim_theme(id).is_none());
 
         let token = CancellationToken::new();
         let mut request = std::pin::pin!(broker.request(selection(), token.clone()));
@@ -236,8 +291,8 @@ mod tests {
         let id = pending_id();
         broker.resolve(id, success.clone());
         assert!(futures_util::poll!(&mut request).is_pending());
-        assert!(broker.claim_theme(id));
-        assert!(!broker.claim_theme(id));
+        assert!(broker.claim_theme(id).is_some());
+        assert!(broker.claim_theme(id).is_none());
         // The authorization stays valid if the caller stops waiting after the claim.
         token.cancel();
         assert!(request.await.is_err());
@@ -247,7 +302,7 @@ mod tests {
         let mut request = std::pin::pin!(broker.request(selection(), CancellationToken::new()));
         assert!(futures_util::poll!(&mut request).is_pending());
         let id = pending_id();
-        assert!(broker.claim_theme(id));
+        assert!(broker.claim_theme(id).is_some());
         broker.resolve(id, success.clone());
         assert_eq!(request.await.unwrap(), success);
     }
@@ -418,7 +473,14 @@ mod tests {
             serde_json::to_value(theme_list).unwrap()[1],
             serde_json::json!({"name":"custom"}),
         );
-        let selected = crate::ui::theme::Theme::load_extension_name("custom", &paths).unwrap();
+        let PreparedTheme::Named {
+            palette,
+            path: watch,
+        } = terminal.prepare_theme(&UiThemeSelection::Name("custom".into()))
+        else {
+            panic!("expected the named theme to retain its native watch path");
+        };
+        let selected = crate::ui::theme::Theme::from_named_palette(palette, watch.map(Into::into));
         assert_eq!(selected.path.as_deref(), Some(path.as_path()));
         assert!(selected.extension_palette().path.is_none());
     }
@@ -441,7 +503,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         let id = *broker.pending.lock().unwrap().keys().next().unwrap();
-        assert!(!broker.claim_theme(id));
+        assert!(broker.claim_theme(id).is_none());
         broker.resolve(id, UiResponse::Confirmed(true));
         assert_eq!(task.await.unwrap().unwrap(), UiResponse::Confirmed(true));
         assert!(broker.pending.lock().unwrap().is_empty());

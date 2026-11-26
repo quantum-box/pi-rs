@@ -330,16 +330,8 @@ impl Theme {
             extension_instance: false,
         })
     }
-    pub fn load_extension_name(name: &str, paths: &[PathBuf]) -> Result<Self> {
-        if name == "system" {
-            return Ok(Self::system());
-        }
-        let snapshot = pi_rs_workbench::theme_resources::extension_theme_snapshot(paths)?;
-        let palette = snapshot
-            .palette(name)
-            .ok_or_else(|| Error::Config(format!("theme {name:?} was not found")))?;
-        let path = snapshot.path(name).map(Path::to_path_buf);
-        Ok(Self::from_palette(palette.clone(), path, false))
+    pub fn from_named_palette(palette: pi_rs::UiThemePalette, path: Option<PathBuf>) -> Self {
+        Self::from_palette(palette, path, false)
     }
 
     pub fn from_extension_palette(palette: pi_rs::UiThemePalette) -> Result<Self> {

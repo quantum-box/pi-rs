@@ -1481,22 +1481,25 @@ impl View {
     }
     fn apply_extension_theme(
         &mut self,
-        selection: pi_rs::UiThemeSelection,
+        selection: super::extension_ui::PreparedTheme,
         args: &mut Cli,
         theme: &mut Theme,
     ) -> pi_rs::UiResponse {
+        use super::extension_ui::PreparedTheme;
         let result = match selection {
-            pi_rs::UiThemeSelection::Name(name) => {
-                match Theme::load_extension_name(&name, &args.theme_paths) {
-                    Ok(next) => save_extension_theme_name(args, name).map(|()| next),
-                    Err(error) => {
-                        // Pi falls back to the system palette on a named load failure.
-                        self.replace_extension_theme(theme, Theme::system());
-                        Err(error)
-                    }
-                }
+            PreparedTheme::System => {
+                save_extension_theme_name(args, "system".into()).map(|()| Theme::system())
             }
-            pi_rs::UiThemeSelection::Palette(palette) => Theme::from_extension_palette(palette),
+            PreparedTheme::Named { palette, path } => {
+                save_extension_theme_name(args, palette.name.clone())
+                    .map(|()| Theme::from_named_palette(palette, path.map(PathBuf::from)))
+            }
+            PreparedTheme::Palette { palette } => Theme::from_extension_palette(palette),
+            PreparedTheme::Unavailable { error } => {
+                // Pi falls back to the system palette on a named load failure.
+                self.replace_extension_theme(theme, Theme::system());
+                Err(Error::Config(error))
+            }
         };
         pi_rs::UiResponse::ThemeChanged(match result {
             Ok(next) => {
@@ -1517,6 +1520,49 @@ impl View {
         *theme = next;
         self.theme_refresh_requested = true;
         self.regular.redraw = true;
+    }
+
+    fn theme_worker_event(
+        &mut self,
+        active: &mut Worker,
+        value: &Value,
+        args: &mut Cli,
+        theme: &mut Theme,
+    ) -> Result<bool> {
+        let id = || serde_json::from_value::<uuid::Uuid>(value["id"].clone());
+        let (id, response) = match value["type"].as_str() {
+            Some("extension_ui_theme_claim") => {
+                let id = id()?;
+                if !active.pending_theme_requests.remove(&id) || value["theme"].is_null() {
+                    return Ok(true);
+                }
+                let selection = serde_json::from_value(value["theme"].clone())?;
+                (id, self.apply_extension_theme(selection, args, theme))
+            }
+            Some("extension_ui_request") => match value["method"].as_str() {
+                Some("setTheme") => {
+                    let id = id()?;
+                    active.pending_theme_requests.insert(id);
+                    active.send(json!({"type":"extension_ui_theme_claim","id":id}))?;
+                    return Ok(true);
+                }
+                Some("getActiveTheme") => (
+                    id()?,
+                    pi_rs::UiResponse::Theme(theme.clone().extension_palette()),
+                ),
+                Some("getTheme") if value["name"] == "system" => (
+                    id()?,
+                    pi_rs::UiResponse::Theme(Theme::system().extension_palette()),
+                ),
+                _ => return Ok(false),
+            },
+            Some("extension_ui_cancelled") => {
+                return Ok(id().is_ok_and(|id| active.pending_theme_requests.remove(&id)));
+            }
+            _ => return Ok(false),
+        };
+        active.send(json!({"type":"extension_ui_response","id":id,"value":response}))?;
+        Ok(true)
     }
 
     fn ui_request(&mut self, value: &Value) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
@@ -1590,16 +1636,9 @@ impl View {
             }
             pi_rs::UiRequest::PasteToEditor { text } => self.paste_editor_text(&text),
             pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
-            pi_rs::UiRequest::GetTheme { name } => {
-                // Fixed themes are served from the worker's scoped resource snapshot.
-                let response = if name == "system" {
-                    pi_rs::UiResponse::Theme(Theme::system().extension_palette())
-                } else {
-                    pi_rs::UiResponse::Cancelled
-                };
-                return Ok(Some((id, response)));
-            }
-            pi_rs::UiRequest::GetActiveTheme | pi_rs::UiRequest::SetTheme { .. } => {
+            pi_rs::UiRequest::GetTheme { .. }
+            | pi_rs::UiRequest::GetActiveTheme
+            | pi_rs::UiRequest::SetTheme { .. } => {
                 return Err(Error::Config(
                     "theme selection requires the terminal controller".into(),
                 ));
@@ -5740,8 +5779,26 @@ fn save_extension_theme_name(args: &mut Cli, name: String) -> Result<()> {
     if args.settings.string("theme") != Some(name.as_str()) {
         args.settings.set_user("theme", json!(name))?;
     }
-    args.use_theme = Some(name);
+    args.extension_theme = Some(name);
     Ok(())
+}
+
+fn notify_extension_selection(
+    worker: &mut Option<Worker>,
+    args: &mut Cli,
+    view: &mut View,
+    theme: &mut Theme,
+    event: &pi_rs::LifecycleEvent,
+) -> Result<bool> {
+    let mut handled = false;
+    if let Some((active, id)) = Worker::begin_selection(worker, args, event)? {
+        active.wait_selection(id, None, |active, value| {
+            let is_theme_event = view.theme_worker_event(active, value, args, theme)?;
+            handled |= is_theme_event;
+            Ok(is_theme_event)
+        })?;
+    }
+    Ok(handled)
 }
 
 fn reset_extension_theme_for_rebind(args: &Cli, view: &mut View, theme: &mut Theme) {
@@ -6295,9 +6352,18 @@ pub(super) async fn run(
         }
         if !is_busy(&worker) {
             for event in std::mem::take(&mut args.selection_events) {
-                if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
-                    view.append(&format!("Extension selection notification: {error}"));
-                    dirty = true;
+                match notify_extension_selection(
+                    &mut worker,
+                    &mut args,
+                    &mut view,
+                    &mut theme,
+                    &event,
+                ) {
+                    Ok(handled) => dirty |= handled,
+                    Err(error) => {
+                        view.append(&format!("Extension selection notification: {error}"));
+                        dirty = true;
+                    }
                 }
             }
         }
@@ -6508,41 +6574,13 @@ pub(super) async fn run(
                     }
                     continue;
                 }
-                if value["type"] == "extension_ui_theme_claim" {
-                    let id = serde_json::from_value::<uuid::Uuid>(value["id"].clone())?;
-                    if let Some(selection) = active.pending_theme_requests.remove(&id)
-                        && value["granted"] == true
-                    {
-                        let response = view.apply_extension_theme(selection, &mut args, &mut theme);
-                        active.send(
-                            json!({"type":"extension_ui_response","id":id,"value":response}),
-                        )?;
-                        dirty = true;
-                    }
+                if view.theme_worker_event(active, &value, &mut args, &mut theme)? {
+                    dirty = true;
                     continue;
                 }
                 if value["type"] == "extension_ui_request" {
-                    if value["method"] == "setTheme" {
-                        let id = serde_json::from_value::<uuid::Uuid>(value["id"].clone())?;
-                        let selection = serde_json::from_value(value["theme"].clone())?;
-                        active.pending_theme_requests.insert(id, selection);
-                        active.send(json!({"type":"extension_ui_theme_claim","id":id}))?;
-                        continue;
-                    }
                     let was_expanded = view.expand_tools;
-                    let response = if value["method"] == "getActiveTheme" {
-                        serde_json::from_value(value["id"].clone())
-                            .map(|id| {
-                                Some((
-                                    id,
-                                    pi_rs::UiResponse::Theme(theme.clone().extension_palette()),
-                                ))
-                            })
-                            .map_err(Error::from)
-                    } else {
-                        view.ui_request(&value)
-                    };
-                    match response {
+                    match view.ui_request(&value) {
                         Ok(Some((id, value))) => active
                             .send(json!({"type":"extension_ui_response","id":id,"value":value}))?,
                         Ok(None) => {}
@@ -6563,9 +6601,6 @@ pub(super) async fn run(
                     continue;
                 }
                 if value["type"] == "extension_ui_cancelled" {
-                    if let Ok(id) = serde_json::from_value::<uuid::Uuid>(value["id"].clone()) {
-                        active.pending_theme_requests.remove(&id);
-                    }
                     cancel_running_extension_editor(&mut external_editor, Some(&value));
                     view.cancel_extension_dialog(&value["id"]);
                     dirty = true;
@@ -8148,6 +8183,7 @@ pub(super) async fn run(
                             ) {
                                 Ok(next) => {
                                     args.settings.set_user("theme", json!(name.trim()))?;
+                                    args.extension_theme = None;
                                     args.use_theme = Some(name.trim().into());
                                     theme = next;
                                     view.theme_refresh_requested = true;
@@ -8221,6 +8257,7 @@ pub(super) async fn run(
                             view.clear_extension_chrome();
                             args.settings =
                                 args.settings.reload_latest(&args.workspace, args.trusted)?;
+                            args.extension_theme = None;
                             for warning in args.settings.diagnostics() {
                                 view.append(warning);
                             }
@@ -8260,7 +8297,12 @@ pub(super) async fn run(
                                 args.trusted,
                             ) {
                                 Ok(next) => theme = next,
-                                Err(error) => view.append(&error.to_string()),
+                                Err(error) => {
+                                    if theme.is_extension_instance() {
+                                        view.replace_extension_theme(&mut theme, Theme::system());
+                                    }
+                                    view.append(&error.to_string());
+                                }
                             }
                             view.theme_refresh_requested = true;
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
@@ -8374,7 +8416,9 @@ pub(super) async fn run(
         }
     }
     for event in std::mem::take(&mut args.selection_events) {
-        if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
+        if let Err(error) =
+            notify_extension_selection(&mut worker, &mut args, &mut view, &mut theme, &event)
+        {
             eprintln!("Extension selection notification: {error}");
         }
     }
@@ -10438,6 +10482,7 @@ fn select(
                     args.trusted,
                 )?;
                 args.settings.set_user(&key, value.clone())?;
+                args.extension_theme = None;
                 args.use_theme = value.as_str().map(str::to_owned);
                 *theme = next;
                 view.theme_refresh_requested = true;
@@ -10486,6 +10531,7 @@ fn select(
             let next =
                 load_resolved_theme(&name, &args.theme_paths, &args.workspace, args.trusted)?;
             args.settings.set_user("theme", json!(name))?;
+            args.extension_theme = None;
             args.use_theme = Some(name);
             *theme = next;
             view.theme_refresh_requested = true;
@@ -16124,7 +16170,7 @@ exit {exit}
         std::fs::write(&valid, theme.to_string()).unwrap();
 
         let paths = [large, valid.clone()];
-        let selected = Theme::load_extension_name("custom", &paths).unwrap();
+        let selected = load_resolved_theme("custom", &paths, directory.path(), false).unwrap();
         let snapshot = pi_rs_workbench::theme_resources::extension_theme_snapshot(&paths).unwrap();
         let listed = snapshot
             .catalog()
@@ -16195,6 +16241,7 @@ exit {exit}
     #[test]
     fn extension_theme_instance_is_local_and_ignores_provenance_path() {
         use super::*;
+        use crate::extension_ui::PreparedTheme;
         use clap::Parser;
         use crossterm::style::Color;
         let mut args = Cli::parse_from(["pi", "--use-theme", "light"]);
@@ -16207,11 +16254,7 @@ exit {exit}
         }))
         .unwrap();
         assert_eq!(
-            view.apply_extension_theme(
-                pi_rs::UiThemeSelection::Palette(palette),
-                &mut args,
-                &mut theme
-            ),
+            view.apply_extension_theme(PreparedTheme::Palette { palette }, &mut args, &mut theme),
             pi_rs::UiResponse::ThemeChanged(pi_rs::UiThemeChange {
                 success: true,
                 error: None,
@@ -16227,7 +16270,7 @@ exit {exit}
         let bad = serde_json::from_value(json!({"name":"invalid","colors":{},"dim":[]})).unwrap();
         assert!(matches!(
             view.apply_extension_theme(
-                pi_rs::UiThemeSelection::Palette(bad),
+                PreparedTheme::Palette { palette: bad },
                 &mut args,
                 &mut theme
             ),
@@ -16270,7 +16313,7 @@ exit {exit}
     }
 
     #[test]
-    fn extension_theme_exact_name_does_not_expand_replaced_directories() {
+    fn resolved_theme_load_does_not_expand_replaced_directories() {
         use super::*;
 
         let dir = tempfile::tempdir().unwrap();
@@ -16281,20 +16324,18 @@ exit {exit}
         file["name"] = json!("unlisted");
         std::fs::write(resolved.join("unlisted.json"), file.to_string()).unwrap();
         let paths = [resolved];
-        assert!(Theme::load_extension_name("unlisted", &paths).is_err());
         assert!(load_resolved_theme("unlisted", &paths, dir.path(), false).is_err());
     }
 
     #[cfg(any(unix, windows))]
     #[test]
     fn extension_system_palette_follows_terminal_reports() {
-        use super::*;
         use crate::ui::theme::{
-            begin_terminal_palette_query, finish_terminal_colors_pending,
+            Theme, begin_terminal_palette_query, finish_terminal_colors_pending,
             mark_terminal_colors_pending, reset_terminal_background, set_terminal_color,
             set_terminal_palette,
         };
-        use pi_rs::{UiResponse, UiThemeColor};
+        use pi_rs::UiThemeColor;
 
         const CHILD: &str = "PI_RS_EXTENSION_SYSTEM_PALETTE_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -16310,16 +16351,9 @@ exit {exit}
             return;
         }
 
-        let mut view = View::default();
-        let id = uuid::Uuid::nil();
-        let request = json!({"id":id,"method":"getTheme","name":"system"});
         reset_terminal_background();
         mark_terminal_colors_pending();
-        let Some((returned_id, UiResponse::Theme(pending))) = view.ui_request(&request).unwrap()
-        else {
-            panic!("missing pending system palette")
-        };
-        assert_eq!(returned_id, id);
+        let pending = Theme::system().extension_palette();
         assert!(pending.path.is_none());
         assert_eq!(pending.colors["accent"], UiThemeColor::Reset);
         assert!(pending.dim.contains("muted"));
@@ -16331,16 +16365,12 @@ exit {exit}
             set_terminal_palette(index, index, 40, 90);
         }
         assert!(finish_terminal_colors_pending());
-        let Some((_, UiResponse::Theme(reported))) = view.ui_request(&request).unwrap() else {
-            panic!("missing reported system palette")
-        };
-        assert_eq!(reported, Theme::system().extension_palette());
+        let reported = Theme::system().extension_palette();
         assert!(matches!(
             reported.colors["accent"],
             UiThemeColor::Rgb { .. }
         ));
         assert!(!reported.dim.contains("muted"));
-        assert!(view.dialogs.is_empty());
     }
 
     #[cfg(any(unix, windows))]

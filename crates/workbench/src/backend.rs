@@ -2647,8 +2647,8 @@ fn read_requests(
                     }
                 }
                 Request::ExtensionUiThemeClaim { id } => {
-                    let granted = ui.claim_theme(id);
-                    output(json!({"type":"extension_ui_theme_claim","id":id,"granted":granted}));
+                    let theme = ui.claim_theme(id);
+                    output(json!({"type":"extension_ui_theme_claim","id":id,"theme":theme}));
                 }
                 Request::ExtensionUiResponse { id, value } => ui.resolve(id, value),
                 request @ (Request::Steer { .. }

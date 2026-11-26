@@ -1216,6 +1216,244 @@ else:
     assert_eq!(settings["theme"], "light");
 }
 
+fn start_theme_extension(root: &std::path::Path, args: &[&str], handler: &str) -> (File, Process) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("settings.json"), br#"{"theme":"dark"}"#).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        br#"{"providers":{"ollama":{"models":[{"id":"fixture","reasoning":true},{"id":"alternate","reasoning":true}]}}}"#,
+    )
+    .unwrap();
+    let extension = root.join("theme-extension.py");
+    let fixture = r#"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request = json.load(sys.stdin)
+    result = {'id':'theme-extension','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'lifecycle_host_calls':True,'session_lifecycle_hook':True,'model_selection_hook':True} if request['type'] == 'describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+    sys.exit(0)
+event = json.loads(sys.stdin.readline())['request']['event']
+def ui(method, **fields):
+    print(json.dumps({'type':'ui','request':{'method':method,**fields}}), flush=True)
+    response = json.loads(sys.stdin.readline())
+    assert 'Ok' in response, response
+    return response['Ok']
+def active():
+    return ui('getActiveTheme')['name']
+def notify(message):
+    assert ui('notify', message=message) is None
+"#;
+    std::fs::write(
+        &extension,
+        format!("{fixture}{handler}\nprint(json.dumps({{'type':'complete','response':{{'Ok':None}}}}), flush=True)\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (mut master, mut slave) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root)
+            .env("PI_RS_HOME", home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--model",
+                "fixture",
+                "--thinking",
+                "off",
+            ])
+            .arg("--extension")
+            .arg(extension)
+            .args(args)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    master.write_all(b"\x1b[?1;2c").unwrap();
+    (master, process)
+}
+
+#[test]
+fn theme_requests_finish_during_selection_callbacks() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _process) = start_theme_extension(
+        root.path(),
+        &[],
+        r#"
+if event['type'] == 'session_start':
+    notify('Theme selection fixture ready')
+elif event['type'] == 'thinking_level_select' and event['level'] == 'low':
+    assert active() == 'dark'
+    assert ui('getTheme', name='system')['name'] == 'system'
+    assert ui('setTheme', theme='light') == {'success':True}
+    assert active() == 'light'
+    notify('Selection callback finished with light theme')
+elif event['type'] == 'model_select':
+    assert active() == 'light'
+    assert ui('setTheme', theme='dark') == {'success':True}
+    assert active() == 'dark'
+    notify('Model callback finished with dark theme')
+"#,
+    );
+    output_until(&mut master, |text| {
+        text.contains("Theme selection fixture ready")
+    });
+    master.write_all(b"/thinking low\r").unwrap();
+    output_until_with_timeout(&mut master, Duration::from_secs(5), |text| {
+        assert!(!text.contains("timed out"), "{text}");
+        text.contains("Selection callback finished with light theme")
+    });
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings["theme"], "light");
+    master.write_all(b"/model ollama/alternate\r").unwrap();
+    output_until_with_timeout(&mut master, Duration::from_secs(5), |text| {
+        assert!(!text.contains("timed out"), "{text}");
+        text.contains("Model callback finished with dark theme")
+    });
+}
+
+#[test]
+fn reload_discards_extension_palette_if_saved_theme_is_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _process) = start_theme_extension(
+        root.path(),
+        &[],
+        r#"
+if event['type'] == 'session_start' and event['reason'] == 'startup':
+    palette = ui('getTheme', name='light')
+    palette['name'] = 'local-palette'
+    assert ui('setTheme', theme=palette) == {'success':True}
+    assert active() == 'local-palette'
+    notify('Local palette installed')
+elif event['type'] == 'session_start' and event['reason'] == 'reload':
+    assert active() == 'system', active()
+    notify('Reload replaced the local palette with system')
+"#,
+    );
+    output_until(&mut master, |text| text.contains("Local palette installed"));
+    std::fs::write(
+        root.path().join("home/settings.json"),
+        br#"{"theme":"missing-theme"}"#,
+    )
+    .unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Reload replaced the local palette with system")
+    });
+}
+
+#[test]
+fn reload_reads_saved_theme_after_named_extension_selection() {
+    for cli_theme in [None, Some("system")] {
+        let root = tempfile::tempdir().unwrap();
+        let args = cli_theme.map(|name| ["--use-theme", name]);
+        let (mut master, _process) = start_theme_extension(
+            root.path(),
+            args.as_ref().map_or(&[], |args| &args[..]),
+            r#"
+if event['type'] == 'session_start' and event['reason'] == 'startup':
+    assert ui('setTheme', theme='light') == {'success':True}
+    assert active() == 'light'
+    notify('Named extension theme installed')
+elif event['type'] == 'session_start' and event['reason'] == 'reload':
+    notify('Theme after reload is ' + active())
+"#,
+        );
+        output_until(&mut master, |text| {
+            text.contains("Named extension theme installed")
+        });
+        std::fs::write(
+            root.path().join("home/settings.json"),
+            br#"{"theme":"dark"}"#,
+        )
+        .unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        let expected = format!("Theme after reload is {}", cli_theme.unwrap_or("dark"));
+        output_until(&mut master, |text| text.contains(&expected));
+    }
+}
+
+#[test]
+fn named_theme_lookup_and_selection_share_snapshot_until_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("theme.json");
+    let mut theme: serde_json::Value =
+        serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+    theme["name"] = serde_json::json!("original");
+    std::fs::write(&path, theme.to_string()).unwrap();
+    let (mut master, _process) = start_theme_extension(
+        root.path(),
+        &["--theme", path.to_str().unwrap()],
+        r#"
+if event['type'] == 'session_start' and event['reason'] == 'startup':
+    assert ui('getTheme', name='original')['name'] == 'original'
+    notify('Original theme snapshot ready')
+elif event['type'] == 'session_info_changed':
+    assert ui('getTheme', name='renamed') is None
+    assert ui('setTheme', theme='renamed')['success'] is False
+    original = ui('getTheme', name='original')
+    assert ui('setTheme', theme='original') == {'success':True}
+    assert ui('getActiveTheme') == original
+    notify('Lookup and selection used the original snapshot')
+elif event['type'] == 'session_start' and event['reason'] == 'reload':
+    assert ui('getTheme', name='original') is None
+    renamed = ui('getTheme', name='renamed')
+    assert ui('setTheme', theme='renamed') == {'success':True}
+    assert ui('getActiveTheme') == renamed
+    notify('Lookup and selection used the refreshed snapshot')
+"#,
+    );
+    output_until(&mut master, |text| {
+        text.contains("Original theme snapshot ready")
+    });
+    theme["name"] = serde_json::json!("renamed");
+    theme["colors"]["accent"] = serde_json::json!("#123456");
+    std::fs::write(&path, theme.to_string()).unwrap();
+    master.write_all(b"/name refresh-test\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Lookup and selection used the original snapshot")
+    });
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Lookup and selection used the refreshed snapshot")
+    });
+}
+
 #[test]
 fn extension_tool_renderer_displays_resumed_result_and_updates_on_expand() {
     use std::os::unix::fs::PermissionsExt;
