@@ -1,8 +1,8 @@
-use pi_rs_core::Notification;
+use pi_rs_core::{AgentEvent, Notification};
 
 // A downstream exhaustive match written against the existing public enum must
 // continue to compile without an extra metadata variant.
-fn exhaustive(event: Notification<'_>) {
+fn exhaustive_notification(event: Notification<'_>) {
     match event {
         Notification::RunStarted { .. }
         | Notification::RunEnded { .. }
@@ -24,5 +24,22 @@ fn exhaustive(event: Notification<'_>) {
 
 #[test]
 fn downstream_exhaustive_notification_match_compiles() {
-    exhaustive(Notification::SummaryRequest);
+    exhaustive_notification(Notification::SummaryRequest);
+}
+
+#[test]
+fn downstream_exhaustive_agent_event_match_compiles() {
+    fn exhaustive(event: AgentEvent<'_>) {
+        match event {
+            AgentEvent::Notification(event) => exhaustive_notification(event),
+            AgentEvent::AutoCompaction { .. }
+            | AgentEvent::TextStart { .. }
+            | AgentEvent::TextDelta { .. }
+            | AgentEvent::TextEnd { .. }
+            | AgentEvent::ReasoningStart { .. }
+            | AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::ReasoningEnd { .. } => {}
+        }
+    }
+    exhaustive(AgentEvent::Notification(Notification::SummaryRequest));
 }

@@ -1512,18 +1512,19 @@ async fn run_worker(
                         return Err(Error::Session("run is no longer pending".into()));
                     }
                     agent_preflight = rpc_agent;
-                    let answer = Box::pin(agent.run_correlated_with_events(
+                    let answer = Box::pin(agent.run_correlated_with_start(
                         session,
                         run_id,
                         None,
                         &mut queued,
                         &cancel,
-                        &mut |event| match event {
-                            pi_rs::AgentEvent::Started if rpc_agent && !started => {
+                        &mut |_| {
+                            if rpc_agent && !started {
                                 started = true;
                                 output(json!({"type":"agent_started"}));
                             }
-                            pi_rs::AgentEvent::Started => {}
+                        },
+                        &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
                                 let mut event = super::agent_stream_event_json(event);
@@ -1658,14 +1659,14 @@ async fn run_worker(
                             session.records().last().expect("appended user input"),
                         ));
                     }
-                    let answer = Box::pin(agent.run_correlated_with_events(
+                    let answer = Box::pin(agent.run_correlated_with_start(
                         session,
                         run_id,
                         content,
                         &mut queued,
                         &cancel,
-                        &mut |event| match event {
-                            pi_rs::AgentEvent::Started if rpc_agent && !started => {
+                        &mut |_| {
+                            if rpc_agent && !started {
                                 if let Some(id) = prompt_response.take() {
                                     control_response(
                                         "prompt",
@@ -1676,7 +1677,8 @@ async fn run_worker(
                                 started = true;
                                 output(json!({"type":"agent_started"}));
                             }
-                            pi_rs::AgentEvent::Started => {}
+                        },
+                        &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
                                 let mut event = super::agent_stream_event_json(event);
@@ -1719,7 +1721,6 @@ async fn run_worker(
                             &mut queued,
                             &cancel,
                             &mut |event| match event {
-                                pi_rs::AgentEvent::Started => {}
                                 pi_rs::AgentEvent::Notification(event) => observer(event),
                                 event if args.trace => {
                                     let mut event = super::agent_stream_event_json(event);

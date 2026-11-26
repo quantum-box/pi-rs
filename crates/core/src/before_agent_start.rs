@@ -463,6 +463,8 @@ mod tests {
         ProviderIo,
         ProviderJson,
         SettlementIo,
+        AllowanceOverrun,
+        BudgetUnavailable,
         Veto,
     }
 
@@ -471,6 +473,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Model for CompactionTrace {
+        fn minimum_output_tokens(&self) -> u32 {
+            if matches!(self.1, SummaryOutcome::BudgetUnavailable) {
+                17
+            } else {
+                1
+            }
+        }
+
         async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
             let summary = matches!(request.messages.last(), Some(Message::User { content })
                 if content.starts_with("Summarize only this older conversation."));
@@ -521,7 +531,13 @@ mod tests {
                     calls: vec![],
                     usage: Some(crate::Usage {
                         input_tokens: 24,
-                        output_tokens: 3,
+                        output_tokens: if summary
+                            && matches!(self.1, SummaryOutcome::AllowanceOverrun)
+                        {
+                            u64::from(request.max_output_tokens) + 1
+                        } else {
+                            3
+                        },
                     }),
                 }),
             ])))
@@ -638,15 +654,19 @@ mod tests {
     fn compaction_builder(trace: &Arc<CompactionTrace>) -> SessionBuilder {
         SessionBuilder::new(trace.clone(), "fixture")
             .system_prompt("base prompt")
-            .limits(crate::Limits {
-                context_window: Some(4096),
-                output_tokens_per_request: 32,
-                compaction_tokens: Some(crate::CompactionTokens {
-                    reserve_tokens: Some(256),
-                    keep_recent_tokens: Some(1),
-                }),
-                ..Default::default()
-            })
+            .limits(compaction_limits())
+    }
+
+    fn compaction_limits() -> crate::Limits {
+        crate::Limits {
+            context_window: Some(4096),
+            output_tokens_per_request: 32,
+            compaction_tokens: Some(crate::CompactionTokens {
+                reserve_tokens: Some(256),
+                keep_recent_tokens: Some(1),
+            }),
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
@@ -831,6 +851,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn before_agent_start_distinguishes_unavailable_budget_from_dispatched_overrun() {
+        for summary in [
+            SummaryOutcome::BudgetUnavailable,
+            SummaryOutcome::AllowanceOverrun,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+            let trace = Arc::new(CompactionTrace(Mutex::default(), summary));
+            let mut sdk = compaction_builder(&trace)
+                .limits(crate::Limits {
+                    output_tokens_per_run: 32,
+                    ..compaction_limits()
+                })
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+            let result = sdk.prompt("new question").await;
+            let seen = trace.0.lock().unwrap();
+            if matches!(summary, SummaryOutcome::AllowanceOverrun) {
+                assert!(matches!(result, Err(Error::Budget)), "{result:?}");
+                assert_eq!(*seen, ["before compaction", "summary request"]);
+                let journal = sdk.journal().unwrap();
+                assert!(journal.records().iter().any(|record| matches!(
+                    record.event, Event::ModelFinished { usage: crate::UsageReport::Measured { usage }, .. }
+                        if usage.output_tokens == 17
+                )));
+            } else {
+                assert_eq!(result.unwrap(), "answer");
+                assert_eq!(
+                    *seen,
+                    ["before compaction", "before_agent_start", "turn request"]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_surfaces_journal_failure_from_failed_compaction_hook() {
+        struct FailingStore(crate::MemoryStore);
+        impl crate::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                if matches!(record.event, Event::CustomMessageQueued { .. }) {
+                    return Err(std::io::Error::other("compaction callback journal failure").into());
+                }
+                self.0.append(record)
+            }
+        }
+
+        struct FailureHook;
+        #[async_trait::async_trait]
+        impl Extension for FailureHook {
+            fn id(&self) -> &str {
+                "compaction failure fixture"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&ExtensionState>,
+                host: Arc<dyn crate::ToolHost>,
+            ) -> ExtensionResult<()> {
+                if matches!(event, crate::LifecycleEvent::SessionCompactFailed { .. }) {
+                    host.send_message(message("failed summary"), CustomMessageDelivery::NextTurn)
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+
+        let trace = Arc::new(CompactionTrace(
+            Mutex::default(),
+            SummaryOutcome::ProviderIo,
+        ));
+        let mut registry = Registry::default();
+        registry.register(trace.clone()).unwrap();
+        registry.register(Arc::new(FailureHook)).unwrap();
+        let mut session = Session::with_store(FailingStore(crate::MemoryStore::default())).unwrap();
+        seed_compaction_history(&mut session, false);
+        let agent = Agent {
+            model: trace.as_ref(),
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "base prompt",
+            limits: compaction_limits(),
+        };
+        let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let result = agent
+            .run(
+                &mut session,
+                Some("new question".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::Io(error)) if error.to_string() == "compaction callback journal failure")
+        );
+        assert_eq!(
+            *trace.0.lock().unwrap(),
+            [
+                "before compaction",
+                "summary request",
+                "settle unconfirmed summary"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn before_agent_start_full_cancellation_stops_preflight() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
@@ -844,7 +983,6 @@ mod tests {
         let control = sdk.controls();
         let result = sdk
             .run_with_events(Some("new question".into()), Uuid::new_v4(), &mut |event| {
-                assert!(!matches!(event, crate::AgentEvent::Started));
                 if matches!(
                     event,
                     crate::AgentEvent::Notification(Notification::SummaryRequest)

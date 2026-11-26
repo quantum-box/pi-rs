@@ -286,8 +286,6 @@ pub type Observer<'a> = dyn for<'event> FnMut(Notification<'event>) + Send + 'a;
 /// Reasoning item events are transient and are not journal records.
 pub enum AgentEvent<'a> {
     Notification(Notification<'a>),
-    /// Run preparation has completed and the agent can begin its first turn.
-    Started,
     AutoCompaction {
         reason: crate::CompactionTrigger,
         update: &'a AutoCompactionUpdate,
@@ -322,17 +320,13 @@ pub type AgentObserver<'a> = dyn for<'event> FnMut(AgentEvent<'event>) + Send + 
 // internal adapter preserves all non-reasoning notifications and their order.
 fn dispatch_agent_event(event: Notification<'_>, observer: &mut AgentObserver<'_>) {
     if matches!(event, Notification::SummaryRequest)
-        && let Some(boundary) = AGENT_BOUNDARY_EVENT.with(|stack| stack.borrow().last().cloned())
+        && let Some((reason, update)) =
+            AUTO_COMPACTION_EVENT.with(|stack| stack.borrow().last().cloned())
     {
-        match boundary {
-            AgentBoundaryEvent::Started => observer(AgentEvent::Started),
-            AgentBoundaryEvent::AutoCompaction(reason, update) => {
-                observer(AgentEvent::AutoCompaction {
-                    reason,
-                    update: &update,
-                });
-            }
-        }
+        observer(AgentEvent::AutoCompaction {
+            reason,
+            update: &update,
+        });
         return;
     }
     if let Notification::Text(delta) = &event {
@@ -380,7 +374,7 @@ fn dispatch_agent_event(event: Notification<'_>, observer: &mut AgentObserver<'_
 
 fn dispatch_legacy_event(event: Notification<'_>, observer: &mut Observer<'_>) {
     if matches!(event, Notification::SummaryRequest)
-        && AGENT_BOUNDARY_EVENT.with(|stack| !stack.borrow().is_empty())
+        && AUTO_COMPACTION_EVENT.with(|stack| !stack.borrow().is_empty())
     {
         return;
     }
@@ -657,9 +651,43 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut AgentObserver<'_>,
     ) -> Result<String> {
+        self.run_correlated_with_start(
+            session,
+            run_id,
+            input,
+            followups,
+            cancel,
+            &mut |_| {},
+            observer,
+        )
+        .await
+    }
+
+    /// Run with ordered events and notify the host when a run is ready to drive
+    /// its first turn, after preparation and the agent-start lifecycle hooks.
+    /// A run cancelled during preparation does not invoke the start callback.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_correlated_with_start<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        input: Option<String>,
+        followups: &mut mpsc::Receiver<T>,
+        cancel: &CancellationToken,
+        on_started: &mut (dyn FnMut(Uuid) + Send),
+        observer: &mut AgentObserver<'_>,
+    ) -> Result<String> {
         let mut adapter = |event: Notification<'_>| dispatch_agent_event(event, observer);
-        self.run_correlated_inner(session, run_id, input, followups, cancel, &mut adapter)
-            .await
+        self.run_correlated_inner(
+            session,
+            run_id,
+            input,
+            followups,
+            cancel,
+            on_started,
+            &mut adapter,
+        )
+        .await
     }
 
     pub async fn run_correlated<T: Into<AgentInput> + Send>(
@@ -672,10 +700,19 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         let mut adapter = |event: Notification<'_>| dispatch_legacy_event(event, observer);
-        self.run_correlated_inner(session, run_id, input, followups, cancel, &mut adapter)
-            .await
+        self.run_correlated_inner(
+            session,
+            run_id,
+            input,
+            followups,
+            cancel,
+            &mut |_| {},
+            &mut adapter,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_correlated_inner<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
@@ -683,6 +720,7 @@ impl Agent<'_> {
         input: Option<String>,
         followups: &mut mpsc::Receiver<T>,
         cancel: &CancellationToken,
+        on_started: &mut (dyn FnMut(Uuid) + Send),
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         if input.as_ref().is_some_and(|text| text.trim().is_empty()) {
@@ -834,7 +872,9 @@ impl Agent<'_> {
                 .unwrap_or_else(|| self.limits.clone()),
         };
         let mut result = branch_agent
-            .run_turns(session, run_id, input, followups, cancel, observer)
+            .run_turns(
+                session, run_id, input, followups, cancel, on_started, observer,
+            )
             .await;
         session.set_run_id(None);
         if let Some((return_to, _)) = handoff
@@ -941,7 +981,9 @@ impl Agent<'_> {
                     .unwrap_or_else(|| self.limits.clone()),
             };
             let mut trigger_result = branch_agent
-                .run_turns(session, trigger_id, None, followups, cancel, observer)
+                .run_turns(
+                    session, trigger_id, None, followups, cancel, on_started, observer,
+                )
                 .await;
             session.set_run_id(None);
             if let Some(return_to) = handoff
@@ -962,6 +1004,7 @@ impl Agent<'_> {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_turns<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
@@ -969,6 +1012,7 @@ impl Agent<'_> {
         input: Option<String>,
         followups: &mut mpsc::Receiver<T>,
         cancel: &CancellationToken,
+        on_started: &mut (dyn FnMut(Uuid) + Send),
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         use crate::extension_boundary::{
@@ -1084,13 +1128,20 @@ impl Agent<'_> {
                 prior_result
             };
             prior_result = Ok(());
+            // Active lifecycle delivery can return successfully when its
+            // cancellation branch drops a pending callback.
+            let start = if start.is_ok() && cancel.is_cancelled() {
+                Err(Error::Cancelled)
+            } else {
+                start
+            };
 
             let started = resuming_failed_activity || start.is_ok();
             let mut retry_attempt = 0;
             let mut result = match start {
                 Ok(()) => {
                     if !in_process_continuation {
-                        notify_agent_boundary(AgentBoundaryEvent::Started, observer);
+                        on_started(run_id);
                     }
                     let mut retry_observer = |event: Notification<'_>| {
                         match &event {
@@ -1211,15 +1262,21 @@ impl Agent<'_> {
                     continue;
                 }
             }
-            self.finish_run(
-                session,
-                run_id,
-                &result,
-                lifecycle && !preflight_failed,
-                ended,
-                observer,
-            )
-            .await?;
+            let finish = self
+                .finish_run(
+                    session,
+                    run_id,
+                    &result,
+                    lifecycle && !preflight_failed,
+                    ended,
+                    observer,
+                )
+                .await;
+            // A poisoned journal can also reject the final run marker. Keep
+            // the original preparation error that caused the failure.
+            if !preflight_failed {
+                finish?;
+            }
             return result;
         }
     }
@@ -5766,6 +5823,25 @@ impl Agent<'_> {
         if matches!(result, Ok(None)) {
             return Ok(None);
         }
+        // Only optional summary failures may fall back to the prompt. A
+        // checkpoint, settlement, or allowance failure must stop the run.
+        let optional_failure = prestart
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(|error| match progress.failure {
+                    SummaryFailure::Optional => true,
+                    SummaryFailure::Fatal => false,
+                    SummaryFailure::ByError => matches!(
+                        error,
+                        Error::Model(_)
+                            | Error::RetryableModel(_)
+                            | Error::Extension { .. }
+                            | Error::Config(_)
+                            | Error::AuthorizationRequired { .. }
+                            | Error::Cancelled
+                    ),
+                });
         let event = match &result {
             Ok(Some((_, from_extension))) => crate::LifecycleEvent::SessionCompact {
                 compaction_entry: Box::new(
@@ -5811,7 +5887,7 @@ impl Agent<'_> {
         )
         .await;
         if let Some(mut event) = reported_event {
-            if result.is_ok()
+            if (result.is_ok() || optional_failure)
                 && let Err(error) = &notification
             {
                 event = compaction_failed_event(reason, error, cancellation);
@@ -5820,7 +5896,7 @@ impl Agent<'_> {
             notify_auto_compaction(reason, update, observer);
         }
         if let Err(notification_error) = notification {
-            if result.is_ok() {
+            if result.is_ok() || optional_failure {
                 return Err(notification_error);
             }
             let message = notification_error.to_string();
@@ -5830,22 +5906,7 @@ impl Agent<'_> {
                 message: &message,
             });
         }
-        // A summary is optional before the prompt. Keep journal and settlement
-        // failures visible so they cannot be mistaken for a completed preflight.
-        if prestart
-            && !progress.request_checkpoint_failed
-            && (progress.model_failed
-                || matches!(
-                    result,
-                    Err(Error::Model(_)
-                        | Error::RetryableModel(_)
-                        | Error::Extension { .. }
-                        | Error::Config(_)
-                        | Error::AuthorizationRequired { .. }
-                        | Error::Cancelled
-                        | Error::Budget)
-                ))
-        {
+        if optional_failure {
             return Ok(None);
         }
         result.map(|value| value.map(|(spent, _)| (spent, progress.supplied_without_model)))
@@ -5879,6 +5940,7 @@ impl Agent<'_> {
         let model_summary_available =
             limit >= minimum_output_tokens && self.limits.model_requests > 0;
         if !has_pre_summary_hook && !model_summary_available {
+            progress.failure = SummaryFailure::Optional;
             return Err(Error::Budget);
         }
         let before = retention.boundary;
@@ -5994,6 +6056,7 @@ impl Agent<'_> {
             if skip_without_model {
                 return Ok(None);
             }
+            progress.failure = SummaryFailure::Optional;
             return Err(Error::Budget);
         }
         abandon_turn_request_for_summary(session, observer)?;
@@ -6010,6 +6073,7 @@ impl Agent<'_> {
             .await?;
         request.max_output_tokens = request.max_output_tokens.min(limit);
         if request.max_output_tokens < minimum_output_tokens {
+            progress.failure = SummaryFailure::Optional;
             return Err(Error::Budget);
         }
         request.tools.clear();
@@ -6031,7 +6095,7 @@ impl Agent<'_> {
             result = platform_time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
                 result.map_err(|_| Error::Config("model preparation timed out".into()))?,
         }
-        .inspect_err(|_| progress.model_failed = true)?;
+        .inspect_err(|_| progress.failure = SummaryFailure::Optional)?;
         let active = Agent {
             model: prepared.as_deref().unwrap_or(self.model),
             limits: self.limits.clone(),
@@ -6077,9 +6141,21 @@ impl Agent<'_> {
                 inputs.as_deref_mut(),
             )
             .await
-            .inspect_err(|_| progress.request_checkpoint_failed = true)?
+            .inspect_err(|_| progress.failure = SummaryFailure::Fatal)?
             .outcome
-            .inspect_err(|_| progress.model_failed = true)?;
+            .inspect_err(|error| {
+                progress.failure = if matches!(error, Error::Budget) {
+                    SummaryFailure::Fatal
+                } else {
+                    SummaryFailure::Optional
+                };
+            })?;
+        let output = reply
+            .usage
+            .map_or(u64::from(allowance), |usage| usage.output_tokens);
+        if output > u64::from(allowance) {
+            return Err(Error::Budget);
+        }
         if reply.truncated {
             return Err(Error::Model(
                 "summary reached the output token limit".into(),
@@ -6089,12 +6165,6 @@ impl Agent<'_> {
             return Err(Error::Model(
                 "summary response attempted a tool call".into(),
             ));
-        }
-        let output = reply
-            .usage
-            .map_or(u64::from(allowance), |usage| usage.output_tokens);
-        if output > u64::from(allowance) {
-            return Err(Error::Budget);
         }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
@@ -7000,8 +7070,15 @@ struct SummaryScope<'a> {
 struct SummaryProgress {
     reported: bool,
     supplied_without_model: bool,
-    request_checkpoint_failed: bool,
-    model_failed: bool,
+    failure: SummaryFailure,
+}
+
+#[derive(Default)]
+enum SummaryFailure {
+    #[default]
+    ByError,
+    Optional,
+    Fatal,
 }
 
 impl SummaryProgress {
@@ -7708,42 +7785,30 @@ fn branch_excerpt(entry: Message) -> String {
     }
 }
 
-#[derive(Clone)]
-enum AgentBoundaryEvent {
-    Started,
-    AutoCompaction(crate::CompactionTrigger, Arc<AutoCompactionUpdate>),
-}
-
+// The existing summary notification carries the enriched update only through
+// the synchronous adapter. Legacy observers still receive one SummaryRequest
+// at provider dispatch, with no additional notification variants.
 fn notify_auto_compaction(
     reason: crate::CompactionTrigger,
     update: AutoCompactionUpdate,
     observer: &mut Observer<'_>,
 ) {
-    notify_agent_boundary(
-        AgentBoundaryEvent::AutoCompaction(reason, Arc::new(update)),
-        observer,
-    );
-}
-
-// Boundary events pass through the synchronous adapter while legacy observers
-// receive SummaryRequest only at provider dispatch.
-fn notify_agent_boundary(event: AgentBoundaryEvent, observer: &mut Observer<'_>) {
     struct Pop;
     impl Drop for Pop {
         fn drop(&mut self) {
-            AGENT_BOUNDARY_EVENT.with(|stack| {
+            AUTO_COMPACTION_EVENT.with(|stack| {
                 stack.borrow_mut().pop();
             });
         }
     }
-    AGENT_BOUNDARY_EVENT.with(|stack| stack.borrow_mut().push(event));
+    AUTO_COMPACTION_EVENT.with(|stack| stack.borrow_mut().push((reason, Arc::new(update))));
     let _guard = Pop;
     observer(Notification::SummaryRequest);
 }
 
 thread_local! {
     static TOOL_ATTEMPT_OPERATION_ID: std::cell::Cell<Option<Uuid>> = const { std::cell::Cell::new(None) };
-    static AGENT_BOUNDARY_EVENT: std::cell::RefCell<Vec<AgentBoundaryEvent>> = const { std::cell::RefCell::new(Vec::new()) };
+    static AUTO_COMPACTION_EVENT: std::cell::RefCell<Vec<(crate::CompactionTrigger, Arc<AutoCompactionUpdate>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TOOL_EVENT_METADATA: std::cell::RefCell<Vec<(Uuid, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static RECORD_EVENT_METADATA: std::cell::RefCell<Vec<(u64, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TEXT_EVENT_METADATA: std::cell::RefCell<Vec<TextEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };

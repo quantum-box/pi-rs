@@ -5615,10 +5615,13 @@ invoking the hook for a new user or custom trigger. This follows the order in
 The new starting message and the hook's prompt override are excluded from the
 summary. The saved prior-history token estimate also excludes the incoming
 image prompt when the SDK has already journaled it. A prior assistant older than the latest
-compaction cannot trigger this check. Provider failures and extension vetoes
-leave preflight runnable. Journal and usage settlement failures stop it.
-Cancelling the run during preflight stops it before `agent_start`. RPC
-reports a started prompt after compaction and the pre-start hook complete,
+compaction cannot trigger this check. Provider failures, extension vetoes,
+and a lack of optional summary budget leave preflight runnable. A dispatched
+summary that exceeds its allowance stops the run. Journal failures, including
+writes requested by the failed-compaction hook, and usage settlement failures
+also stop it. Cancelling preflight or the native agent-start hook stops the run
+before RPC emits `agent_start`. RPC reports a started prompt after compaction
+and the startup hooks complete,
 following [Pi's pinned run startup](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L1958-L1984).
 If a run is
 interrupted during pre-start compaction, recovery settles the original summary
