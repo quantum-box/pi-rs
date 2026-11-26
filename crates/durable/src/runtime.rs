@@ -4057,6 +4057,13 @@ struct DisplayForkOrigin {
     observation: u64,
 }
 
+struct DisplayEntryCut {
+    source: Uuid,
+    observation: crate::observer::Cursor,
+    visible_writes: usize,
+    checks: Vec<Check>,
+}
+
 fn display_fork_origin_key(child: Uuid) -> Vec<u8> {
     format!("runtime/display-fork-origin/{child}").into_bytes()
 }
@@ -10305,8 +10312,35 @@ impl Harness {
     /// Fork a display write whose placement and visible ancestry can be
     /// authenticated. Ambiguous and untracked cuts are rejected.
     pub fn fork_by_display_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
-        let _bounded_reads = crate::transcript::BoundedForkReads::enter();
-        let _bounded_runtime_reads = durable_store::BoundedReadScope::enter(
+        let _reads = Self::display_entry_read_scope();
+        let membership = self.fork_membership_proof(id)?;
+        let _proof_scope = ResetProofScope::enter();
+        let cut = self.prepare_display_entry_cut(id, entry_id)?;
+        #[cfg(test)]
+        DISPLAY_FORK_BEFORE_SAVE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        self.fork_at_selected(
+            cut.source,
+            cut.observation,
+            ForkBoundary::Display { entry_id },
+            None,
+            None,
+            None,
+            Some(cut.visible_writes),
+            &cut.checks,
+            &membership,
+        )
+    }
+
+    fn display_entry_read_scope() -> (
+        crate::transcript::BoundedForkReads,
+        durable_store::BoundedReadScope,
+    ) {
+        let transcript = crate::transcript::BoundedForkReads::enter();
+        let runtime = durable_store::BoundedReadScope::enter(
             &[
                 b"runtime/conversation/",
                 b"runtime/fork/",
@@ -10319,27 +10353,25 @@ impl Harness {
             ],
             crate::transcript::DISPLAY_FORK_RECORD_LIMIT,
         );
-        let membership = self.fork_membership_proof(id)?;
-        let _proof_scope = ResetProofScope::enter();
-        self.fork_by_display_entry_with_origin(
-            id,
-            entry_id,
-            None,
-            Vec::new(),
-            &mut HashSet::new(),
-            &membership,
-        )
+        (transcript, runtime)
     }
 
-    fn fork_by_display_entry_with_origin(
-        &mut self,
+    fn prepare_display_entry_cut(
+        &self,
+        id: Uuid,
+        entry_id: Uuid,
+    ) -> Result<DisplayEntryCut, Error> {
+        self.display_entry_cut_with_origin(id, entry_id, None, Vec::new(), &mut HashSet::new())
+    }
+
+    fn display_entry_cut_with_origin(
+        &self,
         id: Uuid,
         entry_id: Uuid,
         through: Option<crate::observer::Cursor>,
         mut checks: Vec<Check>,
         visited: &mut HashSet<Uuid>,
-        membership: &crate::session_membership::ForkMembershipProof,
-    ) -> Result<Uuid, Error> {
+    ) -> Result<DisplayEntryCut, Error> {
         if visited.len() >= 32 || !visited.insert(id) {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
@@ -10496,13 +10528,12 @@ impl Harness {
                             expected: Expected::Version(source.version),
                         },
                     ]);
-                    return self.fork_by_display_entry_with_origin(
+                    return self.display_entry_cut_with_origin(
                         origin.source,
                         entry_id,
                         Some(crate::observer::Cursor(origin.observation)),
                         checks,
                         visited,
-                        membership,
                     );
                 }
                 snapshot
@@ -10544,23 +10575,12 @@ impl Harness {
                         if before.map(|entry| entry.value) != after.map(|entry| entry.value) {
                             return Err(crate::fork::Error::InvalidSnapshot.into());
                         }
-                        #[cfg(test)]
-                        DISPLAY_FORK_BEFORE_SAVE.with(|hook| {
-                            if let Some(hook) = hook.borrow_mut().take() {
-                                hook();
-                            }
+                        return Ok(DisplayEntryCut {
+                            source: id,
+                            observation: record.cursor,
+                            visible_writes: index + 1,
+                            checks,
                         });
-                        return self.fork_at_selected(
-                            id,
-                            record.cursor,
-                            ForkBoundary::Display { entry_id },
-                            None,
-                            None,
-                            None,
-                            Some(index + 1),
-                            &checks,
-                            membership,
-                        );
                     }
                 }
                 prior = Some((snapshot, observed, writes, revision));
@@ -11343,7 +11363,7 @@ impl Harness {
                 .find(|node| node.entry.id() == target)
                 .ok_or(InvalidSnapshot)?
                 .entry;
-            self.load_checkout_context(&mut state, entry)?
+            self.load_checkout_context(&mut state, version, entry)?
         } else {
             state.messages.clear();
             state.content_blocks.clear();
@@ -11381,11 +11401,14 @@ impl Harness {
     fn load_checkout_context(
         &self,
         state: &mut Conversation,
+        version: u64,
         entry: &SessionEntry,
     ) -> Result<Vec<Check>, Error> {
         use crate::fork::Error::InvalidSnapshot;
 
-        let (origin, observation, position) = match entry {
+        let _reads =
+            matches!(entry, SessionEntry::Custom { .. }).then(Self::display_entry_read_scope);
+        let (origin, observation, position, placement_checks) = match entry {
             SessionEntry::Message(message) => {
                 let ViewCursor { cursor, remaining } =
                     self.original_occurrence_position(&message.history, &message.message)?;
@@ -11394,6 +11417,7 @@ impl Harness {
                     message.history.origin,
                     crate::observer::Cursor(message.history.commit),
                     Some((cursor, remaining.filter(|_| interior))),
+                    Vec::new(),
                 )
             }
             SessionEntry::SessionInfo {
@@ -11405,11 +11429,17 @@ impl Harness {
                 origin,
                 observation,
                 ..
-            } => (*origin, *observation, None),
-            _ => {
-                return Err(Error::Invalid(
-                    "checkout requires a complete session entry boundary".into(),
-                ));
+            } => (*origin, *observation, None, Vec::new()),
+            SessionEntry::Custom { entry, .. } => {
+                let mut cut = self.prepare_display_entry_cut(state.id, entry.id)?;
+                // The checkout saves this same root under its original CAS.
+                // Keep a conflicting version so it cannot be silently removed.
+                let checkout_root = Check {
+                    key: Self::key(state.id),
+                    expected: Expected::Version(version),
+                };
+                cut.checks.retain(|check| check != &checkout_root);
+                (cut.source, cut.observation, None, cut.checks)
             }
         };
         let anchor = self.fork_anchor_checks(origin, observation.0)?;
@@ -11472,6 +11502,9 @@ impl Harness {
             None
         };
         checks.extend(anchor);
+        if !placement_checks.is_empty() {
+            merge_reset_proof_checks(&mut checks, placement_checks);
+        }
         crate::fork::validate_context(&messages)?;
         state.messages = messages;
         state.content_blocks = blocks;
