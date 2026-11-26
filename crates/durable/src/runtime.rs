@@ -104,6 +104,8 @@ pub enum Error {
     #[error("reentrant conversation abort")]
     ReentrantAbort,
     #[error("invalid operation: {0}")]
+    CheckpointableSelectionChanged(String),
+    #[error("invalid operation: {0}")]
     Invalid(String),
 }
 
@@ -3797,6 +3799,11 @@ pub struct UnifiedHistoryCommit {
     pub applications: Option<Vec<crate::application_entry::ApplicationEntry>>,
     /// Generation and tool progress committed alongside any other records.
     pub progress: Vec<ProgressHistoryFrame>,
+    /// Document changes in the conversation's explicit address scope.
+    pub documents: Vec<(
+        crate::document::Address,
+        crate::document::DocumentOperationFrame,
+    )>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5735,7 +5742,7 @@ impl Harness {
             {
                 Ok(())
             }
-            _ => Err(Error::Invalid(
+            _ => Err(Error::CheckpointableSelectionChanged(
                 "checkpointable extension selection missing or changed".into(),
             )),
         }
@@ -14066,8 +14073,8 @@ impl Harness {
     }
 
     /// Read at most `limit` complete commits in the captured range. Observation
-    /// and application records are snapshots. Progress-only commits also
-    /// advance the cursor in the same order as all other commits.
+    /// and application records are snapshots. Document operation and progress
+    /// frames advance the same cursor, including commits without a snapshot.
     pub fn unified_history(
         &self,
         cursor: &UnifiedHistoryCursor,
@@ -14082,7 +14089,7 @@ impl Harness {
         let progress_prefix =
             crate::observer::Observer::progress_history(store, cursor.conversation).record_prefix();
         let app_key = crate::application_entry::key(cursor.conversation);
-        let mut frames = self.owner.store().conversation_commits_including_progress(
+        let records = store.conversation_commits_including_progress(
             &prefix,
             Some(&progress_prefix),
             &app_key,
@@ -14090,10 +14097,26 @@ impl Harness {
             cursor.through,
             limit.get() + 1,
         )?;
+        let scope = crate::document::Address::conversation_scope_prefix(cursor.conversation);
+        let document_commits = store.scoped_document_commit_positions(
+            &scope,
+            cursor.after,
+            cursor.through,
+            limit.get() + 1,
+        )?;
+        // Both sources read the same immutable range. If a sequence is in the
+        // first N merged frames, it must be in the first N of each component
+        // where it occurs, so the merged page cannot split a commit.
+        let mut frames: std::collections::BTreeMap<_, _> = records
+            .into_iter()
+            .map(|(sequence, records)| (sequence, (records, None)))
+            .collect();
+        for (sequence, revision) in document_commits {
+            frames.entry(sequence).or_default().1 = Some(revision);
+        }
         let has_more = frames.len() > limit.get();
-        frames.truncate(limit.get());
-        let mut commits = Vec::with_capacity(frames.len());
-        for (sequence, records) in frames {
+        let mut commits = Vec::with_capacity(frames.len().min(limit.get()));
+        for (sequence, (records, document_commit)) in frames.into_iter().take(limit.get()) {
             let mut snapshots = Vec::new();
             let mut applications = None;
             let mut progress = Vec::new();
@@ -14137,11 +14160,24 @@ impl Harness {
                     });
                 }
             }
+            let documents = if let Some(revision) = document_commit {
+                let changes =
+                    store.scoped_document_changes_at_commit(&scope, revision, sequence)?;
+                crate::document::scoped_document_operations(
+                    store,
+                    cursor.conversation,
+                    revision,
+                    changes,
+                )?
+            } else {
+                Vec::new()
+            };
             commits.push(UnifiedHistoryCommit {
                 sequence,
                 snapshots,
                 applications,
                 progress,
+                documents,
             });
         }
         let mut next = cursor.clone();
@@ -14233,14 +14269,7 @@ impl Harness {
         conversation: Uuid,
         after: u64,
     ) -> Result<Option<(u64, u64, Vec<MergedDocumentChange>)>, Error> {
-        let scope = conversation.to_string();
-        let mut encoded = serde_json::to_vec(&[scope])?;
-        if encoded.pop() != Some(b']') {
-            return Err(Error::Invalid("invalid document scope".into()));
-        }
-        encoded.push(b',');
-        let mut prefix = b"durable/document/".to_vec();
-        prefix.extend(encoded);
+        let prefix = crate::document::Address::conversation_scope_prefix(conversation);
         let Some((revision, sequence, changes)) = self
             .owner
             .store()

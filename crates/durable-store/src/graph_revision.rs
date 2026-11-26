@@ -536,11 +536,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn v3_migration_rejects_child_marker_and_fences_live_writer() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v3.sqlite");
-        let legacy = rusqlite::Connection::open(&path).unwrap();
+    fn open_v3_writer(path: &std::path::Path) -> rusqlite::Connection {
+        let legacy = rusqlite::Connection::open(path).unwrap();
         legacy
             .create_scalar_function(
                 "pi_graph_protocol_v3",
@@ -549,12 +546,28 @@ mod tests {
                 |_| Ok(1i64),
             )
             .unwrap();
-        legacy.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;
+        legacy
+    }
+
+    #[cfg(unix)]
+    fn create_v3_store(path: &std::path::Path) -> rusqlite::Connection {
+        let legacy = open_v3_writer(path);
+        legacy.execute_batch("CREATE TABLE durable_store_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version>=0)); INSERT INTO durable_store_meta VALUES(1,0);
+            CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;
             CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=3));
             INSERT INTO durable_graph_protocol VALUES(1,3);
             CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
             CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
             CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;").unwrap();
+        legacy
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v3_migration_rejects_child_marker_and_fences_live_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.sqlite");
+        let legacy = create_v3_store(&path);
         let key = b"runtime/woken-owned-child-reservation/v1/forged";
         legacy
             .execute(
@@ -611,6 +624,116 @@ mod tests {
             )
             .is_err());
         drop(store);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v3_graph_backup_restores_the_cut_without_post_migration_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed-graph.sqlite");
+        let backup = dir.path().join("v3-backup.sqlite");
+        let legacy = create_v3_store(&path);
+        legacy.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        let mut expected = Vec::new();
+        for _ in 0..64 {
+            let root = next_uuid();
+            let child = next_uuid();
+            let conversation = next_uuid();
+            expected.extend([
+                (
+                    format!("runtime/conversation/{conversation}").into_bytes(),
+                    serde_json::to_vec(&json!({"id":conversation, "messages":[{"role":"user", "content":"fixture"}]})).unwrap(),
+                ),
+                (task_key(root), task(root, json!({"Conversation":conversation}))),
+                (task_key(child), task(child, json!({"Task":root}))),
+                (
+                    format!("durable/document/{conversation}/preferences").into_bytes(),
+                    serde_json::to_vec(&json!({"theme":"fixture"})).unwrap(),
+                ),
+            ]);
+        }
+        let tx = legacy.unchecked_transaction().unwrap();
+        for (index, (key, value)) in expected.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO durable_store_entries (key, value, version) VALUES (?1, ?2, ?3)",
+                rusqlite::params![key, value, index + 1],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "UPDATE durable_store_meta SET version=?1 WHERE id=1",
+            [expected.len()],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        legacy
+            .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+            .unwrap();
+
+        let store = Store::open(&path).unwrap();
+        let post_migration = b"fixture/after-migration";
+        let cut = store.commit_sequence().unwrap();
+        store
+            .commit(&[], &[put(post_migration.to_vec(), b"new work".to_vec())])
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert!(reopened.commit_sequence().unwrap() > cut);
+        for (key, value) in &expected {
+            assert_eq!(reopened.get(key).unwrap().unwrap().value, *value);
+        }
+        assert!(legacy
+            .execute(
+                "UPDATE durable_store_entries SET value=X'00' WHERE key=?1",
+                [expected[0].0.as_slice()],
+            )
+            .is_err());
+        assert_eq!(
+            reopened.get(post_migration).unwrap().unwrap().value,
+            b"new work"
+        );
+
+        // Restore to a separate path so a failed assertion cannot overwrite the
+        // migrated store or leave its WAL sidecar attached to the backup.
+        let restored_path = dir.path().join("restored-v3.sqlite");
+        std::fs::copy(backup, &restored_path).unwrap();
+        let restored = open_v3_writer(&restored_path);
+        let protocol: i64 = restored
+            .query_row(
+                "SELECT version FROM durable_graph_protocol WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(protocol, 3);
+        let check: String = restored
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        let mut rows = restored
+            .prepare("SELECT key,value FROM durable_store_entries ORDER BY key")
+            .unwrap();
+        let actual = rows
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        expected.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            actual, expected,
+            "restoration contains exactly the backup cut"
+        );
+        assert_eq!(
+            restored
+                .execute(
+                    "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,X'31',?2)",
+                    rusqlite::params![post_migration, expected.len() + 1],
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
