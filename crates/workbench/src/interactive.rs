@@ -110,11 +110,12 @@ pub(super) fn latest_session(
         })
         .filter(|entry| {
             Session::snapshot(entry.path()).is_ok_and(|session| {
-                session.working_directory().is_some_and(|cwd| {
-                    std::path::Path::new(cwd)
-                        .canonicalize()
-                        .is_ok_and(|cwd| cwd == workspace)
-                })
+                session.host_binding().is_none()
+                    && session.working_directory().is_some_and(|cwd| {
+                        std::path::Path::new(cwd)
+                            .canonicalize()
+                            .is_ok_and(|cwd| cwd == workspace)
+                    })
             })
         })
         .filter_map(|entry| {
@@ -17200,7 +17201,12 @@ exit {exit}
         let header = json!({"type":"session","version":3,"id":"external","cwd":workspace});
         std::fs::write(&pi_source, format!("{header}\n{{")).unwrap();
         assert!(crate::session_import::read(&pi_source).is_ok());
-        for path in [&foreign, &invalid, &pi_source] {
+        let managed = directory.path().join("managed.jsonl");
+        let mut session = pi_rs::Session::open(&managed).unwrap();
+        session.bind_host("test-scope").unwrap();
+        session.set_working_directory(&workspace).unwrap();
+        drop(session);
+        for path in [&foreign, &invalid, &pi_source, &managed] {
             std::fs::File::options()
                 .write(true)
                 .open(path)
