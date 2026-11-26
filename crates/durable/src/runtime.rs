@@ -23626,38 +23626,16 @@ impl Scheduler {
             ))?;
         }
         let foreground_receiver = if let Some((parent, config, allowed_tools)) = foreground {
-            validate_allowed_tools(&allowed_tools)?;
-            harness.conversation(parent)?;
-            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-            let mut worker = harness.worker();
-            worker.extensions =
-                Arc::new(std::sync::RwLock::new(crate::extension::Registry::default()));
-            let (extension, handler) = crate::foreground_subagent::extension(
-                worker,
+            let tasks = tasks.as_mut().ok_or_else(|| {
+                Error::Invalid("foreground extension requires task driver".into())
+            })?;
+            Some(Self::configure_foreground(
+                &harness,
+                tasks,
                 parent,
                 config,
                 allowed_tools,
-                sender,
-            );
-            if !tasks
-                .as_mut()
-                .ok_or_else(|| Error::Invalid("foreground extension requires task driver".into()))?
-                .register_shared(crate::foreground_subagent::KIND, true, handler)
-            {
-                return Err(Error::Invalid(
-                    "foreground task kind already registered".into(),
-                ));
-            }
-            tasks.as_mut().expect("task registry checked").set_abort(
-                crate::foreground_subagent::KIND,
-                |_: &crate::task::Task| {
-                    Ok(crate::task_scheduler::Step::Succeed(
-                        serde_json::Value::Null,
-                    ))
-                },
-            );
-            harness.install_extension(extension)?;
-            Some(receiver)
+            )?)
         } else {
             None
         };
@@ -23696,6 +23674,67 @@ impl Scheduler {
         scheduler.start_reporter();
         Ok((scheduler, driver))
     }
+    fn configure_foreground(
+        harness: &Harness,
+        tasks: &mut crate::task_scheduler::Registry,
+        parent: Uuid,
+        config: Config,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Uuid>, Error> {
+        validate_config(&config)?;
+        validate_allowed_tools(&allowed_tools)?;
+        harness.conversation(parent)?;
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut worker = harness.worker();
+        worker.extensions = Arc::new(std::sync::RwLock::new(crate::extension::Registry::default()));
+        let (extension, handler) =
+            crate::foreground_subagent::extension(worker, parent, config, allowed_tools, sender);
+        if !tasks.register_shared(crate::foreground_subagent::KIND, true, handler) {
+            return Err(Error::Invalid(
+                "foreground task kind already registered".into(),
+            ));
+        }
+        tasks.set_abort(crate::foreground_subagent::KIND, |_: &crate::task::Task| {
+            Ok(crate::task_scheduler::Step::Succeed(
+                serde_json::Value::Null,
+            ))
+        });
+        harness.install_extension(extension)?;
+        Ok(receiver)
+    }
+
+    /// Install a parent-bound foreground extension on a paused scheduler
+    /// before submitting or resuming any conversation. The host selects the
+    /// extension on the parent and must keep the returned driver running.
+    pub fn start_foreground_subagent(
+        &mut self,
+        parent: Uuid,
+        config: Config,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<crate::task_driver::Driver, Error> {
+        if self.foreground_worker.is_some()
+            || !self.tasks.is_empty()
+            || self
+                .harness
+                .task_driver
+                .lock()
+                .map_err(|_| Error::Failed)?
+                .as_ref()
+                .and_then(|driver| driver.upgrade())
+                .is_some()
+        {
+            return Err(Error::Invalid(
+                "foreground subagent setup requires a paused scheduler before task dispatch".into(),
+            ));
+        }
+        let mut tasks = crate::task_scheduler::Registry::default();
+        let receiver =
+            Self::configure_foreground(&self.harness, &mut tasks, parent, config, allowed_tools)?;
+        let driver = self.start_tasks(tasks)?;
+        self.start_foreground_worker(receiver);
+        Ok(driver)
+    }
+
     fn with_harness(
         harness: Harness,
         summary_provider: Option<SummaryProviderIdentity>,

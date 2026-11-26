@@ -49,6 +49,9 @@ struct Args {
     /// Accept text RPC commands over stdin and return session events on stdout.
     #[arg(long, conflicts_with_all = ["prompt", "request_id"])]
     rpc: bool,
+    /// Enable foreground subagents using the conversation's model.
+    #[arg(long)]
+    foreground_subagent: bool,
     #[arg(required_unless_present = "rpc")]
     prompt: Option<String>,
 }
@@ -107,39 +110,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model: model.clone(),
             tools: Vec::new(),
             restart_limit: 3,
-            max_turns: 1,
+            max_turns: 4,
             uncertain_policy: UncertainPolicy::RequireReconciliation,
         },
     )?;
 
-    let result = run(&mut scheduler, &model, args).await;
-    let shutdown = scheduler.shutdown().await;
-    result?;
-    shutdown?;
-    Ok(())
-}
-
-async fn run(
-    scheduler: &mut Scheduler,
-    model: &RoutedModel,
-    args: Args,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Args {
-        model: new_model,
-        conversation,
-        request_id,
-        prompt,
-        json: json_output,
-        rpc,
-        ..
-    } = args;
-    let id = match conversation {
-        Some(id) => {
-            model.provider_model(&scheduler.conversation(id)?.config.model)?;
-            id
-        }
+    let id = match args.conversation {
+        Some(id) => id,
         None => {
-            let provider_model = new_model
+            let provider_model = args
+                .model
+                .as_deref()
                 .filter(|name| !name.trim().is_empty())
                 .ok_or("a model is required")?;
             scheduler.create_conversation(Config {
@@ -149,6 +130,47 @@ async fn run(
             })?
         }
     };
+    let state = scheduler.conversation(id)?;
+    model.provider_model(&state.config.model)?;
+    let foreground = pi_rs_durable::foreground_subagent::extension_name(id);
+    let already_selected = state.extensions.contains(&foreground);
+    let driver = if args.foreground_subagent || already_selected {
+        let driver = scheduler.start_foreground_subagent(id, state.config, Some(Vec::new()))?;
+        if !already_selected {
+            let mut extensions = state.extensions;
+            extensions.push(foreground);
+            scheduler.select_extensions(id, extensions)?;
+        }
+        Some(driver)
+    } else {
+        None
+    };
+
+    let result = run(&mut scheduler, id, &model, args).await;
+    let shutdown = scheduler.shutdown().await;
+    let driver_shutdown = match driver {
+        Some(driver) => tokio::task::spawn_blocking(move || driver.shutdown()).await?,
+        None => Ok(()),
+    };
+    result?;
+    shutdown?;
+    driver_shutdown?;
+    Ok(())
+}
+
+async fn run(
+    scheduler: &mut Scheduler,
+    id: Uuid,
+    model: &RoutedModel,
+    args: Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Args {
+        request_id,
+        prompt,
+        json: json_output,
+        rpc,
+        ..
+    } = args;
     if rpc {
         return text_rpc::run(scheduler, id, model).await;
     }

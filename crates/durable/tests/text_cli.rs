@@ -31,36 +31,8 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         .into_iter()
         .enumerate()
         {
-            let deadline = Instant::now() + Duration::from_secs(15);
-            let mut socket = loop {
-                match listener.accept() {
-                    Ok((socket, _)) => break socket,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "provider request timed out");
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("accept provider request: {error}"),
-                }
-            };
-            socket.set_nonblocking(false).unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut socket);
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = value.trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-            bodies.push(serde_json::from_slice::<Value>(&body).unwrap());
+            let (mut socket, body) = read_fixture_request(&listener, Duration::from_secs(15));
+            bodies.push(body);
             let delta = serde_json::json!({
                 "type": "response.output_text.delta", "output_index": 0, "delta": answer
             });
@@ -347,4 +319,209 @@ fn frames(output: Output) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+#[test]
+fn foreground_option_drives_a_child_and_exposes_its_live_and_final_rpc_views() {
+    use serde_json::json;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let (release, released) = mpsc::channel();
+    let provider = thread::spawn(move || {
+        for index in 0..4 {
+            let (mut socket, request) = read_fixture_request(&listener, Duration::from_secs(20));
+            let tools = request["tools"].as_array();
+            if index == 1 {
+                assert!(tools.is_none_or(Vec::is_empty));
+                assert!(request["input"].to_string().contains("delegated input"));
+            } else {
+                assert!(tools.unwrap().iter().any(|tool| tool["name"] == "subagent"));
+            }
+            let (events, output) = if index == 0 {
+                let call = json!({
+                    "type": "function_call", "id": "fc_delegate", "call_id": "call_delegate",
+                    "name": "subagent", "arguments": "{\"task\":\"delegated input\"}"
+                });
+                (
+                    vec![
+                        json!({"type":"response.output_item.added", "output_index":0, "item":call}),
+                    ],
+                    call,
+                )
+            } else {
+                let text = match index {
+                    1 => "child answer",
+                    2 => {
+                        assert!(request["input"].to_string().contains("child answer"));
+                        "parent answer"
+                    }
+                    _ => "resumed answer",
+                };
+                (
+                    vec![
+                        json!({"type":"response.output_text.delta", "output_index":0, "delta":text}),
+                    ],
+                    json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}),
+                )
+            };
+            let partial: String = events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            let complete = json!({
+                "type":"response.completed","response":{"status":"completed","output":[output]}
+            });
+            let end = format!("data: {complete}\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}", partial.len() + end.len()).unwrap();
+            if index == 1 {
+                socket.flush().unwrap();
+                released.recv_timeout(Duration::from_secs(20)).unwrap();
+            }
+            socket.write_all(end.as_bytes()).unwrap();
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("foreground.sqlite");
+    let command = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi-rs-durable"));
+        command
+            .env("OPENAI_API_KEY", "fixture-key")
+            .arg("--db")
+            .arg(&db)
+            .args(["--endpoint", &endpoint])
+            .args(args);
+        command
+    };
+    let mut rpc = command(&["--model", "fixture", "--rpc", "--foreground-subagent"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = rpc.stdin.take().unwrap();
+    let stdout = BufReader::new(rpc.stdout.take().unwrap());
+    let (frames, receive) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in stdout.lines() {
+            let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if frames.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    let next = || receive.recv_timeout(Duration::from_secs(20)).unwrap();
+    writeln!(stdin, "{}", json!({"type":"get_state","id":"root"})).unwrap();
+    let root = next()["data"]["sessionId"].as_str().unwrap().to_owned();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"type":"prompt","message":"delegate this"})
+    )
+    .unwrap();
+    let child = loop {
+        let frame = next();
+        assert_ne!(frame["type"], "agent_end", "{frame}");
+        if frame["type"] == "durable_foreground_subagents" {
+            break frame["conversationIds"][0].clone();
+        }
+    };
+    assert!(child.is_string());
+    writeln!(
+        stdin,
+        "{}",
+        json!({"type":"get_foreground_subagent","conversationId":child,"id":"live"})
+    )
+    .unwrap();
+    loop {
+        let frame = next();
+        assert_ne!(frame["type"], "agent_end", "{frame}");
+        if frame["id"] == "live" {
+            assert_eq!(frame["success"], true, "{frame}");
+            assert_eq!(frame["data"]["conversationId"], child);
+            assert!(
+                frame["data"]["messages"]
+                    .to_string()
+                    .contains("delegated input")
+            );
+            break;
+        }
+    }
+    release.send(()).unwrap();
+    loop {
+        let frame = next();
+        if frame["type"] == "agent_end" {
+            assert_eq!(frame["success"], true, "{frame}");
+            assert!(frame["messages"].to_string().contains("parent answer"));
+            break;
+        }
+    }
+    writeln!(
+        stdin,
+        "{}",
+        json!({"type":"get_foreground_subagent","conversationId":child,"id":"settled"})
+    )
+    .unwrap();
+    let settled = next();
+    assert_eq!(settled["id"], "settled", "{settled}");
+    assert_eq!(settled["success"], true, "{settled}");
+    assert!(
+        settled["data"]["messages"]
+            .to_string()
+            .contains("child answer")
+    );
+    drop(stdin);
+    let output = rpc.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    reader.join().unwrap();
+
+    let reopened = command(&["--conversation", &root, "continue"])
+        .output()
+        .unwrap();
+    assert!(
+        reopened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    assert!(String::from_utf8_lossy(&reopened.stdout).contains("resumed answer"));
+    provider.join().unwrap();
+}
+
+fn read_fixture_request(listener: &TcpListener, timeout: Duration) -> (std::net::TcpStream, Value) {
+    let deadline = Instant::now() + timeout;
+    let mut socket = loop {
+        match listener.accept() {
+            Ok((socket, _)) => break socket,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "provider request timed out");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept provider request: {error}"),
+        }
+    };
+    socket.set_nonblocking(false).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(&mut socket);
+    let mut length = None;
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = Some(value.trim().parse().unwrap());
+        }
+    }
+    let mut body = vec![0; length.unwrap()];
+    reader.read_exact(&mut body).unwrap();
+    (socket, serde_json::from_slice(&body).unwrap())
 }

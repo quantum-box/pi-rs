@@ -505,6 +505,11 @@ watch to a listed ID. The Durable RPC stream sends
 `get_foreground_subagent` request takes a tool-owned foreground `conversationId` of the parent, including
 a settled child, and returns
 up to 32 recent native messages with the child's live model and tool output.
+Start the text CLI or RPC companion with `--foreground-subagent` to select
+the built-in `subagent` tool on the conversation. The child uses the same
+provider route and model and starts with an empty tool allowlist. Reopening the
+conversation restores the selection before resuming work.
+
 
 `StandaloneNoHooksHost` constructs a standalone scheduler with an explicit
 host assertion that no hook policy applies. It cannot prove policy outside this
