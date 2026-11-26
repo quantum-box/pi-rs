@@ -15,10 +15,10 @@ const PAGE_ROWS: usize = 16;
 const MARKER_BYTES: usize = 256;
 
 #[derive(Deserialize, Serialize)]
-struct TerminalObservation {
-    task_version: u64,
-    progress_version: u64,
-    observed_ms: u64,
+pub(crate) struct TerminalObservation {
+    pub task_version: u64,
+    pub progress_version: u64,
+    pub observed_ms: u64,
 }
 
 fn parse_progress_key(key: &[u8]) -> Result<(Uuid, Uuid), Error> {
