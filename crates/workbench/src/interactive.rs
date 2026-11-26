@@ -7617,7 +7617,7 @@ pub(super) async fn run(
                     }
                     continue;
                 }
-                let mut submit_completion = false;
+                let mut completion_submit_action = None;
                 if let Some(mut picker) = view.picker.take() {
                     let input = if mouse_activate {
                         picker.activate_mouse_selection(&keys)
@@ -7782,11 +7782,18 @@ pub(super) async fn run(
                             view.tree_confirmation = None;
                             // A leading slash word opens the command-name menu.
                             // File completions elsewhere can also start with "/".
-                            submit_completion = !mouse_activate
-                                && keys.matches("tui.select.confirm", key)
-                                && !keys.matches("tui.input.tab", key)
+                            if !mouse_activate
                                 && matches!(&selection, Selection::Completion { range, .. }
-                                    if range.start == 0 && view.editor.text.starts_with('/'));
+                                    if range.start == 0 && view.editor.text.starts_with('/'))
+                            {
+                                if keys.matches("app.message.followUp", key) {
+                                    completion_submit_action = Some("app.message.followUp");
+                                } else if keys.matches("tui.select.confirm", key)
+                                    && !keys.matches("tui.input.tab", key)
+                                {
+                                    completion_submit_action = Some("tui.input.submit");
+                                }
+                            }
                             let settings = picker.title == "Settings";
                             if settings
                                 && let Selection::EditSetting(name) = &selection
@@ -8048,11 +8055,11 @@ pub(super) async fn run(
                             }
                         }
                     }
-                    if !submit_completion {
+                    if completion_submit_action.is_none() {
                         continue;
                     }
                 }
-                if !submit_completion && args.tui_mode != Some(TuiMode::Regular) {
+                if completion_submit_action.is_none() && args.tui_mode != Some(TuiMode::Regular) {
                     if keys.matches("tui.altScreen.search", key) {
                         last_idle_interrupt = None;
                         view.mouse.clear();
@@ -8083,7 +8090,7 @@ pub(super) async fn run(
                         continue;
                     }
                 }
-                if !submit_completion
+                if completion_submit_action.is_none()
                     && view.keyboard_copies_selection(
                         keys.matches("tui.input.copy", key),
                         keys.matches("app.message.copy", key),
@@ -8094,19 +8101,17 @@ pub(super) async fn run(
                     continue;
                 }
                 view.mouse.clear();
-                let action = if submit_completion {
-                    "tui.input.submit"
-                } else {
+                let action = completion_submit_action.unwrap_or_else(|| {
                     keys.action(
                         key,
                         view.editor.text.is_empty() && view.draft_images.is_empty(),
                     )
                     .unwrap_or("")
-                };
+                });
                 if action != "app.interrupt" || is_busy(&worker) {
                     last_idle_interrupt = None;
                 }
-                if !submit_completion
+                if completion_submit_action.is_none()
                     && (view.editor.jump_key(action, key) || view.editor.action(action))
                 {
                     continue;
