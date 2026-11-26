@@ -448,6 +448,8 @@ struct Description {
     command_failure_classification_v1: bool,
     #[serde(default)]
     before_agent_start_hook: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    before_agent_start_prompt_options_v1: bool,
     #[serde(default)]
     input_hook: bool,
     #[serde(default)]
@@ -1058,6 +1060,10 @@ impl Extension for ExecutableExtension {
         self.description.before_agent_start_hook
     }
 
+    fn supports_before_agent_start_prompt_options(&self) -> bool {
+        self.description.before_agent_start_prompt_options_v1
+    }
+
     async fn before_agent_start(
         &self,
         event: &BeforeAgentStartEvent,
@@ -1078,15 +1084,22 @@ impl Extension for ExecutableExtension {
         options: &BeforeAgentStartPromptOptions,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<BeforeAgentStartPromptResult> {
-        let response: BeforeAgentStartWireResult = self
-            .request_async(ProtocolRequest::BeforeAgentStart {
-                event: BeforeAgentStartWireEvent {
-                    event: event.clone(),
-                    system_prompt_options: (!options.sections.is_empty()).then(|| options.clone()),
-                },
-                state: state.cloned(),
-            })
-            .await?;
+        let supports_options = self.supports_before_agent_start_prompt_options();
+        let request = ProtocolRequest::BeforeAgentStart {
+            event: BeforeAgentStartWireEvent {
+                event: event.clone(),
+                system_prompt_options: (supports_options && !options.sections.is_empty())
+                    .then(|| options.clone()),
+            },
+            state: state.cloned(),
+        };
+        if !supports_options {
+            return self
+                .request_async::<BeforeAgentStartResult>(request)
+                .await
+                .map(Into::into);
+        }
+        let response: BeforeAgentStartWireResult = self.request_async(request).await?;
         Ok(BeforeAgentStartPromptResult {
             result: response.result,
             system_prompt_options: response.system_prompt_options.unwrap_or_default(),
@@ -4252,6 +4265,8 @@ async fn dispatch_inner(
             command_effects: extension.supports_command_effects(),
             command_failure_classification_v1: true,
             before_agent_start_hook: extension.handles_before_agent_start(),
+            before_agent_start_prompt_options_v1: extension.handles_before_agent_start()
+                && extension.supports_before_agent_start_prompt_options(),
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
             result_presence_v1: true,
@@ -4361,16 +4376,26 @@ async fn dispatch_inner(
                 ContextResponse::Changed { value: request }
             }))
         }
-        ProtocolRequest::BeforeAgentStart { event, state } => encode(
-            extension
-                .before_agent_start_with_prompt_options(
-                    &event.event,
-                    &event.system_prompt_options.unwrap_or_default(),
-                    state.as_ref(),
+        ProtocolRequest::BeforeAgentStart { event, state } => {
+            if extension.supports_before_agent_start_prompt_options() {
+                encode(
+                    extension
+                        .before_agent_start_with_prompt_options(
+                            &event.event,
+                            &event.system_prompt_options.unwrap_or_default(),
+                            state.as_ref(),
+                        )
+                        .await
+                        .map(BeforeAgentStartWireResult::from),
                 )
-                .await
-                .map(BeforeAgentStartWireResult::from),
-        ),
+            } else {
+                encode(
+                    extension
+                        .before_agent_start(&event.event, state.as_ref())
+                        .await,
+                )
+            }
+        }
         ProtocolRequest::Input { event, state } => {
             if host.supports_custom_messages() {
                 encode(
@@ -6352,6 +6377,10 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
                 true
             }
 
+            fn supports_before_agent_start_prompt_options(&self) -> bool {
+                true
+            }
+
             async fn before_agent_start_with_prompt_options(
                 &self,
                 event: &BeforeAgentStartEvent,
@@ -6379,11 +6408,28 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
             }
         }
 
+        let legacy: Arc<dyn Extension> = Arc::new(LegacyHook);
+        let legacy_description = dispatch(legacy.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(legacy_description["before_agent_start_hook"], true);
+        assert!(
+            legacy_description
+                .get("before_agent_start_prompt_options_v1")
+                .is_none()
+        );
+        assert!(
+            !serde_json::from_value::<Description>(legacy_description)
+                .unwrap()
+                .before_agent_start_prompt_options_v1
+        );
+
         let extension: Arc<dyn Extension> = Arc::new(SectionHook);
         let mut description = dispatch(extension.clone(), ProtocolRequest::Describe)
             .await
             .unwrap();
         assert_eq!(description["before_agent_start_hook"], true);
+        assert_eq!(description["before_agent_start_prompt_options_v1"], true);
         description
             .as_object_mut()
             .unwrap()
@@ -6414,7 +6460,7 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
         let request =
             serde_json::from_value::<ProtocolRequest>(structured_request.clone()).unwrap();
         assert_eq!(serde_json::to_value(&request).unwrap(), structured_request);
-        let response = dispatch(Arc::new(LegacyHook), request).await.unwrap();
+        let response = dispatch(legacy, request).await.unwrap();
         assert_eq!(response, serde_json::json!({"systemPrompt": ""}));
         let legacy_result: BeforeAgentStartWireResult = serde_json::from_value(response).unwrap();
         assert_eq!(legacy_result.result.system_prompt.as_deref(), Some(""));
@@ -6437,6 +6483,92 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
                 ("rules".into(), Some("new rules".into())),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_before_agent_start_sends_prompt_options_only_after_opt_in() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+request = json.load(sys.stdin)
+name = os.path.basename(sys.argv[0])
+if request["type"] == "describe":
+    response = {
+        "id": name, "dependencies": [], "commands": [], "tools": [],
+        "before_agent_start_hook": True,
+    }
+    if name != "legacy":
+        response["before_agent_start_prompt_options_v1"] = name == "sections"
+else:
+    expected = {
+        "type": "before_agent_start",
+        "event": {"messageType": "user", "prompt": "question", "systemPrompt": "host prompt"},
+        "state": {"version": 1, "data": {"saved": True}},
+    }
+    response = {"systemPrompt": "legacy override"}
+    if name == "sections":
+        expected["event"]["systemPromptOptions"] = {"sections": {"rules": "host rules"}}
+        response = {"systemPromptOptions": {"sections": {"rules": "new rules", "cwd": None}}}
+    assert request == expected, request
+print(json.dumps({"version": 1, "response": {"Ok": response}}))
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let event = BeforeAgentStartEvent {
+            trigger: pi_rs_core::AgentStartTrigger::User {
+                prompt: "question".into(),
+                images: Vec::new(),
+            },
+            system_prompt: "host prompt".into(),
+        };
+        let options = BeforeAgentStartPromptOptions {
+            sections: [("rules".into(), "host rules".into())]
+                .into_iter()
+                .collect(),
+        };
+        let state = ExtensionState {
+            version: 1,
+            data: serde_json::json!({"saved": true}),
+        };
+        for (name, opted_in) in [("legacy", false), ("disabled", false), ("sections", true)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let extension = ExecutableExtension::load(&path).unwrap();
+            assert!(extension.handles_before_agent_start());
+            assert_eq!(
+                extension.supports_before_agent_start_prompt_options(),
+                opted_in
+            );
+            let result = extension
+                .before_agent_start_with_prompt_options(&event, &options, Some(&state))
+                .await
+                .unwrap();
+            if opted_in {
+                assert!(result.result.system_prompt.is_none());
+                assert_eq!(
+                    result
+                        .system_prompt_options
+                        .sections
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    [
+                        ("rules".into(), Some("new rules".into())),
+                        ("cwd".into(), None)
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    result.result.system_prompt.as_deref(),
+                    Some("legacy override")
+                );
+                assert!(result.system_prompt_options.sections.is_empty());
+            }
+        }
     }
 
     #[tokio::test]

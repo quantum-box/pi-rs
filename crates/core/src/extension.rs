@@ -1433,6 +1433,13 @@ pub trait Extension: Send + Sync {
         Ok(BeforeAgentStartResult::default())
     }
 
+    /// Advertise prompt section support when served as an executable extension.
+    /// Enable this alongside `handles_before_agent_start` for the richer callback.
+    /// In-process registration only needs `handles_before_agent_start`.
+    fn supports_before_agent_start_prompt_options(&self) -> bool {
+        false
+    }
+
     /// Run preflight with ordered prompt sections using the existing handler opt-in.
     /// By default, delegates to the original preflight callback.
     async fn before_agent_start_with_prompt_options(

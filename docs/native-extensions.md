@@ -344,8 +344,15 @@ earlier handlers' edits in extension load order.
 
 Executable extensions advertise `before_agent_start_hook` and receive the
 `before_agent_start` protocol request. The event identifies the starting
-message and carries the resolved system prompt. Read the current section bodies
-and return section edits through `systemPromptOptions.sections`.
+message and carries the resolved system prompt. For structured section editing,
+also advertise `"before_agent_start_prompt_options_v1": true` in the v1
+`describe` response. Rust executable extensions advertise it by returning
+`true` from `supports_before_agent_start_prompt_options` alongside the
+`handles_before_agent_start` opt-in. In-process Rust extensions only need the
+existing handler opt-in. A missing or false executable capability uses the
+original request and result fields. With the capability enabled, the host sends
+available section bodies in `event.systemPromptOptions.sections` and accepts
+edits in the response's `systemPromptOptions.sections`.
 The response `{"systemPromptOptions":{"sections":{"rules":"New guidance","skills":null}}}`
 replaces the rules text and removes the skills section. Names must begin with
 a lowercase ASCII letter and may contain lowercase ASCII letters, digits,

@@ -5613,8 +5613,9 @@ preparation plan retains the run-local prompt edits and deduplicates its appende
 messages when the run resumes before its first model request is journaled.
 
 Rust extensions can opt into the additive `before_agent_start_with_prompt_options`
-callback to read section bodies and return a patch. Executable extensions use
-`systemPromptOptions.sections` in the existing request and response. Upstream
+callback to read section bodies and return a patch. Executable extensions
+advertise `before_agent_start_prompt_options_v1` to exchange
+`systemPromptOptions.sections` through the v1 request and response. Upstream
 exposes the full mutable prompt builder, including tool selection, and compacts
 incoming prompt context before invoking the hook. The native hook runs before the agent
 loop's automatic compaction checks.
