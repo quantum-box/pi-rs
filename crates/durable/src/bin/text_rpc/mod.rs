@@ -772,12 +772,17 @@ impl ToolEvents {
 
 fn messages(state: &Conversation) -> Vec<Value> {
     let mut pending: HashMap<&str, VecDeque<Invocation>> = HashMap::new();
-    let mut metadata: HashMap<&str, VecDeque<_>> = HashMap::new();
+    let mut metadata_by_block = HashMap::new();
+    let mut legacy_metadata: HashMap<&str, VecDeque<_>> = HashMap::new();
     for result in &state.tool_results {
-        metadata
-            .entry(&result.call_id)
-            .or_default()
-            .push_back(result);
+        if let Some(id) = result.content_block_id {
+            metadata_by_block.insert(id, result);
+        } else {
+            legacy_metadata
+                .entry(&result.call_id)
+                .or_default()
+                .push_back(result);
+        }
     }
     state
         .messages
@@ -824,13 +829,20 @@ fn messages(state: &Conversation) -> Vec<Value> {
                 ..
             } => {
                 let invocation = pending.get_mut(call_id.as_str())?.pop_front()?;
-                let result = metadata
-                    .get_mut(call_id.as_str())
-                    .and_then(VecDeque::pop_front);
+                let blocks = state.content_blocks.get(&index);
+                let result = match blocks {
+                    Some(blocks) => metadata_by_block
+                        .get(&blocks.message_id)
+                        .copied()
+                        .filter(|result| result.call_id == *call_id),
+                    None => legacy_metadata
+                        .get_mut(call_id.as_str())
+                        .and_then(VecDeque::pop_front),
+                };
                 let is_error = result.map_or(*is_error, |result| result.is_error);
                 let details = result.and_then(|result| result.details.clone());
                 let mut message = text_message("toolResult", content);
-                let outcome = if let Some(blocks) = state.content_blocks.get(&index) {
+                let outcome = if let Some(blocks) = blocks {
                     message["content"] = json!(blocks.blocks);
                     let data = json!({"content":blocks.blocks, "isError":is_error});
                     let attachments = result
