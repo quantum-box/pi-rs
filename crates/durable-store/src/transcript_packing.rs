@@ -27,7 +27,7 @@ pub struct PackingCursor {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackingPage {
-    /// Number of eligible entries examined.
+    /// Number of transcript keys visited, including skipped entries.
     pub examined: usize,
     pub packed: usize,
     pub reclaimed_bytes: usize,
@@ -129,40 +129,42 @@ impl Store {
         }
         let after = cursor.after.map_or_else(|| PREFIX.to_vec(), key_for);
         let end = prefix_end(PREFIX).ok_or(Error::InvalidSnapshot)?;
-        let candidates = {
+        let page = {
             let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
             let mut stmt = conn.prepare(
                 "SELECT key, version FROM durable_store_entries
-                 WHERE key>?1 AND key<?2 AND version<=?3
-                   AND length(key)=?4 AND length(value) BETWEEN ?5 AND ?6
-                   AND substr(value, 1, ?7)<>?8
-                 ORDER BY key LIMIT ?9",
+                 WHERE key>?1 AND key<?2
+                 ORDER BY key LIMIT ?3",
             )?;
-            let rows = stmt.query_map(
-                params![
-                    after,
-                    end,
-                    cursor.through_version,
-                    PREFIX.len() + 16,
-                    MIN_BYTES,
-                    MAX_BYTES,
-                    MAGIC.len(),
-                    MAGIC,
-                    limit
-                ],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?)),
-            )?;
+            let rows = stmt.query_map(params![after, end, limit], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?))
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let next = page
+            .last()
+            .filter(|_| page.len() == limit)
+            .map(|(key, _)| -> Result<PackingCursor, Error> {
+                Ok(PackingCursor {
+                    through_version: cursor.through_version,
+                    after: Some(entry_id(key)?),
+                })
+            })
+            .transpose()?;
         let mut packed = 0;
         let mut reclaimed_bytes = 0;
-        for (key, version) in &candidates {
+        for (key, version) in &page {
+            entry_id(key)?;
+            if *version > cursor.through_version {
+                continue;
+            }
             let raw: Option<Vec<u8>> = {
                 let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
                 conn.query_row(
                     "SELECT value FROM durable_store_entries
-                     WHERE key=?1 AND version=?2 AND length(value) BETWEEN ?3 AND ?4",
-                    params![key, version, MIN_BYTES, MAX_BYTES],
+                     WHERE key=?1 AND version=?2 AND length(value) BETWEEN ?3 AND ?4
+                       AND substr(value, 1, ?5)<>?6",
+                    params![key, version, MIN_BYTES, MAX_BYTES, MAGIC.len(), MAGIC],
                     |row| row.get(0),
                 )
                 .optional()?
@@ -190,18 +192,8 @@ impl Store {
                 reclaimed_bytes += saved;
             }
         }
-        let next = candidates
-            .last()
-            .filter(|_| candidates.len() == limit)
-            .map(|(key, _)| -> Result<PackingCursor, Error> {
-                Ok(PackingCursor {
-                    through_version: cursor.through_version,
-                    after: Some(entry_id(key)?),
-                })
-            })
-            .transpose()?;
         Ok(PackingPage {
-            examined: candidates.len(),
+            examined: page.len(),
             packed,
             reclaimed_bytes,
             next,
@@ -212,6 +204,39 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packing_page_advances_past_ineligible_keys_and_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("packing.sqlite")).unwrap();
+        let text = b"transcript fixture".repeat(400);
+        let put = |id, value| crate::Mutation::Put {
+            key: key_for(Uuid::from_u128(id)),
+            value,
+        };
+        store
+            .commit(
+                &[],
+                &[
+                    put(1, b"too short".to_vec()),
+                    put(2, packed_bytes(&text).unwrap().unwrap()),
+                    put(3, text.clone()),
+                ],
+            )
+            .unwrap();
+        let mut cursor = store.transcript_packing_start().unwrap();
+        store.commit(&[], &[put(4, text)]).unwrap();
+
+        for (id, packed) in [(1, 0), (2, 0), (3, 1), (4, 0)] {
+            let page = store.pack_transcript_history(&cursor, 1).unwrap();
+            assert_eq!((page.examined, page.packed), (1, packed));
+            cursor = page.next.unwrap();
+            assert_eq!(cursor.after, Some(Uuid::from_u128(id)));
+        }
+        let end = store.pack_transcript_history(&cursor, 1).unwrap();
+        assert_eq!(end.examined, 0);
+        assert!(end.next.is_none());
+    }
 
     #[cfg(all(feature = "experimental-graph-revision", unix))]
     #[test]
