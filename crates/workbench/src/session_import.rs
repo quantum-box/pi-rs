@@ -405,15 +405,6 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 "cannot import compaction involving an orphaned branch".into(),
             ));
         }
-        if converted["type"] == "compaction"
-            && let Some(target) = converted["firstKeptEntryId"].as_str()
-            && let Some(target_branch) = branches.get(target)
-            && !ancestry.is_ancestor(target_branch.ancestry_index, branch.ancestry_index)
-        {
-            return Err(Error::Session(format!(
-                "imported compaction target {target} is outside its branch"
-            )));
-        }
         let parent_ancestry = branch.ancestry_index;
         let events = convert_references(
             converted,
@@ -421,7 +412,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
             &mut branch,
             &branches,
             |target| source_ids.contains(target),
-            &ancestry,
+            |ancestor, parent| ancestry.is_ancestor(ancestor, parent),
         )?;
         let extra_compaction_metadata = (entry["type"] == "compaction"
             && (entry.get("details").is_some() || entry["fromHook"] == true))
@@ -1234,7 +1225,12 @@ mod tests {
         let mut cursor = super::super::rpc_entries::Cursor::default();
         cursor.set_verified_counts(&session.validated_pi_conversion_counts().unwrap());
         cursor.advance(&session.records()[..(native - 1) as usize]);
-        let live = cursor.appended(session.records(), None, &Default::default());
+        let live = cursor.appended(
+            session.records(),
+            session.records().len() - 1,
+            None,
+            &Default::default(),
+        );
         assert_eq!(changes, live);
         session.set_label(source, Some("source".into())).unwrap();
         session.set_label(native, Some("native".into())).unwrap();
@@ -2312,16 +2308,178 @@ mod tests {
     }
 
     #[test]
-    fn compaction_rejects_boundary_from_another_complete_branch() {
-        let header = json!({"type":"session","version":3});
-        let first = json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"first"}});
-        let second = json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"other branch"}});
-        let compact = json!({"type":"compaction","id":"c","parentId":"b","firstKeptEntryId":"a","summary":"summary","tokensBefore":100});
-        let error = match import_pi(vec![header, first, second, compact]) {
-            Ok(_) => panic!("cross-branch compaction was accepted"),
-            Err(error) => error,
+    fn earlier_sibling_compaction_keeps_only_its_summary_and_descendants() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"root"}}),
+            json!({"type":"message","id":"sibling","parentId":"root","message":{"role":"user","content":"sibling"}}),
+            json!({"type":"message","id":"before","parentId":"root","message":{"role":"user","content":"before"}}),
+            json!({"type":"compaction","id":"compact","parentId":"before","firstKeptEntryId":"sibling","summary":"saved summary","tokensBefore":42,
+                "systemMessage":{"role":"system","content":"saved system"},
+                "usage":{"input":2,"output":1,"cost":{"total":0.125}}}),
+            json!({"type":"message","id":"after","parentId":"compact","message":{"role":"user","content":"after"}}),
+        ]).unwrap();
+        let check = |session: &Session, raw_target: &str| {
+            assert!(
+                session
+                    .records()
+                    .iter()
+                    .any(|record| matches!(&record.event,
+                Event::SourceEntry { entry, .. }
+                    if entry["id"] == "compact" && entry["firstKeptEntryId"] == raw_target))
+            );
+            assert!(session.branch().iter().any(|record| matches!(
+                &record.event,
+                Event::Compacted {
+                    retain_from: None,
+                    system_prompt: Some(_),
+                    tokens_before: Some(42),
+                    ..
+                }
+            )));
+            assert_eq!(
+                session.current_messages(),
+                [
+                    Message::User {
+                        content: "Prior conversation summary:\nsaved summary".into()
+                    },
+                    Message::User {
+                        content: "after".into()
+                    },
+                ]
+            );
+            assert_eq!(session.statistics().cost, Some(0.125));
+            let wire = super::super::rpc_entries::Entries::new(session)
+                .after(None)
+                .unwrap();
+            let compaction = wire["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["type"] == "compaction")
+                .unwrap();
+            assert_eq!(compaction["firstKeptEntryId"], compaction["id"]);
+            assert_eq!(compaction["systemMessage"]["content"], "saved system");
         };
-        assert!(error.to_string().contains("outside its branch"));
+        check(&session, "sibling");
+        let leaf = session.head();
+        let sibling = session.records().iter().find(|record| {
+            matches!(&record.event, Event::User { content, .. } if content == "sibling")
+        }).unwrap().id;
+        session.checkout(sibling).unwrap();
+        assert_eq!(
+            session.current_messages(),
+            [
+                Message::User {
+                    content: "root".into()
+                },
+                Message::User {
+                    content: "sibling".into()
+                },
+            ]
+        );
+        session.checkout(leaf).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let reopened = Session::open(&path).unwrap();
+        check(&reopened, "sibling");
+        let fork = reopened
+            .fork_to(leaf, directory.path().join("fork.jsonl"))
+            .unwrap();
+        check(&fork, "compact");
+        assert!(!fork.records().iter().any(|record| matches!(&record.event,
+            Event::SourceEntry { entry, .. } if entry["id"] == "sibling")));
+
+        let metadata: BTreeMap<_, _> = reopened
+            .records()
+            .iter()
+            .filter_map(|record| {
+                reopened
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|value| (record.id, value))
+            })
+            .collect();
+        let mut verifier = pi_rs::pi_import::StreamVerifier::new();
+        let mut cursor = super::super::rpc_entries::Cursor::default();
+        let mut projected = Vec::new();
+        let mut next = 0;
+        for end in 1..=reopened.records().len() {
+            let prefix = &reopened.records()[..end];
+            if verifier
+                .advance(prefix, &metadata, false)
+                .unwrap()
+                .is_some()
+            {
+                continue;
+            }
+            for (id, count) in verifier.take_new_counts() {
+                cursor.set_verified_count(id, count);
+            }
+            for index in next..end {
+                projected.extend(cursor.appended(
+                    prefix,
+                    index,
+                    metadata.get(&prefix[index].id),
+                    &metadata,
+                ));
+            }
+            next = end;
+        }
+        assert_eq!(
+            verifier.counts(),
+            &reopened.validated_pi_conversion_counts().unwrap()
+        );
+        let compact = projected
+            .iter()
+            .find(|entry| entry["type"] == "compaction")
+            .unwrap();
+        assert_eq!(compact["firstKeptEntryId"], compact["id"]);
+
+        let mut records = reopened.records().to_vec();
+        for record in &mut records {
+            if let Event::Compacted { retain_from, .. } = &mut record.event {
+                *retain_from = Some(sibling);
+            }
+        }
+        let forged = Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+        assert!(forged.validated_pi_conversion_counts().is_err());
+        assert!(
+            pi_rs::pi_import::StreamVerifier::new()
+                .advance(forged.records(), &metadata, true)
+                .is_err()
+        );
+        assert!(forged.fork_session(leaf).is_err());
+
+        let mut records = reopened.records().to_vec();
+        for record in &mut records {
+            if let Event::SourceEntry { entry, .. } = &mut record.event
+                && entry["id"] == "sibling"
+            {
+                entry["parentId"] = json!("missing");
+            }
+        }
+        let orphaned = Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+        assert!(orphaned.validated_pi_conversion_counts().is_err());
+        assert!(
+            pi_rs::pi_import::StreamVerifier::new()
+                .advance(orphaned.records(), &metadata, true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compaction_recovery_rejects_missing_and_forward_boundaries() {
+        for target in ["missing", "later"] {
+            let error = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"before","parentId":null,"message":{"role":"user","content":"before"}}),
+                json!({"type":"compaction","id":"compact","parentId":"before","firstKeptEntryId":target,"summary":"summary"}),
+                json!({"type":"message","id":"later","parentId":"compact","message":{"role":"user","content":"later"}}),
+            ]).err().unwrap();
+            assert!(error.to_string().contains("compaction target"), "{error}");
+        }
     }
 
     #[test]
@@ -3774,5 +3932,48 @@ mod tests {
                 "{entry}"
             );
         }
+    }
+
+    #[test]
+    fn replay_rejects_context_edit_pointing_to_a_sibling() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"sibling","parentId":null,"message":{"role":"user","content":"sibling"}}),
+            json!({"type":"message","id":"local","parentId":null,"message":{"role":"user","content":"local"}}),
+            json!({"type":"context_edit","id":"edit","parentId":"local","targetId":"local","replacement":null}),
+        ]).unwrap();
+        let mut records = session.records().to_vec();
+        let sibling = records.iter().find(|record| {
+            matches!(&record.event, Event::User { content, .. } if content == "sibling")
+        }).unwrap().id;
+        let mut metadata = BTreeMap::new();
+        for record in &mut records {
+            if let Some(value) = session.record_metadata(record.id) {
+                metadata.insert(record.id, value.clone());
+            }
+            match &mut record.event {
+                Event::SourceEntry { entry, .. } if entry["id"] == "edit" => {
+                    entry["targetId"] = json!("sibling");
+                }
+                Event::ContextEdited { target, .. } => *target = sibling,
+                _ => {}
+            }
+        }
+        let replayed = Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+        assert!(
+            replayed
+                .validated_pi_conversion_counts()
+                .unwrap_err()
+                .to_string()
+                .contains("outside its branch")
+        );
+        let mut stream = pi_rs::pi_import::StreamVerifier::new();
+        assert!(
+            stream
+                .advance(replayed.records(), &metadata, true)
+                .unwrap_err()
+                .to_string()
+                .contains("outside its branch")
+        );
     }
 }

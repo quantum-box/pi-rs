@@ -184,7 +184,7 @@ pub fn convert_references(
     branch: &mut Branch,
     branches: &BTreeMap<String, Branch>,
     namespace_contains: impl FnOnce(&str) -> bool,
-    ancestry: &SourceAncestry,
+    is_ancestor: impl Fn(usize, usize) -> bool,
 ) -> Result<Vec<Event>> {
     if let Some(target) = metadata_target(entry)? {
         if target == name || (!branches.contains_key(target) && namespace_contains(target)) {
@@ -195,7 +195,7 @@ pub fn convert_references(
         }
         if let Some(target_branch) = branches.get(target) {
             if entry["type"] == "context_edit"
-                && !ancestry.is_ancestor(target_branch.ancestry_index, branch.ancestry_index)
+                && !is_ancestor(target_branch.ancestry_index, branch.ancestry_index)
             {
                 return Err(Error::Session(format!(
                     "imported context edit target {target} is outside its branch"
@@ -210,7 +210,29 @@ pub fn convert_references(
             return Ok(Vec::new());
         }
     }
-    convert(entry, branch, branches)
+    let discard_earlier = if entry["type"] == "compaction" {
+        let target = required(entry, "firstKeptEntryId")?;
+        if target == name {
+            true
+        } else if let Some(target_branch) = branches.get(target) {
+            let sibling = !is_ancestor(target_branch.ancestry_index, branch.ancestry_index);
+            if sibling && (branch.missing_ancestors || target_branch.missing_ancestors) {
+                return Err(Error::Session(
+                    "cannot import compaction involving an orphaned branch".into(),
+                ));
+            }
+            // A sibling boundary is absent from this path. Pi keeps the
+            // compaction and its descendants, with no pre-compaction messages.
+            sibling
+        } else {
+            return Err(Error::Session(format!(
+                "missing or forward imported compaction target {target}"
+            )));
+        }
+    } else {
+        false
+    };
+    convert_entry(entry, branch, branches, discard_earlier)
 }
 
 fn context_edit_replacement(entry: &Value) -> Result<Option<crate::ContextContent>> {
@@ -607,6 +629,10 @@ impl StreamVerifier {
                 let mut branch = parent_source
                     .and_then(|source| self.states.get(&source).cloned())
                     .unwrap_or_default();
+                branch.missing_ancestors |= !self.legacy
+                    && entry["parentId"]
+                        .as_str()
+                        .is_some_and(|parent| !self.source_ids.contains_key(parent));
                 branch.head = record.parent.unwrap_or(0);
                 let mut migrated = entry.clone();
                 if self.legacy
@@ -648,7 +674,7 @@ impl StreamVerifier {
                     &mut branch,
                     &self.branches,
                     |target| self.authoritative_ids.contains(target),
-                    &self.ancestry,
+                    |ancestor, parent| self.ancestry.is_ancestor(ancestor, parent),
                 )?;
                 let events = if marker.is_none()
                     && entry["type"] == "model_change"
@@ -994,7 +1020,6 @@ pub(crate) fn validate_conversions(
     }
     let mut states = BTreeMap::<u64, Branch>::new();
     let mut branches = BTreeMap::<String, Branch>::new();
-    let mut ancestry = SourceAncestry::default();
     let mut ids = PersistentMap::new();
     let mut reverse = PersistentMap::new();
     let mut verified = BTreeMap::new();
@@ -1082,6 +1107,10 @@ pub(crate) fn validate_conversions(
         } else {
             Branch::default()
         };
+        branch.missing_ancestors |= !legacy
+            && entry["parentId"]
+                .as_str()
+                .is_some_and(|parent| !branches.contains_key(parent));
         branch.head = record.parent.unwrap_or(0);
         let mut migrated = entry.clone();
         if legacy
@@ -1117,7 +1146,7 @@ pub(crate) fn validate_conversions(
             &mut branch,
             &branches,
             |target| by_name.contains_key(target),
-            &ancestry,
+            |ancestor, parent| is_ancestor(ancestor as u64, parent as u64),
         )?;
         let mut count = events.len() as u64;
         if marker.is_none() {
@@ -1255,7 +1284,7 @@ pub(crate) fn validate_conversions(
             }
         }
         branch.head = record.id + count;
-        branch.ancestry_index = ancestry.add(branch.ancestry_index);
+        branch.ancestry_index = record.id as usize;
         if let Some(name) = source_names.get(&record.id) {
             branches.insert(
                 name.clone(),
@@ -1263,6 +1292,7 @@ pub(crate) fn validate_conversions(
                     head: branch.head,
                     entry_start: branch.entry_start,
                     context_target: branch.context_target,
+                    missing_ancestors: branch.missing_ancestors,
                     ancestry_index: branch.ancestry_index,
                     ..Branch::default()
                 },
@@ -1531,6 +1561,15 @@ pub fn convert(
     entry: &Value,
     branch: &mut Branch,
     branches: &BTreeMap<String, Branch>,
+) -> Result<Vec<Event>> {
+    convert_entry(entry, branch, branches, false)
+}
+
+fn convert_entry(
+    entry: &Value,
+    branch: &mut Branch,
+    branches: &BTreeMap<String, Branch>,
+    discard_earlier: bool,
 ) -> Result<Vec<Event>> {
     let mut events = Vec::new();
     match required(entry, "type")? {
@@ -1828,7 +1867,7 @@ pub fn convert(
         }
         "compaction" => {
             let target = required(entry, "firstKeptEntryId")?;
-            let retain_from = if Some(target) == entry["id"].as_str() {
+            let retain_from = if discard_earlier || Some(target) == entry["id"].as_str() {
                 None
             } else {
                 Some(
