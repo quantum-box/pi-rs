@@ -584,8 +584,21 @@ impl Cli {
         provider: &Provider,
         model: Option<&str>,
     ) -> Result<providers::Client> {
+        self.connect_provider_for_route(provider, model, false)
+    }
+
+    fn connect_workspace_relay_catalog(&self, provider: &Provider) -> Result<providers::Client> {
+        let direct = self.offline && Self::is_loopback_endpoint(self.endpoint_for(provider));
+        self.connect_provider_for_route(provider, None, direct)
+    }
+
+    fn connect_provider_for_route(
+        &self,
+        provider: &Provider,
+        model: Option<&str>,
+        direct: bool,
+    ) -> Result<providers::Client> {
         let endpoint = self.model_endpoint_for(provider, model);
-        let direct = self.offline && Self::is_loopback_endpoint(endpoint);
         let adapter = model.map_or_else(
             || provider.adapter(),
             |model| self.model_profiles.model_adapter(provider, model),
@@ -1234,15 +1247,21 @@ impl Cli {
                         }
                     }
                     Ok::<_, Error>(
-                        futures_util::future::join_all(selected.into_iter().map(
-                            |provider| async {
-                                tokio::time::timeout(
-                                    timeout,
-                                    model_selection::catalog(&args, provider, true),
-                                )
+                        futures_util::future::join_all(selected.into_iter().map(|provider| {
+                            let args = &args;
+                            let refresh_relay = retired_relay_provider.as_ref() == Some(&provider);
+                            async move {
+                                tokio::time::timeout(timeout, async {
+                                    if refresh_relay {
+                                        model_selection::workspace_relay_catalog(args, provider)
+                                            .await
+                                    } else {
+                                        model_selection::catalog(args, provider, true).await
+                                    }
+                                })
                                 .await
-                            },
-                        ))
+                            }
+                        }))
                         .await,
                     )
                 })

@@ -298,9 +298,25 @@ fn catalog_client(
 }
 
 pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
-    let probe = probe && args.allow_endpoint_probes(args.endpoint_for(&provider));
     let mut models = args.model_profiles.model_ids(&provider);
-    let client = catalog_client(args, &provider, &mut models)?.map(|client| {
+    let client = catalog_client(args, &provider, &mut models)?;
+    catalog_with_client(args, provider, probe, models, client).await
+}
+
+pub(super) async fn workspace_relay_catalog(args: &Cli, provider: Provider) -> Result<Catalog> {
+    let models = args.model_profiles.model_ids(&provider);
+    let client = args.connect_workspace_relay_catalog(&provider)?;
+    catalog_with_client(args, provider, true, models, Some(client)).await
+}
+
+async fn catalog_with_client(
+    args: &Cli,
+    provider: Provider,
+    probe: bool,
+    mut models: Vec<String>,
+    client: Option<super::providers::Client>,
+) -> Result<Catalog> {
+    let client = client.map(|client| {
         if provider == Provider::Radius {
             client.with_context_probes(probe)
         } else {

@@ -8199,11 +8199,12 @@ fn http_idle_timeout_applies_to_native_provider_streams() {
 
 #[test]
 fn model_requests_use_configured_http_proxy_and_environment_overrides() {
-    for (provider, path, from_env) in [
-        ("ollama", "/v1/chat/completions", false),
-        ("anthropic", "/v1/messages", false),
-        ("google", "/v1beta", true),
-        ("radius", "/v1/messages", true),
+    for (provider, path, from_env, offline) in [
+        ("ollama", "/v1/chat/completions", false, false),
+        ("ollama", "/v1/chat/completions", false, true),
+        ("anthropic", "/v1/messages", false, true),
+        ("google", "/v1beta", true, true),
+        ("radius", "/v1/messages", true, true),
     ] {
         let root = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -8289,6 +8290,9 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                 "--print",
                 "hello",
             ]);
+        if offline {
+            command.arg("--offline");
+        }
         if from_env {
             command.env("http_proxy", &proxy);
         }
@@ -8381,6 +8385,7 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
         .args([
             "--no-session",
             "--no-mcp",
+            "--offline",
             "--model",
             "fixture-model",
             "--endpoint",
@@ -8467,6 +8472,7 @@ fn model_listing_uses_proxy_before_a_model_request() {
         .env_remove("NO_PROXY")
         .args([
             "--no-mcp",
+            "--offline",
             "--provider",
             "ollama",
             "--endpoint",
@@ -9306,7 +9312,89 @@ fn together_retired_default_discovers_again_after_rpc_workspace_switch() {
 }
 
 #[test]
-fn together_workspace_replacement_uses_the_local_route_without_proxying() {
+fn explicit_catalog_read_keeps_the_proxy_for_remote_routes_in_offline_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"httpProxy":format!("http://{}", proxy.local_addr().unwrap())}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"together":{
+            "baseUrl":"https://127.0.0.2:1/v1", "apiKey":"fixture-key",
+            "models":[{"id":"configured-fixture"}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+
+    let server = std::thread::spawn(move || {
+        loop {
+            let (mut socket, mut reader, first) = accept_proxy_request(proxy.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            // The fixture records the chosen destination and never opens a tunnel.
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            if first.trim_end() == "CONNECT 127.0.0.2:1 HTTP/1.1" {
+                break;
+            }
+        }
+    });
+
+    let mut child = together_fixture_cli(root.path(), false)
+        .args([
+            "--mode",
+            "rpc",
+            "--provider",
+            "together",
+            "--model",
+            "configured-fixture",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{}",
+        json!({"id":"models","type":"get_available_models"})
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let reply = BufReader::new(output.stdout.as_slice())
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+        .find(|reply| reply["id"] == "models")
+        .unwrap();
+    assert_eq!(reply["success"], true, "{reply}");
+    assert!(
+        reply["data"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| {
+                model["id"] == "configured-fixture" && model["provider"] == "together"
+            }),
+        "{reply}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn together_workspace_discovery_is_direct_and_replacement_inference_uses_the_proxy() {
     let root = tempfile::tempdir().unwrap();
     let launch = root.path().join("launch");
     let target = root.path().join("target");
@@ -9351,19 +9439,87 @@ fn together_workspace_replacement_uses_the_local_route_without_proxying() {
     )
     .unwrap();
 
-    let server = std::thread::spawn(move || {
+    let relay_addr = relay.local_addr().unwrap();
+    let proxy_server = std::thread::spawn(move || {
         loop {
-            let (mut socket, mut reader, first) = accept_proxy_request(relay.try_clone().unwrap());
-            let mut headers = String::new();
+            let (mut socket, mut reader, first) = accept_proxy_request(proxy.try_clone().unwrap());
+            assert_eq!(first.trim_end(), format!("CONNECT {relay_addr} HTTP/1.1"));
+            let mut line = String::new();
             loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line.is_empty() || line == "\r\n" {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
                     break;
                 }
-                headers.push_str(&line);
             }
-            if first.starts_with("GET /ollama/api/ps ") {
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            let is_inference = line.starts_with("POST /together/v1/chat/completions ");
+            assert!(
+                is_inference
+                    || line.starts_with("GET /ollama/api/ps ")
+                    || line.starts_with("GET /together/api/ps "),
+                "{line}"
+            );
+            let mut request = line.clone();
+            let mut length = 0;
+            loop {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+                request.push_str(&line);
+            }
+            request.push_str("x-fixture-proxy: forwarded\r\n\r\n");
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let mut origin = TcpStream::connect(relay_addr).unwrap();
+            origin
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            origin.write_all(request.as_bytes()).unwrap();
+            origin.write_all(&body).unwrap();
+            std::io::copy(&mut origin, &mut socket).unwrap();
+            if is_inference {
+                break;
+            }
+        }
+    });
+    let server = std::thread::spawn(move || {
+        let mut discovered = false;
+        loop {
+            let (mut socket, mut reader, first) = accept_proxy_request(relay.try_clone().unwrap());
+            let mut authorization = None;
+            let mut via_proxy = false;
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    match name.to_ascii_lowercase().as_str() {
+                        "authorization" => authorization = Some(value.trim().to_owned()),
+                        "x-fixture-proxy" => via_proxy = value.trim() == "forwarded",
+                        "content-length" => length = value.trim().parse().unwrap(),
+                        _ => {}
+                    }
+                }
+            }
+            if first.starts_with("GET /ollama/api/ps ")
+                || first.starts_with("GET /together/api/ps ")
+            {
                 write!(
                     socket,
                     "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -9371,20 +9527,39 @@ fn together_workspace_replacement_uses_the_local_route_without_proxying() {
                 .unwrap();
                 continue;
             }
-            assert!(first.starts_with("GET /together/v1/models "), "{first}");
+            assert_eq!(authorization.as_deref(), Some("Bearer relay-fixture"));
+            if first.starts_with("GET /together/v1/models ") {
+                assert!(!via_proxy);
+                assert!(!discovered);
+                discovered = true;
+                let body = r#"{"data":[{"id":"relay-replacement"},{"id":"separate-route"}]}"#;
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                continue;
+            }
             assert!(
-                headers
-                    .to_ascii_lowercase()
-                    .contains("authorization: bearer relay-fixture")
+                first.starts_with("POST /together/v1/chat/completions "),
+                "{first}"
             );
-            let body = r#"{"data":[{"id":"relay-replacement"},{"id":"separate-route"}]}"#;
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            assert!(discovered && via_proxy);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], "relay-replacement");
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"relay fixture answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
             break;
         }
     });
 
     let mut child = together_fixture_cli(root.path(), true)
-        .args(["--mode", "rpc", "--workspace"])
+        .args([
+            "--no-tools",
+            "--no-skills",
+            "--no-extensions",
+            "--mode",
+            "rpc",
+            "--workspace",
+        ])
         .arg(&launch)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -9392,30 +9567,59 @@ fn together_workspace_replacement_uses_the_local_route_without_proxying() {
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
+    let (events, received) = std::sync::mpsc::channel();
+    let output = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if events
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut observed = Vec::new();
     for request in [
         json!({"id":"start","type":"get_state"}),
         json!({"id":"switch","type":"switch_session","sessionPath":target_session}),
         json!({"id":"switched","type":"get_state"}),
         json!({"id":"new","type":"new_session"}),
         json!({"id":"after","type":"get_state"}),
+        json!({"id":"prompt","type":"prompt","message":"fixture prompt"}),
     ] {
         writeln!(input, "{request}").unwrap();
+        loop {
+            let event = received.recv_timeout(Duration::from_secs(30)).unwrap();
+            let matched = event["id"] == request["id"];
+            observed.push(event);
+            if matched {
+                break;
+            }
+        }
     }
+    while !observed.iter().any(|event| event["type"] == "agent_end") {
+        observed.push(received.recv_timeout(Duration::from_secs(30)).unwrap());
+    }
+    assert!(
+        observed.iter().any(|event| {
+            event["type"] == "message_end"
+                && event["message"]["content"].as_array().is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part["text"] == "relay fixture answer")
+                })
+        }),
+        "{:?}",
+        observed.iter().find(|event| event["type"] == "agent_end")
+    );
     drop(input);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
-    proxy.set_nonblocking(true).unwrap();
-    assert_eq!(
-        proxy.accept().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
-    );
-
-    let events: Vec<Value> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    reader.join().unwrap();
+    let events = observed;
     let reply = |id| events.iter().find(|event| event["id"] == id).unwrap();
-    for id in ["switch", "new"] {
+    for id in ["switch", "new", "prompt"] {
         assert_eq!(reply(id)["success"], true, "{events:?}");
     }
     for (id, provider, model) in [
@@ -9427,6 +9631,7 @@ fn together_workspace_replacement_uses_the_local_route_without_proxying() {
         assert_eq!(reply(id)["data"]["model"]["id"], model, "{events:?}");
     }
     server.join().unwrap();
+    proxy_server.join().unwrap();
 }
 
 #[test]
