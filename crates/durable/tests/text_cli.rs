@@ -659,8 +659,10 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let (summary_started, wait_for_summary) = std::sync::mpsc::channel();
+    let (summary_released, wait_for_release) = std::sync::mpsc::channel();
     let provider = thread::spawn(move || {
-        for step in 0..2 {
+        for step in 0..4 {
             let deadline = Instant::now() + Duration::from_secs(20);
             let mut socket = loop {
                 match listener.accept() {
@@ -691,6 +693,13 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
             let mut body = vec![0; length.unwrap()];
             reader.read_exact(&mut body).unwrap();
             let request: Value = serde_json::from_slice(&body).unwrap();
+            if step == 3 {
+                summary_started.send(()).unwrap();
+                wait_for_release
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                break;
+            }
             let events = if step == 0 {
                 let tools = request["tools"].as_array().unwrap();
                 assert_eq!(tools.len(), 4);
@@ -704,7 +713,7 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
                     json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":call["arguments"]}),
                     json!({"type":"response.completed","response":{"status":"completed","output":[call],"usage":{"input_tokens":1,"output_tokens":1}}}),
                 ]
-            } else {
+            } else if step == 1 {
                 assert!(request["input"].as_array().unwrap().iter().any(|item| {
                     item["type"] == "function_call_output"
                         && item["call_id"] == "fixture-call"
@@ -713,6 +722,17 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
                 vec![
                     json!({"type":"response.output_text.delta","output_index":0,"delta":"File read."}),
                     json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"File read."}]}],"usage":{"input_tokens":1,"output_tokens":1}}}),
+                ]
+            } else {
+                let input = request["input"].to_string();
+                assert!(input.contains("File read."));
+                assert!(input.contains("Focus on results"));
+                assert!(!input.contains("Read the fixture"));
+                assert!(!input.contains("durable-file-content"));
+                assert!(request["tools"].as_array().is_none_or(Vec::is_empty));
+                vec![
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":"The fixture was read."}),
+                    json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The fixture was read."}]}],"usage":{"input_tokens":1,"output_tokens":1}}}),
                 ]
             };
             let response = events
@@ -726,8 +746,8 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
     let db = dir.path().join("durable.sqlite");
     std::fs::write(dir.path().join("fixture.txt"), "durable-file-content").unwrap();
     let other = tempfile::tempdir().unwrap();
-    let rpc = |workspace: &std::path::Path, args: &[&str], requests: &[Value]| {
-        let mut process = Command::new(env!("CARGO_BIN_EXE_pi-rs-durable"))
+    let spawn_rpc = |workspace: &std::path::Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi-rs-durable"))
             .env("OPENAI_API_KEY", "fixture-key")
             .args(["--endpoint", &endpoint, "--rpc", "--db"])
             .arg(&db)
@@ -738,7 +758,10 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap();
+            .unwrap()
+    };
+    let rpc = |workspace: &std::path::Path, args: &[&str], requests: &[Value]| {
+        let mut process = spawn_rpc(workspace, args);
         let mut input = process.stdin.take().unwrap();
         for request in requests {
             writeln!(input, "{request}").unwrap();
@@ -818,6 +841,63 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
     );
     assert_eq!(navigation[1]["data"]["leafId"], Value::Null);
     assert_eq!(navigation[1]["data"]["entries"], json!(entries));
+    let original_leaf = &reopened[1]["data"]["leafId"];
+    let summarized = frames(rpc(
+        dir.path(),
+        &["--conversation", id],
+        &[
+            json!({"type":"checkout_entry","entryId":original_leaf}),
+            json!({
+                "type":"navigate_entry","entryId":first_prompt["id"],"summarize":true,
+                "instructions":"Focus on results"
+            }),
+        ],
+    ));
+    assert_eq!(summarized[1]["success"], true, "{summarized:#?}");
+    assert_eq!(
+        summarized[1]["data"]["editorDraft"],
+        first_prompt["message"]
+    );
+    let saved = frames(rpc(
+        dir.path(),
+        &["--conversation", id],
+        &[
+            json!({"type":"get_messages"}),
+            json!({"type":"get_entries"}),
+        ],
+    ));
+    let summary = &saved[0]["data"]["messages"][0];
+    assert_eq!(summary["role"], "branchSummary");
+    assert_eq!(summary["content"][0]["text"], "The fixture was read.");
+    let nodes = saved[1]["data"]["entries"].as_array().unwrap();
+    assert_eq!(nodes.last().unwrap()["type"], "branch_summary");
+    assert_eq!(nodes.last().unwrap()["fromId"], *original_leaf);
+    assert_eq!(nodes.last().unwrap()["parentId"], Value::Null);
+    assert_eq!(nodes.len(), entries.len() + 1);
+
+    let mut cancelled = spawn_rpc(dir.path(), &["--conversation", id]);
+    let mut stdin = cancelled.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"type":"navigate_entry","entryId":original_leaf,"summarize":true})
+    )
+    .unwrap();
+    wait_for_summary
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    writeln!(stdin, "{}", json!({"type":"abort"})).unwrap();
+    drop(stdin);
+    let cancelled = frames(cancelled.wait_with_output().unwrap());
+    assert_eq!(cancelled[0]["success"], false);
+    assert_eq!(cancelled[1]["success"], true);
+    summary_released.send(()).unwrap();
+    let after_cancel = frames(rpc(
+        dir.path(),
+        &["--conversation", id],
+        &[json!({"type":"get_entries"})],
+    ));
+    assert_eq!(after_cancel[0]["data"], saved[1]["data"]);
     provider.join().unwrap();
 }
 

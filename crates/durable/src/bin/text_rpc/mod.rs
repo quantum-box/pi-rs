@@ -1,7 +1,8 @@
 //! Companion implementation of the line-delimited Pi RPC protocol.
+mod branch_summary;
 mod session_history;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, Read};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use pi_rs_durable::images::{BuiltinImageProcessor, UserImageAdmission};
 use pi_rs_durable::progress;
 use pi_rs_durable::runtime::{
     AdmissionError, AdmissionOptions, Conversation, Error, InputMode, OnAbort, QueueMode,
-    Scheduler, Status, Submission, ToolAttempt,
+    Scheduler, SessionBranchSummary, SessionBranchSummaryPlan, Status, Submission, ToolAttempt,
 };
 use pi_rs_durable::tool_progress;
 use pi_rs_durable::worker_activity::WorkerKind;
@@ -228,46 +229,85 @@ pub(super) async fn run(
     let mut tools = model.has_coding_tools.then(|| ToolEvents::new(&state));
     let mut input = input_reader();
     let mut input_open = true;
+    let mut summary: Option<PendingSummary> = None;
     let mut poll = tokio::time::interval(Duration::from_millis(50));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
-    while input_open || watching {
-        tokio::select! {
+    while input_open || watching || summary.is_some() {
+        let switched = tokio::select! {
             result = &mut interrupt => {
                 result?;
                 return Err("interrupted".into());
             }
             received = input.recv(), if input_open => {
                 match received {
+                    Some(Ok(request)) if summary.is_some()
+                        && !matches!(request["type"].as_str(), Some("get_state" | "get_messages" | "get_entries" | "get_tree")) => {
+                        if request["type"] == "abort" {
+                            let pending = summary.take().unwrap();
+                            reply(&pending.request, Err("Branch summary cancelled".into()))?;
+                            reply(&request, Ok(None))?;
+                        } else {
+                            reply(&request, Err("Wait for the branch summary to finish".into()))?;
+                        }
+                        None
+                    }
+                    Some(Ok(request)) if request["type"] == "navigate_entry" && request["summarize"] == true => {
+                        match start_summary(scheduler, model, id, watching, &request) {
+                            Ok(pending) => summary = Some(pending),
+                            Err(error) => reply(&request, Err(error))?,
+                        }
+                        None
+                    }
                     Some(Ok(request)) if matches!(request["type"].as_str(), Some("fork_at_entry" | "checkout_entry" | "navigate_entry")) => {
-                        let result = switch_session_entry(scheduler, model, id, watching, &request)
-                            .map(|switched| {
-                                id = switched.id;
-                                provider_model = switched.provider_model;
-                                seen = settled_submissions(&switched.state);
-                                tools = model.has_coding_tools.then(|| ToolEvents::new(&switched.state));
-                                let mut data = json!({
-                                    "sessionId": id,
-                                    "model": {"id": provider_model},
-                                    "messages": messages(&switched.state)
-                                });
-                                if let Some(draft) = switched.draft {
-                                    data["editorDraft"] = draft;
-                                }
-                                Some(data)
-                            });
-                        reply(&request, result)?;
+                        let result = switch_session_entry(scheduler, model, id, watching, &request);
+                        Some((request, result))
                     }
                     Some(request) => {
                         watching |= respond(scheduler, id, &provider_model, model.has_image_adapter, &mut active, &mut seen, &mut tools, request).await?;
+                        None
                     }
-                    None => input_open = false,
+                    None => {
+                        input_open = false;
+                        None
+                    }
                 }
+            }
+            result = async { (&mut summary.as_mut().unwrap().task).await }, if summary.is_some() => {
+                let pending = summary.take().unwrap();
+                let result = result.map_err(|error| error.to_string()).and_then(|(plan, result)| {
+                    let draft = scheduler.finish_session_branch_summary(plan, result?)
+                        .map_err(|error| error.to_string())?
+                        .as_ref().map(session_history::editor_draft);
+                    session_switch(scheduler, model, id, draft)
+                });
+                Some((pending.request.clone(), result))
             }
             _ = poll.tick(), if watching => {
                 watching = advance(scheduler, id, &mut active, &mut seen, &mut tools).await?;
+                None
             }
+        };
+        if let Some((request, result)) = switched {
+            let result = result.map(|switched| {
+                id = switched.id;
+                provider_model = switched.provider_model;
+                seen = settled_submissions(&switched.state);
+                tools = model
+                    .has_coding_tools
+                    .then(|| ToolEvents::new(&switched.state));
+                let mut data = json!({
+                    "sessionId": id,
+                    "model": {"id": provider_model},
+                    "messages": switched.history
+                });
+                if let Some(draft) = switched.draft {
+                    data["editorDraft"] = draft;
+                }
+                Some(data)
+            });
+            reply(&request, result)?;
         }
     }
     Ok(())
@@ -285,8 +325,67 @@ fn settled_submissions(state: &Conversation) -> HashSet<Uuid> {
 struct SessionSwitch {
     id: Uuid,
     state: Conversation,
+    history: Vec<Value>,
     provider_model: String,
     draft: Option<Value>,
+}
+
+type SummaryResult = (SessionBranchSummaryPlan, Result<Option<String>, String>);
+
+struct PendingSummary {
+    request: Value,
+    task: tokio::task::JoinHandle<SummaryResult>,
+}
+
+impl Drop for PendingSummary {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn start_summary(
+    scheduler: &Scheduler,
+    model: &RoutedModel,
+    id: Uuid,
+    watching: bool,
+    request: &Value,
+) -> Result<PendingSummary, String> {
+    if watching {
+        return Err("Wait for the current turn before summarizing the branch".into());
+    }
+    let plan = scheduler
+        .plan_session_branch_summary(id, requested_entry(request)?)
+        .map_err(|error| error.to_string())?;
+    let name = model
+        .provider_model(&plan.config().model)
+        .map_err(|error| error.to_string())?
+        .to_owned();
+    let instructions = request["instructions"].as_str().map(str::to_owned);
+    let reserve_tokens = request["reserve_tokens"].as_u64().unwrap_or(16_384);
+    let client = model.client.clone();
+    let task = tokio::spawn(async move {
+        let result = branch_summary::generate(
+            client,
+            name,
+            plan.config().max_output_tokens,
+            instructions,
+            reserve_tokens,
+            plan.messages(),
+        )
+        .await;
+        (plan, result)
+    });
+    Ok(PendingSummary {
+        request: request.clone(),
+        task,
+    })
+}
+
+fn requested_entry(request: &Value) -> Result<Uuid, String> {
+    request["entryId"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or_else(|| "Invalid session entry ID".into())
 }
 
 fn switch_session_entry(
@@ -302,10 +401,7 @@ fn switch_session_entry(
     if watching || current.input_run_active() {
         return Err("Wait for the current turn before changing the session position".into());
     }
-    let entry = request["entryId"]
-        .as_str()
-        .and_then(|id| Uuid::parse_str(id).ok())
-        .ok_or("Invalid session entry ID")?;
+    let entry = requested_entry(request)?;
     let (id, draft) = match request["type"].as_str() {
         Some("navigate_entry") => {
             let draft = scheduler
@@ -328,6 +424,15 @@ fn switch_session_entry(
             None,
         ),
     };
+    session_switch(scheduler, model, id, draft)
+}
+
+fn session_switch(
+    scheduler: &Scheduler,
+    model: &RoutedModel,
+    id: Uuid,
+    draft: Option<Value>,
+) -> Result<SessionSwitch, String> {
     let state = scheduler
         .conversation(id)
         .map_err(|error| error.to_string())?;
@@ -335,9 +440,11 @@ fn switch_session_entry(
         .provider_model(&state.config.model)
         .map_err(|error| error.to_string())?
         .to_owned();
+    let history = displayed_messages(scheduler, &state).map_err(|error| error.to_string())?;
     Ok(SessionSwitch {
         id,
         state,
+        history,
         provider_model,
         draft,
     })
@@ -501,12 +608,12 @@ async fn respond(
             }
             Some(data)
         }).map_err(|error| error.to_string()),
-        "get_messages" => scheduler.conversation(id).map(|state| {
-            let mut data = json!({"messages":messages(&state)});
+        "get_messages" => scheduler.conversation(id).and_then(|state| {
+            let mut data = json!({"messages":displayed_messages(scheduler, &state)?});
             if request["includeNative"] == true {
                 data["nativeMessages"] = json!(state.messages);
             }
-            Some(data)
+            Ok(Some(data))
         }).map_err(|error| error.to_string()),
         "get_entries" => session_history::snapshot(scheduler, id)
             .and_then(|tree| tree.entries_after(request.get("since")))
@@ -871,6 +978,20 @@ impl ToolEvents {
 }
 
 fn messages(state: &Conversation) -> Vec<Value> {
+    project_messages(state, &BTreeMap::new())
+}
+
+fn displayed_messages(scheduler: &Scheduler, state: &Conversation) -> Result<Vec<Value>, Error> {
+    Ok(project_messages(
+        state,
+        &scheduler.active_branch_summaries(state)?,
+    ))
+}
+
+fn project_messages(
+    state: &Conversation,
+    summaries: &BTreeMap<usize, SessionBranchSummary>,
+) -> Vec<Value> {
     let mut pending: HashMap<&str, VecDeque<Invocation>> = HashMap::new();
     let mut metadata: HashMap<&str, VecDeque<_>> = HashMap::new();
     for result in &state.tool_results {
@@ -884,6 +1005,12 @@ fn messages(state: &Conversation) -> Vec<Value> {
         .iter()
         .enumerate()
         .filter_map(|(index, message)| match message {
+            Message::User { .. } if summaries.contains_key(&index) => {
+                let summary = &summaries[&index];
+                let mut message = text_message("branchSummary", &summary.summary);
+                message["fromId"] = json!(summary.from_id);
+                Some(message)
+            }
             Message::User { content } => Some(state.content_blocks.get(&index).map_or_else(
                 || text_message("user", content),
                 |value| user_message(&value.blocks),

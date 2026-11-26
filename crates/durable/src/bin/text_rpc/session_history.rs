@@ -111,7 +111,12 @@ fn project(node: &SessionTreeEntry, tool_names: &mut HashMap<String, String>) ->
     }
     let mut entry = match &node.entry {
         SessionEntry::Message(entry) => {
-            if let Some(compaction) = &entry.compaction
+            if let Some(summary) = &entry.branch_summary {
+                json!({
+                    "type":"branch_summary", "summary":summary.summary,
+                    "fromId":summary.from_id,
+                })
+            } else if let Some(compaction) = &entry.compaction
                 && let Some(first_kept) = compaction.first_kept_entry_id
             {
                 json!({

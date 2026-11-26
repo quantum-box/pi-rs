@@ -309,6 +309,43 @@ impl<'a> Transcript<'a> {
         records: &[(Value, Option<Vec<MessageContentBlocks>>)],
         create: bool,
     ) -> Result<(Batch, Vec<Cursor>), Error> {
+        let (tip, expected) = if create {
+            (None, Expected::Missing)
+        } else {
+            let (head, version) = self.load_head()?;
+            (head.tip, Expected::Version(version))
+        };
+        self.prepare_writes_at(tip, expected, records)
+    }
+
+    pub(crate) fn prepare_checkout_append(
+        &self,
+        previous: &Cursor,
+        source: &Cursor,
+        records: &[(Value, Option<Vec<MessageContentBlocks>>)],
+    ) -> Result<(Batch, Cursor), Error> {
+        if previous.transcript != self.id {
+            return Err(Error::WrongTranscript);
+        }
+        let (head, version) = self.load_head()?;
+        if head.tip != previous.next {
+            return Err(durable_store::Error::Conflict {
+                key: head_key(self.id),
+            }
+            .into());
+        }
+        let tip = source.next.ok_or(Error::Corrupt)?;
+        let (batch, mut positions) =
+            self.prepare_writes_at(Some(tip), Expected::Version(version), records)?;
+        Ok((batch, positions.pop().expect("nonempty entry batch")))
+    }
+
+    fn prepare_writes_at(
+        &self,
+        mut previous: Option<Link>,
+        expected: Expected,
+        records: &[(Value, Option<Vec<MessageContentBlocks>>)],
+    ) -> Result<(Batch, Vec<Cursor>), Error> {
         if records.is_empty()
             || records.iter().any(|(value, blocks)| {
                 blocks
@@ -318,19 +355,7 @@ impl<'a> Transcript<'a> {
         {
             return Err(Error::Corrupt);
         }
-        let (head, expected) = if create {
-            (
-                Head {
-                    format: 1,
-                    tip: None,
-                },
-                Expected::Missing,
-            )
-        } else {
-            let (head, version) = self.load_head()?;
-            (head, Expected::Version(version))
-        };
-        if let Some(tip) = head.tip {
+        if let Some(tip) = previous {
             self.load_entry(tip)?;
         }
         let head_key = head_key(self.id);
@@ -340,7 +365,6 @@ impl<'a> Transcript<'a> {
         }];
         let mut mutations = Vec::with_capacity(records.len() + 1);
         let mut positions = Vec::with_capacity(records.len());
-        let mut previous = head.tip;
         let mut keys = std::collections::HashSet::new();
         for (value, blocks) in records {
             let sequence = previous
