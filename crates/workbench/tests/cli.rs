@@ -8827,7 +8827,7 @@ fn startup_replaces_only_missing_retired_builtin_defaults() {
             "ANT_LING_API_KEY",
             json!({}),
             vec![],
-            Some(("ant-ling", "Ring-2.6-1T")),
+            Some(("ant-ling", "Ring-2.6-1T", "Ling-3.1-flash")),
             ("ant-ling", "Ling-3.1-flash", "high"),
         ),
         (
@@ -8859,7 +8859,7 @@ fn startup_replaces_only_missing_retired_builtin_defaults() {
             "TOGETHER_API_KEY",
             json!({}),
             vec![],
-            Some(("together", "thinkingmachines/Inkling")),
+            Some(("together", "thinkingmachines/Inkling", "moonshotai/Kimi-K3")),
             ("together", "moonshotai/Kimi-K3", "off"),
         ),
         (
@@ -8900,6 +8900,51 @@ fn startup_replaces_only_missing_retired_builtin_defaults() {
             ("together", "MiniMaxAI/MiniMax-M3", "off"),
         ),
         (
+            json!({"defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec!["--model", "OPENAI/GPT-OSS-120B"],
+            None,
+            ("together", "openai/gpt-oss-120b", "off"),
+        ),
+        (
+            json!({"defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec!["--model", "TOGETHER/THINKINGMACHINES/INKLING:off"],
+            None,
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![
+                "--provider",
+                "together",
+                "--model",
+                "THINKINGMACHINES/INKLING",
+            ],
+            None,
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultModel":"together/thinkingmachines/Inkling","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({"providers":{"together":{"baseUrl":"https://fixture.example/v1","apiKey":"fixture"}}}),
+            vec![],
+            None,
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({"providers":{"together":{"baseUrl":"https://fixture.example/v1","apiKey":"fixture"}}}),
+            vec![],
+            Some(("together", "openai/gpt-oss-120b", "openai/gpt-oss-120b")),
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
             json!({"defaultProvider":"together","defaultModel":"private/unknown-model","defaultThinkingLevel":"off"}),
             "TOGETHER_API_KEY",
             json!({}),
@@ -8929,7 +8974,7 @@ fn startup_replaces_only_missing_retired_builtin_defaults() {
                 command.env(name, value);
             }
         }
-        if let Some((provider, model)) = saved_session_model {
+        if let Some((provider, model, _)) = saved_session_model {
             let path = root.path().join("resume.jsonl");
             let mut session = pi_rs::Session::open(&path).unwrap();
             session
@@ -8974,7 +9019,12 @@ fn startup_replaces_only_missing_retired_builtin_defaults() {
         for id in ["state", "after"] {
             let data = &events.iter().find(|event| event["id"] == id).unwrap()["data"];
             assert_eq!(data["model"]["provider"], expected.0, "{settings}: {data}");
-            assert_eq!(data["model"]["id"], expected.1, "{settings}: {data}");
+            let expected_model = if id == "state" {
+                saved_session_model.map_or(expected.1, |(_, _, model)| model)
+            } else {
+                expected.1
+            };
+            assert_eq!(data["model"]["id"], expected_model, "{settings}: {data}");
             assert_eq!(data["thinkingLevel"], expected.2, "{settings}: {data}");
         }
         assert_eq!(

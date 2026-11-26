@@ -102,21 +102,26 @@ pub(super) fn is_unconfigured_retired_builtin_model(
     provider: &Provider,
     id: &str,
 ) -> bool {
-    is_retired_builtin_model(provider, id) && profiles.model(provider, id).is_none()
+    retired_builtin_model_id(provider, id).is_some_and(|canonical| {
+        profiles.model(provider, id).is_none()
+            && (canonical == id || profiles.model(provider, canonical).is_none())
+    })
 }
 
-fn is_retired_builtin_model(provider: &Provider, id: &str) -> bool {
-    match provider.id() {
-        "ant-ling" => matches!(id, "Ling-2.6-flash" | "Ling-2.6-1T" | "Ring-2.6-1T"),
-        "together" => matches!(
-            id,
-            "deepseek-ai/DeepSeek-V4-Pro-0813"
-                | "MiniMaxAI/MiniMax-M3"
-                | "openai/gpt-oss-120b"
-                | "thinkingmachines/Inkling"
-        ),
-        _ => false,
-    }
+fn retired_builtin_model_id(provider: &Provider, id: &str) -> Option<&'static str> {
+    let ids: &[_] = match provider.id() {
+        "ant-ling" => &["Ling-2.6-flash", "Ling-2.6-1T", "Ring-2.6-1T"],
+        "together" => &[
+            "deepseek-ai/DeepSeek-V4-Pro-0813",
+            "MiniMaxAI/MiniMax-M3",
+            "openai/gpt-oss-120b",
+            "thinkingmachines/Inkling",
+        ],
+        _ => return None,
+    };
+    ids.iter()
+        .copied()
+        .find(|known| known.eq_ignore_ascii_case(id))
 }
 
 /// Choose from known catalog entries without resolving credential commands
@@ -742,22 +747,20 @@ fn resolve_cli_catalog_model(
         let mut matches = Vec::new();
         for (provider, models) in &catalogs {
             let explicit = named.as_ref().filter(|(named, _)| provider == named);
-            let known = models
-                .iter()
-                .find(|model| explicit.is_some_and(|(_, id)| model.eq_ignore_ascii_case(id)))
-                .or_else(|| {
-                    models
-                        .iter()
-                        .find(|model| model.eq_ignore_ascii_case(reference))
-                });
-            // Pi also treats the named provider's own full literal ID as a
-            // qualified match. A named partial match can compete with raw IDs.
-            let id = known.cloned().or_else(|| {
+            // Exact retired IDs still participate in explicit resolution and
+            // credential precedence without appearing in discovery or fuzzy matches.
+            let exact_id = |id: &str| {
+                models
+                    .iter()
+                    .find(|model| model.eq_ignore_ascii_case(id))
+                    .map(String::as_str)
+                    .or_else(|| retired_builtin_model_id(provider, id))
+            };
+            let known = explicit
+                .and_then(|(_, id)| exact_id(id))
+                .or_else(|| exact_id(reference));
+            let id = known.map(str::to_owned).or_else(|| {
                 let (_, id) = explicit?;
-                // Keep an exact, provider-qualified request for a former bundled ID.
-                if is_retired_builtin_model(provider, id) {
-                    return Some((*id).to_owned());
-                }
                 let names = aliases(profiles, provider, models);
                 let candidates = search_ids(models, &names);
                 exact(id, &candidates, provider.id())
@@ -874,11 +877,11 @@ pub fn split_with_profiles(
     }
     let named = unqualified(value, provider.id());
     let id = thinking_suffix(named).map_or(named, |(id, _)| id);
-    if is_retired_builtin_model(provider, id)
+    if let Some(canonical) = retired_builtin_model_id(provider, id)
         && !ids.iter().any(|model| model.eq_ignore_ascii_case(id))
     {
-        // Treat the requested retired ID as exact so a successor cannot win a partial match.
-        ids.push(id.to_owned());
+        // Keep an exact retired ID ahead of any successor's partial match.
+        ids.push(canonical.to_owned());
     }
     let aliases = aliases(profiles, provider, &ids);
     let mut selected = split(value, &search_ids(&ids, &aliases), provider.id())?;
@@ -1348,6 +1351,48 @@ mod tests {
         let (choices, warnings) = scoped_choices(["widget:bad:high"], &catalogs);
         assert_eq!(choices[0].pattern(), "anthropic/widget-z");
         assert!(warnings[0].contains("Invalid thinking level \"bad\""));
+    }
+
+    #[test]
+    fn retired_together_resume_requires_catalog_authority_for_its_endpoint() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{"together":{"baseUrl":"https://fixture.example/v1","apiKey":"fixture"}}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("together").unwrap();
+        args.endpoint = args.model_profiles.endpoint(&args.provider).to_owned();
+        let retired = "thinkingmachines/Inkling";
+        for (catalog_endpoint, listed, expected) in [
+            (None, false, retired),
+            (
+                Some("https://other.example/v1/chat/completions"),
+                false,
+                retired,
+            ),
+            (Some(args.endpoint.as_str()), false, "moonshotai/Kimi-K3"),
+            (Some(args.endpoint.as_str()), true, retired),
+        ] {
+            let mut args = args.clone();
+            args.model = "moonshotai/Kimi-K3".into();
+            args.remember_initial_selection();
+            if let Some(endpoint) = catalog_endpoint {
+                args.complete_catalogs
+                    .push(("together".into(), endpoint.into()));
+            }
+            if listed {
+                args.discovered_models
+                    .push(("together".into(), retired.into()));
+            }
+            args.restore_branch_selection(retired.into(), None, Some("together"));
+            assert_eq!(
+                args.model, expected,
+                "{catalog_endpoint:?}, listed={listed}"
+            );
+        }
     }
 
     #[test]

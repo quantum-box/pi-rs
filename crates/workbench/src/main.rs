@@ -913,6 +913,18 @@ impl Cli {
         thinking::ant_ling_default(self).unwrap_or_else(|| "medium".into())
     }
 
+    fn retired_catalog_is_authoritative(&self, provider: &Provider) -> bool {
+        let endpoint = self.endpoint_for(provider);
+        // Together's bundled catalog describes its default endpoint. A custom
+        // endpoint can still serve former models until discovery says otherwise.
+        provider.id() != "together"
+            || endpoint == provider.default_endpoint()
+            || self
+                .complete_catalogs
+                .iter()
+                .any(|(id, address)| id == provider.id() && address == endpoint)
+    }
+
     fn restore_branch_selection(
         &mut self,
         model: String,
@@ -953,7 +965,10 @@ impl Cli {
                     &provider,
                     &model,
                 );
-                (known, complete || retired)
+                (
+                    known,
+                    complete || (retired && self.retired_catalog_is_authoritative(&provider)),
+                )
             });
         let unavailable = availability.is_none_or(|(known, complete)| !known && complete);
         if unavailable || !self.restore_model_selection(model, thinking.clone(), provider, true) {
@@ -1208,16 +1223,16 @@ impl Cli {
                 id
             }
         });
-        let missing_retired_default = configured_model.is_some_and(|model| {
-            model_selection::is_unconfigured_retired_builtin_model(
-                &self.model_profiles,
-                &provider,
-                model,
-            ) && !self
-                .discovered_models
-                .iter()
-                .any(|(id, discovered)| id == provider.id() && model == discovered)
-        });
+        let missing_retired_default = self.retired_catalog_is_authoritative(&provider)
+            && configured_model.is_some_and(|model| {
+                model_selection::is_unconfigured_retired_builtin_model(
+                    &self.model_profiles,
+                    &provider,
+                    model,
+                ) && !self.discovered_models.iter().any(|(id, discovered)| {
+                    id == provider.id() && model.eq_ignore_ascii_case(discovered)
+                })
+            });
         let provider = if missing_retired_default && !self.connection_explicit {
             fallback.provider.clone()
         } else {
@@ -2041,7 +2056,11 @@ async fn execute(
             .await
         {
             Ok(catalog) => vec![catalog],
-            Err(error) if retired_default && can_select_automatically => {
+            Err(error)
+                if retired_default
+                    && can_select_automatically
+                    && args.retired_catalog_is_authoritative(&args.provider) =>
+            {
                 retired_catalog_error = Some(error);
                 Vec::new()
             }
@@ -2054,13 +2073,6 @@ async fn execute(
         .iter()
         .find(|catalog| catalog.provider == args.provider)
         .map_or(&[][..], |catalog| catalog.models.as_slice());
-    let missing_retired_default = retired_default
-        && !available
-            .iter()
-            .any(|id| id == saved_model || id == &args.model);
-    if missing_retired_default {
-        args.model.clear();
-    }
     args.discovered_models = catalogs
         .iter()
         .flat_map(|catalog| {
@@ -2080,6 +2092,14 @@ async fn execute(
             )
         })
         .collect();
+    let missing_retired_default = retired_default
+        && args.retired_catalog_is_authoritative(&args.provider)
+        && !available
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(saved_model) || id.eq_ignore_ascii_case(&args.model));
+    if missing_retired_default {
+        args.model.clear();
+    }
     // The hidden worker command receives an already-resolved, literal model ID.
     if !args.model.is_empty()
         && !args.model_is_literal
