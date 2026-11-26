@@ -3639,8 +3639,6 @@ impl AgentSession {
                 .map_err(|_| Error::Session("session journal is in use".into()))?
                 .session_id(),
         );
-        self.registry
-            .copy_cycled_models(self.session_id, fork.session_id);
         let mut fork_registry = self.registry.as_ref().clone();
         fork_registry.isolate_mcp_runtime();
         fork.registry = Arc::new(fork_registry);

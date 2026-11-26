@@ -30,12 +30,19 @@ impl From<&str> for CommandCallbackFailure {
     }
 }
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
-type BranchModels = BTreeMap<
+type NamedBranchModels = BTreeMap<
     (Option<Uuid>, Option<String>, String),
     (Arc<dyn crate::Model>, Option<crate::Limits>),
 >;
 
 type CycledModels = BTreeMap<(Uuid, crate::journal::CycledModelSelection), Arc<dyn crate::Model>>;
+// Registry snapshots and reloads carry both kinds of journal binding together.
+#[derive(Default)]
+struct BranchModels {
+    named: NamedBranchModels,
+    cycled: CycledModels,
+}
+
 type ReservedBranchModel = (Uuid, String, String);
 struct BranchModelReservation {
     reserved: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
@@ -2155,7 +2162,6 @@ pub struct Registry {
     omit_mcp_declarations: bool,
     pub(crate) publish_tool_attempts: bool,
     branch_models: Arc<RwLock<BranchModels>>,
-    cycled_models: Arc<RwLock<CycledModels>>,
     branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
 }
 
@@ -2347,6 +2353,7 @@ impl Registry {
         self.branch_models
             .write()
             .expect("branch models")
+            .named
             .insert((None, None, name), (model, None));
         Ok(())
     }
@@ -2372,6 +2379,7 @@ impl Registry {
         self.branch_models
             .write()
             .expect("branch models")
+            .named
             .insert((Some(session_id), None, name), (model, None));
         Ok(())
     }
@@ -2426,8 +2434,9 @@ impl Registry {
                 .expect("branch reservations");
             let models = self.branch_models.read().expect("branch models");
             let existing = models
+                .named
                 .get(&(Some(session_id), None, name.to_owned()))
-                .or_else(|| models.get(&(None, None, name.to_owned())));
+                .or_else(|| models.named.get(&(None, None, name.to_owned())));
             if reservations.contains_key(&key)
                 || reservations.contains_key(&(session_id, String::new(), String::new()))
                 || !existing.is_some_and(|(existing, _)| Arc::ptr_eq(existing, &model))
@@ -2472,7 +2481,7 @@ impl Registry {
                 .write()
                 .expect("branch reservations");
             let models = self.branch_models.read().expect("branch models");
-            let existing = models.get(&key);
+            let existing = models.named.get(&key);
             if reservations.contains_key(&reservation_key)
                 || reservations.contains_key(&(session_id, String::new(), String::new()))
                 || existing.is_some_and(|(existing, _)| !Arc::ptr_eq(existing, &model))
@@ -2498,6 +2507,7 @@ impl Registry {
             self.branch_models
                 .write()
                 .expect("branch models")
+                .named
                 .entry(key)
                 .or_insert((model, None));
         }
@@ -2508,9 +2518,10 @@ impl Registry {
         session: Uuid,
         selection: &crate::journal::CycledModelSelection,
     ) -> Option<Arc<dyn crate::Model>> {
-        self.cycled_models
+        self.branch_models
             .read()
-            .expect("cycled models")
+            .expect("branch models")
+            .cycled
             .get(&(session, selection.clone()))
             .cloned()
     }
@@ -2527,7 +2538,8 @@ impl Registry {
         self.commit_reserved_session_models(
             session,
             || {
-                let models = self.cycled_models.read().expect("cycled models");
+                let models = self.branch_models.read().expect("branch models");
+                let models = &models.cycled;
                 match models.get(&key) {
                     Some(existing) if Arc::ptr_eq(existing, &client) => Ok(()),
                     None if !require_existing => Ok(()),
@@ -2538,9 +2550,10 @@ impl Registry {
             },
             commit,
             || {
-                self.cycled_models
+                self.branch_models
                     .write()
-                    .expect("cycled models")
+                    .expect("branch models")
+                    .cycled
                     .entry(key.clone())
                     .or_insert_with(|| client.clone());
             },
@@ -2569,6 +2582,7 @@ impl Registry {
                         .branch_models
                         .read()
                         .expect("branch models")
+                        .named
                         .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
                         .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, client))
                 {
@@ -2586,9 +2600,9 @@ impl Registry {
                         .is_some_and(|(p, n, _)| provider.as_deref() == Some(p) && name == n);
                     let key = (Some(session_id), provider, name);
                     if guarded_binding {
-                        models.entry(key).or_insert((client, None));
+                        models.named.entry(key).or_insert((client, None));
                     } else {
-                        models.insert(key, (client, None));
+                        models.named.insert(key, (client, None));
                     }
                 }
             },
@@ -2651,10 +2665,14 @@ impl Registry {
         {
             return Err(Error::Config("model client is being resolved".into()));
         }
-        self.branch_models.write().expect("branch models").insert(
-            (Some(session_id), Some(provider.to_owned()), name.to_owned()),
-            (model, limits),
-        );
+        self.branch_models
+            .write()
+            .expect("branch models")
+            .named
+            .insert(
+                (Some(session_id), Some(provider.to_owned()), name.to_owned()),
+                (model, limits),
+            );
         Ok(())
     }
     pub(crate) fn provider_branch_config(
@@ -2666,6 +2684,7 @@ impl Registry {
         self.branch_models
             .read()
             .expect("branch models")
+            .named
             .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
             .cloned()
     }
@@ -2676,8 +2695,9 @@ impl Registry {
     ) -> Option<Arc<dyn crate::Model>> {
         let models = self.branch_models.read().expect("branch models");
         models
+            .named
             .get(&(Some(session_id), None, name.to_owned()))
-            .or_else(|| models.get(&(None, None, name.to_owned())))
+            .or_else(|| models.named.get(&(None, None, name.to_owned())))
             .map(|(model, _)| model.clone())
     }
     pub(crate) fn copy_session_branch_models(&self, source: Uuid, destination: Uuid) {
@@ -2685,16 +2705,17 @@ impl Registry {
             .branch_reservations
             .read()
             .expect("branch reservations");
+        if reservations.contains_key(&(destination, String::new(), String::new())) {
+            return;
+        }
         let mut models = self.branch_models.write().expect("branch models");
-        let copies: Vec<_> = models
+        let named: Vec<_> = models
+            .named
             .iter()
             .filter(|((owner, _, _), _)| *owner == Some(source))
             .map(|((_, provider, name), model)| (provider.clone(), name.clone(), model.clone()))
             .collect();
-        for (provider, name, model) in copies {
-            if reservations.contains_key(&(destination, String::new(), String::new())) {
-                continue;
-            }
+        for (provider, name, model) in named {
             if reservations.contains_key(&(
                 destination,
                 provider.clone().unwrap_or_default(),
@@ -2702,26 +2723,19 @@ impl Registry {
             )) {
                 continue;
             }
-            models.insert((Some(destination), provider, name), model);
+            models
+                .named
+                .insert((Some(destination), provider, name), model);
         }
-    }
-    pub(crate) fn copy_cycled_models(&self, source: Uuid, destination: Uuid) {
-        let reservations = self
-            .branch_reservations
-            .read()
-            .expect("branch reservations");
-        if reservations.get(&(source, String::new(), String::new())) == Some(&true)
-            || reservations.contains_key(&(destination, String::new(), String::new()))
-        {
-            return;
+        if reservations.get(&(source, String::new(), String::new())) != Some(&true) {
+            let cycled: Vec<_> = models
+                .cycled
+                .iter()
+                .filter(|((owner, _), _)| *owner == source)
+                .map(|((_, selection), client)| ((destination, selection.clone()), client.clone()))
+                .collect();
+            models.cycled.extend(cycled);
         }
-        let mut models = self.cycled_models.write().expect("cycled models");
-        let copies: Vec<_> = models
-            .iter()
-            .filter(|((owner, _), _)| *owner == source)
-            .map(|((_, selection), model)| ((destination, selection.clone()), model.clone()))
-            .collect();
-        models.extend(copies);
     }
 
     /// Remove recovery clients for a session before rebuilding its host configuration.
@@ -2735,13 +2749,10 @@ impl Registry {
                 *revoked = true;
             }
         }
-        self.cycled_models
-            .write()
-            .expect("cycled models")
-            .retain(|(owner, _), _| *owner != session_id);
-        self.branch_models
-            .write()
-            .expect("branch models")
+        let mut models = self.branch_models.write().expect("branch models");
+        models.cycled.retain(|(owner, _), _| *owner != session_id);
+        models
+            .named
             .retain(|(owner, _, _), _| *owner != Some(session_id));
     }
     /// Allow tools that opt out to run without the host's default timeout.
@@ -3353,7 +3364,6 @@ impl Registry {
             mcp_servers: Arc::new(self.mcp_servers.copy_registrations()),
             omit_mcp_declarations: self.omit_mcp_declarations,
             publish_tool_attempts: self.publish_tool_attempts,
-            cycled_models: self.cycled_models.clone(),
             branch_models: self.branch_models.clone(),
             branch_reservations: self.branch_reservations.clone(),
         })
