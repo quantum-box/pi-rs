@@ -439,6 +439,100 @@ fn latest_conversation_documents_fork_current_values_without_retaining_payload_h
     );
 }
 
+#[tokio::test]
+async fn latest_conversation_watch_tracks_its_address_and_delivers_replacements() {
+    use pi_rs_durable::{
+        document::{LatestConversationDocument, LatestDocumentFork},
+        runtime::ViewWatchEnd,
+    };
+    use std::{num::NonZeroU32, time::Duration};
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let parent = harness.create_conversation(config()).unwrap();
+        let definition = LatestConversationDocument {
+            kind: "live".into(),
+            version: NonZeroU32::MIN,
+            initial: object(0),
+            fork: LatestDocumentFork::Current,
+        };
+        let cancel = pi_rs_core::CancellationToken::new();
+        // With a long poll interval, local commits update via notifications.
+        let interval = Duration::from_secs(60);
+        assert!(
+            harness
+                .watch_latest_document(parent, &definition, "", interval, cancel.clone())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            harness
+                .watch_latest_document(Uuid::new_v4(), &definition, "", interval, cancel.clone())
+                .is_err()
+        );
+        harness
+            .session_transaction(parent, |tx| {
+                tx.edit_latest_document(&definition, "", |_| Ok(()))
+            })
+            .unwrap();
+        let mut watch = harness
+            .watch_latest_document(parent, &definition, "", interval, cancel.clone())
+            .unwrap()
+            .unwrap();
+        let initial = watch.value().clone();
+        let child = harness.fork(parent).unwrap();
+        harness
+            .session_transaction(child, |tx| {
+                tx.edit_latest_document(&definition, "", |doc| {
+                    *doc = object(99);
+                    Ok(())
+                })
+            })
+            .unwrap();
+
+        let update = async {
+            tokio::task::yield_now().await;
+            harness
+                .session_transaction(parent, |tx| {
+                    tx.edit_latest_document(&definition, "", |doc| {
+                        *doc = object(1);
+                        Ok(())
+                    })
+                })
+                .unwrap();
+        };
+        let (frame, ()) = tokio::join!(watch.next(), update);
+        let frame = frame.unwrap().unwrap();
+        assert_eq!(frame.value.value, object(1));
+        assert!(!frame.retired);
+        assert_eq!(frame.operations, vec![json!(["r", {"n": 1}])]);
+        assert_eq!(initial.value, object(0));
+
+        harness
+            .session_transaction(parent, |tx| tx.retire_latest_document(&definition, ""))
+            .unwrap();
+        let retired = watch.next().await.unwrap().unwrap();
+        assert!(retired.retired);
+        assert_eq!(retired.value.incarnation, initial.incarnation);
+        assert!(retired.operations.is_empty());
+        harness
+            .session_transaction(parent, |tx| {
+                tx.edit_latest_document(&definition, "", |_| Ok(()))
+            })
+            .unwrap();
+        let recreated = watch.next().await.unwrap().unwrap();
+        assert_ne!(recreated.value.incarnation, initial.incarnation);
+        assert_eq!(recreated.operations, vec![json!(["r", {"n": 0}])]);
+        cancel.cancel();
+        assert!(watch.next().await.unwrap().is_none());
+        assert_eq!(watch.end_reason(), Some(&ViewWatchEnd::Aborted));
+    })
+    .await
+    .expect("local commits should wake current document watches");
+}
+
 #[test]
 fn typed_document_edits_keep_fields_and_commit_with_entries() {
     #[derive(serde::Serialize, serde::Deserialize)]

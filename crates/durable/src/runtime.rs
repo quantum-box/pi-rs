@@ -13863,6 +13863,7 @@ impl Harness {
         interval: Duration,
         cancel: CancellationToken,
     ) -> Result<Option<crate::document::SessionDocumentWatch<T>>, Error> {
+        self.subagent_store()?;
         let source = self
             .merged_source
             .as_ref()
@@ -13871,7 +13872,38 @@ impl Harness {
             &self.owner,
             source.signal.closed.clone(),
             conversation,
-            definition,
+            definition.into(),
+            key,
+            interval,
+            cancel,
+        )?)
+    }
+
+    /// Watch one latest-only conversation document without creating it.
+    pub fn watch_latest_document<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        conversation: Uuid,
+        definition: &crate::document::LatestConversationDocument<T>,
+        key: &str,
+        interval: Duration,
+        cancel: CancellationToken,
+    ) -> Result<Option<crate::document::CurrentDocumentWatch<T>>, Error> {
+        if self
+            .subagent_store()?
+            .get(&Self::key(conversation))?
+            .is_none()
+        {
+            return Err(Error::NotFound);
+        }
+        let source = self
+            .merged_source
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("document watch source already closed".into()))?;
+        Ok(crate::document::CurrentDocumentWatch::attach(
+            &self.owner,
+            source.signal.closed.clone(),
+            conversation,
+            definition.into(),
             key,
             interval,
             cancel,
@@ -24190,6 +24222,19 @@ impl Scheduler {
     ) -> Result<Option<crate::document::SessionDocumentWatch<T>>, Error> {
         self.harness
             .watch_session_document(conversation, definition, key, interval, cancel)
+    }
+
+    /// Watch the current value at one latest-only conversation address.
+    pub fn watch_latest_document<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        conversation: Uuid,
+        definition: &crate::document::LatestConversationDocument<T>,
+        key: &str,
+        interval: Duration,
+        cancel: CancellationToken,
+    ) -> Result<Option<crate::document::CurrentDocumentWatch<T>>, Error> {
+        self.harness
+            .watch_latest_document(conversation, definition, key, interval, cancel)
     }
 
     pub fn watch_merged_progress_handle(
