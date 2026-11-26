@@ -1430,7 +1430,9 @@ async fn exercise_foreground_delegation(
             })
             .await
             .unwrap();
-            let child_view = scheduler.view(child, NonZeroUsize::MIN).unwrap();
+            let child_view = scheduler
+                .foreground_subagent_view(root, child, NonZeroUsize::MIN)
+                .unwrap();
             assert_eq!(child_view.state.submissions.len(), 1);
             assert!(!matches!(
                 child_view.state.submissions[0].status,
@@ -1461,6 +1463,21 @@ async fn exercise_foreground_delegation(
     )
     .unwrap();
     assert_eq!(scheduler.conversation(child).unwrap().submissions.len(), 1);
+    let settled = scheduler
+        .foreground_subagent_view(root, child, NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(
+        settled.state.submissions[0].status,
+        Status::Done {
+            answer: "child answer".into()
+        }
+    );
+    assert!(
+        scheduler
+            .foreground_subagent_view(uuid::Uuid::new_v4(), child, NonZeroUsize::MIN)
+            .is_err()
+    );
+
     let page = scheduler
         .scan_task_owned_subagents(result.tool_results[0].operation_id, None, 16)
         .unwrap();

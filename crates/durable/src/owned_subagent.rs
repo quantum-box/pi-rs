@@ -311,6 +311,34 @@ thread_local! {
 impl Harness {
     /// Scan at most `scan_budget` (1..=256) ownership edges for one task.
     /// Each page is a separate snapshot and must not authorize graph writes.
+    /// Read a direct tool-owned foreground conversation, including after
+    /// its tool has settled. Ownership is checked independently of the live view.
+    pub fn foreground_subagent_view(
+        &self,
+        parent: Uuid,
+        child: Uuid,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::runtime::ConversationView, Error> {
+        let store = self.subagent_store()?;
+        let edge = ownership_edge::EdgeStore::new(store)
+            .get(child)
+            .map_err(|error| Error::Invalid(error.to_string()))?
+            .ok_or(Error::NotFound)?
+            .edge;
+        let expected_owner = TaskOwner::Conversation(parent);
+        if edge.mode != Mode::Foreground || edge.task_owner != expected_owner {
+            return Err(Error::NotFound);
+        }
+        let task = task_store::TaskStore::new(store)
+            .load(edge.task)
+            .map_err(crate::task_scheduler::Error::from)?
+            .ok_or(Error::NotFound)?;
+        if !task.task.is_task_tool() || task.task.owner() != &expected_owner {
+            return Err(Error::NotFound);
+        }
+        self.view(child, limit)
+    }
+
     pub fn scan_task_owned_subagents(
         &self,
         task: Uuid,

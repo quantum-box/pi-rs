@@ -336,17 +336,9 @@ fn foreground_subagent_view(
         .as_str()
         .and_then(|id| Uuid::parse_str(id).ok())
         .ok_or("conversationId must be a UUID")?;
-    let parent_view = scheduler
-        .view(parent, NonZeroUsize::MIN)
-        .map_err(|error| error.to_string())?;
-    if !parent_view.foreground_subagents.contains(&child) {
-        return Err(
-            "foreground subagent is not attached to this conversation's active tool".into(),
-        );
-    }
     let limit = NonZeroUsize::new(32).expect("nonzero transcript read limit");
     let child_view = scheduler
-        .view(child, limit)
+        .foreground_subagent_view(parent, child, limit)
         .map_err(|error| error.to_string())?;
     Ok(json!({
         "conversationId": child,

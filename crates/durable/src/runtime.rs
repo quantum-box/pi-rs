@@ -23829,6 +23829,16 @@ impl Scheduler {
     ) -> Result<Option<crate::document::Document>, Error> {
         self.harness.document(address)
     }
+    /// Read a direct foreground child of one of the parent's durable tools.
+    pub fn foreground_subagent_view(
+        &self,
+        parent: Uuid,
+        child: Uuid,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<ConversationView, Error> {
+        self.harness.foreground_subagent_view(parent, child, limit)
+    }
+
     pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
         self.harness.view(id, limit)
     }

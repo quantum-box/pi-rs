@@ -502,7 +502,8 @@ recently admitted foreground conversations. `watch_view` reports changes to
 that list, including before a child answers. A host can attach a separate view
 watch to a listed ID. The Durable RPC stream sends
 `durable_foreground_subagents` with `conversationIds`. Its
-`get_foreground_subagent` request takes a listed `conversationId` and returns
+`get_foreground_subagent` request takes a tool-owned foreground `conversationId` of the parent, including
+a settled child, and returns
 up to 32 recent native messages with the child's live model and tool output.
 
 `StandaloneNoHooksHost` constructs a standalone scheduler with an explicit
