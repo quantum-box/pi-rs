@@ -3,9 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pi_rs::{
-    Event, Invocation, ModelFailure, ModelMetadata, Notification, Outcome, Record, ToolCall,
-    ToolCallDelta, Usage, UsageReport,
+    Event, Invocation, ModelFailure, ModelMetadata, Notification, Outcome, Record, ToolCallDelta,
+    Usage, UsageReport,
 };
+use pi_rs_workbench::native_pi_messages::tool_result_content;
+pub(super) use pi_rs_workbench::native_pi_messages::{tool_call_value, usage_value};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -875,15 +877,6 @@ impl Stream {
     }
 }
 
-pub(super) fn tool_call_value(call: &ToolCall) -> Value {
-    let arguments = pi_rs::parse_tool_arguments(&call.arguments);
-    let mut value = json!({"type":"toolCall","id":call.id,"name":call.name,"arguments":arguments.as_ref().cloned().unwrap_or_else(|_| json!({}))});
-    if let Err(error) = arguments {
-        value["argumentsError"] = json!(error);
-    }
-    value
-}
-
 pub(super) fn user_content(content: &str, images: &[pi_rs::ImageContent]) -> Value {
     let mut blocks = vec![json!({"type":"text", "text":content})];
     blocks.extend(
@@ -903,18 +896,7 @@ pub(super) fn tool_result_value(
     outcome: Option<&Outcome>,
     is_structured: Option<bool>,
 ) -> Value {
-    let (text, images) = if pi_rs::tool_content_is_structured(text, is_structured) {
-        pi_rs::extract_tool_images(text.to_owned())
-    } else {
-        (text.to_owned(), Vec::new())
-    };
-    let mut content = vec![json!({"type":"text","text":text})];
-    content.extend(
-        images
-            .into_iter()
-            .map(|image| json!({"type":"image","data":image.data,"mimeType":image.mime_type})),
-    );
-    let mut result = json!({"content":content});
+    let mut result = json!({"content":tool_result_content(text, is_structured)});
     if matches!(outcome, Some(Outcome::Failed(_) | Outcome::Skipped(_))) {
         result["details"] = json!({});
     }
@@ -1072,32 +1054,6 @@ pub(super) fn auto_compaction_value(
     }
 }
 
-pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
-    let read = metadata.cached_input_tokens.unwrap_or_default();
-    let write = metadata.cache_creation_input_tokens.unwrap_or_default();
-    let breakdown = metadata.cost_breakdown.clone().unwrap_or_default();
-    let mut value = json!({
-        "input":usage.input_tokens.saturating_sub(read).saturating_sub(write),
-        "output":usage.output_tokens,"cacheRead":read,"cacheWrite":write,
-        "totalTokens":usage.input_tokens.saturating_add(usage.output_tokens),
-        "cost":{
-            "input":breakdown.input,"output":breakdown.output,
-            "cacheRead":breakdown.cache_read,"cacheWrite":breakdown.cache_write,
-            "total":metadata.cost_usd.as_ref().and_then(serde_json::Number::as_f64).unwrap_or_default()
-        },
-    });
-    if let Some(reasoning) = metadata.reasoning_output_tokens {
-        value["reasoning"] = json!(reasoning);
-    }
-    if let Some(long) = metadata.cache_write_1h_tokens {
-        value["cacheWrite1h"] = json!(long);
-    }
-    if let Some(from_provider) = metadata.cost_from_provider {
-        value["cost"]["totalFromProvider"] = json!(from_provider);
-    }
-    value
-}
-
 fn timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1108,6 +1064,7 @@ fn timestamp() -> u64 {
 #[cfg(test)]
 mod streaming_tool_tests {
     use super::*;
+    use pi_rs::ToolCall;
 
     #[test]
     fn portable_usage_reports_reasoning_without_counting_it_twice() {

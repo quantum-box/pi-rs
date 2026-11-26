@@ -809,6 +809,13 @@ impl Session {
         crate::extension_boundary::resumable_run(self)
     }
 
+    /// An ordinary interrupted run with a saved preflight on the selected branch
+    /// that has yet to record its first model request.
+    /// Resume it with the same run ID before submitting another prompt.
+    pub fn pending_before_agent_start_run(&self) -> Option<Uuid> {
+        crate::before_agent_start::pending_run(self)
+    }
+
     /// Hold the journal lock while reading a complete session without repairing it.
     /// This is intended for exports that must not modify the source journal.
     pub fn open_for_share(path: impl AsRef<Path>) -> Result<Self> {
@@ -6285,7 +6292,7 @@ mod shell_tests {
             output: "visible".into(),
             exit_code: Some(0),
             cancelled: false,
-            truncated: false,
+            truncated: true,
             full_output_path: None,
             exclude_from_context: false,
         };
@@ -6302,7 +6309,7 @@ mod shell_tests {
         let messages = session.conversation_at(session.head()).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(
-            matches!(&messages[0], Message::User { content } if content.contains("visible") && !content.contains("secret"))
+            matches!(&messages[0], Message::User { content } if content.contains("visible") && !content.contains("secret") && content.ends_with("[Output truncated]"))
         );
         assert_eq!(
             session
