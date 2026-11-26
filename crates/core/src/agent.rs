@@ -986,6 +986,9 @@ impl Agent<'_> {
             .extensions
             .iter()
             .any(|ext| ext.handles_agent_before_settle());
+        if cfg!(not(target_family = "wasm")) && recovered.is_none() {
+            Box::pin(self.settle_interrupted_prestart_compaction(session, run_id)).await?;
+        }
         let branch = session.branch();
         let accepted = branch.iter().any(
             |record| matches!(record.event, Event::User { input_id: Some(id), .. } | Event::UserWithImages { input_id: Some(id), .. } if id == run_id),
@@ -1954,8 +1957,10 @@ impl Agent<'_> {
             .limits
             .output_tokens_per_run
             .saturating_sub(output_used.min(u64::from(u32::MAX)) as u32);
-        let mut compacted =
-            overflow_recovery_state(session, run_id).is_some_and(|state| state.compacted);
+        // An interrupted pre-start attempt also spends this run's bounded
+        // pre-request compaction attempt. It may already have called a provider.
+        let mut compacted = crate::before_agent_start::compaction_start(&branch, run_id).is_some()
+            || overflow_recovery_state(session, run_id).is_some_and(|state| state.compacted);
         let mut retry_attempt = 0;
         let mut recovery_marker_created_in_run = false;
         let lifecycle = crate::lifecycle::enabled(self.registry);
@@ -2101,6 +2106,7 @@ impl Agent<'_> {
                         session,
                         &states,
                         SummaryScope {
+                            history_before: None,
                             retention,
                             instructions: None,
                             output_limit: summary_limit,
@@ -2460,6 +2466,7 @@ impl Agent<'_> {
                         session,
                         &states,
                         SummaryScope {
+                            history_before: None,
                             retention,
                             instructions: None,
                             output_limit: summary_limit,
@@ -2769,6 +2776,171 @@ impl Agent<'_> {
         Err(Error::Budget)
     }
 
+    async fn settle_interrupted_prestart_compaction(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+    ) -> Result<()> {
+        let branch = session.branch();
+        if let Some(started_at) = crate::before_agent_start::interrupted_compaction(&branch, run_id)
+        {
+            let following = &branch[branch.partition_point(|record| record.id <= started_at)..];
+            // Compaction is committed after usage settlement. If interrupted
+            // earlier, settle the original request and skip the ambiguous work.
+            if !following.iter().any(|record| {
+                record.run_id == Some(run_id) && matches!(record.event, Event::Compacted { .. })
+            }) && let Some(id) = following.iter().find_map(|record| match record.event {
+                Event::ModelRequested { request_id, .. } if record.run_id == Some(run_id) => {
+                    request_id
+                }
+                _ => None,
+            }) {
+                let (usage, metadata) = following
+                    .iter()
+                    .find_map(|record| match &record.event {
+                        Event::ModelFinished {
+                            request_id,
+                            usage,
+                            metadata,
+                            ..
+                        } if *request_id == id => Some((usage.clone(), metadata.clone())),
+                        _ => None,
+                    })
+                    .unwrap_or((UsageReport::Unconfirmed, ModelMetadata::default()));
+                self.settle_usage(id, &usage, &metadata).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn compact_before_start<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        followups: &mut mpsc::Receiver<T>,
+    ) -> Result<bool> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let branch = session.branch();
+        let control = session.auto_compaction_control();
+        let tokens = self.compaction_tokens(session);
+        let Some(reserve) = tokens.reserve_tokens.filter(|_| control.enabled()) else {
+            return Ok(false);
+        };
+        // The SDK may already have persisted this run's image prompt. Its
+        // content must not affect the decision about the prior conversation.
+        let history_end = branch.iter().position(|record| matches!(
+            record.event,
+            Event::User { input_id: Some(id), .. } | Event::UserWithImages { input_id: Some(id), .. }
+                if id == run_id
+        )).unwrap_or(branch.len());
+        let history_before = branch.get(history_end).map(|record| record.id);
+        let history = &branch[..history_end];
+        let latest_boundary = history.iter().rposition(|record| {
+            matches!(
+                record.event,
+                Event::Assistant { .. } | Event::Compacted { .. }
+            )
+        });
+        let Some(index) = latest_boundary else {
+            return Ok(false);
+        };
+        let Event::Assistant { request_id, .. } = history[index].event else {
+            return Ok(false);
+        };
+        // A silent-overflow recovery can intentionally leave the old answer
+        // visible. Respect its durable skip when checking the next prompt.
+        let skipped =
+            request_id.is_some_and(|id| {
+                let id = id.to_string();
+                history[index + 1..].iter().any(|record| matches!(&record.event,
+                Event::SourceEntry { format, entry }
+                    if format == "pi-rs:silent-overflow-skipped-v1" && entry["requestId"] == id
+            ))
+            });
+        if skipped || ensure_settled(session.operations()).is_err() {
+            return Ok(false);
+        }
+        let window = match self.limits.context_window {
+            Some(window) => Some(window),
+            None => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                result = platform_time::timeout(self.limits.model_timeout, self.model.context_window(self.model_name)) =>
+                    result.ok().flatten(),
+            },
+        };
+        let Some(window) = window.filter(|window| *window > 0) else {
+            return Ok(false);
+        };
+        if session.context_usage_estimate_for_branch(history).tokens
+            <= u64::from(window).saturating_sub(reserve)
+            || !control.enabled()
+        {
+            return Ok(false);
+        }
+        let mut retention =
+            configured_retention_for_branch(session, history, tokens.keep_recent_tokens, 1);
+        let Some(boundary) = retention.boundary else {
+            return Ok(false);
+        };
+        retention.keep_turns += usize::from(history_end < branch.len());
+        if !has_summary_prefix(session, Some(boundary)) {
+            return Ok(false);
+        }
+        let summary_budget = self
+            .limits
+            .output_tokens_per_request
+            .min(512)
+            .min(self.limits.output_tokens_per_run / 2);
+        let model_summary_available = self.limits.model_requests > 1
+            && summary_budget >= self.model.minimum_output_tokens().max(1);
+        if !model_summary_available
+            && !self
+                .registry
+                .extensions
+                .iter()
+                .any(|extension| extension.handles_before_summary_compaction())
+        {
+            return Ok(false);
+        }
+
+        let states = self.migrate(session, observer)?;
+        commit(
+            session,
+            Event::SourceEntry {
+                format: crate::before_agent_start::COMPACTION_FORMAT.into(),
+                entry: serde_json::Value::Null,
+            },
+            observer,
+        )?;
+        self.summarize_prefix(
+            session,
+            &states,
+            SummaryScope {
+                history_before,
+                retention,
+                instructions: None,
+                output_limit: if model_summary_available {
+                    summary_budget
+                } else {
+                    0
+                },
+                cancellation: cancel,
+                reason: crate::CompactionTrigger::Threshold,
+                will_retry: false,
+                skip_without_model: !model_summary_available,
+            },
+            observer,
+            Some(followups),
+        )
+        .await?;
+        Ok(true)
+    }
+
     async fn compact_silent_overflow<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
@@ -3003,6 +3175,7 @@ impl Agent<'_> {
                 session,
                 states,
                 SummaryScope {
+                    history_before: None,
                     retention,
                     instructions: None,
                     output_limit,
@@ -5517,6 +5690,7 @@ impl Agent<'_> {
             session,
             &states,
             SummaryScope {
+                history_before: None,
                 retention,
                 instructions,
                 output_limit: limit,
@@ -5627,6 +5801,7 @@ impl Agent<'_> {
         progress: &mut SummaryProgress,
     ) -> Result<Option<(u32, bool)>> {
         let SummaryScope {
+            history_before,
             retention,
             instructions,
             output_limit: limit,
@@ -5655,18 +5830,23 @@ impl Agent<'_> {
         if !skip_without_model {
             progress.start(reason, observer);
         }
+        let (branch_entries, tokens_before) = if has_pre_summary_hook {
+            let branch = session.branch();
+            let history = match history_before {
+                Some(id) => &branch[..branch.partition_point(|record| record.id < id)],
+                None => &branch,
+            };
+            (
+                history.iter().map(|entry| (*entry).clone()).collect(),
+                session.context_usage_estimate_for_branch(history).tokens,
+            )
+        } else {
+            (Vec::new(), 0)
+        };
         let preparation = crate::CompactionPreparation {
-            branch_entries: if has_pre_summary_hook {
-                session.branch().into_iter().cloned().collect()
-            } else {
-                Vec::new()
-            },
+            branch_entries,
             first_kept_entry: before,
-            tokens_before: if has_pre_summary_hook {
-                session.context_usage_estimate().tokens
-            } else {
-                0
-            },
+            tokens_before,
             reason,
             will_retry,
             custom_instructions: instructions.map(str::to_owned),
@@ -6556,12 +6736,30 @@ fn configured_retention(
     target: Option<u64>,
     fallback: usize,
 ) -> Result<RetentionPlan> {
-    let Some(target) = target else {
-        return Ok(RetentionPlan::turns(session, fallback));
+    Ok(configured_retention_for_branch(
+        session,
+        &session.branch(),
+        target,
+        fallback,
+    ))
+}
+
+fn configured_retention_for_branch(
+    session: &Session,
+    branch: &[&Record],
+    target: Option<u64>,
+    fallback: usize,
+) -> RetentionPlan {
+    let fallback = || RetentionPlan {
+        keep_turns: fallback,
+        boundary: retain_from(branch, fallback),
+        split_turn: false,
     };
-    let branch = session.branch();
-    let token_index = crate::tokens::SourceTokenIndex::new(session, &branch);
-    let entries = conversation_entries(&branch, session.operations());
+    let Some(target) = target else {
+        return fallback();
+    };
+    let token_index = crate::tokens::SourceTokenIndex::new(session, branch);
+    let entries = conversation_entries(branch, session.operations());
     let candidates: Vec<_> = entries
         .iter()
         .enumerate()
@@ -6574,7 +6772,7 @@ fn configured_retention(
         })
         .collect();
     let Some(&first) = candidates.first() else {
-        return Ok(RetentionPlan::turns(session, fallback));
+        return fallback();
     };
     let mut cut = first;
     let mut accumulated = 0_u64;
@@ -6624,11 +6822,11 @@ fn configured_retention(
         })
         .count()
         .max(1);
-    Ok(RetentionPlan {
+    RetentionPlan {
         keep_turns,
         boundary: Some(branch[boundary_index].id),
         split_turn: matches!(entries[cut].1, Message::Assistant { .. }),
-    })
+    }
 }
 
 fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> {
@@ -6713,6 +6911,7 @@ fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {
 }
 
 struct SummaryScope<'a> {
+    history_before: Option<u64>,
     retention: RetentionPlan,
     instructions: Option<&'a str>,
     output_limit: u32,
@@ -8877,6 +9076,7 @@ mod tree_tests {
                             &mut session,
                             &ExtensionStates::new(),
                             SummaryScope {
+                                history_before: None,
                                 retention,
                                 instructions: None,
                                 output_limit: 0,
@@ -11670,6 +11870,7 @@ mod tree_tests {
                     &mut session,
                     &ExtensionStates::new(),
                     SummaryScope {
+                        history_before: None,
                         retention,
                         instructions: None,
                         output_limit: 16,
@@ -12419,6 +12620,7 @@ mod tree_tests {
                     &mut session,
                     &ExtensionStates::new(),
                     SummaryScope {
+                        history_before: None,
                         retention,
                         instructions: None,
                         output_limit: 0,

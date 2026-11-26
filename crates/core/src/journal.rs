@@ -1672,10 +1672,16 @@ impl Session {
     }
 
     pub fn context_usage_estimate(&self) -> crate::ContextUsageEstimate {
-        let branch = self.branch();
-        let token_index = crate::tokens::SourceTokenIndex::new(self, &branch);
-        let entries = conversation_entries_unrepaired(&branch, self.operations());
-        let system_invalidations = crate::tokens::non_additive_native_system_checkpoints(&branch);
+        self.context_usage_estimate_for_branch(&self.branch())
+    }
+
+    pub(crate) fn context_usage_estimate_for_branch(
+        &self,
+        branch: &[&Record],
+    ) -> crate::ContextUsageEstimate {
+        let token_index = crate::tokens::SourceTokenIndex::new(self, branch);
+        let entries = conversation_entries_unrepaired(branch, operations(branch));
+        let system_invalidations = crate::tokens::non_additive_native_system_checkpoints(branch);
         let invalidated_at = branch
             .iter()
             .rev()
@@ -1768,7 +1774,7 @@ impl Session {
                     content: summary.clone(),
                 })
             })
-            .saturating_add(crate::tokens::estimate_system_tokens(&branch));
+            .saturating_add(crate::tokens::estimate_system_tokens(branch));
         let tokens = entries.iter().fold(initial, |tokens, (source, message)| {
             tokens.saturating_add(token_index.estimate(*source, message))
         });

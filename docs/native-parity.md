@@ -5607,12 +5607,24 @@ Returned custom messages enter the run after the initial message and next-turn
 messages queued by the end of preflight, including arrivals during handlers.
 The final prompt override applies after request context transforms. A recorded
 preparation plan retains the run-local prompt and deduplicates its appended
-messages when the run resumes before its first model request is journaled.
+messages when the run resumes before its first turn request is journaled.
 
-This API accepts a full text override. Upstream also exposes mutable prompt
-sections, including the tool loadout, and does its incoming-prompt compaction
-before invoking the hook. The native hook currently runs before the existing
-agent loop's automatic compaction checks.
+Native checks the prior conversation for automatic threshold compaction before
+invoking the hook for a new user or custom trigger. This follows the order in
+[Pi's pinned `_prepareRun`](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L2005-L2020).
+The new starting message and the hook's prompt override are excluded from the
+summary. A prior assistant older than the latest compaction cannot trigger this
+check. Native reports the threshold reason and leaves continuation to the
+starting message. If a run is interrupted during pre-start compaction, recovery
+settles the original summary request when one was recorded, skips the
+interrupted attempt, and resumes preflight on the same run. A committed
+compaction is retained on resume.
+
+The native pre-start check covers configured threshold compaction. Explicit
+overflow and length-stop recovery use the existing turn recovery paths, and
+request preparation still enforces the context limit after hooks and input
+delivery. The extension API accepts a full text override. Upstream also exposes
+mutable prompt sections, including the tool loadout.
 
 ### Rust extension lifecycle observation
 

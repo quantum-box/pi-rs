@@ -338,15 +338,16 @@ To run an extension callback for a submitted user prompt or an idle custom
 trigger, opt into `handles_before_agent_start` and implement
 `before_agent_start`. Executable extensions advertise `before_agent_start_hook`
 and receive the `before_agent_start` protocol request. The event identifies
-the starting message and carries the resolved system prompt. Each handler
-sees the latest prompt override in extension load order, and can return an
+the starting message and carries the resolved system prompt. Automatic
+threshold compaction of the prior conversation runs before these handlers.
+Each handler sees the latest prompt override in extension load order, and can return an
 exact prompt for the current run and a custom message. The final override is
 applied after request context hooks. An empty override clears the prompt text.
 Returned messages follow the starting input and the next-turn messages queued
 by the end of preflight. Cancellation interrupts delivery while a returned
 message's lifecycle hook is running. Handler failures are reported while
 subsequent handlers can still contribute within the shared deadline.
-Until the first model request is journaled, the SDK's `resume()` and native CLI
+Until the first turn request is journaled, the SDK's `resume()` and native CLI
 recovery reuse the saved plan and run ID on the selected branch. SDK hosts
 using `run` or `run_with_events` can also resume with the saved run ID and no
 new input, keeping their per-run observer.
