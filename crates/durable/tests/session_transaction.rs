@@ -339,6 +339,107 @@ async fn shared_current_document_watch_follows_retirement_recreation_and_source_
 }
 
 #[test]
+fn latest_conversation_documents_fork_current_values_without_retaining_payload_history() {
+    use pi_rs_durable::{
+        document::{
+            ConversationDocument, DefinedDocumentFork, LatestConversationDocument,
+            LatestDocumentFork,
+        },
+        observer::Observer,
+    };
+    use std::num::NonZeroU32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let root = harness.create_conversation(config()).unwrap();
+    let store = Store::open(&path).unwrap();
+    let current = LatestConversationDocument {
+        kind: "latest".into(),
+        version: NonZeroU32::MIN,
+        initial: object(1),
+        fork: LatestDocumentFork::Current,
+    };
+    let initial = LatestConversationDocument {
+        kind: "initial".into(),
+        version: NonZeroU32::MIN,
+        initial: object(0),
+        fork: LatestDocumentFork::Initial,
+    };
+    let rewindable = ConversationDocument {
+        kind: current.kind.clone(),
+        version: NonZeroU32::MIN,
+        initial: object(1),
+        fork: DefinedDocumentFork::AsOf,
+    };
+    let revision = store.document_snapshot().unwrap();
+    harness
+        .session_transaction(root, |tx| {
+            tx.edit_latest_document(&current, "", |_| Ok(()))?;
+            tx.edit_latest_document(&initial, "", |value| {
+                *value = object(9);
+                Ok(())
+            })
+        })
+        .unwrap();
+    let cut = Observer::new(&store, root).head().unwrap();
+    let parent = harness
+        .session_transaction(root, |tx| {
+            tx.edit_latest_document(&current, "", |value| {
+                *value = object(2);
+                Ok(())
+            })?;
+            Ok(tx.read_latest_document(&current, "")?.unwrap())
+        })
+        .unwrap();
+    assert_eq!(store.document_snapshot().unwrap(), revision);
+    assert!(
+        harness
+            .session_transaction(root, |tx| tx.defined_document(&rewindable, ""))
+            .is_err()
+    );
+
+    let child = harness.fork_at(root, cut).unwrap();
+    let copied = harness
+        .session_transaction(child, |tx| {
+            assert!(tx.read_latest_document(&initial, "")?.is_none());
+            Ok(tx.read_latest_document(&current, "")?.unwrap())
+        })
+        .unwrap();
+    assert_eq!(copied.value, object(2));
+    assert_ne!(copied.incarnation, parent.incarnation);
+    harness
+        .session_transaction(root, |tx| tx.retire_latest_document(&current, ""))
+        .unwrap();
+    let after_retirement = harness.fork(root).unwrap();
+    harness
+        .session_transaction(after_retirement, |tx| {
+            assert!(tx.read_latest_document(&current, "")?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        harness
+            .session_transaction(child, |tx| tx.read_latest_document(&current, ""))
+            .unwrap(),
+        Some(copied)
+    );
+
+    let another = harness.create_conversation(config()).unwrap();
+    harness
+        .session_transaction(another, |tx| {
+            tx.edit_defined_document(&rewindable, "", |_| Ok(()))
+        })
+        .unwrap();
+    assert!(
+        harness
+            .session_transaction(another, |tx| tx
+                .edit_latest_document(&current, "", |_| Ok(())))
+            .is_err()
+    );
+}
+
+#[test]
 fn typed_document_edits_keep_fields_and_commit_with_entries() {
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Settings {

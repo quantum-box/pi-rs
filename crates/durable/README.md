@@ -487,6 +487,14 @@ Membership revocation, runtime shutdown, cancellation, or a definition change
 ends the watch. Acquire a watch with the new definition after migration.
 
 
+Use `document::LatestConversationDocument<T>` for a conversation value
+that does not require historical reads. `LatestDocumentFork::Current` copies
+the immediate parent's committed value into an independent incarnation, even
+when the transcript is forked at an older entry. `Initial` leaves the child's
+address absent until it is first edited. Migration keeps the fork policy and
+incarnation. Updates replace the current payload, and retirement reclaims the
+payload while preserving definition metadata.
+
 Nested tool calls are journaled by parent operation and call order. The standalone
 `NestedHost::call_keyed` API also accepts explicit caller-scoped keys and reuses
 completed results across reordered replay, rejecting a changed tool or arguments.
