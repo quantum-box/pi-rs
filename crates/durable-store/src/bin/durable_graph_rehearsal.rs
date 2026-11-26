@@ -2,7 +2,7 @@
 
 #[cfg(unix)]
 mod unix {
-    use std::{error::Error, fs, path::Path, time::Instant};
+    use std::{error::Error, fs, os::unix::fs::DirBuilderExt, path::Path, time::Instant};
 
     use durable_store::{Check, Expected, Mutation, Store};
     use rusqlite::{functions::FunctionFlags, params, Connection, OpenFlags, OptionalExtension};
@@ -122,7 +122,7 @@ mod unix {
             |row| row.get::<_, u64>(0),
         )?;
         input.prepare("SELECT key,value,version FROM durable_store_entries")?;
-        fs::create_dir(directory)?;
+        fs::DirBuilder::new().mode(0o700).create(directory)?;
         let backup = directory.join(backup_name);
         let migrated = directory.join("migrated-v4.sqlite");
         let restored = directory.join(restored_name);
@@ -249,6 +249,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::unix::run;
     use rusqlite::{params, Connection};
 
@@ -289,6 +291,7 @@ mod tests {
         let original = std::fs::read(&source).unwrap();
         let report = serde_json::to_value(run(&source, &output).unwrap()).unwrap();
         assert_eq!(report["cutoff_rows"]["rows"], 1);
+        assert_eq!(output.metadata().unwrap().permissions().mode() & 0o077, 0);
         assert_eq!(
             report["source_graph_protocol"],
             serde_json::json!(v3.then_some(3)),

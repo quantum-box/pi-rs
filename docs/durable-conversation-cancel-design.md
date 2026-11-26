@@ -532,8 +532,8 @@ and reconciliation budget, and a successful restore drill.
 ### Migration and restore drill
 
 On Unix, `durable-graph-rehearsal` takes a standard Durable database or a
-v3 experimental database and a new output directory. It creates a consistent
-backup, a v4 migration copy, and a copy restored in the input format. It
+v3 experimental database and creates a private output directory. It makes a
+consistent backup, a v4 migration copy, and a copy restored in the input format. It
 reports the original graph protocol (null for a standard database), record
 counts, and elapsed times. The source is opened read-only.
 
