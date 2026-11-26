@@ -9,40 +9,55 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub fn read(path: &Path) -> Result<Session> {
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(128 * 1024 * 1024 + 1)
-        .read_to_string(&mut text)?;
-    if text.len() > 128 * 1024 * 1024 {
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 128 * 1024 * 1024 {
         return Err(Error::Session("import exceeds 128 MiB".into()));
     }
     let mut entries = Vec::new();
     let mut leading_error = None;
     let mut recover_pi = false;
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.len() > 16 * 1024 * 1024 {
             return Err(Error::Session("imported entry exceeds 16 MiB".into()));
         }
-        match serde_json::from_str::<Value>(line) {
+        let line = String::from_utf8_lossy(line);
+        if !recover_pi && matches!(line, std::borrow::Cow::Owned(_)) {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "native session import contains invalid UTF-8",
+            );
+            if !entries.is_empty() {
+                return Err(error.into());
+            }
+            leading_error.get_or_insert_with(|| error.into());
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(&line) {
             Ok(entry) => {
                 if entries.is_empty() {
                     recover_pi = has_pi_header(&entry);
                     if !recover_pi && let Some(error) = leading_error.take() {
-                        return Err(Error::from(error));
+                        return Err(error);
                     }
                 }
                 entries.push(entry);
             }
             Err(_) if recover_pi => {}
             Err(error) if entries.is_empty() => {
-                leading_error.get_or_insert(error);
+                leading_error.get_or_insert_with(|| error.into());
             }
             Err(error) => return Err(error.into()),
         }
     }
     if entries.is_empty() {
         if let Some(error) = leading_error {
-            return Err(error.into());
+            return Err(error);
         }
         return Err(Error::Session("imported session is empty".into()));
     }

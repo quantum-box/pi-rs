@@ -136,19 +136,27 @@ fn sort_by_activity(paths: &mut [PathBuf]) {
 
 fn stored_ids(path: &Path) -> Option<(String, Option<String>)> {
     use std::io::{BufRead, Read};
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     let mut header_scan = reader.by_ref().take(1024 * 1024);
     let mut skipped_malformed = false;
     let record: serde_json::Value = loop {
         line.clear();
-        if header_scan.read_line(&mut line).ok()? == 0 {
+        if header_scan.read_until(b'\n', &mut line).ok()? == 0 {
             return None;
         }
-        if line.trim().is_empty() {
+        if header_scan.limit() == 0
+            && !line.ends_with(b"\n")
+            && !header_scan.get_mut().fill_buf().ok()?.is_empty()
+        {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&line);
+        if text.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str(&line) {
+        skipped_malformed |= matches!(text, std::borrow::Cow::Owned(_));
+        match serde_json::from_str(&text) {
             Ok(entry) => break entry,
             Err(_) => skipped_malformed = true,
         }
@@ -169,13 +177,13 @@ fn stored_ids(path: &Path) -> Option<(String, Option<String>)> {
     if reader
         .by_ref()
         .take(16 * 1024 * 1024 + 1)
-        .read_line(&mut line)
+        .read_until(b'\n', &mut line)
         .is_err()
         || line.len() > 16 * 1024 * 1024
     {
         return fallback();
     }
-    let Ok(next) = serde_json::from_str::<serde_json::Value>(&line) else {
+    let Ok(next) = serde_json::from_slice::<serde_json::Value>(&line) else {
         return fallback();
     };
     let event = &next["event"];
@@ -1521,15 +1529,17 @@ mod tests {
     fn malformed_pi_lines_are_skipped_in_reopened_sessions_and_id_lookup() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("recovered.jsonl");
-        let source = concat!(
-            "invalid leading record\n",
+        let source = [
+            &b"invalid leading record \xff\n"[..],
+            concat!(
             "{\"type\":\"session\",\"version\":3,\"id\":\"recovered-id\"}\n",
             "{\"type\":\"message\",\"id\":\"first\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"first prompt\"}}\n",
             "{\"type\":\"message\",\n",
             "{\"type\":\"message\",\"id\":\"second\",\"parentId\":\"first\",\"message\":{\"role\":\"user\",\"content\":\"second prompt\"}}\n",
-            "{"
-        );
-        std::fs::write(&path, source).unwrap();
+            ).as_bytes(),
+            b"{\"type\":\"message\",\"id\":\"third\",\"parentId\":\"second\",\"message\":{\"role\":\"user\",\"content\":\"third \xff prompt\"}}\n{",
+        ].concat();
+        std::fs::write(&path, &source).unwrap();
         assert_eq!(
             resolve_reference(Path::new("recovered-id"), root.path()).unwrap(),
             path
@@ -1545,17 +1555,34 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            ["first prompt", "second prompt"]
+            ["first prompt", "second prompt", "third � prompt"]
         );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert_eq!(std::fs::read(&path).unwrap(), source);
 
         let native_path = root.path().join("native.jsonl");
         session.export_jsonl(&native_path).unwrap();
-        let native = std::fs::read_to_string(&native_path).unwrap();
-        for damaged in [format!("invalid\n{native}"), format!("{native}{{")] {
+        let native = std::fs::read(&native_path).unwrap();
+        for damaged in [
+            [&b"invalid\xff\n"[..], native.as_slice()].concat(),
+            [native.as_slice(), &b"{"[..]].concat(),
+            [native.as_slice(), &b"{\"id\":\"\xff\"}"[..]].concat(),
+        ] {
             std::fs::write(&native_path, damaged).unwrap();
             assert!(super::super::session_import::read(&native_path).is_err());
         }
+    }
+
+    #[test]
+    fn session_id_lookup_rejects_a_header_truncated_at_the_scan_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("truncated.jsonl");
+        let mut line = br#"{"type":"session","version":3,"id":"scan-limit"}"#.to_vec();
+        line.resize(1024 * 1024, b' ');
+        std::fs::write(&path, &line).unwrap();
+        assert_eq!(stored_ids(&path), Some(("scan-limit".into(), None)));
+        line.extend_from_slice(b"malformed\n");
+        std::fs::write(&path, &line).unwrap();
+        assert!(stored_ids(&path).is_none());
     }
     #[tokio::test]
     async fn radius_share_uses_configured_proxy() {

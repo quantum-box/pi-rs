@@ -298,8 +298,10 @@ lookup.
 The read-only importer skips malformed JSON lines when the first parsed entry
 is a Pi session header with a string ID. Session ID lookup recognizes a Pi
 header after malformed or blank lines within its existing scan limit.
-Native journal import still rejects malformed JSON, and Pi imports retain
-their entry-size, version, and reference validation.
+Invalid UTF-8 in Pi sources is decoded with replacement characters before
+parsing each line. Native journal import requires valid UTF-8 and JSON.
+`--continue` selects an existing native journal that can be reopened for
+writing. Pi imports retain their entry-size, version, and reference validation.
 [Pinned Pi JSONL parser](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/session-manager.ts#L619-L688)
 
 Fullscreen selector lists accept mouse wheel navigation and click selection,

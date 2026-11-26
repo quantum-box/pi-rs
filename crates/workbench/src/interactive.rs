@@ -109,7 +109,7 @@ pub(super) fn latest_session(
                 .is_some_and(|value| value == "jsonl")
         })
         .filter(|entry| {
-            super::session_import::read(&entry.path()).is_ok_and(|session| {
+            Session::snapshot(entry.path()).is_ok_and(|session| {
                 session.working_directory().is_some_and(|cwd| {
                     std::path::Path::new(cwd)
                         .canonicalize()
@@ -17196,7 +17196,11 @@ exit {exit}
         let invalid = directory.path().join("invalid.jsonl");
         std::fs::write(&invalid, "invalid").unwrap();
         let late = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
-        for path in [&foreign, &invalid] {
+        let pi_source = directory.path().join("external.jsonl");
+        let header = json!({"type":"session","version":3,"id":"external","cwd":workspace});
+        std::fs::write(&pi_source, format!("{header}\n{{")).unwrap();
+        assert!(crate::session_import::read(&pi_source).is_ok());
+        for path in [&foreign, &invalid, &pi_source] {
             std::fs::File::options()
                 .write(true)
                 .open(path)
