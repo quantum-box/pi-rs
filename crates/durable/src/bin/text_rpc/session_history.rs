@@ -104,10 +104,21 @@ fn project(node: &SessionTreeEntry, tool_names: &mut HashMap<String, String>) ->
         tool_names.clear();
     }
     let mut entry = match &node.entry {
-        SessionEntry::Message(entry) => json!({
-            "type": "message",
-            "message": project_message(&entry.message, entry.blocks.as_deref(), tool_names)
-        }),
+        SessionEntry::Message(entry) => {
+            if let Some(compaction) = &entry.compaction
+                && let Some(first_kept) = compaction.first_kept_entry_id
+            {
+                json!({
+                    "type":"compaction", "summary":compaction.summary,
+                    "firstKeptEntryId":first_kept, "tokensBefore":0
+                })
+            } else {
+                json!({
+                    "type": "message",
+                    "message": project_message(&entry.message, entry.blocks.as_deref(), tool_names)
+                })
+            }
+        }
         SessionEntry::SessionInfo { entry, .. } => {
             let mut value = json!({"type":"session_info"});
             if let Some(name) = &entry.name {

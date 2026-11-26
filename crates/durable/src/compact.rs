@@ -585,7 +585,12 @@ impl CompactionResult {
             ));
         }
         let mut result = current[..system_end].to_vec();
-        result.push(Message::User { content: format!("The conversation history before this point was compacted into the following summary:\n\n<summary>\n{}\n</summary>", self.generation.content) });
+        result.push(Message::User {
+            content: format!(
+                "{SUMMARY_PREFIX}{}{SUMMARY_SUFFIX}",
+                self.generation.content
+            ),
+        });
         result.extend_from_slice(&current[first_kept..]);
         validate(&result)?;
         Ok((result, (system_end, first_kept)))
@@ -637,11 +642,25 @@ impl CompactionResult {
             ));
         }
         let mut result = current[..p.system_end].to_vec();
-        result.push(Message::User { content: format!("The conversation history before this point was compacted into the following summary:\n\n<summary>\n{}\n</summary>", self.generation.content) });
+        result.push(Message::User {
+            content: format!(
+                "{SUMMARY_PREFIX}{}{SUMMARY_SUFFIX}",
+                self.generation.content
+            ),
+        });
         result.extend_from_slice(&current[p.first_kept..]);
         validate(&result)?;
         Ok(result)
     }
+}
+
+const SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+const SUMMARY_SUFFIX: &str = "\n</summary>";
+
+pub(crate) fn summary_text(content: &str) -> Option<&str> {
+    content
+        .strip_prefix(SUMMARY_PREFIX)?
+        .strip_suffix(SUMMARY_SUFFIX)
 }
 
 #[cfg(test)]
