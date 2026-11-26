@@ -454,6 +454,8 @@ pub(crate) struct TreeModelResolution {
     pub revoked: Arc<std::sync::atomic::AtomicBool>,
 }
 
+type TreeHandoffModel = (Arc<dyn Model>, Option<Limits>);
+
 impl Agent<'_> {
     fn tree_handoff_model(
         &self,
@@ -461,7 +463,7 @@ impl Agent<'_> {
         name: Option<&str>,
         previous_provider: Option<&str>,
         previous_cycle: Option<&crate::journal::CycledModelSelection>,
-    ) -> Result<Option<(Arc<dyn Model>, Option<Limits>)>> {
+    ) -> Result<Option<TreeHandoffModel>> {
         let cycle = session.cycled_model_at(session.head())?;
         let provider = session.model_provider();
         let Some(name) = name.filter(|name| {
