@@ -233,11 +233,15 @@ fn defined_task_document_migrates_retires_and_recreates_across_reopen() {
                     cp("finish")
                 }
                 "finish" => {
+                    docs.defined_document(&second, "progress").unwrap();
+                    docs.defined_document(&first, "terminal-only").unwrap();
                     docs.edit_defined_document(&second, "progress", |draft| {
                         draft.text = "not published".into();
                         Ok(())
                     })
                     .unwrap();
+                    docs.edit_defined_document(&first, "terminal-only", |_| Ok(()))
+                        .unwrap();
                     return Ok(Step::Succeed(json!(null)));
                 }
                 phase => panic!("unexpected phase {phase}"),
@@ -263,8 +267,22 @@ fn defined_task_document_migrates_retires_and_recreates_across_reopen() {
     let store = Store::open(&path).unwrap();
     let docs = Documents::new(&store);
     let address = initial().address(task.id(), "progress");
+    let policy_key = |address: &Address| {
+        format!(
+            "durable/document-policy/{}",
+            serde_json::to_string(&[&address.scope, &address.name, &address.key]).unwrap()
+        )
+    };
+    let policy = |store: &Store, key: &str| {
+        let entry = store.get(key.as_bytes()).unwrap().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&entry.value).unwrap(),
+            entry.version,
+        )
+    };
     let (baseline, mut watch) = docs.watch_task_document(&address).unwrap();
     assert_eq!(baseline.document.unwrap().value["count"], 2);
+    assert!(policy(&store, &policy_key(&address)).0["definition"]["incarnation"].is_string());
 
     let mut scheduler = Scheduler::open(&path, document_registry()).unwrap();
     for _ in 0..4 {
@@ -284,6 +302,37 @@ fn defined_task_document_migrates_retires_and_recreates_across_reopen() {
     assert!(frames[3].ops.is_empty());
     assert!(watch.ended());
     assert!(docs.get(&address).unwrap().is_none());
+    let reopened = Store::open(&path).unwrap();
+    let terminal_only = initial().address(task.id(), "terminal-only");
+    for (address, schema) in [(&address, 2), (&terminal_only, 1)] {
+        assert!(Documents::new(&reopened).get(address).unwrap().is_none());
+        let key = policy_key(address);
+        let (retired, version) = policy(&reopened, &key);
+        let definition = retired["definition"].as_object().unwrap();
+        assert_eq!(
+            definition.get("incarnation"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(definition["schema"], schema);
+        assert_eq!(
+            reopened
+                .commit_for_version(key.as_bytes(), version)
+                .unwrap(),
+            reopened
+                .document_commit_sequence(frames[3].revision)
+                .unwrap()
+        );
+    }
+
+    let key = policy_key(&address);
+    let historical = reopened
+        .document_at(key.as_bytes(), frames[2].revision)
+        .unwrap()
+        .unwrap();
+    let mut historical: serde_json::Value = serde_json::from_slice(&historical.value).unwrap();
+    assert!(historical["definition"]["incarnation"].is_string());
+    historical["definition"]["incarnation"] = serde_json::Value::Null;
+    assert_eq!(historical, policy(&reopened, &key).0);
 }
 
 #[test]
