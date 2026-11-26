@@ -91,7 +91,16 @@ struct StoredAdmission {
     inherit_parent_config: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     inheritance_policy_version: Option<u8>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    checkpointable_dispatch: bool,
 }
+
+pub(crate) type CallbackChecks<'a> = dyn Fn(
+        &Harness,
+        &Task,
+        &crate::task_scheduler::AdmissionPublication<'_>,
+    ) -> Result<Vec<Check>, Error>
+    + 'a;
 
 fn inheritance_v3_key(task: Uuid, name: &str) -> Vec<u8> {
     let mut key = format!("durable/owned-subagent-policy-provenance-v3/{task}/").into_bytes();
@@ -587,6 +596,79 @@ impl Harness {
         notify: Option<SubmissionNotify>,
         inherit_parent_tools: bool,
     ) -> Result<Admission, Error> {
+        self.admit_task_owned_subagent_checked(
+            task,
+            owner,
+            name,
+            config,
+            mode,
+            content,
+            allowed_tools,
+            notify,
+            inherit_parent_tools,
+            None,
+        )
+    }
+
+    pub(crate) fn admit_checkpointable_subagent(
+        &mut self,
+        parent: &Task,
+        request: crate::async_task_tool::ForegroundSubagentRequest,
+        validate: &CallbackChecks<'_>,
+    ) -> Result<Admission, Error> {
+        if request.prompt.trim().is_empty() {
+            return Err(invalid());
+        }
+        self.admit_task_owned_subagent_checked(
+            parent.id(),
+            parent.owner().clone(),
+            &request.key,
+            Some(request.config),
+            Mode::Foreground,
+            Some(request.prompt),
+            Some(request.allowed_tools),
+            None,
+            false,
+            Some(validate),
+        )
+    }
+
+    pub(crate) fn checkpointable_subagent_status(
+        &self,
+        parent: &Task,
+        admission: &Admission,
+    ) -> Result<crate::runtime::Status, Error> {
+        let store = self.subagent_store()?;
+        let record = store
+            .get(&reservation_key(parent.id(), &admission.key))?
+            .ok_or_else(invalid)?;
+        let stored: StoredAdmission = serde_json::from_slice(&record.value)?;
+        if !stored.checkpointable_dispatch || stored.admission != *admission {
+            return Err(invalid());
+        }
+        let submission = stored.admission.submission.ok_or_else(invalid)?;
+        self.conversation(stored.admission.child)?
+            .submissions
+            .into_iter()
+            .find(|item| item.id == submission.id)
+            .map(|item| item.status)
+            .ok_or_else(invalid)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_task_owned_subagent_checked(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Option<Config>,
+        mode: Mode,
+        content: Option<String>,
+        allowed_tools: Option<Vec<String>>,
+        notify: Option<SubmissionNotify>,
+        inherit_parent_tools: bool,
+        live_checks: Option<&CallbackChecks<'_>>,
+    ) -> Result<Admission, Error> {
         crate::runtime::validate_allowed_tools(&allowed_tools)?;
         if name.is_empty() {
             return Err(invalid());
@@ -600,6 +682,12 @@ impl Harness {
         // Serialize admission with the scheduler's post-handler graph decision.
         let owner_store = self.owner.clone();
         let _gate = owner_store.task_gate().lock().map_err(|_| Error::Failed)?;
+        let selection_gate = live_checks.map(|_| self.checkpointable_extension_gate());
+        let _selection = selection_gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|_| Error::Failed)?;
         let publication = self
             .task_publication
             .lock()
@@ -629,10 +717,20 @@ impl Harness {
         let mut inherited_conflicts = 0;
         loop {
             let store = self.subagent_store()?;
+            let callback_checks = if let Some(validate) = live_checks {
+                let task = task_store::TaskStore::new(store)
+                    .load(task)
+                    .map_err(crate::task_scheduler::Error::from)?
+                    .ok_or_else(invalid)?;
+                validate(self, &task.task, _publication.as_ref().ok_or_else(invalid)?)?
+            } else {
+                Vec::new()
+            };
             if let Some(entry) = store.get(&key)? {
                 let stored: StoredAdmission = serde_json::from_slice(&entry.value)?;
                 let a = stored.admission;
                 if stored.inherit_parent_config != inherit_parent_config
+                    || stored.checkpointable_dispatch != live_checks.is_some()
                     || (inherit_parent_tools && stored.inheritance_policy_version != Some(3))
                     || (!inherit_parent_tools && stored.inheritance_policy_version.is_some())
                     || a.task != task
@@ -855,6 +953,7 @@ impl Harness {
                         admission: a.clone(),
                         inherit_parent_config,
                         inheritance_policy_version: inherit_parent_tools.then_some(3),
+                        checkpointable_dispatch: live_checks.is_some(),
                     })?,
                 },
                 Mutation::Put {
@@ -900,6 +999,22 @@ impl Harness {
             }
             prepared.checks.extend(checks);
             prepared.mutations.extend(mutations);
+            if live_checks.is_some() {
+                for check in callback_checks {
+                    if !prepared.checks.contains(&check) {
+                        prepared.checks.push(check);
+                    }
+                }
+                let wake = crate::runtime::task_input_wake_key(child);
+                prepared.checks.push(Check {
+                    key: wake.clone(),
+                    expected: Expected::Missing,
+                });
+                prepared.mutations.push(Mutation::Put {
+                    key: wake,
+                    value: Vec::new(),
+                });
+            }
             #[cfg(test)]
             if inherit_parent_tools {
                 BEFORE_INHERITED_ADMISSION.with(|hook| {
@@ -920,7 +1035,9 @@ impl Harness {
             };
             match result {
                 Ok(()) => return Ok(a),
-                Err(error @ durable_store::Error::Conflict { .. }) if inherit_parent_tools => {
+                Err(error @ durable_store::Error::Conflict { .. })
+                    if inherit_parent_tools || live_checks.is_some() =>
+                {
                     inherited_conflicts += 1;
                     if inherited_conflicts >= 8 {
                         return Err(error.into());
