@@ -75,9 +75,12 @@ fn display_only(record: &Record, compaction: Option<&Record>) -> bool {
     }
 }
 
-// Markers are written only for cancelled turn requests, never summaries.
 // Older journals without a marker keep their previous projection.
-fn aborted_partial_records(branch: &[&Record], compaction: Option<&Record>) -> HashSet<u64> {
+fn turn_partial_records(
+    records: &[Record],
+    branch: &[&Record],
+    compaction: Option<&Record>,
+) -> HashSet<u64> {
     let retain_from = compaction.and_then(|entry| match entry.event {
         Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(entry.id)),
         _ => None,
@@ -93,26 +96,15 @@ fn aborted_partial_records(branch: &[&Record], compaction: Option<&Record>) -> H
         })
         .collect();
     branch
-        .windows(2)
-        .filter_map(|pair| {
-            let Event::SourceEntry { format, entry } = &pair[0].event else {
+        .iter()
+        .filter_map(|record| {
+            let Event::ModelFinished { request_id, .. } = &record.event else {
                 return None;
             };
-            let Event::ModelFinished {
-                request_id,
-                failure: Some(pi_rs::ModelFailure::Cancelled),
-                partial,
-                ..
-            } = &pair[1].event
-            else {
-                return None;
-            };
-            (format == "pi-rs:aborted-turn-partial"
-                && entry["requestId"].as_str() == Some(request_id.to_string().as_str())
-                && !partial.is_empty()
-                && !assistants.contains(request_id)
-                && retain_from.is_none_or(|retain| pair[1].id >= retain))
-            .then_some(pair[1].id)
+            (!assistants.contains(request_id)
+                && retain_from.is_none_or(|retain| record.id >= retain)
+                && pi_rs::turn_partial_failure(records, record).is_some())
+            .then_some(record.id)
         })
         .collect()
 }
@@ -120,14 +112,14 @@ fn aborted_partial_records(branch: &[&Record], compaction: Option<&Record>) -> H
 pub(super) fn count(session: &Session) -> usize {
     let branch = session.branch();
     let compaction = latest_compaction(&branch);
-    let aborted = aborted_partial_records(&branch, compaction);
+    let partials = turn_partial_records(session.records(), &branch, compaction);
     let deleted: HashSet<u64> = branch
         .iter()
         .filter_map(|record| match &record.event {
             Event::ContextEdited {
                 target,
                 replacement,
-            } if aborted.contains(target) => Some((*target, replacement.is_none())),
+            } if partials.contains(target) => Some((*target, replacement.is_none())),
             _ => None,
         })
         .fold(HashMap::new(), |mut latest, (target, deleted)| {
@@ -138,7 +130,7 @@ pub(super) fn count(session: &Session) -> usize {
         .filter_map(|(target, deleted)| deleted.then_some(target))
         .collect();
     session.current_message_entries().len()
-        + aborted.difference(&deleted).count()
+        + partials.difference(&deleted).count()
         + branch
             .iter()
             .filter(|record| display_only(record, compaction))
@@ -154,28 +146,6 @@ pub(super) fn count(session: &Session) -> usize {
         }))
 }
 
-pub(super) fn last_assistant_text(session: &Session) -> Option<String> {
-    let (messages, _) = snapshot(session);
-    messages
-        .iter()
-        .rev()
-        .filter(|message| message["role"] == "assistant")
-        .find_map(|message| {
-            let text: String = message["content"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|block| block["type"] == "text")
-                .filter_map(|block| block["text"].as_str())
-                .collect();
-            let text = text
-                .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
-            // A normal stop is the last reply even if it has no text.
-            (message["stopReason"] == "stop" || !text.is_empty()).then(|| text.to_owned())
-        })
-        .filter(|text| !text.is_empty())
-}
-
 pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let branch = session.branch();
     let entries = session.current_message_entries();
@@ -185,7 +155,7 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let mut edited = HashSet::new();
     let mut partial_edits = HashMap::new();
     let compaction = latest_compaction(&branch);
-    let aborted = aborted_partial_records(&branch, compaction);
+    let partials = turn_partial_records(session.records(), &branch, compaction);
     for record in &branch {
         if let Event::SourceEntry { format, entry } = &record.event {
             import = (format == "pi").then_some(entry);
@@ -208,11 +178,11 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     }
     let mut extra_messages = branch
         .into_iter()
-        .filter(|record| display_only(record, compaction) || aborted.contains(&record.id))
+        .filter(|record| display_only(record, compaction) || partials.contains(&record.id))
         .filter_map(|record| {
             let value = match &record.event {
-                Event::ModelFinished { .. } if aborted.contains(&record.id) => {
-                    let mut value = projection.aborted_partial(session.records(), record)?;
+                Event::ModelFinished { .. } if partials.contains(&record.id) => {
+                    let mut value = projection.turn_partial(session.records(), record)?;
                     if let Some(replacement) = partial_edits.get(&record.id) {
                         match replacement {
                             None => return None,
@@ -513,10 +483,8 @@ impl Projection {
         invocations.get(*index)
     }
 
-    pub(super) fn aborted_partial(&self, records: &[Record], record: &Record) -> Option<Value> {
-        if !pi_rs::is_aborted_turn_partial(records, record) {
-            return None;
-        }
+    pub(super) fn turn_partial(&self, records: &[Record], record: &Record) -> Option<Value> {
+        let failure = pi_rs::turn_partial_failure(records, record)?;
         let Event::ModelFinished {
             request_id,
             partial,
@@ -538,7 +506,11 @@ impl Projection {
             replay: None,
         };
         let mut value = self.message(records, &assistant_record, &message, false, None);
-        value["stopReason"] = json!("aborted");
+        value["stopReason"] = json!(if failure == pi_rs::ModelFailure::Cancelled {
+            "aborted"
+        } else {
+            "error"
+        });
         Some(value)
     }
 
@@ -902,11 +874,6 @@ fn imported_message(
     };
     if edited {
         message["content"] = projected["content"].clone();
-        if message["role"] == "assistant"
-            && !matches!(message["stopReason"].as_str(), Some("aborted" | "error"))
-        {
-            message["stopReason"] = projected["stopReason"].clone();
-        }
     }
     Some(message)
 }
@@ -1019,7 +986,7 @@ mod tests {
             }
             let session = super::super::session_import::read(fixture.path()).unwrap();
             assert_eq!(
-                last_assistant_text(&session).as_deref(),
+                session.last_assistant_text().as_deref(),
                 expected,
                 "{reason}"
             );
@@ -1027,7 +994,20 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_turn_partial_is_display_only_and_not_duplicated() {
+    fn failed_and_cancelled_turn_partials_are_display_only_and_not_duplicated() {
+        assert_turn_partial(
+            pi_rs::ModelFailure::Cancelled,
+            "pi-rs:aborted-turn-partial",
+            "aborted",
+        );
+        assert_turn_partial(
+            pi_rs::ModelFailure::Failed,
+            "pi-rs:failed-turn-partial",
+            "error",
+        );
+    }
+
+    fn assert_turn_partial(failure: pi_rs::ModelFailure, marker: &str, stop: &str) {
         let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
         initial
             .append_user_with_images("question".into(), vec![], None)
@@ -1058,14 +1038,14 @@ mod tests {
             tool_decision: None,
         });
         append(Event::SourceEntry {
-            format: "pi-rs:aborted-turn-partial".into(),
+            format: marker.into(),
             entry: json!({"requestId":request_id}),
         });
         append(Event::ModelFinished {
             request_id,
             metadata: ModelMetadata::default(),
             usage: UsageReport::Unconfirmed,
-            failure: Some(pi_rs::ModelFailure::Cancelled),
+            failure: Some(failure),
             partial: "partial answer".into(),
             reply: None,
         });
@@ -1077,7 +1057,11 @@ mod tests {
             visible[1]["content"],
             json!([{"type":"text","text":"partial answer"}])
         );
-        assert_eq!(visible[1]["stopReason"], "aborted");
+        assert_eq!(visible[1]["stopReason"], stop);
+        assert_eq!(
+            session.last_assistant_text().as_deref(),
+            Some("partial answer")
+        );
         assert_eq!(native.len(), 1);
         let mut reopened = Session::from_records(session.records().to_vec()).unwrap();
         assert_eq!(snapshot(&reopened).0, visible);
@@ -1086,11 +1070,13 @@ mod tests {
             .edit_context(target, Some(pi_rs::ContextContent::Text("changed".into())))
             .unwrap();
         assert_eq!(snapshot(&reopened).0[1]["content"][0]["text"], "changed");
+        assert_eq!(reopened.last_assistant_text().as_deref(), Some("changed"));
         assert_eq!(reopened.current_messages().len(), 1);
         let mut reopened = Session::from_records(reopened.records().to_vec()).unwrap();
         assert_eq!(snapshot(&reopened).0[1]["content"][0]["text"], "changed");
         reopened.edit_context(target, None).unwrap();
         assert_eq!(snapshot(&reopened).0.len(), 1);
+        assert_eq!(reopened.last_assistant_text(), None);
         assert_eq!(count(&reopened), 1);
         let reopened = Session::from_records(reopened.records().to_vec()).unwrap();
         assert_eq!(snapshot(&reopened).0.len(), 1);
@@ -1141,6 +1127,7 @@ mod tests {
         let (visible, _) = snapshot(&session);
         assert_eq!(visible.len(), 1);
         assert_eq!(count(&session), 1);
+        assert_eq!(session.last_assistant_text(), None);
         let target = session.head();
         assert!(session.edit_context(target, None).is_err());
         assert!(

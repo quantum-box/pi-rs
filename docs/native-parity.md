@@ -7383,6 +7383,15 @@ The file getter reports paths managed by the SDK. Hosts that supply their own
 journal store retain responsibility for its location. ID and name reads return
 an error while the journal is locked.
 
+`AgentSession::get_last_assistant_text()` and native RPC
+`get_last_assistant_text` select from the active branch after compaction and
+context edits. They concatenate text and trim ECMAScript whitespace. An empty
+normal reply ends the search, while an omitted reply or a non-normal reply
+without text lets it continue. Marked failed and cancelled turn partials can
+provide display text without entering model context. Older unmarked failures
+and summary partials remain excluded.
+[Pinned Pi assistant text selection](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4522-L4549)
+
 ### SDK skill commands
 
 `SkillResources::expand_command` renders Pi-style `/skill:name` invocations

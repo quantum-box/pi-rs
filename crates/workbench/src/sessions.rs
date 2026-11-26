@@ -864,7 +864,8 @@ fn tool_html(outcome: &pi_rs::Outcome) -> String {
 }
 
 pub fn copy_last(session: &Session) -> Result<()> {
-    let text = super::rpc_messages::last_assistant_text(session)
+    let text = session
+        .last_assistant_text()
         .ok_or_else(|| Error::Config("No agent messages to copy yet.".into()))?;
     copy_text(&text)
 }

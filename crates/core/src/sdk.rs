@@ -1779,6 +1779,12 @@ impl AgentSession {
             session.conversation_at(session.head())
         }
     }
+    /// Text of the latest qualifying assistant reply on the active branch.
+    /// A normally completed reply with no text returns `None`. A busy journal
+    /// returns an error, as with [`Self::messages`].
+    pub fn get_last_assistant_text(&self) -> Result<Option<String>> {
+        Ok(self.journal()?.last_assistant_text())
+    }
     /// Usage and message counts across the complete durable session.
     pub fn statistics(&self) -> Result<crate::SessionStats> {
         Ok(self.journal()?.statistics())
@@ -10387,6 +10393,130 @@ mod tests {
                     usage: None,
                 }),
             ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_last_assistant_text_tracks_edits_branches_and_compaction() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.get_last_assistant_text().unwrap(), None);
+        session.prompt("first").await.unwrap();
+        let first = session.journal().unwrap().head();
+        session.prompt("second").await.unwrap();
+        let second = session
+            .journal()
+            .unwrap()
+            .current_message_entries()
+            .last()
+            .unwrap()
+            .0;
+        let original = session.journal().unwrap().head();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("answer 2")
+        );
+
+        session
+            .journal()
+            .unwrap()
+            .edit_context(second, Some(crate::ContextContent::Blocks(vec![])))
+            .unwrap();
+        assert_eq!(session.get_last_assistant_text().unwrap(), None);
+        session
+            .journal()
+            .unwrap()
+            .edit_context(second, None)
+            .unwrap();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("answer 1")
+        );
+
+        session.checkout(first).unwrap();
+        session.prompt("sibling").await.unwrap();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("answer 3")
+        );
+        session.checkout(original).unwrap();
+        session
+            .journal()
+            .unwrap()
+            .edit_context(
+                second,
+                Some(crate::ContextContent::Text(
+                    "\u{feff}\u{00a0}\u{0085} revised\u{3000}".into(),
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("\u{0085} revised")
+        );
+
+        for (retain_from, expected) in [(Some(second), Some("\u{0085} revised")), (None, None)] {
+            session
+                .journal()
+                .unwrap()
+                .append(crate::Event::Compacted {
+                    summary: "summary".into(),
+                    system_prompt: None,
+                    retain_from,
+                    tokens_before: None,
+                    states: Default::default(),
+                    usage: None,
+                    usage_metadata: None,
+                })
+                .unwrap();
+            assert_eq!(
+                session.get_last_assistant_text().unwrap().as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_last_assistant_text_includes_failed_and_cancelled_turn_partials() {
+        struct PartialModel(AtomicUsize);
+        #[async_trait::async_trait]
+        impl Model for PartialModel {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                assert!(!request.messages.iter().any(|message| matches!(message,
+                    Message::Assistant { content, .. } if content.contains("partial"))));
+                let (text, error) = match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => ("failed partial", Error::Model("fixture failure".into())),
+                    1 => ("cancelled partial", Error::Cancelled),
+                    _ => ("\u{feff}\u{00a0}", Error::Model("fixture failure".into())),
+                };
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text(text.into())),
+                    Err(error),
+                ])))
+            }
+        }
+        let mut session =
+            SessionBuilder::new(Arc::new(PartialModel(AtomicUsize::new(0))), "fixture")
+                .in_memory()
+                .unwrap();
+        for (input, expected) in [
+            ("fail", "failed partial"),
+            ("cancel", "cancelled partial"),
+            ("blank failure", "cancelled partial"),
+        ] {
+            assert!(session.prompt(input).await.is_err());
+            assert_eq!(
+                session.get_last_assistant_text().unwrap().as_deref(),
+                Some(expected)
+            );
+            assert!(
+                session
+                    .messages()
+                    .unwrap()
+                    .iter()
+                    .all(|message| !matches!(message, Message::Assistant { .. }))
+            );
         }
     }
 

@@ -3957,11 +3957,14 @@ impl Agent<'_> {
         };
         // Only turn replies are displayable. Summary requests can contain
         // private prompt material and must never enter the RPC transcript.
-        if retain_reply && matches!(result, Err(Error::Cancelled)) && !content.is_empty() {
+        if retain_reply
+            && !content.is_empty()
+            && let Some(failure) = failure
+        {
             commit(
                 session,
                 Event::SourceEntry {
-                    format: "pi-rs:aborted-turn-partial".into(),
+                    format: crate::journal::turn_partial_marker(failure).into(),
                     entry: serde_json::json!({"requestId": request_id}),
                 },
                 observer,

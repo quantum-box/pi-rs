@@ -12,6 +12,8 @@ use crate::{
     Usage, UsageReport,
 };
 
+mod assistant_transcript;
+
 pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
 const BRANCH_FALLBACK_JOURNAL_VERSION: u32 = 4;
 pub(crate) const TOOL_DECISION_JOURNAL_VERSION: u32 = 5;
@@ -3923,23 +3925,40 @@ pub fn aborted_turn_partial_request(event: &Event) -> Option<Uuid> {
 /// Whether a completion is a marked, display-only cancelled turn partial.
 #[doc(hidden)]
 pub fn is_aborted_turn_partial(records: &[Record], record: &Record) -> bool {
+    turn_partial_failure(records, record) == Some(ModelFailure::Cancelled)
+}
+
+pub(crate) fn turn_partial_marker(failure: ModelFailure) -> &'static str {
+    match failure {
+        ModelFailure::Cancelled => "pi-rs:aborted-turn-partial",
+        ModelFailure::Failed | ModelFailure::Retryable => "pi-rs:failed-turn-partial",
+    }
+}
+
+/// The failure of a marked, display-only turn partial. Summary partials and
+/// older unmarked failures have no display provenance.
+#[doc(hidden)]
+pub fn turn_partial_failure(records: &[Record], record: &Record) -> Option<ModelFailure> {
     let Event::ModelFinished {
         request_id,
-        failure: Some(ModelFailure::Cancelled),
+        failure: Some(failure),
         partial,
         ..
     } = &record.event
     else {
-        return false;
+        return None;
     };
-    let Some(parent) = record
-        .parent
-        .and_then(|id| id.checked_sub(1))
-        .and_then(|index| records.get(index as usize))
-    else {
-        return false;
+    let parent = records.get(record.parent?.checked_sub(1)? as usize)?;
+    let Event::SourceEntry { format, entry } = &parent.event else {
+        return None;
     };
-    aborted_turn_partial_request(&parent.event) == Some(*request_id) && !partial.is_empty()
+    (!partial.is_empty()
+        && format == turn_partial_marker(*failure)
+        && entry["requestId"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            == Some(*request_id))
+    .then_some(*failure)
 }
 
 fn validate_context_edit(
@@ -3951,8 +3970,8 @@ fn validate_context_edit(
         .checked_sub(1)
         .and_then(|index| records.get(index as usize))
         .ok_or_else(|| Error::Session("invalid context edit target".into()))?;
-    let assistant =
-        matches!(record.event, Event::Assistant { .. }) || is_aborted_turn_partial(records, record);
+    let assistant = matches!(record.event, Event::Assistant { .. })
+        || turn_partial_failure(records, record).is_some();
     if !assistant
         && !matches!(
             record.event,
@@ -4804,30 +4823,36 @@ pub(crate) fn conversation_entries(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<(u64, Message)> {
-    let retain_from = path
-        .iter()
+    conversation_entries_since(path, operations, retained_message_floor(path))
+}
+
+fn retained_message_floor(path: &[&Record]) -> u64 {
+    path.iter()
         .rev()
         .find_map(|record| match record.event {
             Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(record.id)),
             _ => None,
         })
-        .unwrap_or(0);
-    conversation_entries_since(path, operations, retain_from)
+        .unwrap_or(0)
 }
 
 pub(crate) fn conversation_entries_unrepaired(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<(u64, Message)> {
-    let retain_from = path
-        .iter()
-        .rev()
-        .find_map(|record| match record.event {
-            Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(record.id)),
+    conversation_entries_since_inner(path, operations, retained_message_floor(path), false)
+}
+
+fn context_edits<'a>(path: &[&'a Record]) -> BTreeMap<u64, &'a Option<crate::ContextContent>> {
+    path.iter()
+        .filter_map(|record| match &record.event {
+            Event::ContextEdited {
+                target,
+                replacement,
+            } => Some((*target, replacement)),
             _ => None,
         })
-        .unwrap_or(0);
-    conversation_entries_since_inner(path, operations, retain_from, false)
+        .collect()
 }
 
 fn conversation_entries_since(
@@ -4902,16 +4927,7 @@ fn conversation_entries_since_inner(
             _ => None,
         })
         .collect();
-    let edits: BTreeMap<_, _> = path
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::ContextEdited {
-                target,
-                replacement,
-            } => Some((*target, replacement)),
-            _ => None,
-        })
-        .collect();
+    let edits = context_edits(path);
     // Replacement blocks may introduce calls with no corresponding result.
     // Compare those calls with the actual repaired model projection, while
     // keeping an otherwise empty assistant for its thinking and usage.

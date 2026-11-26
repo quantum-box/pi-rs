@@ -530,10 +530,13 @@ impl Cursor {
                 position.imported = None;
                 None
             }
-            Event::ModelFinished { .. } if pi_rs::is_aborted_turn_partial(records, record) => self
-                .messages
-                .aborted_partial(records, record)
-                .map(|message| json!({"type":"message", "message":message})),
+            Event::ModelFinished { .. }
+                if pi_rs::turn_partial_failure(records, record).is_some() =>
+            {
+                self.messages
+                    .turn_partial(records, record)
+                    .map(|message| json!({"type":"message", "message":message}))
+            }
             Event::CacheWarm {
                 metadata,
                 usage,
