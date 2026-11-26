@@ -177,6 +177,8 @@ struct Cli {
     resume_existing_session: Option<(PathBuf, PathBuf)>,
     #[arg(skip)]
     resume_limits: program_resume::ExplicitLimits,
+    #[arg(skip)]
+    resume_explicit_extensions: bool,
     /// Open or create a named session in this workspace's session directory.
     #[arg(long, conflicts_with_all = ["session", "continue_session", "resume_session", "no_session"], value_parser = sessions::validate_id)]
     session_id: Option<String>,
@@ -1650,7 +1652,7 @@ async fn run_cli(resume_token: Option<String>) -> i32 {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
-        args.resume_limits = program_resume::ExplicitLimits::from_matches(&matches);
+        program_resume::capture_cli_options(&mut args, &matches);
         if args.terminal_resume {
             program_resume::bind_startup(&mut args)?;
         } else if args.terminal_resume_worker {

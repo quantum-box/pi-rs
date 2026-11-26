@@ -580,7 +580,18 @@ impl Reporter {
     }
 }
 
+pub(super) fn capture_cli_options(args: &mut Cli, matches: &clap::ArgMatches) {
+    args.resume_limits = ExplicitLimits::from_matches(matches);
+    // Interactive startup adds its own default extensions to the same list.
+    args.resume_explicit_extensions =
+        matches.value_source("extensions") == Some(clap::parser::ValueSource::CommandLine);
+}
+
 fn report_body(executable: &Path, args: &Cli, confirm_project: bool) -> Option<String> {
+    #[cfg(feature = "evaluation-fixtures")]
+    if args.fixtures.is_some() {
+        return None;
+    }
     if args.no_session
         || args.ephemeral_worker_session
         || args.trust_pending
@@ -588,8 +599,12 @@ fn report_body(executable: &Path, args: &Cli, confirm_project: bool) -> Option<S
         || args.endpoint_explicit
         || args.provider_argument.is_some()
         || args.project.is_some()
-        || !args.extensions.is_empty()
+        || args.resume_explicit_extensions
         || !args.extension_flags.is_empty()
+        || !args.skill.is_empty()
+        || !args.prompt_template.is_empty()
+        || !args.themes.is_empty()
+        || args.orders.is_some()
         || args.system_prompt.is_some()
         || !args.append_system_prompt.is_empty()
         || args.instruction.is_some()
@@ -616,6 +631,7 @@ fn report_body(executable: &Path, args: &Cli, confirm_project: bool) -> Option<S
         (args.offline, "--offline"),
         (args.no_tools, "--no-tools"),
         (args.no_builtin_tools, "--no-builtin-tools"),
+        (args.coding_tools, "--coding-tools"),
         (args.no_themes, "--no-themes"),
         (args.no_skills, "--no-skills"),
         (args.no_prompt_templates, "--no-prompt-templates"),
@@ -625,9 +641,18 @@ fn report_body(executable: &Path, args: &Cli, confirm_project: bool) -> Option<S
             argv.push(flag.into());
         }
     }
+    if let Some(mode) = args.tui_mode {
+        let mode = match mode {
+            super::TuiMode::Fullscreen => "fullscreen",
+            super::TuiMode::Regular => "regular",
+        };
+        argv.push(format!("--tui-mode={mode}"));
+    }
     for (flag, value) in [
         ("tools", &args.tools),
         ("exclude-tools", &args.exclude_tools),
+        ("models", &args.models),
+        ("use-theme", &args.use_theme),
     ] {
         if let Some(value) = value {
             argv.push(format!("--{flag}={value}"));
@@ -835,8 +860,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn program_resume_suppresses_explicit_projects_and_extensions() {
-        use clap::Parser;
+    fn program_resume_suppresses_unrestorable_explicit_overrides() {
+        use clap::{CommandFactory, FromArgMatches};
 
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -851,9 +876,20 @@ mod tests {
             &["--extension", "./local extension"],
             &["--extension", "builtin:mcp"],
             &["--no-extensions", "--extension=builtin:mcp"],
+            &["--extension=notes"],
+            &["--skill", "./skill with spaces.md"],
+            &["--no-skills", "--skill=skill.md"],
+            &["--prompt-template", "./prompt with spaces.md"],
+            &["--no-prompt-templates", "--prompt-template=prompt.md"],
+            &["--no-themes", "--theme=theme.json"],
+            &["--orders=https://example.test/orders"],
         ];
         for flags in cases {
-            let mut args = Cli::parse_from(std::iter::once("pi").chain(flags.iter().copied()));
+            let matches = Cli::command()
+                .try_get_matches_from(std::iter::once("pi").chain(flags.iter().copied()))
+                .unwrap();
+            let mut args = Cli::from_arg_matches(&matches).unwrap();
+            capture_cli_options(&mut args, &matches);
             args.session = baseline.session.clone();
             args.workspace = root.clone();
             assert!(
@@ -997,6 +1033,7 @@ mod tests {
         let mut explicit_mcp = args.clone();
         explicit_mcp.no_extensions = true;
         explicit_mcp.extensions.push("builtin:mcp".into());
+        explicit_mcp.resume_explicit_extensions = true;
 
         let mcp = project.join("mcp.json");
         for (config, approval) in [
