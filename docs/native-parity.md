@@ -517,10 +517,13 @@ tool turns. Loopback CLI coverage does not replace live Xiaomi acceptance.
 
 ### Ant Ling API key checkpoint
 
-Ant Ling uses the pinned Pi catalog of two Ling models and the reasoning
-Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
-mapped high or xhigh effort in the provider's nested `reasoning` field.
-Live acceptance with an Ant Ling account remains open.
+The pinned Ant Ling catalog defaults to `Ling-3.1-flash` and uses
+`ANT_LING_API_KEY` at the official chat endpoint. The endpoint accepts
+`thinking.type` set to `enabled` or `disabled`. The built-in profile exposes
+`high` and `off`, and custom profiles with the legacy `ant-ling`
+`thinkingFormat` use the same toggle. Live acceptance with an Ant Ling account
+remains open. The pinned Cloudflare defaults are `@cf/zai-org/glm-5.3` for
+Workers AI and `workers-ai/@cf/zai-org/glm-5.3` for AI Gateway.
 
 ### OpenCode Zen and Go
 

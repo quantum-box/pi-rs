@@ -3288,20 +3288,17 @@ mod tests {
             builtin_chat::find("ant-ling").unwrap().env(),
             "ANT_LING_API_KEY"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 3);
-        let ring = profiles.model(&provider, "Ring-2.6-1T").unwrap();
+        assert_eq!(profiles.model_ids(&provider).len(), 5);
+        let model = profiles.model(&provider, "Ling-3.1-flash").unwrap();
         assert_eq!(
-            ring.levels(Adapter::ChatCompletions).unwrap(),
-            ["high", "xhigh"]
+            model.levels(Adapter::ChatCompletions).unwrap(),
+            ["off", "high"]
         );
-        assert_eq!(ring.mapped_effort("high"), Some(Some("high")));
-        assert_eq!(
-            profiles
-                .model(&provider, "Ling-2.6-flash")
-                .unwrap()
-                .reasoning,
-            Some(false)
-        );
+        assert_eq!(model.mapped_effort("off"), Some(Some("off")));
+        assert_eq!(model.mapped_effort("high"), Some(Some("high")));
+        assert_eq!(model.mapped_effort("medium"), Some(None));
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert!(profiles.model(&provider, "Ring-2.6-1T").is_none());
     }
 
     #[test]

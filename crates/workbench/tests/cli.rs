@@ -2004,6 +2004,77 @@ fn kimi_coding_models_send_their_specific_reasoning_options() {
 }
 
 #[test]
+fn ant_ling_print_sends_binary_thinking_for_the_default_model() {
+    let root = tempfile::tempdir().unwrap();
+    for (level, expected) in [("high", "enabled"), ("off", "disabled")] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, request) = accept_proxy_request(listener);
+            assert!(
+                request.starts_with("POST /v1/chat/completions "),
+                "{request}"
+            );
+            let mut length = None;
+            for line in reader.by_ref().lines() {
+                let line = line.unwrap();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = Some(value.trim().parse().unwrap());
+                }
+            }
+            let mut body = vec![0; length.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            let events = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            body
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                "ant-ling",
+                "--thinking",
+                level,
+                "--api-key",
+                "fixture",
+                "--endpoint",
+                &endpoint,
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+        let request = server.join().unwrap();
+        assert_eq!(request["model"], "Ling-3.1-flash");
+        assert_eq!(request["thinking"], json!({"type":expected}));
+        assert!(request.get("reasoning").is_none());
+        assert!(request.get("reasoning_effort").is_none());
+    }
+}
+
+#[test]
 fn qwen_token_plans_use_model_specific_thinking_and_tool_format() {
     for (provider, model, level, effort) in [
         ("qwen-token-plan", "qwen3.7-plus", "high", None),
