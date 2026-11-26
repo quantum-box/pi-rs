@@ -82,6 +82,15 @@ impl<'a> ResourceMatcher<'a> {
             .any(|candidate| self.matches_candidate(candidate))
     }
 
+    /// Match a package-relative prompt source using the path glob only.
+    pub fn matches_relative_glob(&self, path: &Path, root: &Path) -> bool {
+        path.strip_prefix(root).ok().is_some_and(|relative| {
+            self.glob
+                .as_ref()
+                .is_some_and(|glob| glob.is_match(relative))
+        })
+    }
+
     fn matches_candidate(&self, candidate: &str) -> bool {
         // The extglob translators cover ASCII paths without hidden components.
         // Other spellings keep using the native glob matcher.
@@ -108,6 +117,10 @@ impl<'a> ResourceMatcher<'a> {
                 .as_ref()
                 .is_some_and(|prefix| candidate.starts_with(prefix))
     }
+}
+
+pub fn has_path_glob(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '[', '{'])
 }
 
 pub fn has_extglob(pattern: &str) -> bool {

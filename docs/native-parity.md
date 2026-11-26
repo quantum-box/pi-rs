@@ -7584,6 +7584,10 @@ native CLI's path, basename, glob and supported extglob matcher. Skill
 patterns can match the directory containing `SKILL.md`, including exact
 `+` and `-` overrides. Wildcards match the file or its containing directory.
 A literal directory path can select its subtree.
+Qualified prompt sources use the native path glob syntax, so a source such as
+`prompts/@(one).md` names that file literally. Prompt basename lookups, prompt
+exclusions, and theme filters still use the shared matcher. Exact `+` and `-`
+overrides compare literal paths.
 Native skill discovery looks for `SKILL.md` and can include nested skill
 directories.
 For extensions, discovery starts with executable files directly inside

@@ -12,7 +12,7 @@ use pi_rs_workbench::package_manifest::{
     extension_stem_matches, has_resource_fields, is_native_executable, local_startup_manifest,
     manifest_pi, resource_patterns, select_resource_with, validate_resource_patterns,
 };
-use pi_rs_workbench::package_pattern::ResourceMatcher;
+use pi_rs_workbench::package_pattern::{ResourceMatcher, has_path_glob};
 use pi_rs_workbench::process_cleanup::{Children, owns_kill_target};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -649,7 +649,7 @@ fn collect_package_themes(root: &Path, pi: &Value) -> Result<Vec<PathBuf>> {
     // rules for directory scans must not hide a named manifest entry.
     for pattern in &patterns {
         let candidate = pattern.strip_prefix('+').unwrap_or(pattern);
-        if pattern.starts_with(['!', '-']) || candidate.contains(['*', '?', '[', '{']) {
+        if pattern.starts_with(['!', '-']) || has_path_glob(candidate) {
             continue;
         }
         let path = root.join(candidate.replace('\\', "/"));
@@ -1833,7 +1833,7 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
             .iter()
             .flat_map(|pattern| {
                 let pattern = pattern.replace('\\', "/");
-                if pattern.contains(['*', '?', '[', '{']) {
+                if has_path_glob(&pattern) {
                     if !pattern.trim_start_matches("./").contains('/') {
                         let mut legacy = legacy_prompt_candidates(root, None, true);
                         legacy.retain(|path| resource_matches(path, root, &pattern, false, true));
@@ -3779,6 +3779,96 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
                 actual.sort();
                 assert_eq!(*actual, expected, "{pi}");
             }
+        }
+    }
+
+    #[test]
+    fn sdk_prompt_and_theme_extglob_sources_follow_native_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for relative in [
+            "@(one).md",
+            "prompts/one.md",
+            "prompts/two.md",
+            "prompts/@(one).md",
+            "prompts/+(one).md",
+            "themes/one.json",
+            "themes/two.json",
+            "themes/@(one).json",
+            "themes/+(one).json",
+            ".themes/@(fallback(inner)).json",
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+
+        for (kind, patterns, expected) in [
+            (
+                "prompts",
+                &["prompts/@(one).md"][..],
+                &["prompts/@(one).md"][..],
+            ),
+            ("prompts", &["prompts/@(one)*.md"], &["prompts/@(one).md"]),
+            ("prompts", &["@(one).md"], &["@(one).md", "prompts/one.md"]),
+            (
+                "prompts",
+                &[
+                    "prompts/one.md",
+                    "+prompts/@(one).md",
+                    "+prompts/+(one).md",
+                    "-prompts/@(one).md",
+                ],
+                &["prompts/+(one).md", "prompts/one.md"],
+            ),
+            (
+                "prompts",
+                &[
+                    "prompts",
+                    "!prompts/@(one).md",
+                    "+prompts/one.md",
+                    "-prompts/+(one).md",
+                ],
+                &["prompts/@(one).md", "prompts/one.md", "prompts/two.md"],
+            ),
+            ("themes", &["themes/@(one).json"], &["themes/one.json"]),
+            (
+                "themes",
+                &[".themes/@(fallback(inner)).json"],
+                &[".themes/@(fallback(inner)).json"],
+            ),
+            (
+                "themes",
+                &[
+                    "themes/one.json",
+                    "+themes/@(one).json",
+                    "+themes/+(one).json",
+                    "-themes/@(one).json",
+                ],
+                &["themes/+(one).json", "themes/one.json"],
+            ),
+            (
+                "themes",
+                &["themes", "!themes/@(one).json", "-themes/+(one).json"],
+                &["themes/@(one).json", "themes/two.json"],
+            ),
+        ] {
+            let pi = json!({(kind): patterns});
+            std::fs::write(root.join("pi-package.json"), json!({"pi": pi}).to_string()).unwrap();
+            let native = collect_package_resources(root, &pi, Vec::new()).unwrap();
+            let sdk = pi_rs_workbench::package_resources::PackageResourcePaths::discover(&[
+                root.to_path_buf()
+            ])
+            .unwrap();
+            let (mut native, sdk) = if kind == "prompts" {
+                (native.prompts, sdk.prompts)
+            } else {
+                (native.themes, sdk.themes)
+            };
+            native.sort();
+            let expected: Vec<_> = expected.iter().map(|path| root.join(path)).collect();
+            assert_eq!(native, expected, "native {pi}");
+            assert_eq!(sdk, expected, "SDK {pi}");
         }
     }
 

@@ -131,14 +131,14 @@ fn extension_discovery_uses_native_candidates_and_stem_overrides() {
         fs::write(&manifest, json!({"pi":{"extensions":patterns}}).to_string()).unwrap();
         candidates()
     };
-    assert_eq!(discover(&["!helper"]), [runner.clone()]);
+    assert_eq!(discover(&["!helper"]), std::slice::from_ref(&runner));
     assert_eq!(
         discover(&["!helper", "+helper"]),
         [helper.clone(), runner.clone()]
     );
     assert_eq!(
         discover(&["!helper", "+helper", "-helper"]),
-        [runner.clone()]
+        std::slice::from_ref(&runner)
     );
     assert!(discover(&["+tools/worker.exe", "!*.exe"]).is_empty());
     assert_eq!(
@@ -191,13 +191,19 @@ fn skill_patterns_match_containing_directories_and_exact_overrides() {
 
     assert_eq!(
         discover(&["skills", "!skills/internal-*"]),
-        [public.clone()]
+        std::slice::from_ref(&public)
     );
-    assert_eq!(discover(&["skills/*", "!internal-*"]), [public.clone()]);
-    assert_eq!(discover(&["public"]), [public.clone()]);
+    assert_eq!(
+        discover(&["skills/*", "!internal-*"]),
+        std::slice::from_ref(&public)
+    );
+    assert_eq!(discover(&["public"]), std::slice::from_ref(&public));
     let nested = write(root, "skills/public-guide/internal/SKILL.md", "");
     assert!(discover(&["skills/public-*"]).is_empty());
-    assert_eq!(discover(&["skills/public-guide"]), [nested.clone()]);
+    assert_eq!(
+        discover(&["skills/public-guide"]),
+        std::slice::from_ref(&nested)
+    );
     fs::remove_file(nested).unwrap();
     assert_eq!(
         discover(&["!internal-*"]),

@@ -11,7 +11,7 @@ use crate::package_manifest::{
     manifest_pi, resource_patterns, select_resource_with,
 };
 
-use crate::package_pattern::{ResourceMatcher, has_extglob};
+use crate::package_pattern::{ResourceMatcher, has_extglob, has_path_glob};
 
 const MAX_PATHS: usize = 128;
 const MAX_ENTRIES: usize = 10_000;
@@ -127,7 +127,7 @@ fn has_suffix(path: &Path, suffix: &[u8]) -> bool {
 }
 
 fn has_glob(pattern: &str) -> bool {
-    pattern.contains(['*', '?', '[', '{']) || has_extglob(pattern)
+    has_path_glob(pattern) || has_extglob(pattern)
 }
 
 fn normalize_pattern(pattern: &str) -> Result<String> {
@@ -197,7 +197,7 @@ fn discover_extensions(
 
     if explicit {
         let matcher = ManifestMatcher::new(patterns);
-        for path in literal_sources(root, patterns) {
+        for (_, path) in literal_sources(root, Kind::Extension, patterns) {
             if metadata(&path)?.is_some_and(|metadata| is_native_executable(&path, &metadata)) {
                 candidates.push(path);
             }
@@ -209,12 +209,17 @@ fn discover_extensions(
 
 fn literal_sources<'a>(
     root: &'a Path,
+    kind: Kind,
     patterns: &'a [String],
-) -> impl Iterator<Item = PathBuf> + 'a {
+) -> impl Iterator<Item = (&'a str, PathBuf)> + 'a {
     patterns
         .iter()
-        .filter(|pattern| !is_override(pattern) && !has_glob(pattern))
-        .map(|pattern| root.join(pattern))
+        .filter(move |pattern| {
+            !is_override(pattern)
+                && !has_path_glob(pattern)
+                && (matches!(kind, Kind::Prompt | Kind::Theme) || !has_extglob(pattern))
+        })
+        .map(|pattern| (pattern.as_str(), root.join(pattern)))
 }
 
 fn is_override(pattern: &str) -> bool {
@@ -269,10 +274,14 @@ fn discover_file_resources(
     let mut candidates = Vec::new();
     // Retain exact sources, including authorized directory symlinks that a
     // recursive scan of the package would skip.
-    for source in literal_sources(root, patterns) {
+    for (pattern, source) in literal_sources(root, kind, patterns) {
         if let Some(info) = metadata(&source)? {
             if info.is_dir() {
-                scan(&source, kind, examined, |path| candidates.push(path))?;
+                // The native theme prepass checks named files. Extglob theme
+                // patterns still use the package scan for directories.
+                if kind != Kind::Theme || !has_extglob(pattern) {
+                    scan(&source, kind, examined, |path| candidates.push(path))?;
+                }
             } else if kind.accepts(&source, &info) {
                 candidates.push(source);
             }
@@ -352,7 +361,7 @@ fn collect_prompt_matches(
     let implicit = plain.peek().is_none();
     let scan_patterns: Vec<_> = plain
         .filter(|pattern| {
-            has_glob(pattern)
+            has_path_glob(pattern)
                 || (!pattern.trim_start_matches("./").contains('/') && pattern.ends_with(".md"))
         })
         .collect();
@@ -360,12 +369,15 @@ fn collect_prompt_matches(
         scan(root, Kind::Prompt, examined, |path| {
             let selected = implicit
                 || scan_patterns.iter().any(|pattern| {
-                    matcher.matches(&path, root, pattern, false)
-                    // A qualified prompt glob can resolve to a directory
-                    // source. Unqualified globs match file basenames only.
-                    || (pattern.trim_start_matches("./").contains('/')
-                        && path.ancestors().skip(1).take_while(|parent| *parent != root)
-                            .any(|parent| matcher.matches(parent, root, pattern, false)))
+                    if pattern.trim_start_matches("./").contains('/') {
+                        // A qualified path glob can select a directory source.
+                        let glob = &matcher.patterns[&(pattern.as_str(), false)];
+                        path.ancestors()
+                            .take_while(|source| *source != root)
+                            .any(|source| glob.matches_relative_glob(source, root))
+                    } else {
+                        matcher.matches(&path, root, pattern, false)
+                    }
                 });
             if selected {
                 candidates.push(path);
