@@ -420,12 +420,12 @@ impl CodingTools {
                     _ = cancellation.cancelled() => { cancelled = true; operation_cancel.cancel(); break None; }
                     _ = &mut deadline => { cancelled = true; timed_out = true; operation_cancel.cancel(); break None; }
                     chunk = receiver.recv(), if open => match chunk {
-                        Some(chunk) => append_user_shell_chunk(&mut output, &mut text, &mut filter, &chunk, progress)?,
+                        Some(chunk) => append_user_shell_chunk(&mut output, &mut text, &mut filter, &chunk, progress),
                         None => open = false,
                     },
                     result = &mut operation => {
                         while let Ok(chunk) = receiver.try_recv() {
-                            append_user_shell_chunk(&mut output, &mut text, &mut filter, &chunk, progress)?;
+                            append_user_shell_chunk(&mut output, &mut text, &mut filter, &chunk, progress);
                         }
                         break result.map_err(|message| Error::Extension { id: extension.id().into(), message })?;
                     }
@@ -433,16 +433,16 @@ impl CodingTools {
             }
         };
         while let Ok(chunk) = receiver.try_recv() {
-            append_user_shell_chunk(&mut output, &mut text, &mut filter, &chunk, progress)?;
+            append_user_shell_chunk(&mut output, &mut text, &mut filter, &chunk, progress);
         }
         let mut remaining = String::new();
         text.finish(&mut |text| remaining.push_str(&filter.filter(text)));
         remaining.push_str(&filter.finish());
         if !remaining.is_empty() {
             progress(&remaining);
-            output.append(remaining.as_bytes())?;
+            output.append(remaining.as_bytes());
         }
-        let result = output.finish()?;
+        let result = output.finish();
         let output = if timed_out {
             format!(
                 "{}\nCommand timed out after {} seconds",
@@ -599,15 +599,14 @@ fn append_user_shell_chunk(
     filter: &mut UserShellFilter,
     chunk: &[u8],
     progress: &mut (dyn FnMut(&str) + Send),
-) -> Result<()> {
+) {
     output.record_raw_bytes(chunk.len());
     let mut clean = String::new();
     decoder.push(chunk, &mut |text| clean.push_str(&filter.filter(text)));
     if !clean.is_empty() {
         progress(&clean);
-        output.append(clean.as_bytes())?;
+        output.append(clean.as_bytes());
     }
-    Ok(())
 }
 
 impl Extension for CodingTools {
@@ -2135,7 +2134,7 @@ impl RemoteShellTool {
                     _ = cancellation.cancelled() => { child.cancel(); break (Ok(None), true, false); }
                     _ = &mut deadline, if !backend_owns_timeout => { child.cancel(); break (Ok(None), true, true); }
                     chunk = receiver.recv(), if open => match chunk {
-                        Some(chunk) => { output.append(&chunk)?; if let Some((sender, _)) = &progress { let _ = sender.send_replace(Some(output.partial_result())); } },
+                        Some(chunk) => { output.append(&chunk); if let Some((sender, _)) = &progress { let _ = sender.send_replace(Some(output.partial_result())); } },
                         None => open = false,
                     },
                     result = &mut operation => { break (result, false, false); }
@@ -2143,7 +2142,7 @@ impl RemoteShellTool {
             }
         };
         while let Ok(chunk) = receiver.try_recv() {
-            output.append(&chunk)?;
+            output.append(&chunk);
             if let Some((sender, _)) = &progress {
                 let _ = sender.send_replace(Some(output.partial_result()));
             }
@@ -2157,7 +2156,7 @@ impl RemoteShellTool {
                 worker.abort();
             }
         }
-        let output = output.finish()?;
+        let output = output.finish();
         if let Some(path) = &output.path {
             self.shell_outputs
                 .0
@@ -2260,9 +2259,7 @@ impl Tool for RemoteShellTool {
         match self.run(&args, &context.cancellation, Some(host)).await {
             Ok(result) => {
                 let mut data = json!({"output":result.output.script,"truncated":result.output.script_truncated,"exit_code":result.exit_code,"wall_time_seconds":(result.elapsed * 10.0).round() / 10.0});
-                if result.output.script_truncated {
-                    data["full_output_path"] = json!(result.output.path);
-                }
+                result.output.add_structured_file_details(&mut data);
                 Outcome::Structured {
                     data,
                     attachments: vec![],
@@ -2285,11 +2282,7 @@ fn pi_tool_failure(output: String) -> Outcome {
 fn shell_outcome(output: crate::shell_output::Output, code: i32, elapsed: f64) -> Outcome {
     let text = output.result_display();
     let mut structured_content = json!({"output":output.script,"truncated":output.script_truncated,"exit_code":code,"wall_time_seconds":(elapsed * 10.0).round() / 10.0});
-    if output.script_truncated
-        && let Some(path) = &output.path
-    {
-        structured_content["full_output_path"] = json!(path);
-    }
+    output.add_structured_file_details(&mut structured_content);
     Outcome::TextResultWithStructuredContent {
         output: if code == 0 {
             text
@@ -2619,9 +2612,7 @@ impl Tool for CodingTool {
                         result.elapsed
                     };
                     let mut data = json!({"output":result.output.script,"truncated":result.output.script_truncated,"exit_code":exit_code(result.status),"wall_time_seconds":elapsed});
-                    if result.output.script_truncated {
-                        data["full_output_path"] = json!(result.output.path);
-                    }
+                    result.output.add_structured_file_details(&mut data);
                     Outcome::Structured {
                         data,
                         attachments: vec![],
@@ -4051,10 +4042,10 @@ impl CodingTool {
                         stdout_text.push(&stdout_chunk[..count], &mut |text| clean.push_str(&stdout_filter.filter(text)));
                         if !clean.is_empty() {
                             progress(&clean);
-                            output.append(clean.as_bytes())?;
+                            output.append(clean.as_bytes());
                         }
                     } else {
-                        output.append(&stdout_chunk[..count])?;
+                        output.append(&stdout_chunk[..count]);
                         stdout_text.push(&stdout_chunk[..count], progress);
                     }
                     if count != 0 && let Some((sender, _)) = &progress_forwarder {
@@ -4073,10 +4064,10 @@ impl CodingTool {
                         stdout_text.push(&stderr_chunk[..count], &mut |text| clean.push_str(&stdout_filter.filter(text)));
                         if !clean.is_empty() {
                             progress(&clean);
-                            output.append(clean.as_bytes())?;
+                            output.append(clean.as_bytes());
                         }
                     } else {
-                        output.append(&stderr_chunk[..count])?;
+                        output.append(&stderr_chunk[..count]);
                         stderr_text.push(&stderr_chunk[..count], progress);
                     }
                     if count != 0 && let Some((sender, _)) = &progress_forwarder {
@@ -4112,7 +4103,7 @@ impl CodingTool {
             remaining.push_str(&stdout_filter.finish());
             if !remaining.is_empty() {
                 progress(&remaining);
-                output.append(remaining.as_bytes())?;
+                output.append(remaining.as_bytes());
             }
         } else {
             stdout_text.finish(progress);
@@ -4132,7 +4123,7 @@ impl CodingTool {
             cancelled,
             timed_out,
             exit_before_timeout,
-            output: output.finish()?,
+            output: output.finish(),
             status,
             elapsed: started.elapsed().as_secs_f64(),
             #[cfg(all(test, unix))]
@@ -4911,11 +4902,77 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_spill_failure_keeps_the_command_exit_and_bounded_result() {
+        const CHILD_ROOT: &str = "PI_RS_TEST_SHELL_SPILL_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            let root = tempfile::tempdir().unwrap();
+            let test = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "shell_spill_failure_keeps_the_command_exit_and_bounded_result",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, root.path())
+                .env("TMPDIR", root.path().join("not-created"))
+                .output()
+                .unwrap();
+            assert!(
+                test.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&test.stdout),
+                String::from_utf8_lossy(&test.stderr),
+            );
+            assert!(String::from_utf8_lossy(&test.stdout).contains("1 passed"));
+            return;
+        };
+        let tool = super::CodingTool {
+            root: root.into(),
+            unrestricted: true,
+            shell: super::ShellConfig::default(),
+            kind: super::Kind::Bash,
+        };
+        let outcome = tool
+            .bash(
+                &serde_json::json!({
+                    "command":"printf START; printf '%1049000s' ''; printf END; exit 7",
+                    "timeout": 5
+                }),
+                &pi_rs::CancellationToken::new(),
+            )
+            .await;
+        let pi_rs::Outcome::TextResultWithStructuredContent {
+            output,
+            structured_content,
+            details,
+            is_error,
+        } = outcome
+        else {
+            panic!("save failure discarded the shell outcome: {outcome:?}");
+        };
+        let details = details.unwrap();
+        assert!(is_error);
+        assert_eq!(structured_content["exit_code"], 7);
+        assert_eq!(structured_content["truncated"], true);
+        assert!(details["fullOutputError"].is_string());
+        assert_eq!(
+            structured_content["full_output_error"],
+            details["fullOutputError"]
+        );
+        assert!(details.get("fullOutputPath").is_none());
+        assert!(structured_content.get("full_output_path").is_none());
+        let retained = structured_content["output"].as_str().unwrap();
+        assert!(retained.starts_with("START") && retained.ends_with("END"));
+        assert!(output.contains("END\n\n[Showing last"));
+        assert!(output.contains("Could not save the full output:"));
+        assert!(output.ends_with("Command exited with code 7"));
+    }
+
     #[test]
     fn shell_structured_result_reports_bounded_full_output() {
         let mut output = super::super::shell_output::Accumulator::default();
-        output.append(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
-        let outcome = super::shell_outcome(output.finish().unwrap(), 0, 1.26);
+        output.append(&vec![b'x'; 1024 * 1024 + 1]);
+        let outcome = super::shell_outcome(output.finish(), 0, 1.26);
         let pi_rs::Outcome::TextResultWithStructuredContent {
             structured_content,
             details,
@@ -4946,9 +5003,9 @@ mod tests {
             let input = format!("{}\n", "x".repeat(300_000));
             let mut output = super::super::shell_output::Accumulator::default();
             for chunk in input.as_bytes().chunks(313) {
-                output.append(chunk).unwrap();
+                output.append(chunk);
             }
-            let output = output.finish().unwrap();
+            let output = output.finish();
             let path = output.path.clone().unwrap();
             let outcome = super::shell_outcome(output, code, 0.0);
             let pi_rs::Outcome::TextResultWithStructuredContent {
