@@ -10,6 +10,7 @@
     "fullscreenScrollbar": { "enum": ["auto", "always", "hidden"] },
     "fullscreenCopyOnSelect": { "type": "boolean" },
     "fullscreenWheelScrollLines": { "type": ["number", "string"], "anyOf": [{"type": "number"}, {"const": "auto"}] },
+    "externalEditor": { "type": "string" },
     "shellPath": { "type": "string" },
     "shellCommandPrefix": { "type": "string" },
     "showHardwareCursor": { "type": "boolean" },

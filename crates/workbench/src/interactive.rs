@@ -10125,6 +10125,7 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         "defaultThinkingLevel",
         "httpProxy",
         "sessionDir",
+        "externalEditor",
         "shellPath",
         "shellCommandPrefix",
         "defaultTools",
@@ -10362,7 +10363,7 @@ fn select(
                         .unwrap_or_else(|| std::path::Path::new(""))
                 ),
                 "fullscreenWheelScrollLines" => json!("auto"),
-                "shellPath" | "shellCommandPrefix" | "httpProxy" => json!(""),
+                "externalEditor" | "shellPath" | "shellCommandPrefix" | "httpProxy" => json!(""),
                 "defaultProjectTrust" => json!("ask"),
                 "defaultTools" => json!(["read", "bash", "edit", "write"]),
                 "modelThinkingLevels" => json!({}),

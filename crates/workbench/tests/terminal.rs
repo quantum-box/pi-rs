@@ -2063,6 +2063,14 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         output_until(&mut master, |text| {
             text.contains("Edit shellPath") && text.contains("to change")
         });
+        master.write_all(b"\x15Edit externalEditor\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Edit externalEditor as JSON")
+        });
+        master.write_all(b"\x13").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Edit externalEditor") && text.contains("to change")
+        });
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
                 .unwrap();
@@ -2075,6 +2083,7 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             "high"
         );
         assert_eq!(settings["shellPath"], "");
+        assert_eq!(settings["externalEditor"], "");
         finish.send(()).unwrap();
         server.join().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);

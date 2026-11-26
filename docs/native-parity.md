@@ -7092,7 +7092,9 @@ provide a configured AWS SDK client through `Bedrock::new`.
 
 The external-editor command follows Pi's configured, `VISUAL`, `EDITOR`, then
 platform-default precedence, ignoring blank configured values and empty
-environment values. On successful return it decodes UTF-8 with replacement,
+environment values. The settings schema checks that `externalEditor` is a
+string, and the native `/settings` editor can set the command or leave it empty
+to use environment and platform defaults. On successful return it decodes UTF-8 with replacement,
 strips one leading BOM and removes exactly one final LF. Failed editors leave
 the draft unchanged. As in Pi, the temporary draft is closed before the editor
 launches, allowing editors that require exclusive file access. Native shell-style
