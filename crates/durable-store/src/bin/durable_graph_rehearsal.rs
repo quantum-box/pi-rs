@@ -138,6 +138,7 @@ mod unix {
         Ok(digest.finalize().into())
     }
 
+    #[derive(Clone)]
     pub(super) struct HistoryFingerprint {
         table: &'static str,
         query: &'static str,
@@ -147,12 +148,7 @@ mod unix {
     pub(super) fn capture_history(connection: &Connection) -> Result<Vec<HistoryFingerprint>> {
         let mut fingerprints = Vec::new();
         for &(table, query) in HISTORY_TABLES {
-            let exists: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
-                [table],
-                |row| row.get(0),
-            )?;
-            if exists {
+            if table_exists(connection, table)? {
                 fingerprints.push(HistoryFingerprint {
                     table,
                     query,
@@ -161,6 +157,59 @@ mod unix {
             }
         }
         Ok(fingerprints)
+    }
+
+    fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+        Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(super) fn expected_migrated_history(
+        backup: &Connection,
+        history: &[HistoryFingerprint],
+    ) -> Result<Vec<HistoryFingerprint>> {
+        let mut migrated = history.to_vec();
+        let has_boundary = table_exists(backup, "durable_application_history_meta")?
+            && backup.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_application_history_meta WHERE id=1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if has_boundary || !table_exists(backup, "durable_document_history_meta")? {
+            return Ok(migrated);
+        }
+
+        // The first open adds one boundary and seeds only existing live
+        // application logs. Reproduce the expected rows on the read-only
+        // backup, so old rows and the new seed must both match in full.
+        for item in &mut migrated {
+            let query = match item.table {
+                "durable_document_history_meta" => "SELECT id,revision+1 FROM durable_document_history_meta ORDER BY id",
+                "durable_document_history" => "
+                    SELECT key,revision,value,version FROM durable_document_history
+                    UNION ALL
+                    SELECT key,(SELECT revision+1 FROM durable_document_history_meta WHERE id=1),value,version
+                    FROM durable_store_entries
+                    WHERE substr(key,1,28)=CAST('durable/application-entries/' AS BLOB)
+                    ORDER BY key,revision",
+                _ => continue,
+            };
+            item.digest = historical_fingerprint(backup, query)?;
+        }
+        let boundary = HistoryFingerprint {
+            table: "durable_application_history_meta",
+            query: "SELECT id,first_revision FROM durable_application_history_meta ORDER BY id",
+            digest: historical_fingerprint(
+                backup,
+                "SELECT id,revision+1 FROM durable_document_history_meta WHERE id=1",
+            )?,
+        };
+        migrated.retain(|item| item.table != boundary.table);
+        migrated.push(boundary);
+        Ok(migrated)
     }
 
     pub(super) fn verify_history(
@@ -221,6 +270,7 @@ mod unix {
         check_integrity(&baseline)?;
         let snapshot = fingerprint(&baseline)?;
         let history = capture_history(&baseline)?;
+        let migrated_history = expected_migrated_history(&baseline, &history)?;
         drop(baseline);
 
         fs::copy(&backup, &migrated)?;
@@ -234,7 +284,7 @@ mod unix {
         if protocol(&migrated_read)? != Some(4) || fingerprint(&migrated_read)? != snapshot {
             return Err("the reopened v4 store differs from the backup cut".into());
         }
-        verify_history(&migrated_read, &history)?;
+        verify_history(&migrated_read, &migrated_history)?;
         check_integrity(&migrated_read)?;
         drop(migrated_read);
 
@@ -334,7 +384,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use super::unix::{capture_history, run, verify_history};
+    use super::unix::{capture_history, expected_migrated_history, run, verify_history};
     use rusqlite::{params, Connection};
 
     fn verify_rehearsal(v3: bool, backup_name: &str, restore_name: &str) {
@@ -407,6 +457,68 @@ mod tests {
         )
         .unwrap();
         assert!(verify_history(&db, &expected).is_err());
+    }
+
+    #[test]
+    fn rehearsal_initializes_legacy_application_history_without_losing_old_rows() {
+        for has_empty_marker in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("legacy.sqlite");
+            let output = dir.path().join("report");
+            let connection = Connection::open(&source).unwrap();
+            connection.execute_batch("
+                CREATE TABLE durable_store_meta(id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+                INSERT INTO durable_store_meta VALUES(1,3);
+                CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;
+                INSERT INTO durable_store_entries VALUES(CAST('durable/application-entries/fixture' AS BLOB),X'5b5d',3);
+                CREATE TABLE durable_document_history_meta(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision>=0));
+                INSERT INTO durable_document_history_meta VALUES(1,2);
+                CREATE TABLE durable_document_history(key BLOB NOT NULL,revision INTEGER NOT NULL,value BLOB,version INTEGER,PRIMARY KEY(key,revision)) WITHOUT ROWID;
+                INSERT INTO durable_document_history VALUES(CAST('durable/document/fixture' AS BLOB),1,X'7b7d',1);
+                INSERT INTO durable_document_history VALUES(CAST('durable/document/fixture' AS BLOB),2,NULL,NULL);
+            ").unwrap();
+            if has_empty_marker {
+                connection.execute_batch("
+                    CREATE TABLE durable_application_history_meta (id INTEGER PRIMARY KEY CHECK(id=1), first_revision INTEGER NOT NULL);
+                ").unwrap();
+            }
+            drop(connection);
+            let original = std::fs::read(&source).unwrap();
+
+            run(&source, &output).unwrap();
+            let backup = Connection::open(output.join("backup-default.sqlite")).unwrap();
+            let original_history = capture_history(&backup).unwrap();
+            let expected = expected_migrated_history(&backup, &original_history).unwrap();
+            let migrated = Connection::open(output.join("migrated-v4.sqlite")).unwrap();
+            verify_history(&migrated, &expected).unwrap();
+            let seed: (i64, Vec<u8>, i64) = migrated.query_row(
+                "SELECT revision,value,version FROM durable_document_history WHERE key=CAST('durable/application-entries/fixture' AS BLOB)",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(seed, (3, b"[]".to_vec(), 3));
+            let restored = Connection::open(output.join("restored-default.sqlite")).unwrap();
+            verify_history(&restored, &original_history).unwrap();
+
+            migrated
+                .execute(
+                    "UPDATE durable_document_history SET value=X'ff' WHERE revision=3",
+                    [],
+                )
+                .unwrap();
+            assert!(verify_history(&migrated, &expected).is_err());
+            migrated
+                .execute(
+                    "UPDATE durable_document_history SET value=X'5b5d' WHERE revision=3",
+                    [],
+                )
+                .unwrap();
+            verify_history(&migrated, &expected).unwrap();
+            migrated
+                .execute("DELETE FROM durable_document_history WHERE revision=1", [])
+                .unwrap();
+            assert!(verify_history(&migrated, &expected).is_err());
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+        }
     }
 
     #[test]

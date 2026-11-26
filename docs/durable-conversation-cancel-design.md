@@ -537,7 +537,10 @@ consistent backup, a v4 migration copy, and a copy restored in the input format.
 reports the original graph protocol (null for a standard database), record
 counts, and elapsed times. The source is opened read-only. The checks compare
 existing commit history, document revisions, fork cuts, and task document
-ownership in addition to the live entries.
+ownership in addition to the live entries. On older sources with document
+history, the migration check also verifies the first application history
+boundary and the live application entries seeded there. Restoration still
+verifies the original pre-initialization history.
 
 1. Stop the scheduler and let all workers release the database. On Unix, run
    the migration only once the selected binary can acquire the owner lock.
@@ -572,3 +575,12 @@ This local run measured 1,047 ms to back up the source, 137 ms to migrate and
 reopen it, and 1,487 ms to restore and verify the backup. Production-scale
 migration and recovery timing still need measurements on a representative
 copy.
+
+
+A synthetic legacy document-heavy database with 4,096 live documents and
+4,096 application logs exercised initialization of the missing application
+history boundary. Migration preserved all 16,384 existing revisions and
+seeded 4,096 application rows at the new boundary. Restoration retained the
+original revision and row count. The source hash was unchanged. For this
+21,217,280-byte backup, the rehearsal reported 41 ms to back up, 34 ms to
+migrate and reopen, and 490 ms to restore and verify.
