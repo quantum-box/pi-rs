@@ -972,7 +972,11 @@ async fn run_worker(
             json!({"type":"worker_extension_sources", "sources":runtime.extension_sources}),
         );
     }
-    let ui = Arc::new(super::extension_ui::Broker::default());
+    let ui = Arc::new(super::extension_ui::Broker::new(
+        args.terminal_managed_worker,
+    ));
+    let base_theme_paths = runtime.resources.themes.clone();
+    ui.refresh_themes(&base_theme_paths);
     runtime.registry.set_ui(ui.clone());
     let active = Arc::new(Mutex::new(ControlState::default()));
     let stopping = Arc::new(AtomicBool::new(false));
@@ -1063,22 +1067,15 @@ async fn run_worker(
     };
     emit_refreshed_entries(refreshed);
     share_ready.send_replace(true);
-    let startup_trigger = session
-        .host_binding()
-        .is_none()
-        .then(|| {
-            session
-                .pending_extension_boundary_run()
-                .or_else(|| session.pending_custom_trigger())
-        })
-        .flatten();
+    let startup_trigger = pending_worker_run(&session);
     drop(session);
     *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
     *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
-    resources_ready.send_replace(true);
     if runtime.registry.has_resource_discovery_hooks() {
+        ui.refresh_themes(&runtime.resources.themes);
         output(json!({"type":"resources_discovered","resources":discovered}));
     }
+    resources_ready.send_replace(true);
     if args.terminal_managed_worker {
         let messages = runtime.registry.custom_message_renderers();
         let entries = runtime.registry.custom_entry_renderers();
@@ -1143,7 +1140,7 @@ async fn run_worker(
                                     }
                                 }
                             }
-                            Ok((starts_run && !session.queued_inputs().is_empty(), session.pending_custom_trigger()))
+                            Ok((starts_run && !session.queued_inputs().is_empty(), pending_worker_run(&session)))
                         });
                         for (reply, result) in replies {
                             let _ = reply.send(result);
@@ -1327,6 +1324,7 @@ async fn run_worker(
             model_reports_thinking = reported_thinking;
             refresh_snapshot(&snapshot, &Session::open(&args.session)?);
             if switched {
+                ui.refresh_themes(&base_theme_paths);
                 notify_session_lifecycle(
                     &args,
                     &runtime,
@@ -1348,14 +1346,15 @@ async fn run_worker(
                     )
                     .await?;
                 refresh_snapshot(&snapshot, &session);
-                pending_discovery_trigger = session.pending_custom_trigger();
+                pending_discovery_trigger = pending_worker_run(&session);
                 drop(session);
                 *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
                 *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
-                resources_ready.send_replace(true);
                 if runtime.registry.has_resource_discovery_hooks() {
+                    ui.refresh_themes(&runtime.resources.themes);
                     output(json!({"type":"resources_discovered","resources":discovered}));
                 }
+                resources_ready.send_replace(true);
             }
             {
                 let mut snapshot = snapshot.lock().expect("session snapshot");
@@ -1503,12 +1502,8 @@ async fn run_worker(
             };
             match request {
                 Request::TriggerCustom { run_id } => {
-                    if session
-                        .pending_extension_boundary_run()
-                        .or_else(|| session.pending_custom_trigger())
-                        != Some(run_id)
-                    {
-                        return Err(Error::Session("custom trigger is no longer pending".into()));
+                    if pending_worker_run(session) != Some(run_id) {
+                        return Err(Error::Session("run is no longer pending".into()));
                     }
                     let answer = Box::pin(agent.run_correlated_with_events(
                         session,
@@ -1539,6 +1534,11 @@ async fn run_worker(
                     rpc,
                     ..
                 } => {
+                    if session.pending_before_agent_start_run().is_some() {
+                        return Err(Error::Session(
+                            "resume the pending run preflight before submitting a prompt".into(),
+                        ));
+                    }
                     let mut prompt_acknowledged = false;
                     if queued_only
                         && !agent
@@ -1970,9 +1970,7 @@ async fn run_worker(
             }
         }
         if idle_callback_operation {
-            pending_discovery_trigger = run_session
-                .as_ref()
-                .and_then(Session::pending_custom_trigger);
+            pending_discovery_trigger = run_session.as_ref().and_then(pending_worker_run);
         }
         drop(run_session);
         if started && resume_queued && (result.is_ok() || matches!(&result, Err(Error::Cancelled)))
@@ -2030,6 +2028,16 @@ async fn run_worker(
     )
     .await;
     runtime.close().await
+}
+
+fn pending_worker_run(session: &Session) -> Option<Uuid> {
+    if session.host_binding().is_some() {
+        return None;
+    }
+    session
+        .pending_extension_boundary_run()
+        .or_else(|| session.pending_before_agent_start_run())
+        .or_else(|| session.pending_custom_trigger())
 }
 
 async fn notify_session_lifecycle(args: &Cli, runtime: &runtime::Runtime, event: LifecycleEvent) {

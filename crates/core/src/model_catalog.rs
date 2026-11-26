@@ -1,5 +1,5 @@
 //! Host-owned, provider-qualified model clients for SDK sessions.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map};
 use std::sync::Arc;
 
 use crate::{
@@ -32,6 +32,37 @@ pub struct CatalogModelCost {
     pub cache_write: Option<serde_json::Number>,
 }
 
+/// The exact identity and optional host-supplied metadata of a registered model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogModelDescriptor<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub info: Option<&'a CatalogModelInfo>,
+}
+
+/// A provider represented by at least one model in this catalog snapshot.
+#[derive(Clone, Copy)]
+pub struct CatalogProviderDescriptor<'a> {
+    id: &'a str,
+    catalog: &'a ModelCatalog,
+}
+
+impl<'a> CatalogProviderDescriptor<'a> {
+    /// The provider's exact registered identity.
+    pub fn id(&self) -> &'a str {
+        self.id
+    }
+
+    /// The provider's registered model descriptors, ordered by model identity.
+    pub fn models(self) -> impl Iterator<Item = CatalogModelDescriptor<'a>> + 'a {
+        let id = self.id;
+        self.catalog
+            .bindings_from_provider(id)
+            .take_while(move |((provider, _), _)| provider == id)
+            .map(describe_model)
+    }
+}
+
 /// An immutable catalog of clients constructed and authorized by the host.
 ///
 /// The provider and model names are exact, case-sensitive identities. A client
@@ -52,6 +83,16 @@ pub struct ModelCatalogBuilder {
 struct CatalogBinding {
     client: Arc<dyn Model>,
     info: Option<CatalogModelInfo>,
+}
+
+fn describe_model<'a>(
+    ((provider, model), binding): (&'a (String, String), &'a CatalogBinding),
+) -> CatalogModelDescriptor<'a> {
+    CatalogModelDescriptor {
+        provider,
+        model,
+        info: binding.info.as_ref(),
+    }
 }
 
 impl ModelCatalogBuilder {
@@ -93,11 +134,11 @@ impl ModelCatalogBuilder {
             return Err(Error::Config("provider or model name is empty".into()));
         }
         match self.clients.entry((provider, model)) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
+            btree_map::Entry::Vacant(entry) => {
                 entry.insert(CatalogBinding { client, info });
                 Ok(self)
             }
-            std::collections::btree_map::Entry::Occupied(_) => Err(Error::Config(
+            btree_map::Entry::Occupied(_) => Err(Error::Config(
                 "duplicate provider and model identity".into(),
             )),
         }
@@ -118,6 +159,48 @@ impl ModelCatalog {
             .map(|binding| binding.client.clone())
     }
 
+    /// Find a registered model by exact, case-sensitive provider and model
+    /// identities. A registered model without metadata still has a descriptor.
+    /// This is a snapshot read and does not access the client or resolve auth.
+    pub fn find(&self, provider: &str, model: &str) -> Option<CatalogModelDescriptor<'_>> {
+        self.clients
+            .get_key_value(&(provider.to_owned(), model.to_owned()))
+            .map(describe_model)
+    }
+
+    /// List all registered model descriptors, ordered by provider then model.
+    pub fn models(&self) -> impl ExactSizeIterator<Item = CatalogModelDescriptor<'_>> {
+        self.clients.iter().map(describe_model)
+    }
+
+    /// Find a provider by exact, case-sensitive identity.
+    pub fn find_provider(&self, id: &str) -> Option<CatalogProviderDescriptor<'_>> {
+        let ((provider, _), _) = self.bindings_from_provider(id).next()?;
+        (provider == id).then_some(CatalogProviderDescriptor {
+            id: provider,
+            catalog: self,
+        })
+    }
+
+    /// List each registered provider once, ordered by provider identity.
+    pub fn providers(&self) -> impl Iterator<Item = CatalogProviderDescriptor<'_>> {
+        let mut previous = None;
+        self.identities().filter_map(move |(id, _)| {
+            if previous == Some(id) {
+                return None;
+            }
+            previous = Some(id);
+            Some(CatalogProviderDescriptor { id, catalog: self })
+        })
+    }
+
+    fn bindings_from_provider(
+        &self,
+        id: &str,
+    ) -> btree_map::Range<'_, (String, String), CatalogBinding> {
+        self.clients.range((id.to_owned(), String::new())..)
+    }
+
     /// List the exact identities registered by the host, ordered by provider
     /// and then model. This does not probe clients or guarantee that credentials
     /// remain valid. The iterator cannot expose clients or their credentials.
@@ -130,19 +213,15 @@ impl ModelCatalog {
     /// Host-supplied information for this exact identity, if registered with it.
     /// This is not a live capability or credential availability check.
     pub fn info(&self, provider: &str, model: &str) -> Option<&CatalogModelInfo> {
-        self.clients
-            .get(&(provider.to_owned(), model.to_owned()))?
-            .info
-            .as_ref()
+        self.find(provider, model)?.info
     }
 
     /// Ordered catalog identities and their optional host-supplied information.
     pub fn entries(
         &self,
     ) -> impl ExactSizeIterator<Item = (&str, &str, Option<&CatalogModelInfo>)> + '_ {
-        self.clients.iter().map(|((provider, model), binding)| {
-            (provider.as_str(), model.as_str(), binding.info.as_ref())
-        })
+        self.models()
+            .map(|entry| (entry.provider, entry.model, entry.info))
     }
 
     /// Create a session builder and configure exact historical model recovery.

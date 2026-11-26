@@ -1120,6 +1120,40 @@ pub enum InputAction {
     Handled,
 }
 
+/// Input that starts an agent run, after input transformations and expansion.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "messageType", rename_all = "snake_case")]
+pub enum AgentStartTrigger {
+    User {
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::ImageContent>,
+    },
+    Custom {
+        message: CustomMessage,
+    },
+}
+
+/// Run preflight after a starting message is selected.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeforeAgentStartEvent {
+    #[serde(flatten)]
+    pub trigger: AgentStartTrigger,
+    /// The current prompt, including replacements from earlier extensions.
+    pub system_prompt: String,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BeforeAgentStartResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<CustomMessage>,
+    /// An exact prompt replacement for this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+}
+
 /// A shell command entered by the user, before the host executes it.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1350,6 +1384,19 @@ pub trait Extension: Send + Sync {
         _host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<InputAction> {
         self.input(event, state).await
+    }
+
+    /// Opt in to run preflight for user prompts and idle custom triggers.
+    fn handles_before_agent_start(&self) -> bool {
+        false
+    }
+
+    async fn before_agent_start(
+        &self,
+        _event: &BeforeAgentStartEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<BeforeAgentStartResult> {
+        Ok(BeforeAgentStartResult::default())
     }
 
     fn handles_user_bash(&self) -> bool {

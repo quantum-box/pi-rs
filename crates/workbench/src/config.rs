@@ -11,6 +11,41 @@ pub fn agent_dir() -> PathBuf {
 type WorkerHistory =
     std::sync::Arc<std::sync::Mutex<Option<(PathBuf, bool, Vec<(PathBuf, Value)>)>>>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    CacheMisses,
+    CacheWarming,
+    CompactionCosts,
+    ReasoningDrops,
+}
+
+impl NoticeKind {
+    const ALL: [Self; 4] = [
+        Self::CacheMisses,
+        Self::CacheWarming,
+        Self::CompactionCosts,
+        Self::ReasoningDrops,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::CacheMisses => "cacheMisses",
+            Self::CacheWarming => "cacheWarming",
+            Self::CompactionCosts => "compactionCosts",
+            Self::ReasoningDrops => "reasoningDrops",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoticeSettings([bool; NoticeKind::ALL.len()]);
+
+impl NoticeSettings {
+    pub fn shows(self, kind: NoticeKind) -> bool {
+        self.0[kind as usize]
+    }
+}
+
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     value: Value,
@@ -30,11 +65,11 @@ impl Settings {
         self.set_user_values_at(&agent_dir().join("settings.json"), values)
     }
     fn set_user_values_at(&mut self, path: &Path, values: &[(String, Value)]) -> Result<()> {
-        update_object(path, |settings| {
+        update_user_settings(path, |settings| {
             for (key, value) in values {
                 settings.insert(key.clone(), value.clone());
             }
-            validate_settings(&Value::Object(settings.clone()), path)
+            Ok(())
         })?;
         if !self.value.is_object() {
             self.value = Value::Object(Map::new());
@@ -476,6 +511,10 @@ impl Settings {
     pub fn enable_skill_commands(&self) -> bool {
         self.boolean("enableSkillCommands").unwrap_or(true)
     }
+    pub fn terminal_true_color(&self) -> Option<bool> {
+        // Like Pi, other JSON values leave capability detection in charge.
+        self.value["terminal"]["trueColor"].as_bool()
+    }
     pub fn terminal_progress(&self) -> bool {
         self.value["terminal"]["showTerminalProgress"]
             .as_bool()
@@ -530,6 +569,14 @@ impl Settings {
         self.value["warnings"]["anthropicExtraUsage"] != false
     }
 
+    pub fn notices(&self) -> NoticeSettings {
+        let mut notices = NoticeSettings::default();
+        for kind in NoticeKind::ALL {
+            notices.0[kind as usize] = self.value["notices"][kind.key()].as_bool().unwrap_or(false);
+        }
+        notices
+    }
+
     pub fn set_user_member(&mut self, key: &str, member: &str, value: Value) -> Result<()> {
         self.set_user_member_at(&agent_dir().join("settings.json"), key, member, value)
     }
@@ -549,10 +596,7 @@ impl Settings {
                 .insert(member.into(), value.clone());
             Ok(())
         };
-        update_object(path, |settings| {
-            update(settings)?;
-            validate_settings(&Value::Object(settings.clone()), path)
-        })?;
+        update_user_settings(path, update)?;
         if !self.value.is_object() {
             self.value = Value::Object(Map::new());
         }
@@ -580,14 +624,14 @@ impl Settings {
         self.remove_user_member_at(&agent_dir().join("settings.json"), key, member)
     }
     fn remove_user_member_at(&mut self, path: &Path, key: &str, member: &str) -> Result<()> {
-        update_object(path, |settings| {
+        update_user_settings(path, |settings| {
             if let Some(object) = settings.get_mut(key).and_then(Value::as_object_mut) {
                 object.remove(member);
                 if object.is_empty() {
                     settings.remove(key);
                 }
             }
-            validate_settings(&Value::Object(settings.clone()), path)
+            Ok(())
         })?;
         if let Some((_, user)) = self.resource_layers.first_mut()
             && let Some(settings) = user.as_object_mut()
@@ -634,21 +678,10 @@ impl Settings {
         self.set_user_at(&agent_dir().join("settings.json"), key, value)
     }
     fn set_user_at(&mut self, path: &Path, key: &str, value: Value) -> Result<()> {
-        std::fs::create_dir_all(path.parent().expect("agent directory"))?;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path.with_extension("lock"))?;
-        lock.lock()?;
-        let mut settings = read_object(path)?;
-        settings
-            .as_object_mut()
-            .expect("validated settings object")
-            .insert(key.into(), value.clone());
-        validate_settings(&settings, path)?;
-        write_json(path, &settings)?;
+        update_user_settings(path, |settings| {
+            settings.insert(key.into(), value.clone());
+            Ok(())
+        })?;
         if !self.value.is_object() {
             self.value = Value::Object(Map::new());
         }
@@ -668,6 +701,17 @@ impl Settings {
         });
         Ok(())
     }
+}
+
+fn update_user_settings(
+    path: &Path,
+    update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
+) -> Result<()> {
+    update_object(path, |settings| {
+        migrate_legacy_notices(settings);
+        update(settings)?;
+        validate_settings(&Value::Object(settings.clone()), path)
+    })
 }
 
 // A broken settings file must not hide the other layer. Writes still read the
@@ -828,6 +872,7 @@ fn migrate_legacy_settings(value: &mut Value) {
         settings.insert("transport".into(), Value::String(transport.into()));
         settings.remove("websockets");
     }
+    migrate_legacy_notices(settings);
     if let Some(retry) = settings.get_mut("retry").and_then(Value::as_object_mut)
         && let Some(delay) = retry.remove("maxDelayMs").filter(Value::is_number)
     {
@@ -856,6 +901,27 @@ fn migrate_legacy_settings(value: &mut Value) {
             }
         }
     }
+}
+
+fn migrate_legacy_notices(settings: &mut Map<String, Value>) {
+    let Some(shown) = settings
+        .get("showCacheMissNotices")
+        .and_then(Value::as_bool)
+    else {
+        return;
+    };
+    let Some(notices) = settings
+        .entry("notices")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+    else {
+        // Leave malformed explicit settings to the native schema validator.
+        return;
+    };
+    for kind in NoticeKind::ALL {
+        notices.entry(kind.key()).or_insert(Value::Bool(shown));
+    }
+    settings.remove("showCacheMissNotices");
 }
 
 pub fn project_trust(workspace: &Path, explicit: Option<bool>) -> Result<Option<bool>> {
@@ -1452,6 +1518,124 @@ mod tests {
         }
         std::fs::write(&user, r#"{"cacheWarming":"unknown"}"#).unwrap();
         assert!(super::Settings::load_from_paths(root.path(), true, &user).is_err());
+    }
+
+    #[test]
+    fn true_color_setting_only_accepts_booleans_in_effective_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("settings.json");
+        let workspace = directory.path().join("project");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        let project = workspace.join(".pi/settings.json");
+        std::fs::write(&user, br#"{"terminal":{"trueColor":true}}"#).unwrap();
+        std::fs::write(&project, br#"{"terminal":{"trueColor":false}}"#).unwrap();
+        let load = |trusted| super::Settings::load_from_paths(&workspace, trusted, &user).unwrap();
+        assert_eq!(load(false).terminal_true_color(), Some(true));
+        assert_eq!(load(true).terminal_true_color(), Some(false));
+        std::fs::write(project, br#"{"terminal":{"trueColor":"auto"}}"#).unwrap();
+        assert_eq!(load(true).terminal_true_color(), None);
+    }
+
+    #[test]
+    fn legacy_notices_migrate_per_layer_and_explicit_fields_win() {
+        use super::{NoticeKind, Settings};
+        use serde_json::json;
+
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("settings.json");
+        let workspace = root.path().join("project");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        let original_user = r#"{"showCacheMissNotices":true,"notices":{"cacheMisses":true,"cacheWarming":false,"extensionFlag":true},"customSetting":7}"#;
+        let original_project = r#"{"showCacheMissNotices":false,"notices":{"cacheWarming":true}}"#;
+        std::fs::write(&user, original_user).unwrap();
+        std::fs::write(&project, original_project).unwrap();
+
+        let read_notices =
+            |settings: &Settings| NoticeKind::ALL.map(|kind| settings.notices().shows(kind));
+        assert_eq!(read_notices(&Settings::default()), [false; 4]);
+        let user_only = Settings::load_from_paths(&workspace, false, &user).unwrap();
+        assert_eq!(read_notices(&user_only), [true, false, true, true]);
+        let mut settings = Settings::load_from_paths(&workspace, true, &user).unwrap();
+        assert_eq!(read_notices(&settings), [false, true, false, false]);
+        assert!(settings.value().get("showCacheMissNotices").is_none());
+        assert_eq!(settings.cache_warming_mode(), "idle");
+        assert_eq!(std::fs::read_to_string(&user).unwrap(), original_user);
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), original_project);
+
+        settings
+            .set_user_member_at(&user, "notices", "reasoningDrops", json!(false))
+            .unwrap();
+        assert_eq!(
+            super::read_object(&user).unwrap(),
+            json!({
+                "notices": {
+                    "cacheMisses": true,
+                    "cacheWarming": false,
+                    "compactionCosts": true,
+                    "reasoningDrops": false,
+                    "extensionFlag": true
+                },
+                "customSetting": 7
+            })
+        );
+        assert_eq!(read_notices(&settings), [false, true, false, false]);
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), original_project);
+    }
+
+    #[test]
+    fn saving_one_notice_does_not_materialize_defaults_or_project_values() {
+        use super::{NoticeKind, Settings};
+        use serde_json::json;
+
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("settings.json");
+        let workspace = root.path().join("project");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"notices":{"cacheMisses":true,"reasoningDrops":false}}"#,
+        )
+        .unwrap();
+        let mut settings = Settings::load_from_paths(&workspace, true, &user).unwrap();
+        settings
+            .set_user_member_at(&user, "notices", "reasoningDrops", json!(true))
+            .unwrap();
+
+        assert_eq!(
+            super::read_object(&user).unwrap(),
+            json!({"notices":{"reasoningDrops":true}})
+        );
+        let notices = settings.notices();
+        assert!(notices.shows(NoticeKind::CacheMisses));
+        assert!(!notices.shows(NoticeKind::ReasoningDrops));
+        assert!(
+            Settings::load_from_paths(&workspace, false, &user)
+                .unwrap()
+                .notices()
+                .shows(NoticeKind::ReasoningDrops)
+        );
+    }
+
+    #[test]
+    fn notice_settings_schema_reports_invalid_members_without_overwriting_them() {
+        use serde_json::json;
+
+        for kind in super::NoticeKind::ALL {
+            let value = json!({"showCacheMissNotices":true,"notices":{(kind.key()):"invalid"}});
+            let error = super::validate_settings(&value, std::path::Path::new("settings.json"))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("settings.json/notices/{}", kind.key()))
+            );
+        }
+        let value = json!({"showCacheMissNotices":true,"notices":[]});
+        let error =
+            super::validate_settings(&value, std::path::Path::new("settings.json")).unwrap_err();
+        assert!(error.to_string().contains("settings.json/notices"));
     }
 
     #[test]

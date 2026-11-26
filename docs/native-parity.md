@@ -250,7 +250,10 @@ Positive extglobs such as `prompts/@(review|triage).md` work in package filters
 for bounded ASCII patterns and paths without dot-prefixed components. Package
 settings filters also support a single negated group with literal alternatives
 and a supported suffix, such as `prompts/!(review|triage).md`. Exact path and
-force-inclusion rules still apply.
+force-inclusion rules still apply. With `autoload: false`, a path takes its
+position from the first matching pattern and its enabled state from the
+last matching pattern. Unmatched paths remain available to a lower-scope
+declaration, matching Pi's ordered package delta.
 
 An invalid file URL in a package settings filter reports an error when
 reached against an available native or Pi manifest diagnostic candidate. For a local directory
@@ -948,6 +951,22 @@ arbitrary live components and passes a footer data provider to its
 factory. Native extensions supply updated rows through non-blocking host UI
 requests, including in terminal session and selection callbacks.
 
+### Native extension theme discovery
+
+Extensions can query `getAllThemes` and receive `UiResponse::Themes`. The
+terminal worker snapshots its resolved theme files at startup and refreshes
+the catalog after resource discovery. Session start can query the base catalog,
+then later calls see the additional discovered files. Headless RPC returns an
+empty list locally, as Pi does. It does not ask the RPC client for a reply.
+
+The list puts `system` first and sorts other names by the host locale. The first
+valid source wins for duplicate names. Embedded themes and paths that cannot be
+represented in UTF-8 omit their file path. The snapshot skips invalid files, includes explicit `--theme` paths and
+uses the native theme resource read limits. Theme selection and the catalog
+both accept a UTF-8 BOM. Native theme objects and switching
+through extension UI remain open.
+[Pi theme listing](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L403-L434)
+
 ### Native extension working indicator
 
 Native extensions can change the working message, hide the working display,
@@ -1613,6 +1632,15 @@ clamps them to at least one and uses Pi's numeric comparison and notices.
 
 ### Model-selection checkpoint
 
+The public Rust `ModelCatalog` supports Pi-style synchronous inspection of
+configured models by exact provider and model identity. Hosts can list model
+descriptors, find an exact pair even when it has no metadata, or find a provider
+and list its registered models. The Rust catalog reflects the host's immutable
+registration snapshot. Reads expose descriptive metadata and perform no config
+I/O, credential resolution, provider probes, or route fallback. Hosts publish a
+new snapshot when definitions change. Providers appear once they have a
+registered model.
+
 Native hosts can build a `ModelCatalog` from explicitly authorized provider,
 endpoint, protocol and model definitions through `ModelClientFactory::catalog`.
 Optional metadata describes entries. A missing credential or invalid entry
@@ -2152,7 +2180,23 @@ when execution has no deadline; a shorter script or host deadline and
 cancellation stop the wait sooner. An admission failure reports the wall time
 and that the script did not start. As in Pi 1.6.0, it reports the configured
 deadline when a script times out or the shared worker count when the pool
-stays busy for 60 seconds. `PI_CODEMODE_MAX_WORKERS` is re-read when
+stays busy for 60 seconds. The same absolute deadline applies while the
+admitted job is queued in the blocking executor. Expiry at that stage returns
+without waiting for the queue to drain and releases the reserved slot. Once
+execution starts, it keeps its slot through shutdown and output formatting.
+Caller cancellation while formatting is queued returns immediately and releases
+the reserved slot. An active formatter keeps the slot until it exits.
+Unpublished transcripts are removed. A deadline interrupt in QuickJS and a
+timeout awaiting a tool report the effective timeout in milliseconds. Nested
+calls receive cancellation when execution settles, before formatting. Error
+replies preserve partial text and inline images within the output limits and
+discard uncommitted store writes. Text-only errors retain the existing failed outcome. The session
+scheduler can still settle a host-wide tool timeout or cancellation before
+Codemode publishes the reply.
+[Pinned Codemode worker deadline](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/codemode/src/runtime/execution.ts)
+[Pinned coding-agent result formatting](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/extensions/codemode/execute.ts)
+
+`PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
 running. Positive integer values accept Pi's numeric forms, including
 JavaScript whitespace, decimal notation and radix prefixes. Reducing the limit does not interrupt
@@ -5635,6 +5679,22 @@ both immediate and delivered queued messages appear live and on session reopen.
 Hidden messages and their details remain undisplayed. Native additionally keeps
 its existing inline-image display for image blocks when graphics are enabled.
 
+### Native extension run preflight
+
+Native and executable `before_agent_start` handlers get the initial user
+prompt and its images or the idle custom trigger, in extension load order.
+The current system prompt reflects earlier handlers' full-prompt replacements.
+Returned custom messages enter the run after the initial message and next-turn
+messages queued by the end of preflight, including arrivals during handlers.
+The final prompt override applies after request context transforms. A recorded
+preparation plan retains the run-local prompt and deduplicates its appended
+messages when the run resumes before its first model request is journaled.
+
+This API accepts a full text override. Upstream also exposes mutable prompt
+sections, including the tool loadout, and does its incoming-prompt compaction
+before invoking the hook. The native hook currently runs before the existing
+agent loop's automatic compaction checks.
+
 ### Rust extension lifecycle observation
 
 Rust extensions can opt into `agent_start`, `agent_end`, `turn_start`
@@ -6145,6 +6205,26 @@ continuations and session restarts. Text and summary fragments are combined
 into their logical blocks, and encrypted blocks stay separate. Replay is
 bound to the original endpoint and model. A loopback RPC check exercised
 restart, encrypted-only thinking and a switch to a different model endpoint.
+
+### Terminal color capability
+
+In regular and fullscreen mode, a boolean `terminal.trueColor` takes precedence
+over `PI_TRUE_COLOR` (`1` or `0`), followed by Pi's automatic detection from
+terminal environment hints and the platform. As in Pi, other setting values
+leave detection in charge. The startup session picker uses the same precedence.
+`/reload` reads the setting again, so removing an override restores the
+environment-derived mode. Regular mode redraws its committed
+transcript when the mode changes.
+
+In 256-color mode, foregrounds and backgrounds use Pi's RGB-to-ANSI conversion
+at the point of drawing. Theme contrast and syntax highlighting are computed
+using the original colors, and palette indices stay the same in both modes.
+Native output still follows Crossterm’s `NO_COLOR` handling. Session exports
+retain their original color behavior.
+
+See the pinned Pi [settings override](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/settings-manager.ts#L1204-L1211),
+[capability detection](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/tui/src/terminal-image.ts#L71-L194),
+and [ANSI conversion](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/tui/src/colors.ts#L279-L307).
 
 ### Terminal progress indicator
 
@@ -6680,22 +6760,37 @@ the metadata. Custom declarations merge individual limit, resize, and
 lifetime fields. Release checks covered the offline catalogs, nested
 overrides, invalid values, and the existing image resize and cost paths.
 
-### Cache miss notices checkpoint
+### Transcript notices checkpoint
 
-`showCacheMissNotices` is available from `/settings` and defaults off.
-Both terminal modes derive notices from measured, completed chat turns
-during a run and when reopening a session. Model switches and recorded
-idle gaps appear in the notice. `/session` totals re-billed tokens and
-estimated cost even when notices are disabled. Compaction and branch
-summaries reset the comparison baseline. Failed requests and summary
-usage stay out of the conversation cache comparison.
+The `/settings` Notices submenu controls `notices.cacheMisses`,
+`notices.cacheWarming`, `notices.compactionCosts`, and
+`notices.reasoningDrops` independently. All four default off, matching
+upstream. Each settings layer migrates a legacy `showCacheMissNotices`
+boolean into any missing notice fields before user and trusted-project
+settings are merged. An explicit field wins within its layer. Loading
+leaves the files untouched. A user settings edit saves any migrated user
+fields and the edited value, without copying project values or defaults.
+Malformed settings retain the usual native validation diagnostics.
+[Pinned settings schema](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/core/settings-schema.ts)
+[Pinned settings manager](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/core/settings-manager.ts)
+
+Both terminal modes update retained cache miss, cache warming and summary
+cost notices when the corresponding setting changes. Cache misses are
+derived from measured, completed chat turns during a run and when
+reopening a session. Model switches and recorded idle gaps appear in the
+notice. `/session` totals re-billed tokens and estimated cost even when
+notices are disabled. Compaction and branch summaries reset the
+comparison baseline. Failed requests and summary usage stay out of the
+conversation cache comparison.
 
 ### Imported cache refresh checkpoint
 
 Imported Pi session entries with `kind: "cache_warm"` preserve their
 cache refresh notice, optional note, and billed cost. They also reset
 the cache comparison baseline to the measured prompt at the refresh
-timestamp. The original usage remains part of session billing. An
+timestamp. `notices.cacheWarming` controls display for both imported and
+native cache refreshes. The separate user setting `cacheWarming` controls
+whether warm-up requests run. The original usage remains part of session billing. An
 offline session import verified display and totals without duplicate
 billing or an additional conversation message.
 
@@ -6762,8 +6857,8 @@ status for the previous head.
 
 Measured summary usage and cost stay attached to compaction and branch
 summary entries, including when a fork omits the original model request.
-The terminal shows the billed tokens and cost when cache notices are
-enabled. RPC session entries expose the cache breakdown and provider
+The terminal shows the billed tokens and cost when
+`notices.compactionCosts` is enabled. RPC session entries expose the cache breakdown and provider
 total. Older native journals recover usage details from the adjacent
 model completion when available. Imported Pi usage remains intact and
 session statistics count each completed summary once.
@@ -6785,9 +6880,10 @@ Anthropic Messages responses retain bounded input transformation diagnostics
 in the assistant's journal metadata and RPC message. A final SSE array
 supersedes the initial array, including when it is empty. Pi JSONL imports
 retain the diagnostic timestamp and transformation type, path, and reason.
-With `showCacheMissNotices` enabled, both terminal modes warn when the
-number of dropped thinking blocks increases compared to the previous
-assistant response on the active branch. Reopening restores that baseline.
+With `notices.reasoningDrops` enabled, both terminal modes warn during a
+live run when the number of dropped thinking blocks increases compared
+to the previous assistant response on the active branch. Reopening
+restores that baseline.
 
 ### Tool-result extension hooks
 

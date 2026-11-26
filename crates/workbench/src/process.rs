@@ -372,6 +372,9 @@ impl Worker {
                 command.arg(flag);
             }
         }
+        for path in &args.themes {
+            command.arg("--theme").arg(path);
+        }
         for path in &args.prompt_template {
             command.arg("--prompt-template").arg(path);
         }
@@ -944,6 +947,12 @@ fn configuration(args: &Cli) -> Value {
         "values": args.extension_flags,
         "order": args.extension_flag_order,
     });
+    let theme_paths = args
+        .themes
+        .iter()
+        .map(|path| path.as_os_str().as_encoded_bytes())
+        .collect::<Vec<_>>();
+    let theme_inputs = json!({"disabled":args.no_themes,"paths":theme_paths});
     let mut configuration = json!({
         "workspace":args.workspace,
         "provider":args.provider.id(),"endpoint":args.model_endpoint_for(&args.provider, Some(&args.model)),"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
@@ -953,7 +962,7 @@ fn configuration(args: &Cli) -> Value {
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
         "system_prompt":args.system_prompt,"append_system_prompt":args.append_system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
         "tools":args.tools,"exclude_tools":args.exclude_tools,"no_tools":args.no_tools,"no_builtin_tools":args.no_builtin_tools,
-        "no_extensions":args.no_extensions,"no_themes":args.no_themes,"no_skills":args.no_skills,"no_prompt_templates":args.no_prompt_templates,
+        "no_extensions":args.no_extensions,"theme_inputs":theme_inputs,"no_skills":args.no_skills,"no_prompt_templates":args.no_prompt_templates,
         "no_context_files":args.no_context_files,"no_mcp":args.no_mcp,"prompt_templates":args.prompt_template,
         "coding_tools":args.coding_tools,"requests":args.max_requests,"output_tokens":args.max_output_tokens,
         "output_budget":args.output_budget,"context_window":args.context_window,
@@ -1021,6 +1030,25 @@ fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: I
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn worker_theme_identity_preserves_distinct_non_utf8_arguments() {
+        use clap::Parser;
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStrExt;
+
+        let args_for = |path: &[u8]| {
+            super::super::Cli::parse_from([
+                OsString::from("pi"),
+                OsString::from("--theme"),
+                OsStr::from_bytes(path).to_owned(),
+            ])
+        };
+        let first = super::configuration(&args_for(b"theme-\xff.json"));
+        let second = super::configuration(&args_for(b"theme-\xfe.json"));
+        assert_ne!(first["theme_inputs"], second["theme_inputs"]);
+    }
+
     #[test]
     fn settings_bootstrap_frame_preserves_following_input_and_rejects_invalid_lengths() {
         use std::io::Read;

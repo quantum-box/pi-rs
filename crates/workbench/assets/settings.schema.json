@@ -81,7 +81,9 @@
       "type": "boolean"
     },
     "showCacheMissNotices": {
-      "type": "boolean"
+      "type": "boolean",
+      "deprecated": true,
+      "description": "Legacy setting migrated to notices."
     },
     "transport": {
       "enum": ["sse", "websocket", "websocket-cached", "auto"]
@@ -128,6 +130,15 @@
       "type": "object",
       "properties": {
         "anthropicExtraUsage": { "type": "boolean", "default": true }
+      }
+    },
+    "notices": {
+      "type": "object",
+      "properties": {
+        "cacheMisses": { "type": "boolean", "default": false },
+        "cacheWarming": { "type": "boolean", "default": false },
+        "compactionCosts": { "type": "boolean", "default": false },
+        "reasoningDrops": { "type": "boolean", "default": false }
       }
     },
     "extensions": {

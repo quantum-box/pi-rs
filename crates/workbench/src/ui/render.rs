@@ -18,7 +18,7 @@ use syntect::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::theme::Theme;
+use super::{color::ColorMode, theme::Theme};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
@@ -175,11 +175,12 @@ impl Line {
         }
     }
 
-    pub fn draw(&self, out: &mut impl Write, width: usize) -> std::io::Result<()> {
+    pub fn draw(&self, out: &mut impl Write, width: usize, mode: ColorMode) -> std::io::Result<()> {
+        let background = mode.encode(self.background.unwrap_or(Color::Reset));
         queue!(
             out,
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(self.background.unwrap_or(Color::Reset))
+            SetBackgroundColor(background)
         )?;
         let mut used = 0;
         for span in &self.spans {
@@ -188,8 +189,11 @@ impl Line {
             }
             queue!(
                 out,
-                SetForegroundColor(span.color),
-                SetBackgroundColor(span.background.or(self.background).unwrap_or(Color::Reset)),
+                SetForegroundColor(mode.encode(span.color)),
+                SetBackgroundColor(
+                    span.background
+                        .map_or(background, |color| mode.encode(color))
+                ),
                 SetAttribute(Attribute::NormalIntensity),
                 SetAttribute(if span.bold {
                     Attribute::Bold
@@ -239,7 +243,7 @@ impl Line {
         queue!(
             out,
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(self.background.unwrap_or(Color::Reset)),
+            SetBackgroundColor(background),
             Print(" ".repeat(width.saturating_sub(used))),
             ResetColor
         )
@@ -315,6 +319,10 @@ impl TranscriptMarkdown {
 #[derive(Clone)]
 pub enum Entry {
     Notice(String),
+    TranscriptNotice {
+        kind: crate::config::NoticeKind,
+        text: String,
+    },
     Changelog(crate::changelog::Notice),
     Status(String),
     Warning(String),
@@ -365,6 +373,7 @@ pub enum Entry {
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranscriptOptions<'a> {
+    pub notices: crate::config::NoticeSettings,
     pub image_width: Option<usize>,
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
@@ -431,6 +440,17 @@ impl Entry {
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
             Self::Notice(text) => return wrap(&[Span::themed(text, theme, "muted")], width),
+            Self::TranscriptNotice { kind, text } => {
+                if !options.notices.shows(*kind) {
+                    return Vec::new();
+                }
+                let role = if *kind == crate::config::NoticeKind::CacheWarming {
+                    "muted"
+                } else {
+                    "warning"
+                };
+                return wrap(&[Span::themed(text, theme, role)], width);
+            }
             Self::Changelog(notice) => {
                 let border = Line::themed(&"─".repeat(inner), theme, "border");
                 let mut lines = vec![Line::default(), border.clone()];
@@ -5089,7 +5109,7 @@ mod tests {
                 .any(|span| !span.dim && !span.text.is_empty())
         );
         let mut output = Vec::new();
-        lines[0].draw(&mut output, 6).unwrap();
+        lines[0].draw(&mut output, 6, ColorMode::TrueColor).unwrap();
         assert!(String::from_utf8(output).unwrap().contains("\x1b[2m"));
         let custom = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
         assert!(!Span::themed("muted", &custom, "muted").dim);
@@ -5266,7 +5286,7 @@ mod tests {
             );
             let mut output = Vec::new();
             for line in lines {
-                line.draw(&mut output, width).unwrap();
+                line.draw(&mut output, width, ColorMode::TrueColor).unwrap();
             }
             assert!(
                 !output
@@ -6388,7 +6408,7 @@ mod tests {
             .filter(|line| line.spans.iter().any(|span| !span.text.is_empty()))
         {
             let mut bytes = Vec::new();
-            line.draw(&mut bytes, 6).unwrap();
+            line.draw(&mut bytes, 6, ColorMode::TrueColor).unwrap();
             let output = String::from_utf8(bytes).unwrap();
             assert!(output.contains("\x1b]8;;https://example.com\x1b\\"));
             assert!(output.contains("\x1b]8;;\x1b\\"));
