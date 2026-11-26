@@ -1675,6 +1675,14 @@ off the UI thread. Unresolved variable or command references and OAuth entries
 leave the route unconfigured. The SDK host controls ambient environment access,
 OAuth, and any credential writes.
 
+For SDK reloads, the host loads one immutable credential snapshot and builds a
+complete replacement with `ModelClientFactory::catalog` before publishing it.
+This preserves the last valid catalog on a read or build failure, following
+Pi's snapshot retention on auth reload errors. A replacement changes future
+lookups. Retained clients keep their original credentials and exact routes.
+The SDK rebuild is explicit and performs no provider discovery or OAuth
+refresh. See [the embedding guide](sdk-embedding.md#reload-saved-keys-and-model-routes).
+
 ### Native SDK model file catalogs
 
 Embedded hosts can build an immutable catalog with
