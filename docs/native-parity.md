@@ -2953,6 +2953,24 @@ dialog, and abort or timeout removes outstanding requests. RPC forwards
 `extension_ui_response` with `value`, `confirmed` or `cancelled`. These transient
 interactions are independent of durable tool outcomes.
 
+The native terminal accepts a declarative `setEditorComponent` descriptor
+with an optional single-line `placeholder` and up to 32 `keybindings`.
+Bindings map a key to one of the native movement, deletion, or undo actions
+in `UiEditorAction`. They apply when the main editor owns input. Unmapped keys
+and application and completion bindings continue through the host. Reset by
+omitting `component` or sending `null`. A response-capable interactive callback
+can use `getEditorComponent` to read the descriptor or receive null for the
+default. Headless RPC treats both requests as local no-ops.
+
+Replacement and restoration use the existing draft buffer and callbacks.
+Expanded paste text, cursor, undo history, autocomplete, and open dialog
+ownership survive the change in both terminal modes. Reload and session rebind
+clear the descriptor. Pi's upstream API accepts a runnable `EditorFactory`
+with its own rendering, input handling, and host objects. The native API
+supports only the descriptor above.
+[Pinned Pi editor replacement](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L3074-L3153)
+[Pinned Pi editor factory](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/extensions/types.ts#L150)
+
 Workspace tests and real executable fixtures cover correlated responses,
 multiline editing, cancellation and request timeouts. PTY fixtures cover both
 terminal modes and restoration. Existing image, Markdown, diff, session,

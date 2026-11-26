@@ -273,6 +273,52 @@ pub struct WorkingIndicatorOptions {
     pub interval_ms: Option<u64>,
 }
 
+/// Declarative customization of the native draft editor.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UiEditorComponent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default)]
+    pub keybindings: Vec<UiEditorKeybinding>,
+}
+
+impl UiEditorComponent {
+    fn valid(&self) -> bool {
+        self.placeholder
+            .as_ref()
+            .is_none_or(|text| text.len() <= 256 && !text.chars().any(char::is_control))
+            && self.keybindings.len() <= 32
+            && self.keybindings.iter().all(|binding| {
+                !binding.key.trim().is_empty()
+                    && binding.key.len() <= 64
+                    && !binding.key.chars().any(char::is_control)
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiEditorKeybinding {
+    pub key: String,
+    pub action: UiEditorAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiEditorAction {
+    CursorLeft,
+    CursorRight,
+    CursorWordLeft,
+    CursorWordRight,
+    CursorLineStart,
+    CursorLineEnd,
+    DeleteCharBackward,
+    DeleteCharForward,
+    DeleteWordBackward,
+    DeleteWordForward,
+    Undo,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
     tag = "method",
@@ -376,6 +422,13 @@ pub enum UiRequest {
         text: String,
     },
     GetEditorText,
+    /// Customize the native draft editor. Omit the component to restore defaults.
+    SetEditorComponent {
+        #[serde(default)]
+        component: Option<UiEditorComponent>,
+    },
+    /// Read the current native editor component descriptor.
+    GetEditorComponent,
     /// List the frontend's built-in and loaded file themes.
     GetAllThemes,
     /// Read the terminal's current tool output expansion state.
@@ -460,6 +513,15 @@ impl UiRequest {
         {
             return Err("extension hidden thinking label exceeds its rendering limits".into());
         }
+        if let Self::SetEditorComponent {
+            component: Some(component),
+        } = self
+            && !component.valid()
+        {
+            return Err(
+                "extension editor component exceeds its rendering or keybinding limits".into(),
+            );
+        }
         if let Self::Custom { lines, actions, .. } = self {
             if !component_lines_within_limits(lines) {
                 return Err("extension component exceeds its rendering limits".into());
@@ -489,6 +551,7 @@ impl UiRequest {
             (Self::GetAllThemes, UiResponse::Themes(themes)) => {
                 serde_json::to_vec(themes).is_ok_and(|value| value.len() <= 1024 * 1024)
             }
+            (Self::GetEditorComponent, UiResponse::EditorComponent(component)) => component.valid(),
             (Self::Custom { actions, .. }, UiResponse::Text(value)) => {
                 actions.iter().any(|action| &action.value == value)
             }
@@ -508,6 +571,7 @@ impl UiRequest {
                 | Self::Editor { .. }
                 | Self::Custom { .. }
                 | Self::GetEditorText
+                | Self::GetEditorComponent
                 | Self::GetAllThemes
                 | Self::GetToolsExpanded
         )
@@ -520,6 +584,7 @@ pub enum UiResponse {
     Text(String),
     Confirmed(bool),
     Themes(Vec<UiThemeInfo>),
+    EditorComponent(UiEditorComponent),
     Cancelled,
 }
 
@@ -535,6 +600,27 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_component_uses_bounded_native_descriptors() {
+        let descriptor = serde_json::json!({
+            "placeholder":"Draft", "keybindings":[{"key":"f6","action":"undo"}]
+        });
+        let wire = serde_json::json!({"method":"setEditorComponent","component":descriptor});
+        let request: UiRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        assert!(request.validate().is_ok());
+        assert!(!request.needs_response());
+        let response: UiResponse = serde_json::from_value(descriptor.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&response).unwrap(), descriptor);
+        assert!(UiRequest::GetEditorComponent.accepts_response(&response));
+        assert!(!UiRequest::GetEditorText.accepts_response(&response));
+        let invalid: UiRequest = serde_json::from_value(serde_json::json!({
+            "method":"setEditorComponent","component":{"placeholder":"line\nbreak"}
+        }))
+        .unwrap();
+        assert!(invalid.validate().is_err());
+    }
     #[test]
     fn theme_list_uses_typed_responses_without_requiring_file_paths() {
         let wire = serde_json::json!({"method":"getAllThemes"});

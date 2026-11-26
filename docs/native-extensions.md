@@ -216,6 +216,27 @@ as a terminal or text clipboard paste. It normalizes line endings and tabs
 and collapses long pastes to a visual marker. `GetEditorText`, draft
 submission, and the external editor receive the full text.
 
+## Customize the native editor
+
+Rust extensions send `SetEditorComponent` with a `UiEditorComponent`.
+Native executables use the following request.
+
+```json
+{
+  "method": "setEditorComponent",
+  "component": {
+    "placeholder": "Write a prompt",
+    "keybindings": [{"key": "f6", "action": "deleteCharBackward"}]
+  }
+}
+```
+
+The main editor keeps its draft and any open dialog keeps focus.
+Omit `component` to restore the default. In callbacks that support UI replies,
+`GetEditorComponent` returns the current descriptor or null. The native terminal
+keeps its keyboard, submission and autocomplete handlers. The descriptor uses
+the fixed actions in `UiEditorAction`.
+
 ## Share SDK extension events
 
 An embedding host can share a `pi_rs_extensions::ExtensionEventBus` with its
