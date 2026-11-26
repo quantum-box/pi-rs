@@ -8756,10 +8756,7 @@ fn default_model_and_provider_are_read_as_separate_fields() {
 }
 
 #[test]
-fn ant_ling_startup_replaces_only_missing_retired_defaults() {
-    let root = tempfile::tempdir().unwrap();
-    let settings_path = root.path().join("settings.json");
-    let models_path = root.path().join("models.json");
+fn startup_replaces_only_missing_retired_builtin_defaults() {
     for (settings, credential, models, extra, saved_session_model, expected) in [
         (
             json!({"defaultProvider":"ant-ling","defaultModel":"Ring-2.6-1T"}),
@@ -8830,10 +8827,98 @@ fn ant_ling_startup_replaces_only_missing_retired_defaults() {
             "ANT_LING_API_KEY",
             json!({}),
             vec![],
-            Some("Ring-2.6-1T"),
+            Some(("ant-ling", "Ring-2.6-1T")),
             ("ant-ling", "Ling-3.1-flash", "high"),
         ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"openai/gpt-oss-120b","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("together", "moonshotai/Kimi-K3", "off"),
+        ),
+        (
+            json!({"defaultModel":"together/deepseek-ai/DeepSeek-V4-Pro-0813","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("together", "moonshotai/Kimi-K3", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"MiniMaxAI/MiniMax-M3","defaultThinkingLevel":"off"}),
+            "GEMINI_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("google", "gemini-4-argon", "low"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"moonshotai/Kimi-K3","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![],
+            Some(("together", "thinkingmachines/Inkling")),
+            ("together", "moonshotai/Kimi-K3", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({"providers":{"together":{"models":[{"id":"thinkingmachines/Inkling"}]}}}),
+            vec![],
+            None,
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"openai/gpt-oss-120b","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec!["--provider", "together", "--model", "openai/gpt-oss-120b"],
+            None,
+            ("together", "openai/gpt-oss-120b", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![
+                "--provider",
+                "together",
+                "--model",
+                "thinkingmachines/Inkling",
+            ],
+            None,
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"MiniMaxAI/MiniMax-M3","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec!["--model", "together/MiniMaxAI/MiniMax-M3:off"],
+            None,
+            ("together", "MiniMaxAI/MiniMax-M3", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"private/unknown-model","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("together", "private/unknown-model", "off"),
+        ),
+        (
+            json!({"defaultProvider":"groq","defaultModel":"openai/gpt-oss-120b","defaultThinkingLevel":"off"}),
+            "GROQ_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("groq", "openai/gpt-oss-120b", "low"),
+        ),
     ] {
+        let root = tempfile::tempdir().unwrap();
+        let settings_path = root.path().join("settings.json");
+        let models_path = root.path().join("models.json");
         let saved_settings = settings.to_string();
         std::fs::write(&settings_path, &saved_settings).unwrap();
         std::fs::write(&models_path, models.to_string()).unwrap();
@@ -8844,11 +8929,11 @@ fn ant_ling_startup_replaces_only_missing_retired_defaults() {
                 command.env(name, value);
             }
         }
-        if let Some(model) = saved_session_model {
+        if let Some((provider, model)) = saved_session_model {
             let path = root.path().join("resume.jsonl");
             let mut session = pi_rs::Session::open(&path).unwrap();
             session
-                .select_provider_model(Some("ant-ling"), model, None)
+                .select_provider_model(Some(provider), model, None)
                 .unwrap();
             session
                 .append_user_with_images("saved conversation".into(), vec![], None)

@@ -97,14 +97,26 @@ pub(super) fn default_for_provider<'a>(
         .or_else(|| models.first())
 }
 
-pub(super) fn is_unconfigured_retired_ant_ling_model(
+pub(super) fn is_unconfigured_retired_builtin_model(
     profiles: &super::model_profiles::Profiles,
     provider: &Provider,
     id: &str,
 ) -> bool {
-    provider.id() == "ant-ling"
-        && matches!(id, "Ling-2.6-flash" | "Ling-2.6-1T" | "Ring-2.6-1T")
-        && profiles.model(provider, id).is_none()
+    is_retired_builtin_model(provider, id) && profiles.model(provider, id).is_none()
+}
+
+fn is_retired_builtin_model(provider: &Provider, id: &str) -> bool {
+    match provider.id() {
+        "ant-ling" => matches!(id, "Ling-2.6-flash" | "Ling-2.6-1T" | "Ring-2.6-1T"),
+        "together" => matches!(
+            id,
+            "deepseek-ai/DeepSeek-V4-Pro-0813"
+                | "MiniMaxAI/MiniMax-M3"
+                | "openai/gpt-oss-120b"
+                | "thinkingmachines/Inkling"
+        ),
+        _ => false,
+    }
 }
 
 /// Choose from known catalog entries without resolving credential commands
@@ -742,6 +754,10 @@ fn resolve_cli_catalog_model(
             // qualified match. A named partial match can compete with raw IDs.
             let id = known.cloned().or_else(|| {
                 let (_, id) = explicit?;
+                // Keep an exact, provider-qualified request for a former bundled ID.
+                if is_retired_builtin_model(provider, id) {
+                    return Some((*id).to_owned());
+                }
                 let names = aliases(profiles, provider, models);
                 let candidates = search_ids(models, &names);
                 exact(id, &candidates, provider.id())
@@ -855,6 +871,14 @@ pub fn split_with_profiles(
         if !ids.contains(&id) {
             ids.push(id);
         }
+    }
+    let named = unqualified(value, provider.id());
+    let id = thinking_suffix(named).map_or(named, |(id, _)| id);
+    if is_retired_builtin_model(provider, id)
+        && !ids.iter().any(|model| model.eq_ignore_ascii_case(id))
+    {
+        // Treat the requested retired ID as exact so a successor cannot win a partial match.
+        ids.push(id.to_owned());
     }
     let aliases = aliases(profiles, provider, &ids);
     let mut selected = split(value, &search_ids(&ids, &aliases), provider.id())?;

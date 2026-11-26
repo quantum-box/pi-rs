@@ -6309,13 +6309,38 @@ together, and `--provider` can restrict the list to one. Built-in environment
 keys and endpoint-bound saved credentials stay off user-configured relays.
 Baseten and NVIDIA's pinned chat-completions catalogs include model-specific
 compatibility, NVIDIA polling headers and Baseten's thinking template. Pi
-1.6.0 supplies 15 Baseten, 16 Together, 12 NVIDIA NIM and 87 Hugging Face
-Router entries. Baseten and Together expose Kimi K3.1 Pro with image input.
-Baseten lists a 262,144-token output maximum, and Together lists 1,048,576 for
-both Kimi K3 and K3.1 Pro. Hugging Face uses the system instruction role.
+1.6.0 supplies 15 Baseten, 12 NVIDIA NIM and 87 Hugging Face Router entries.
+Together has a separate, newer catalog snapshot. Baseten and Together expose
+Kimi K3.1 Pro with image input. Baseten lists a 262,144-token output maximum,
+and Together lists 1,048,576 for both Kimi K3 and K3.1 Pro. Hugging Face uses the system instruction role.
 Users can configure additional NVIDIA deployments by ID. Catalog entries that
 use other upstream APIs still need their own adapters. Live inference on the
 updated catalogs was unverified.
+
+### Together catalog
+
+Together bundles 24 tool-capable chat models from the November 26, 2026
+`togetherai.models` snapshot. The extracted snapshot has SHA-256
+`2abf83a95f57e79358c2b523f5581373a0b4a3795e110d9293be4a7ab170dd5b`.
+The v2 API supplied the chat types and corroborated the IDs, status, tool and
+reasoning capability, image support, limits and prices.
+[models.dev v1 API](https://models.dev/api.json) · [models.dev v2 API](https://models.dev/experimental/v2.0/api.json)
+
+Pi's Together generator at `db79712854` filters out deprecated entries and maps
+the active reasoning models to binary thinking. Commit `e459be65` removed the
+obsolete reasoning-effort overrides for GPT OSS 120B and DeepSeek V4 Pro 0813.
+[Chat catalog generator](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/catalog/define.ts) ·
+[Together mapping](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/catalog/providers/together.ts) ·
+[Pi commit `e459be65`](https://github.com/earendil-works/pi/commit/e459be65a3563d4e58d74f379a55f890475aef81)
+
+Together keeps Kimi K3 as its default. Requests use `reasoning.enabled` for
+thinking, with `off` and `high` as the available levels. If a previously bundled
+Together ID is absent from the effective catalog, saved defaults and resumed
+sessions use the existing retired-model fallback. It applies to
+`deepseek-ai/DeepSeek-V4-Pro-0813`, `MiniMaxAI/MiniMax-M3`,
+`openai/gpt-oss-120b`, and `thinkingmachines/Inkling`. Explicit choices and
+user-configured models still take precedence. Startup leaves the settings file
+as written.
 
 ### Google Vertex AI
 

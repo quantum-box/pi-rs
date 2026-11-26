@@ -4310,7 +4310,7 @@ mod estimation_tests {
     use clap::Parser;
 
     #[tokio::test]
-    async fn bundled_chat_models_send_model_specific_strict_field() {
+    async fn bundled_chat_models_send_model_specific_strict_and_together_thinking_fields() {
         use std::io::{Read, Write};
         for (provider, model_id, config, expected) in [
             (
@@ -4333,13 +4333,13 @@ mod estimation_tests {
             ),
             (
                 "together",
-                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                "deepseek-ai/DeepSeek-V4.1-Flash",
                 serde_json::json!({}),
                 None,
             ),
             (
                 "together",
-                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                "zai-org/GLM-5.3",
                 serde_json::json!({"providers":{"together":{"compat":{"supportsStrictMode":true}}}}),
                 Some(false),
             ),
@@ -4421,6 +4421,12 @@ mod estimation_tests {
             args.model_profiles = super::super::model_profiles::Profiles::parse(&config).unwrap();
             args.provider = args.model_profiles.provider(provider).unwrap();
             args.model = model_id.into();
+            let thinking = match (provider, model_id) {
+                ("together", "deepseek-ai/DeepSeek-V4.1-Flash") => Some("high"),
+                ("together", "zai-org/GLM-5.3") => Some("off"),
+                _ => None,
+            };
+            args.thinking = thinking.map(str::to_owned);
             let client = Client::Ollama(
                 pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
                     .unwrap()
@@ -4449,6 +4455,16 @@ mod estimation_tests {
                 expected,
                 "{provider}/{model_id}"
             );
+            if let Some(thinking) = thinking {
+                assert_eq!(
+                    body["reasoning"],
+                    serde_json::json!({"enabled": thinking == "high"})
+                );
+                assert!(body.get("reasoning_effort").is_none());
+                assert!(body.get("store").is_none());
+                assert_eq!(body["max_tokens"], 10);
+                assert!(body.get("max_completion_tokens").is_none());
+            }
         }
     }
 

@@ -948,7 +948,7 @@ impl Cli {
                         .complete_catalogs
                         .iter()
                         .any(|(p, e)| p == provider.id() && e == endpoint);
-                let retired = model_selection::is_unconfigured_retired_ant_ling_model(
+                let retired = model_selection::is_unconfigured_retired_builtin_model(
                     &self.model_profiles,
                     &provider,
                     &model,
@@ -1196,7 +1196,7 @@ impl Cli {
                 .filter(|(candidate, _)| *candidate == provider)
                 .map_or(value, |(_, id)| *id);
             if id != value
-                && model_selection::is_unconfigured_retired_ant_ling_model(
+                && model_selection::is_unconfigured_retired_builtin_model(
                     &self.model_profiles,
                     &provider,
                     id,
@@ -1209,7 +1209,7 @@ impl Cli {
             }
         });
         let missing_retired_default = configured_model.is_some_and(|model| {
-            model_selection::is_unconfigured_retired_ant_ling_model(
+            model_selection::is_unconfigured_retired_builtin_model(
                 &self.model_profiles,
                 &provider,
                 model,
@@ -1225,7 +1225,7 @@ impl Cli {
         };
         let keep_fallback = provider == fallback.provider
             && !(missing_retired_default
-                && model_selection::is_unconfigured_retired_ant_ling_model(
+                && model_selection::is_unconfigured_retired_builtin_model(
                     &self.model_profiles,
                     &provider,
                     &fallback.model,
@@ -2014,7 +2014,7 @@ async fn execute(
     };
     let retired_default = starts_model_session
         && !args.model_explicit
-        && model_selection::is_unconfigured_retired_ant_ling_model(
+        && model_selection::is_unconfigured_retired_builtin_model(
             &args.model_profiles,
             &args.provider,
             saved_model,
