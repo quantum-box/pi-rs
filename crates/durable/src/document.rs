@@ -1482,7 +1482,8 @@ impl Transaction {
             ],
         })
     }
-    /// Set a policy using its own CAS version; can be composed atomically with document writes.
+    /// Set an unbound policy using its CAS version. Use a typed migration to
+    /// change the policy of a defined document.
     pub fn set_fork_policy(
         &mut self,
         address: &Address,
@@ -1501,6 +1502,8 @@ impl Transaction {
             }],
         })
     }
+    /// Stage deletion of an unbound document. Defined documents require a
+    /// lifecycle transaction that retires their incarnation atomically.
     pub fn delete(&mut self, address: &Address, version: u64) -> Result<(), Error> {
         let key = address.storage_key()?;
         self.append(OwnedBatch {
