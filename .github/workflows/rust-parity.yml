@@ -68,7 +68,8 @@ jobs:
     name: Native tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # The Unix matrix also runs the Durable crash and recovery suite.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 30 || 60 }}
+    # Leave time for Windows acceptance tests and the post-job cache upload.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 60 }}
     strategy:
       fail-fast: false
       matrix:
