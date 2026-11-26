@@ -296,6 +296,9 @@ impl Tool for ScriptTool {
     fn use_default_timeout(&self) -> bool {
         false
     }
+    fn settles_host_timeout(&self) -> bool {
+        true
+    }
     fn output_limit(&self) -> usize {
         8 * 1024 * 1024
     }
@@ -4093,6 +4096,46 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    struct DeadlineFormatGate {
+        occupied: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DeadlineFormatGate {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "hold_formatter".into(),
+                description: "Queue a fixture ahead of the formatter".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            let occupied = self.occupied.lock().unwrap().take().unwrap();
+            let release = self.release.lock().unwrap().take().unwrap();
+            tokio::task::spawn_blocking(move || {
+                let _ = occupied.send(());
+                let _ = release.blocking_recv();
+            });
+            Outcome::Succeeded("queued".into())
+        }
+    }
+
+    struct DeadlineFormatExtension(Arc<DeadlineFormatGate>);
+
+    impl Extension for DeadlineFormatExtension {
+        fn id(&self) -> &str {
+            "deadline-format-fixture"
+        }
+
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![self.0.clone()]
+        }
+    }
+
+    const SDK_TEST_DEADLINE: Duration = Duration::from_secs(1);
+
     struct DeadlineModel;
     #[async_trait::async_trait]
     impl pi_rs_core::Model for DeadlineModel {
@@ -4109,9 +4152,8 @@ mod tests {
                 }
             }) {
                 assert!(
-                    content.contains("error")
-                        || content.contains("timed out")
-                        || content.contains("interrupt"),
+                    content.contains("Script timed out: Execution timed out after 1000 ms")
+                        && content.contains("before-timeout"),
                     "{content}"
                 );
                 vec![
@@ -4126,7 +4168,7 @@ mod tests {
                     calls: vec![ToolCall {
                         id: "deadline".into(),
                         name: "codemode".into(),
-                        arguments: json!({"code":"while (true) {}"}).to_string(),
+                        arguments: json!({"code":"text('before-timeout'); store('discard', true); await tools.hold_formatter({}); while (true) {}"}).to_string(),
                     }],
                     usage: None,
                 })]
@@ -4135,8 +4177,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn public_sdk_explicit_timeouts_interrupt_busy_scripts() {
+    #[test]
+    fn public_sdk_explicit_timeouts_interrupt_busy_scripts() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(check_public_sdk_deadline());
+    }
+
+    async fn check_public_sdk_deadline() {
         for explicit_limits in [false, true] {
             // Keep the original public struct literal and Duration field usable.
             let extension = Codemode {
@@ -4145,44 +4196,59 @@ mod tests {
                 timeout: if explicit_limits {
                     Duration::MAX
                 } else {
-                    Duration::from_millis(20)
+                    SDK_TEST_DEADLINE
                 },
+            };
+            let (occupied, occupied_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = tokio::sync::oneshot::channel();
+            let gate = DeadlineFormatGate {
+                occupied: Mutex::new(Some(occupied)),
+                release: Mutex::new(Some(release_rx)),
             };
             let mut builder = pi_rs_core::SessionBuilder::new(Arc::new(DeadlineModel), "fixture")
                 .extension(Arc::new(extension))
+                .unwrap()
+                .extension(Arc::new(DeadlineFormatExtension(Arc::new(gate))))
                 .unwrap();
             if explicit_limits {
                 builder = builder.limits(pi_rs_core::Limits {
-                    tool_timeout: Duration::from_millis(20),
+                    tool_timeout: SDK_TEST_DEADLINE,
                     ..Default::default()
                 });
             }
             let mut session = builder.in_memory().unwrap();
-            match session.prompt("test").await {
-                Ok(answer) => assert_eq!(answer, "done"),
-                // The host deadline can win the race with the worker's interrupt.
-                // Until the worker reports back, its outcome is safely unknown.
-                Err(pi_rs_core::Error::Reconciliation(operation_id)) if explicit_limits => {
-                    assert!(
-                        session
-                            .journal().unwrap()
-                            .operations()
-                            .iter()
-                            .any(|(invocation, state)| {
-                                invocation.operation_id == operation_id
-                                    && matches!(
-                                        state,
-                                        pi_rs_core::OperationState::Finished(Outcome::Unknown(reason)) if reason == "tool timed out"
-                                    )
-                            })
-                    );
-                    assert!(matches!(
-                        session.resume().await,
-                        Err(pi_rs_core::Error::Reconciliation(_))
-                    ));
-                }
-                result => panic!("unexpected timeout result: {result:?}"),
-            }
+            let (answer, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(session.prompt("test"), async {
+                    // The queued fixture starts only once QuickJS releases the
+                    // sole blocking thread. Keep the formatter queued briefly
+                    // after that execution deadline.
+                    occupied_rx.await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    release.send(()).unwrap();
+                })
+            })
+            .await
+            .expect("the SDK turn should settle");
+
+            let journal = session.journal().unwrap();
+            let operations = journal.operations();
+            assert!(
+                matches!(&answer, Ok(answer) if answer == "done"),
+                "explicit_limits={explicit_limits}: {answer:?}; journal={operations:?}"
+            );
+            assert!(operations.iter().any(|(invocation, state)| {
+                invocation.call.name == "codemode"
+                    && matches!(state, pi_rs_core::OperationState::Finished(Outcome::Failed(reason))
+                        if reason.contains("Script timed out: Execution timed out after 1000 ms")
+                            && reason.contains("before-timeout"))
+            }), "{operations:?}");
+            assert!(
+                journal
+                    .extension_states()
+                    .get(ID)
+                    .is_none_or(|state| state.data.get("discard").is_none())
+            );
+            drop(journal);
             session.close().await.unwrap();
         }
     }
