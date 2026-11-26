@@ -963,9 +963,55 @@ The list puts `system` first and sorts other names by the host locale. The first
 valid source wins for duplicate names. Embedded themes and paths that cannot be
 represented in UTF-8 omit their file path. The snapshot skips invalid files, includes explicit `--theme` paths and
 uses the native theme resource read limits. Theme selection and the catalog
-both accept a UTF-8 BOM. Native theme objects and switching
-through extension UI remain open.
+both accept a UTF-8 BOM.
 [Pi theme listing](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L403-L434)
+
+The read-only `getTheme` request accepts an exact name and returns
+`UiResponse::Theme` with its resolved colors, dim roles, and optional source
+path. Named file and embedded palettes use the same snapshot and precedence
+as the catalog. A refresh loads updated file palettes. Looking up a name
+does not scan directories or open paths supplied by the extension. Unknown
+names and headless RPC lookups return JSON null. Headless RPC handles the
+request locally.
+
+The terminal supplies the generated `system` palette from its current
+color reports, including the grayscale fallback while initial reports are
+pending. Colors preserve the native renderer's RGB, ANSI index, and
+terminal-default reset behavior. Faint styling is carried as dim roles,
+whereas Pi's JavaScript color accessor approximates the resulting colors.
+The request returns palette data and leaves the active theme selection intact.
+[Pi named theme lookup](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L557-L574)
+[Pi RPC extension UI](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/docs/rpc-extension-ui.md)
+
+The `setTheme` UI request accepts an exact, case-sensitive name from the scoped
+theme catalog or a resolved palette returned by `getTheme`. The worker resolves
+named selection and lookup against the same snapshot. Reload refreshes that
+snapshot from the resolved theme files, and the terminal supplies the live
+`system` palette.
+The terminal must claim the request from the worker before it can change the
+palette or settings. Callback cancellation or a disconnected executable before
+the claim prevents both changes. A granted claim authorizes the active terminal
+to finish even if the caller cancels while waiting for its response. The terminal
+answers theme requests during model and thinking-level selection callbacks.
+Final selection callbacks during exit can still read themes. Theme changes return
+`{success: false, error: "UI not available"}` once the terminal is restored.
+
+A successful named selection applies the theme and saves the name in user
+settings when it differs from the current setting. On `/reload`, the terminal
+reads the saved setting again and honors any explicit `--use-theme` override.
+A named load failure applies the live `system` fallback and returns
+`{success: false, error}`,
+as in Pi, without writing settings. A native settings write failure or an
+invalid supplied palette returns failure and preserves the active theme.
+A supplied palette ignores its path, survives passive terminal and resource
+refreshes even while a picker is open, and is discarded on session rebind or
+reload. If the configured theme fails to load during reload, a discarded
+palette is replaced with the live `system` theme. `getActiveTheme` exposes
+the current palette, corresponding to Pi’s extension UI `theme` property.
+Headless RPC returns
+`{success: false, error: "UI not available"}` locally.
+[Pi theme setting](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L2874-L2891)
+[Pi fallback](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L703-L722)
 
 ### Native extension working indicator
 
@@ -1466,6 +1512,12 @@ factories can share a session-scoped `ShellOutputStore` via
 `create_bash_tool_with_shell_outputs` and `create_read_tool_with_shell_outputs`.
 Only paths produced by that store bypass the read backend; do not share a store
 across trust boundaries. The transcript path is not a file on the remote machine.
+Shell progress checks that the spill name still identifies the open file and
+that its size matches the output received so far. Final results perform the
+same check after syncing the file. These checks describe the name at the time
+of observation. If saving or verifying the spill fails, native shell tools
+retain the bounded output and report the spill error where the tool supports
+that metadata. A failed spill can leave a partial file in the temporary directory.
 
 ### Image and file-tool checkpoint
 
@@ -2104,9 +2156,13 @@ Unpublished transcripts are removed. A deadline interrupt in QuickJS and a
 timeout awaiting a tool report the effective timeout in milliseconds. Nested
 calls receive cancellation when execution settles, before formatting. Error
 replies preserve partial text and inline images within the output limits and
-discard uncommitted store writes. Text-only errors retain the existing failed outcome. The session
-scheduler can still settle a host-wide tool timeout or cancellation before
-Codemode publishes the reply.
+discard uncommitted store writes. Text-only errors retain the existing failed
+outcome. An explicit host timeout remains the Codemode execution budget. The
+native session scheduler gives direct Codemode calls up to 250 ms after that
+budget to finish shutdown and publish a reply. If the reply remains pending,
+the scheduler records an unknown outcome for reconciliation. Caller
+cancellation still takes priority. Other tools and programmatic calls retain
+their existing scheduler deadlines.
 [Pinned Codemode worker deadline](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/codemode/src/runtime/execution.ts)
 [Pinned coding-agent result formatting](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/extensions/codemode/execute.ts)
 
@@ -3886,6 +3942,23 @@ Regressions cover chunked multibyte output, trailing whitespace, and both
 progress snapshots and completed results, using upstream
 `780bf31fcaeb252fa9b68df3964c735eae75bde3` as the reference.
 
+### Shell full-output save failures
+
+When Bash or PowerShell cannot save a full-output file, the native shell
+runner continues draining and preserves the command outcome. Model-facing
+text retains its bounded preview and reports the save error. The tool's
+truncation details use `fullOutputError` instead of a file path, and a
+truncated structured result uses `full_output_error`. For the completed
+result, pi-rs uses Rust's checked `File::sync_all` and verifies that the retained
+path identifies the original file at the expected size. Pi waits for Node's
+stream close event and reports errors from that event. Rust's standard file
+drop has no error result. A path in a live progress snapshot refers to a spill
+that is still being written.
+
+User-initiated shell execution also retains its bounded output and exit status.
+Its journal and RPC result do not yet expose the separate save error.
+[Pi shell output accumulator](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/tools/output-accumulator.ts)
+
 ### Grep context and line-limit checkpoint
 
 Invalid regular expressions in unrestricted local `grep` include the `rg:`
@@ -4589,9 +4662,19 @@ fixture verified folding, label editing, checkout and terminal restoration.
 
 ### Offline startup and native package update checkpoint
 
-`pi update --extensions` reconciles configured native packages, and
-`pi update <source>` still updates a single source. `--offline` and
-`PI_OFFLINE=1` suppress automatic Cargo registry and Git package downloads,
+Native bare `pi update` and `pi update --extensions` reconcile configured
+packages. `pi update <source>` updates a single source. Upstream bare
+`pi update` targets the Pi installation and skips extension updates.
+Its global `selfUpdateCommand` setting and `PI_SELF_UPDATE_COMMAND`
+environment variable customize the JavaScript installation step.
+Install or update the pi-rs binary through its original installation method.
+
+Pi's `enableInstallTelemetry`, `enableAnalytics`, and `trackingId` settings
+are specific to upstream Pi. pi-rs keeps changelog state local. Explicit
+model diagnostics, OAuth, and package downloads follow their own
+configuration.
+
+`--offline` and `PI_OFFLINE=1` suppress automatic Cargo registry and Git package downloads,
 including refreshes of temporary packages, and reuse the installed resources.
 Uncached remote packages are skipped with a diagnostic.
 A transient Git source pinned to a commit reuses its cached checkout when
@@ -6819,16 +6902,30 @@ context size, and imported sessions retain Pi's `tokensBefore`.
 Loopback and PTY checks covered live compaction and branch summaries,
 imported journals, custom bindings, individual clicks, and billing.
 
-### Anthropic input transformation diagnostics checkpoint
+### Reasoning-drop diagnostics and notices
 
 Anthropic Messages responses retain bounded input transformation diagnostics
 in the assistant's journal metadata and RPC message. A final SSE array
 supersedes the initial array, including when it is empty. Pi JSONL imports
 retain the diagnostic timestamp and transformation type, path, and reason.
-With `notices.reasoningDrops` enabled, both terminal modes warn during a
-live run when the number of dropped thinking blocks increases compared
-to the previous assistant response on the active branch. Reopening
-restores that baseline.
+
+OpenAI Responses, Azure OpenAI Responses, and OpenAI Codex over SSE or
+WebSocket read `response.input_transformations` on successful terminal
+events, matching the [pinned Pi Responses parser](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/ai/src/api/openai-responses-shared.ts).
+The journal and RPC messages retain up to 256 removed reasoning items per
+diagnostic. Routine `turn_boundary` removals are ignored. Each entry can
+retain a bounded reasoning item ID and a reason from Pi's pinned OpenAI SDK
+(7.59.0). An unrecognized reason still counts toward the notice.
+Pi JSONL import and share support the diagnostic. Earlier native imports
+remain readable, and reimporting the original Pi transcript populates the
+typed OpenAI metadata.
+
+With `notices.reasoningDrops` enabled, both terminal modes show live notices
+with the provider, count, and distinct approved reason labels. A notice is
+suppressed when the preceding assistant response on the active branch had
+the same diagnostic type and at least as many drops. A different type or a
+response without drops starts a new comparison. Reopening or changing
+branches restores the baseline from history.
 
 ### Tool-result extension hooks
 
