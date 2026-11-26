@@ -2161,6 +2161,96 @@ fn atomic_failure_fork_preserves_writes_at_each_reset() {
 }
 
 #[test]
+fn standalone_block_reset_can_fork_at_an_inherited_interior_message() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let id = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (reset, entries) = harness
+        .reset_with_blocks(
+            id,
+            Some("handoff".into()),
+            vec![
+                vec![serde_json::json!({"type":"text","text":"selected"})],
+                vec![serde_json::json!({"type":"text","text":"later"})],
+            ],
+        )
+        .unwrap();
+    let child = harness.fork_by_entry_id(id, entries[1]).unwrap();
+    drop(harness);
+
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let fork = harness.fork_by_entry_id(child, entries[0]).unwrap();
+    drop(harness);
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let view = harness.conversation(fork).unwrap();
+    assert_eq!(view.resets[0].id, reset);
+    assert_eq!(view.messages.len(), 2);
+    assert_eq!(
+        view.messages[0],
+        Message::User {
+            content: "handoff".into()
+        }
+    );
+    assert_eq!(view.content_blocks.len(), 1);
+    assert_eq!(view.content_blocks[&1].message_id, entries[0]);
+    assert_eq!(
+        view.content_blocks[&1].blocks,
+        [serde_json::json!({"type":"text","text":"selected"})]
+    );
+    let tree = harness
+        .session_tree(&harness.session_entries_start(fork).unwrap())
+        .unwrap();
+    assert!(
+        tree.entries
+            .iter()
+            .any(|entry| entry.entry.id() == entries[0])
+    );
+    assert!(
+        !tree
+            .entries
+            .iter()
+            .any(|entry| entry.entry.id() == entries[1])
+    );
+
+    let selected = tree
+        .entries
+        .iter()
+        .find_map(|entry| match &entry.entry {
+            SessionEntry::Message(message) if message.history.id == entries[0] => Some(message),
+            _ => None,
+        })
+        .unwrap();
+    let position = harness
+        .original_occurrence_position(&selected.history, &selected.message)
+        .unwrap();
+    let origin = position.cursor.transcript_id();
+    let source = crate::transcript::Transcript::new(harness.owner.store(), origin);
+    let (key, _) = source.entry_evidence(&position.cursor).unwrap();
+    let store = harness.owner.store();
+    let value = store.get(&key).unwrap().unwrap();
+    store
+        .commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(value.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: value.value,
+            }],
+        )
+        .unwrap();
+    assert!(harness.fork_by_entry_id(id, entries[0]).is_err());
+}
+
+#[test]
 fn repeated_atomic_failure_batches_keep_prior_fork_proofs() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
