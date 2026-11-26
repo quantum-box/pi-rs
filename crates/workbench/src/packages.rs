@@ -3105,7 +3105,10 @@ mod tests {
         ]});
         std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
         let mut args = Cli::parse_from(["pi", "--no-trust"]);
-        args.workspace = directory.clone();
+        // Exercise user-package filters with eligible sources outside the workspace.
+        args.workspace = directory.join("workspace");
+        std::fs::create_dir(&args.workspace).unwrap();
+        let project_settings = args.workspace.join(".pi/settings.json");
         // Before package preparation, theme discovery still honors earlier failures.
         let themes = startup_themes(&args, false).unwrap();
         assert_eq!(themes.len(), 1);
@@ -3245,9 +3248,9 @@ mod tests {
         assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
         // Project deltas run before separate user declarations and reserve
         // explicitly disabled paths while leaving others to user defaults.
-        std::fs::create_dir_all(directory.join(".pi")).unwrap();
+        std::fs::create_dir_all(project_settings.parent().unwrap()).unwrap();
         std::fs::write(
-            directory.join(".pi/settings.json"),
+            &project_settings,
             json!({"packages":[
                 {"source":sources[0],"autoload":false,"prompts":["-prompts/demo.md"]}
             ]})
@@ -3267,7 +3270,7 @@ mod tests {
         assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
         // An error stops only the project declaration. The user declaration
         // still contributes prompts and themes, after prior project skills.
-        std::fs::write(directory.join(".pi/settings.json"), json!({"packages":[
+        std::fs::write(&project_settings, json!({"packages":[
             {"source":sources[0],"autoload":false,"skills":["+skills/demo"],"prompts":["file:///bad%2Fpath"]}
         ]}).to_string()).unwrap();
         let resources = resources_for(&args, false).unwrap();
@@ -3278,7 +3281,7 @@ mod tests {
         // Both user declarations survive a project delta. The first user
         // decision, including an explicit disable, takes precedence.
         std::fs::write(
-            directory.join(".pi/settings.json"),
+            &project_settings,
             json!({"packages":[
                 {"source":sources[0],"autoload":false}
             ]})
@@ -3310,7 +3313,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            directory.join(".pi/settings.json"),
+            &project_settings,
             json!({"packages":[{
                 "source":ordered,
                 "autoload":false,
@@ -3330,7 +3333,7 @@ mod tests {
         // A project delta resolves against the first user source even when
         // its own revision differs.
         std::fs::write(
-            directory.join(".pi/settings.json"),
+            &project_settings,
             json!({"packages":[
                 {"source":"git:https://example.com/org/repo#project","autoload":false}
             ]})
@@ -3378,7 +3381,7 @@ mod tests {
             Value::Object(revision_index).to_string(),
         )
         .unwrap();
-        std::fs::write(directory.join(".pi/settings.json"), json!({"packages":[
+        std::fs::write(&project_settings, json!({"packages":[
             {"source":"git:https://example.com/org/repo#project","autoload":false,"prompts":["-prompts/demo.md"]}
         ]}).to_string()).unwrap();
         assert!(resources_for(&args, false).unwrap().prompts.is_empty());

@@ -15311,6 +15311,7 @@ exit {exit}
             "package-theme"
         );
         args.trusted = false;
+        std::fs::remove_file(project.join("settings.json")).unwrap();
 
         // Cargo metadata is parsed as data: even a build script is never run.
         let cargo_source = home.join("cargo-package");
@@ -15961,7 +15962,7 @@ exit {exit}
             }
         }
 
-        // A regular Cargo manifest still follows the normal offline build path.
+        // The picker can read Cargo theme metadata without granting permission to build.
         let valid_cargo = home.join("valid-cargo");
         std::fs::create_dir_all(valid_cargo.join("src")).unwrap();
         std::fs::create_dir_all(valid_cargo.join("palette")).unwrap();
@@ -15976,10 +15977,23 @@ exit {exit}
         .unwrap();
         args.offline = true;
         args.use_theme = Some("prepared-cargo-theme".into());
-        tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap()
+            .unwrap();
+        let before = std::fs::read(&index).unwrap();
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "prepared-cargo-theme"
+        );
+        runtime
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+
+        // The same package follows the offline build path after the fixture grants trust.
+        args.trusted = true;
+        runtime
             .block_on(super::super::packages::prepare(&args))
             .unwrap();
         assert!(
