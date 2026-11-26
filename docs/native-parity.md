@@ -963,9 +963,55 @@ The list puts `system` first and sorts other names by the host locale. The first
 valid source wins for duplicate names. Embedded themes and paths that cannot be
 represented in UTF-8 omit their file path. The snapshot skips invalid files, includes explicit `--theme` paths and
 uses the native theme resource read limits. Theme selection and the catalog
-both accept a UTF-8 BOM. Native theme objects and switching
-through extension UI remain open.
+both accept a UTF-8 BOM.
 [Pi theme listing](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L403-L434)
+
+The read-only `getTheme` request accepts an exact name and returns
+`UiResponse::Theme` with its resolved colors, dim roles, and optional source
+path. Named file and embedded palettes use the same snapshot and precedence
+as the catalog. A refresh loads updated file palettes. Looking up a name
+does not scan directories or open paths supplied by the extension. Unknown
+names and headless RPC lookups return JSON null. Headless RPC handles the
+request locally.
+
+The terminal supplies the generated `system` palette from its current
+color reports, including the grayscale fallback while initial reports are
+pending. Colors preserve the native renderer's RGB, ANSI index, and
+terminal-default reset behavior. Faint styling is carried as dim roles,
+whereas Pi's JavaScript color accessor approximates the resulting colors.
+The request returns palette data and leaves the active theme selection intact.
+[Pi named theme lookup](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L557-L574)
+[Pi RPC extension UI](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/docs/rpc-extension-ui.md)
+
+The `setTheme` UI request accepts an exact, case-sensitive name from the scoped
+theme catalog or a resolved palette returned by `getTheme`. The worker resolves
+named selection and lookup against the same snapshot. Reload refreshes that
+snapshot from the resolved theme files, and the terminal supplies the live
+`system` palette.
+The terminal must claim the request from the worker before it can change the
+palette or settings. Callback cancellation or a disconnected executable before
+the claim prevents both changes. A granted claim authorizes the active terminal
+to finish even if the caller cancels while waiting for its response. The terminal
+answers theme requests during model and thinking-level selection callbacks.
+Final selection callbacks during exit can still read themes. Theme changes return
+`{success: false, error: "UI not available"}` once the terminal is restored.
+
+A successful named selection applies the theme and saves the name in user
+settings when it differs from the current setting. On `/reload`, the terminal
+reads the saved setting again and honors any explicit `--use-theme` override.
+A named load failure applies the live `system` fallback and returns
+`{success: false, error}`,
+as in Pi, without writing settings. A native settings write failure or an
+invalid supplied palette returns failure and preserves the active theme.
+A supplied palette ignores its path, survives passive terminal and resource
+refreshes even while a picker is open, and is discarded on session rebind or
+reload. If the configured theme fails to load during reload, a discarded
+palette is replaced with the live `system` theme. `getActiveTheme` exposes
+the current palette, corresponding to Pi’s extension UI `theme` property.
+Headless RPC returns
+`{success: false, error: "UI not available"}` locally.
+[Pi theme setting](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L2874-L2891)
+[Pi fallback](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L703-L722)
 
 ### Native extension working indicator
 
@@ -1466,6 +1512,12 @@ factories can share a session-scoped `ShellOutputStore` via
 `create_bash_tool_with_shell_outputs` and `create_read_tool_with_shell_outputs`.
 Only paths produced by that store bypass the read backend; do not share a store
 across trust boundaries. The transcript path is not a file on the remote machine.
+Shell progress checks that the spill name still identifies the open file and
+that its size matches the output received so far. Final results perform the
+same check after syncing the file. These checks describe the name at the time
+of observation. If saving or verifying the spill fails, native shell tools
+retain the bounded output and report the spill error where the tool supports
+that metadata. A failed spill can leave a partial file in the temporary directory.
 
 ### Image and file-tool checkpoint
 
@@ -3907,6 +3959,23 @@ in the display limit. The notice gives the number of the first displayed line.
 Regressions cover chunked multibyte output, trailing whitespace, and both
 progress snapshots and completed results, using upstream
 `780bf31fcaeb252fa9b68df3964c735eae75bde3` as the reference.
+
+### Shell full-output save failures
+
+When Bash or PowerShell cannot save a full-output file, the native shell
+runner continues draining and preserves the command outcome. Model-facing
+text retains its bounded preview and reports the save error. The tool's
+truncation details use `fullOutputError` instead of a file path, and a
+truncated structured result uses `full_output_error`. For the completed
+result, pi-rs uses Rust's checked `File::sync_all` and verifies that the retained
+path identifies the original file at the expected size. Pi waits for Node's
+stream close event and reports errors from that event. Rust's standard file
+drop has no error result. A path in a live progress snapshot refers to a spill
+that is still being written.
+
+User-initiated shell execution also retains its bounded output and exit status.
+Its journal and RPC result do not yet expose the separate save error.
+[Pi shell output accumulator](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/tools/output-accumulator.ts)
 
 ### Grep context and line-limit checkpoint
 
