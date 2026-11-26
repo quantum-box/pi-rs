@@ -5496,8 +5496,23 @@ mod tests {
         };
         original.close().await.unwrap();
         drop(original);
-        assert!(registry.cycled_model(session_id, &current).is_some());
-        assert!(registry.cycled_model(session_id, &historical).is_some());
+        // Seed stale host registrations explicitly. Closing a session may clear
+        // its clients before a new owner opens the same journal.
+        let seed_stale = |selections: &[&CycledModelSelection]| {
+            registry.remove_session_branch_models(session_id);
+            for selection in selections {
+                registry
+                    .commit_cycled_model(
+                        session_id,
+                        selection,
+                        Arc::new(ProviderBranchModel("stale")),
+                        false,
+                        || Ok(()),
+                    )
+                    .unwrap();
+            }
+        };
+        seed_stale(&[&current, &historical]);
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let seen = calls.clone();
@@ -5532,7 +5547,7 @@ mod tests {
         assert_eq!(authorized.prompt("historical").await.unwrap(), "authorized");
         authorized.close().await.unwrap();
         drop(authorized);
-        assert!(registry.cycled_model(session_id, &historical).is_some());
+        seed_stale(&[&historical]);
 
         let denied = Arc::new(AtomicUsize::new(0));
         let observed = denied.clone();
