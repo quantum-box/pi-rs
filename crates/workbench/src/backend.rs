@@ -1067,15 +1067,7 @@ async fn run_worker(
     };
     emit_refreshed_entries(refreshed);
     share_ready.send_replace(true);
-    let startup_trigger = session
-        .host_binding()
-        .is_none()
-        .then(|| {
-            session
-                .pending_extension_boundary_run()
-                .or_else(|| session.pending_custom_trigger())
-        })
-        .flatten();
+    let startup_trigger = pending_worker_run(&session);
     drop(session);
     *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
     *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
@@ -1148,7 +1140,7 @@ async fn run_worker(
                                     }
                                 }
                             }
-                            Ok((starts_run && !session.queued_inputs().is_empty(), session.pending_custom_trigger()))
+                            Ok((starts_run && !session.queued_inputs().is_empty(), pending_worker_run(&session)))
                         });
                         for (reply, result) in replies {
                             let _ = reply.send(result);
@@ -1354,7 +1346,7 @@ async fn run_worker(
                     )
                     .await?;
                 refresh_snapshot(&snapshot, &session);
-                pending_discovery_trigger = session.pending_custom_trigger();
+                pending_discovery_trigger = pending_worker_run(&session);
                 drop(session);
                 *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
                 *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
@@ -1510,12 +1502,8 @@ async fn run_worker(
             };
             match request {
                 Request::TriggerCustom { run_id } => {
-                    if session
-                        .pending_extension_boundary_run()
-                        .or_else(|| session.pending_custom_trigger())
-                        != Some(run_id)
-                    {
-                        return Err(Error::Session("custom trigger is no longer pending".into()));
+                    if pending_worker_run(session) != Some(run_id) {
+                        return Err(Error::Session("run is no longer pending".into()));
                     }
                     let answer = Box::pin(agent.run_correlated_with_events(
                         session,
@@ -1546,6 +1534,11 @@ async fn run_worker(
                     rpc,
                     ..
                 } => {
+                    if session.pending_before_agent_start_run().is_some() {
+                        return Err(Error::Session(
+                            "resume the pending run preflight before submitting a prompt".into(),
+                        ));
+                    }
                     let mut prompt_acknowledged = false;
                     if queued_only
                         && !agent
@@ -1977,9 +1970,7 @@ async fn run_worker(
             }
         }
         if idle_callback_operation {
-            pending_discovery_trigger = run_session
-                .as_ref()
-                .and_then(Session::pending_custom_trigger);
+            pending_discovery_trigger = run_session.as_ref().and_then(pending_worker_run);
         }
         drop(run_session);
         if started && resume_queued && (result.is_ok() || matches!(&result, Err(Error::Cancelled)))
@@ -2037,6 +2028,16 @@ async fn run_worker(
     )
     .await;
     runtime.close().await
+}
+
+fn pending_worker_run(session: &Session) -> Option<Uuid> {
+    if session.host_binding().is_some() {
+        return None;
+    }
+    session
+        .pending_extension_boundary_run()
+        .or_else(|| session.pending_before_agent_start_run())
+        .or_else(|| session.pending_custom_trigger())
 }
 
 async fn notify_session_lifecycle(args: &Cli, runtime: &runtime::Runtime, event: LifecycleEvent) {
