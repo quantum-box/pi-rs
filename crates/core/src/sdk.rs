@@ -82,7 +82,10 @@ pub struct AssistantContentEvent {
     pub update: AssistantContentUpdate,
 }
 
-/// Lifecycle update for a provider item. End content is the complete item text.
+/// Lifecycle update for a provider item.
+///
+/// When the final reasoning content exceeds the response budget, `ReasoningEnd`
+/// carries the reasoning already delivered as deltas for that item.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[non_exhaustive]

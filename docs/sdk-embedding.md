@@ -288,7 +288,9 @@ a prompt, an image prompt, a run, or a run triggered by a cloned control.
 The receiver yields owned `Arc<AssistantContentEvent>` values in provider
 delivery order. Each carries the model request UUID and the provider's item
 index. `AssistantContentUpdate` identifies text and reasoning starts, deltas,
-and ends. Reasoning starts preserve the provider's redaction marker.
+and ends. Reasoning starts preserve the provider's redaction marker. If the
+final reasoning content exceeds the response budget, the end event carries
+the reasoning already delivered as deltas for that item.
 
 Each model retry or subsequent turn has its own request UUID, even when the
 provider reuses item indices. An interrupted attempt can leave an item without
