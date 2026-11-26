@@ -989,10 +989,12 @@ named selection and lookup against the same snapshot. Reload refreshes that
 snapshot from the resolved theme files, and the terminal supplies the live
 `system` palette.
 The terminal must claim the request from the worker before it can change the
-palette or settings. Cancellation before the claim prevents both changes. A
-granted claim authorizes the terminal to finish even if the caller cancels
-while waiting for its response. The terminal answers theme requests while model
-and thinking-level selection callbacks are running.
+palette or settings. Callback cancellation or a disconnected executable before
+the claim prevents both changes. A granted claim authorizes the active terminal
+to finish even if the caller cancels while waiting for its response. The terminal
+answers theme requests during model and thinking-level selection callbacks.
+Final selection callbacks during exit can still read themes. Theme changes return
+`{success: false, error: "UI not available"}` once the terminal is restored.
 
 A successful named selection applies the theme and saves the name in user
 settings when it differs from the current setting. On `/reload`, the terminal

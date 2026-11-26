@@ -18,8 +18,19 @@ struct PendingResponse {
 }
 
 enum ThemeClaim {
-    Unclaimed(CancellationToken, PreparedTheme),
+    Unclaimed {
+        callback: CancellationToken,
+        requester: Option<CancellationToken>,
+        selection: PreparedTheme,
+    },
     Claimed,
+}
+
+pub(super) fn theme_unavailable() -> UiResponse {
+    UiResponse::ThemeChanged(pi_rs::UiThemeChange {
+        success: false,
+        error: Some("UI not available".into()),
+    })
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -96,12 +107,7 @@ impl Broker {
             (None, UiRequest::GetTheme { .. } | UiRequest::GetActiveTheme) => {
                 Ok(Some(UiResponse::Cancelled))
             }
-            (None, UiRequest::SetTheme { .. }) => {
-                Ok(Some(UiResponse::ThemeChanged(pi_rs::UiThemeChange {
-                    success: false,
-                    error: Some("UI not available".into()),
-                })))
-            }
+            (None, UiRequest::SetTheme { .. }) => Ok(Some(theme_unavailable())),
             (Some(_), UiRequest::GetTheme { name }) if name == "system" => Ok(None),
             (Some(themes), UiRequest::GetAllThemes | UiRequest::GetTheme { .. }) => themes
                 .lock()
@@ -148,10 +154,12 @@ impl Broker {
     pub(super) fn claim_theme(&self, id: Uuid) -> Option<PreparedTheme> {
         let mut requests = self.pending.lock().expect("extension UI requests");
         let claim = &mut requests.get_mut(&id)?.theme_claim;
-        // Checking the token under the pending-request lock authorizes the mutation.
+        // Check both the callback and the executable transport before authorizing the mutation.
         // Cancellation after this point can stop the waiter while the frontend finishes.
-        if matches!(claim, Some(ThemeClaim::Unclaimed(token, _)) if !token.is_cancelled())
-            && let Some(ThemeClaim::Unclaimed(_, selection)) = claim.replace(ThemeClaim::Claimed)
+        if matches!(claim, Some(ThemeClaim::Unclaimed { callback, requester, .. })
+            if !callback.is_cancelled() && !requester.as_ref().is_some_and(CancellationToken::is_cancelled))
+            && let Some(ThemeClaim::Unclaimed { selection, .. }) =
+                claim.replace(ThemeClaim::Claimed)
         {
             return Some(selection);
         }
@@ -160,10 +168,9 @@ impl Broker {
 
     pub fn resolve(&self, id: Uuid, value: UiResponse) {
         let mut requests = self.pending.lock().expect("extension UI requests");
-        if requests
-            .get(&id)
-            .is_some_and(|request| !matches!(request.theme_claim, Some(ThemeClaim::Unclaimed(..))))
-            && let Some(request) = requests.remove(&id)
+        if requests.get(&id).is_some_and(|request| {
+            !matches!(request.theme_claim, Some(ThemeClaim::Unclaimed { .. }))
+        }) && let Some(request) = requests.remove(&id)
         {
             drop(requests);
             let _ = request.sender.send(value);
@@ -198,10 +205,11 @@ impl ExtensionUi for Broker {
         let id = Uuid::new_v4();
         let response = if request.needs_response() {
             let theme_claim = match &request {
-                UiRequest::SetTheme { theme } => Some(ThemeClaim::Unclaimed(
-                    cancellation.clone(),
-                    self.prepare_theme(theme),
-                )),
+                UiRequest::SetTheme { theme } => Some(ThemeClaim::Unclaimed {
+                    callback: cancellation.clone(),
+                    requester: pi_rs::ui_requester_cancellation(),
+                    selection: self.prepare_theme(theme),
+                }),
                 _ => None,
             };
             let (sender, receiver) = oneshot::channel();
@@ -263,6 +271,101 @@ impl ExtensionUi for Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn theme_claim_checks_requester_before_waiter_is_polled() {
+        let broker = Broker::new(true);
+        let callback = CancellationToken::new();
+        let requester = CancellationToken::new();
+        let request = broker.request(
+            UiRequest::SetTheme {
+                theme: UiThemeSelection::Name("light".into()),
+            },
+            callback.clone(),
+        );
+        let mut request = std::pin::pin!(pi_rs::with_ui_requester_cancellation(
+            requester.clone(),
+            request
+        ));
+        assert!(futures_util::poll!(&mut request).is_pending());
+        let id = *broker.pending.lock().unwrap().keys().next().unwrap();
+        requester.cancel();
+        assert!(!callback.is_cancelled());
+        assert!(broker.claim_theme(id).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_eof_retracts_pending_theme_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let extension_path = dir.path().join("theme-exit");
+        std::fs::write(&extension_path, r#"#!/usr/bin/env python3
+import json, pathlib, sys, time
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    descriptor = {'id':'theme-exit','dependencies':[],'tools':[],'commands':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True}
+    print(json.dumps({'version':1,'response':{'Ok':descriptor}}))
+else:
+    json.loads(sys.stdin.readline())
+    print(json.dumps({'type':'ui','request':{'method':'setTheme','theme':'light'}}), flush=True)
+    release = pathlib.Path(__file__).with_name('exit-now')
+    while not release.exists():
+        time.sleep(0.005)
+"#).unwrap();
+        std::fs::set_permissions(&extension_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let broker = Arc::new(Broker::new(true));
+        broker.refresh_themes(&[]);
+        let mut registry = pi_rs::Registry::default();
+        registry.set_ui(broker.clone());
+        registry
+            .register(Arc::new(
+                pi_rs_extensions::ExecutableExtension::load(extension_path).unwrap(),
+            ))
+            .unwrap();
+
+        let mut error = None;
+        let states = pi_rs::ExtensionStates::default();
+        let mut observe = |notification: pi_rs::Notification<'_>| {
+            if let pi_rs::Notification::ExtensionLifecycleError { message, .. } = notification {
+                error = Some(message.to_owned());
+            }
+        };
+        let lifecycle = pi_rs::notify_extension_lifecycle_filtered_with_ui(
+            &registry,
+            pi_rs::LifecycleEvent::SessionStart {
+                reason: pi_rs::SessionStartReason::Startup,
+                previous_session_file: None,
+            },
+            &states,
+            Duration::from_secs(10),
+            &mut observe,
+            |_| true,
+        );
+        let ((), id) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(lifecycle, async {
+                let id = loop {
+                    if let Some(id) = broker.pending.lock().unwrap().keys().next().copied() {
+                        break id;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+                std::fs::write(dir.path().join("exit-now"), []).unwrap();
+                id
+            })
+        })
+        .await
+        .expect("EOF must release the waiting UI callback before its lifecycle deadline");
+        assert_eq!(
+            error.as_deref(),
+            Some("native extension disconnected during UI request")
+        );
+        assert!(broker.claim_theme(id).is_none());
+        assert!(broker.pending.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn theme_claim_is_the_mutation_authorization_point() {
         let broker = Broker::new(true);

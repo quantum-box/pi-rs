@@ -1317,6 +1317,7 @@ struct View {
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
     theme_refresh_requested: bool,
+    terminal_closed: bool,
     thinking_settings: Option<ThinkingSettings>,
     toggle_settings_parent: Option<Picker>,
     anthropic_subscription_warning_shown: bool,
@@ -1536,8 +1537,13 @@ impl View {
                 if !active.pending_theme_requests.remove(&id) || value["theme"].is_null() {
                     return Ok(true);
                 }
-                let selection = serde_json::from_value(value["theme"].clone())?;
-                (id, self.apply_extension_theme(selection, args, theme))
+                let response = if self.terminal_closed {
+                    super::extension_ui::theme_unavailable()
+                } else {
+                    let selection = serde_json::from_value(value["theme"].clone())?;
+                    self.apply_extension_theme(selection, args, theme)
+                };
+                (id, response)
             }
             Some("extension_ui_request") => match value["method"].as_str() {
                 Some("setTheme") => {
@@ -8401,6 +8407,7 @@ pub(super) async fn run(
         Ok(())
     };
     drop(_terminal.take());
+    view.terminal_closed = true;
     finish?;
     if is_busy(&worker) {
         drop(worker.take());

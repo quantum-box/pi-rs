@@ -608,6 +608,25 @@ pub trait ExtensionUi: Send + Sync {
     ) -> ExtensionResult<UiResponse>;
 }
 
+tokio::task_local! {
+    static UI_REQUESTER_CANCELLATION: CancellationToken;
+}
+
+/// Bind the transport lifetime while forwarding a UI request from an executable extension.
+#[doc(hidden)]
+pub async fn with_ui_requester_cancellation<F: std::future::Future>(
+    cancellation: CancellationToken,
+    request: F,
+) -> F::Output {
+    UI_REQUESTER_CANCELLATION.scope(cancellation, request).await
+}
+
+/// Capture the transport lifetime for any deferred UI mutation.
+#[doc(hidden)]
+pub fn ui_requester_cancellation() -> Option<CancellationToken> {
+    UI_REQUESTER_CANCELLATION.try_with(Clone::clone).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

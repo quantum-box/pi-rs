@@ -1267,7 +1267,7 @@ def notify(message):
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -1345,6 +1345,58 @@ elif event['type'] == 'model_select':
         assert!(!text.contains("timed out"), "{text}");
         text.contains("Model callback finished with dark theme")
     });
+}
+
+#[test]
+fn final_selection_callback_can_read_but_cannot_change_theme() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, mut process) = start_theme_extension(
+        root.path(),
+        &[],
+        r#"
+import os, pathlib
+if event['type'] == 'session_start':
+    notify('Final selection fixture ready')
+elif event['type'] == 'thinking_level_select':
+    result = [active(), ui('getTheme', name='system')['name'], ui('setTheme', theme='light'), active()]
+    path = pathlib.Path(os.environ['PI_RS_HOME']) / 'final-selection.json'
+    path.write_text(json.dumps(result))
+"#,
+    );
+    output_until(&mut master, |text| {
+        text.contains("Final selection fixture ready")
+    });
+    master
+        .write_all(b"!echo shell-$(printf waiting); sleep 20\r")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("shell-waiting"));
+    // Shift-Tab queues a thinking change while the shell keeps the worker busy.
+    master.write_all(b"\x1b[Z").unwrap();
+    output_until(&mut master, |text| text.contains("Thinking level:"));
+    let home = root.path().join("home");
+    let result = home.join("final-selection.json");
+    assert!(!result.exists());
+    master.write_all(b"/quit\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            assert!(status.success(), "interactive process failed: {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "final selection did not settle");
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+    assert_eq!(
+        result,
+        serde_json::json!(["dark", "system", {"success":false,"error":"UI not available"}, "dark"])
+    );
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["theme"], "dark");
 }
 
 #[test]
