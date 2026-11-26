@@ -879,11 +879,11 @@ async fn evaluate(
     );
     let code = format!("__run(async () => {{\n{source}\n}})");
     let output_cancellation = context.cancellation.clone();
+    let startup_progress = progress
+        .as_ref()
+        .map(|progress| (progress.clone(), host.clone()));
     let operation = javascript.async_with(async move |ctx| {
         let result: rquickjs::Result<String> = async {
-            if let Some(progress) = &progress {
-                progress.lock().await.publish(host.as_ref(), false).await;
-            }
             install_globals(
                 &ctx,
                 documents,
@@ -929,12 +929,21 @@ async fn evaluate(
             }
         }
     });
+    let execution = async {
+        // A host acknowledgement can yield before QuickJS has any jobs.
+        // Keep it under the script's cancellation and deadline, outside the
+        // promise-liveness poll.
+        if let Some((progress, host)) = startup_progress {
+            progress.lock().await.publish(host.as_ref(), false).await;
+        }
+        operation.await
+    };
     let result = tokio::select! {
         biased;
         _ = context.cancellation.cancelled() => return Err("Script cancelled".into()),
         result = async {
             let Some(deadline) = deadline else {
-                return operation.await;
+                return execution.await;
             };
             // Runtime setup may have consumed the rest of the same budget.
             if deadline.elapsed() {
@@ -943,7 +952,7 @@ async fn evaluate(
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(deadline.at.into()) => Err(deadline.error()),
-                result = operation => result,
+                result = execution => result,
             }
         } => result,
     };
@@ -3598,6 +3607,79 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(1));
         }
     }
+
+    #[tokio::test]
+    async fn startup_progress_acknowledgement_does_not_trigger_promise_liveness() {
+        struct AcknowledgingHost(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+
+        #[async_trait::async_trait]
+        impl ToolHost for AcknowledgingHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                Vec::new()
+            }
+
+            fn supports_progress(&self) -> bool {
+                true
+            }
+
+            async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
+                assert_eq!(value["details"]["calls"], json!([]));
+                let ack = self.0.lock().unwrap().take().expect("startup progress");
+                ack.await
+                    .map_err(|_| "startup acknowledgement dropped".into())
+            }
+
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                panic!("text-only script must not call a tool");
+            }
+        }
+
+        for cancel in [false, true] {
+            let (acknowledge, ack) = tokio::sync::oneshot::channel();
+            let host = Arc::new(AcknowledgingHost(Mutex::new(Some(ack))));
+            let cancellation = pi_rs_core::CancellationToken::new();
+            let sink = Arc::new(Mutex::new(Output::default()));
+            let mut script = std::pin::pin!(evaluate(
+                "text('hello')",
+                json!({}),
+                host.clone(),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: cancellation.clone(),
+                },
+                None,
+                sink.clone(),
+                Some(Arc::new(tokio::sync::Mutex::new(NestedProgress {
+                    operation: "fixture".into(),
+                    calls: Vec::new(),
+                    omitted: 0,
+                }))),
+            ));
+
+            assert!(futures_util::poll!(&mut script).is_pending());
+            assert!(host.0.lock().unwrap().is_none());
+            assert!(sink.lock().unwrap().items.is_empty());
+
+            if cancel {
+                cancellation.cancel();
+                let Poll::Ready(Err(error)) = futures_util::poll!(&mut script) else {
+                    panic!(
+                        "cancellation must release the script while the acknowledgement is pending"
+                    );
+                };
+                assert_eq!(error, "Script cancelled");
+                assert!(acknowledge.is_closed());
+                assert!(sink.lock().unwrap().items.is_empty());
+            } else {
+                acknowledge.send(()).unwrap();
+                assert!(script.await.unwrap().ok);
+                assert!(
+                    matches!(&sink.lock().unwrap().items[..], [Item::Text(text)] if text == "hello")
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn unresolved_promise_fails_without_a_deadline() {
         struct DelayedHost;
