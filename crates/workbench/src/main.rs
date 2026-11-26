@@ -52,6 +52,8 @@ mod pi_messages;
 mod process;
 mod providers;
 mod vertex_auth;
+#[cfg(windows)]
+mod windows_file_identity;
 mod xai_auth;
 use providers::Provider;
 mod radius_auth;

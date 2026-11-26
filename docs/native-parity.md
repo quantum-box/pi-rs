@@ -1466,6 +1466,12 @@ factories can share a session-scoped `ShellOutputStore` via
 `create_bash_tool_with_shell_outputs` and `create_read_tool_with_shell_outputs`.
 Only paths produced by that store bypass the read backend; do not share a store
 across trust boundaries. The transcript path is not a file on the remote machine.
+Shell progress checks that the spill name still identifies the open file and
+that its size matches the output received so far. Final results perform the
+same check after syncing the file. These checks describe the name at the time
+of observation. If saving or verifying the spill fails, native shell tools
+retain the bounded output and report the spill error where the tool supports
+that metadata. A failed spill can leave a partial file in the temporary directory.
 
 ### Image and file-tool checkpoint
 
@@ -3889,6 +3895,23 @@ in the display limit. The notice gives the number of the first displayed line.
 Regressions cover chunked multibyte output, trailing whitespace, and both
 progress snapshots and completed results, using upstream
 `780bf31fcaeb252fa9b68df3964c735eae75bde3` as the reference.
+
+### Shell full-output save failures
+
+When Bash or PowerShell cannot save a full-output file, the native shell
+runner continues draining and preserves the command outcome. Model-facing
+text retains its bounded preview and reports the save error. The tool's
+truncation details use `fullOutputError` instead of a file path, and a
+truncated structured result uses `full_output_error`. For the completed
+result, pi-rs uses Rust's checked `File::sync_all` and verifies that the retained
+path identifies the original file at the expected size. Pi waits for Node's
+stream close event and reports errors from that event. Rust's standard file
+drop has no error result. A path in a live progress snapshot refers to a spill
+that is still being written.
+
+User-initiated shell execution also retains its bounded output and exit status.
+Its journal and RPC result do not yet expose the separate save error.
+[Pi shell output accumulator](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/tools/output-accumulator.ts)
 
 ### Grep context and line-limit checkpoint
 
