@@ -112,10 +112,23 @@ fn project(node: &SessionTreeEntry, tool_names: &mut HashMap<String, String>) ->
     let mut entry = match &node.entry {
         SessionEntry::Message(entry) => {
             if let Some(summary) = &entry.branch_summary {
-                json!({
+                let mut value = json!({
                     "type":"branch_summary", "summary":summary.summary,
                     "fromId":summary.from_id,
-                })
+                });
+                if summary.from_extension {
+                    value["fromHook"] = json!(true);
+                }
+                if let Some(details) = &summary.details {
+                    value["details"] = details.clone();
+                }
+                if let Some(usage) = summary.usage {
+                    value["usage"] = pi_rs_workbench::native_pi_messages::usage_value(
+                        usage,
+                        &Default::default(),
+                    );
+                }
+                value
             } else if let Some(compaction) = &entry.compaction
                 && let Some(first_kept) = compaction.first_kept_entry_id
             {

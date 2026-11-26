@@ -277,7 +277,8 @@ pub(super) async fn run(
             result = async { (&mut summary.as_mut().unwrap().task).await }, if summary.is_some() => {
                 let pending = summary.take().unwrap();
                 let result = result.map_err(|error| error.to_string()).and_then(|(plan, result)| {
-                    let draft = scheduler.finish_session_branch_summary(plan, result?)
+                    let (decision, generated) = result?;
+                    let draft = scheduler.finish_session_branch_summary_with_decision(plan, generated, decision)
                         .map_err(|error| error.to_string())?
                         .as_ref().map(session_history::editor_draft);
                     session_switch(scheduler, model, id, draft)
@@ -330,15 +331,20 @@ struct SessionSwitch {
     draft: Option<Value>,
 }
 
-type SummaryResult = (SessionBranchSummaryPlan, Result<Option<String>, String>);
+type SummaryResult = (
+    SessionBranchSummaryPlan,
+    Result<(pi_rs_core::TreeDecision, Option<String>), String>,
+);
 
 struct PendingSummary {
     request: Value,
+    cancellation: CancellationToken,
     task: tokio::task::JoinHandle<SummaryResult>,
 }
 
 impl Drop for PendingSummary {
     fn drop(&mut self) {
+        self.cancellation.cancel();
         self.task.abort();
     }
 }
@@ -361,22 +367,47 @@ fn start_summary(
         .map_err(|error| error.to_string())?
         .to_owned();
     let instructions = request["instructions"].as_str().map(str::to_owned);
+    let replace_instructions = request["replaceInstructions"] == true;
     let reserve_tokens = request["reserve_tokens"].as_u64().unwrap_or(16_384);
     let client = model.client.clone();
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
-        let result = branch_summary::generate(
-            client,
-            name,
-            plan.config().max_output_tokens,
-            instructions,
-            reserve_tokens,
-            plan.messages(),
-        )
+        let result = async {
+            let decision = plan
+                .before_summary(
+                    instructions.as_deref(),
+                    replace_instructions,
+                    &task_cancellation,
+                )
+                .await?;
+            let generated = if decision.summary.is_some() {
+                None
+            } else {
+                branch_summary::generate(
+                    client,
+                    branch_summary::Options {
+                        model_name: name,
+                        max_output_tokens: plan.config().max_output_tokens,
+                        instructions: decision.custom_instructions.clone().or(instructions),
+                        replace_instructions: decision
+                            .replace_instructions
+                            .unwrap_or(replace_instructions),
+                        reserve_tokens,
+                    },
+                    plan.messages(),
+                    &task_cancellation,
+                )
+                .await?
+            };
+            Ok((decision, generated))
+        }
         .await;
         (plan, result)
     });
     Ok(PendingSummary {
         request: request.clone(),
+        cancellation,
         task,
     })
 }

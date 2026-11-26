@@ -2826,6 +2826,12 @@ pub struct SessionBranchSummary {
     pub id: Uuid,
     pub from_id: Uuid,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_extension: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<pi_rs_core::Usage>,
 }
 
 impl SessionBranchSummary {
@@ -2846,8 +2852,16 @@ pub struct SessionBranchSummaryPlan {
     target: Uuid,
     version: u64,
     leaf: Option<Uuid>,
+    common_ancestor: Option<Uuid>,
     config: Config,
     messages: Vec<SessionMessageEntry>,
+    extensions: crate::extension::Resolved,
+}
+
+struct SessionBranchTransition {
+    version: u64,
+    summary: Option<SessionBranchSummary>,
+    label: Option<String>,
 }
 
 impl SessionBranchSummaryPlan {
@@ -2857,6 +2871,31 @@ impl SessionBranchSummaryPlan {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub async fn before_summary(
+        &self,
+        instructions: Option<&str>,
+        replace_instructions: bool,
+        cancel: &CancellationToken,
+    ) -> Result<pi_rs_core::TreeDecision, String> {
+        if cancel.is_cancelled() {
+            return Err("Branch summary cancelled".into());
+        }
+        self.extensions
+            .before_branch_summary(
+                &crate::extension::BranchSummaryRequest {
+                    conversation: self.conversation,
+                    target: self.target,
+                    old_leaf: self.leaf,
+                    common_ancestor: self.common_ancestor,
+                    messages: &self.messages,
+                    instructions,
+                    replace_instructions,
+                },
+                cancel,
+            )
+            .await
     }
 }
 
@@ -11060,6 +11099,8 @@ impl Harness {
             target: entry_id,
             version,
             leaf: tree.leaf_id,
+            common_ancestor: current,
+            extensions: self.selected_extensions(&state)?,
             config: state.config,
             messages,
         })
@@ -11070,24 +11111,80 @@ impl Harness {
         plan: SessionBranchSummaryPlan,
         summary: Option<String>,
     ) -> Result<Option<SessionMessageEntry>, Error> {
-        let summary = match (plan.leaf, summary, plan.messages.is_empty()) {
-            (Some(from_id), Some(summary), false)
+        self.finish_session_branch_summary_with_decision(plan, summary, Default::default())
+    }
+
+    /// Commit an extension decision and the navigation using the same session version.
+    pub fn finish_session_branch_summary_with_decision(
+        &mut self,
+        plan: SessionBranchSummaryPlan,
+        generated: Option<String>,
+        decision: pi_rs_core::TreeDecision,
+    ) -> Result<Option<SessionMessageEntry>, Error> {
+        if decision.cancel {
+            return Err(Error::WaitCancelled);
+        }
+        let gate = self.extension_selection_gate.clone();
+        let _selection = gate.lock().map_err(|_| Error::Failed)?;
+        let (state, version) = self.load(plan.conversation)?;
+        if version != plan.version {
+            return Err(Error::Invalid(
+                "Session changed during branch summarization".into(),
+            ));
+        }
+        if plan.extensions.registration_evidence()
+            != self.selected_extensions(&state)?.registration_evidence()
+        {
+            return Err(Error::Invalid(
+                "Extensions changed during branch summarization".into(),
+            ));
+        }
+
+        let mut summary = None;
+        if let Some(extension) = decision.summary {
+            if serde_json::to_vec(&extension.details)?.len() > 256 * 1024 {
+                return Err(Error::Invalid(
+                    "Branch summary details are too large".into(),
+                ));
+            }
+            summary = Some((extension.summary, extension.details, extension.usage, true));
+        } else if let Some(text) = generated {
+            if plan.messages.is_empty() {
+                return Err(Error::Invalid("Invalid branch summary".into()));
+            }
+            summary = Some((text, None, None, false));
+        } else if !plan.messages.is_empty() {
+            return Err(Error::Invalid("Invalid branch summary".into()));
+        }
+        let summary = match (plan.leaf, summary) {
+            (Some(from_id), Some((summary, details, usage, from_extension)))
                 if !summary.trim().is_empty() && summary.len() <= 256 * 1024 =>
             {
                 Some(SessionBranchSummary {
                     id: Uuid::new_v4(),
                     from_id,
                     summary,
+                    from_extension,
+                    details,
+                    usage,
                 })
             }
-            (_, None, true) => None,
+            (_, None) => None,
             _ => return Err(Error::Invalid("Invalid branch summary".into())),
         };
+        let label = decision.label.filter(|value| !value.is_empty());
+        if label.as_ref().is_some_and(|label| label.len() > 4096) {
+            return Err(Error::Invalid("Branch summary label is too large".into()));
+        }
         self.move_session_entry(
             plan.conversation,
             plan.target,
             true,
-            Some((plan.version, summary)),
+            Some(SessionBranchTransition {
+                version: plan.version,
+                summary,
+                label,
+            }),
         )
     }
 
@@ -11153,20 +11250,20 @@ impl Harness {
         id: Uuid,
         entry_id: Uuid,
         reedit_user: bool,
-        summary_plan: Option<(u64, Option<SessionBranchSummary>)>,
+        summary_plan: Option<SessionBranchTransition>,
     ) -> Result<Option<SessionMessageEntry>, Error> {
         use crate::fork::Error::{InvalidCursor, InvalidSnapshot};
 
         let (mut state, version) = self.load(id)?;
         Self::ensure_session_can_checkout(&state)?;
-        let summary = match summary_plan {
-            Some((expected, summary)) if expected == version => summary,
+        let (summary, label) = match summary_plan {
+            Some(plan) if plan.version == version => (plan.summary, plan.label),
             Some(_) => {
                 return Err(Error::Invalid(
                     "Session changed during branch summarization".into(),
                 ));
             }
-            None => None,
+            None => (None, None),
         };
         let tree = self.session_tree(&self.session_entries_start(id)?)?;
         let selected = tree
@@ -11193,7 +11290,24 @@ impl Harness {
         } else {
             Some(entry_id)
         };
+        let label_changed = label.is_some();
+        if let Some(label) = label {
+            state.last_session_label = Some(SessionLabelEntry {
+                id: Uuid::new_v4(),
+                target_id: summary.as_ref().map_or(entry_id, |summary| summary.id),
+                label: Some(label),
+                timestamp_ms: (self.clock)(),
+            });
+            state.has_session_labels = true;
+        }
         if tree.leaf_id == target && summary.is_none() {
+            if label_changed {
+                let merge = self.merge_admissions;
+                self.merge_admissions = false;
+                let result = self.save(&state, Expected::Version(version));
+                self.merge_admissions = merge;
+                result?;
+            }
             return Ok(draft);
         }
         let checks = if let Some(target) = target {
@@ -26066,6 +26180,16 @@ impl Scheduler {
         summary: Option<String>,
     ) -> Result<Option<SessionMessageEntry>, Error> {
         self.harness.finish_session_branch_summary(plan, summary)
+    }
+
+    pub fn finish_session_branch_summary_with_decision(
+        &mut self,
+        plan: SessionBranchSummaryPlan,
+        generated: Option<String>,
+        decision: pi_rs_core::TreeDecision,
+    ) -> Result<Option<SessionMessageEntry>, Error> {
+        self.harness
+            .finish_session_branch_summary_with_decision(plan, generated, decision)
     }
 
     pub fn active_branch_summaries(
