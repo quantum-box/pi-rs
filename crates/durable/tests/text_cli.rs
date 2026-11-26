@@ -687,6 +687,30 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
     assert!(*turn_index > end.max(failed));
     let results = turn["toolResults"].as_array().unwrap();
     assert_eq!(results.len(), 2);
+    for execution_end in [end, failed] {
+        let call = &events[execution_end]["toolCallId"];
+        let result = results
+            .iter()
+            .find(|result| &result["toolCallId"] == call)
+            .unwrap();
+        let lifecycle: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event["message"]["role"] == "toolResult" && &event["message"]["toolCallId"] == call
+            })
+            .collect();
+        let [(start_index, start_event), (end_index, end_event)] = lifecycle.as_slice() else {
+            panic!("expected one start and one end for {call}: {lifecycle:#?}");
+        };
+        assert!(
+            execution_end < *start_index && *start_index < *end_index && end_index < turn_index
+        );
+        assert_eq!(start_event["type"], "message_start");
+        assert_eq!(end_event["type"], "message_end");
+        assert_eq!(&start_event["message"], result);
+        assert_eq!(&end_event["message"], result);
+    }
     assert!(
         results
             .iter()
