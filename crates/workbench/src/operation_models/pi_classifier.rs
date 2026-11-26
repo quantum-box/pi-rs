@@ -160,13 +160,13 @@ fn has_opaque_credentials(headers: &HeaderMap) -> bool {
     })
 }
 
-pub(super) async fn http_error(
+pub(super) async fn http_error_message(
     mut response: reqwest::Response,
     request_headers: &HeaderMap,
-) -> Error {
+) -> String {
     const MAX_ERROR_BODY: usize = 16 * 1024;
     let status = response.status().as_u16();
-    let fallback = || Error::Model(format!("Pi Decision returned HTTP {status}"));
+    let fallback = || format!("Pi Decision returned HTTP {status}");
     if response
         .content_length()
         .is_some_and(|length| length > MAX_ERROR_BODY as u64)
@@ -206,7 +206,7 @@ pub(super) async fn http_error(
                 | "server_error"
                 | "service_unavailable"
                 | "unauthorized"),
-            ) => Error::Model(format!("Pi Decision returned HTTP {status} ({code})")),
+            ) => format!("Pi Decision returned HTTP {status} ({code})"),
             _ => fallback(),
         };
     }
@@ -232,11 +232,11 @@ pub(super) async fn http_error(
         (!value.is_empty()).then(|| value.trim_end().to_owned())
     };
     match (clean("code", 64), clean("message", 512)) {
-        (Some(code), Some(message)) => Error::Model(format!(
-            "Pi Decision returned HTTP {status} ({code}): {message}"
-        )),
+        (Some(code), Some(message)) => {
+            format!("Pi Decision returned HTTP {status} ({code}): {message}")
+        }
         (Some(detail), None) | (None, Some(detail)) => {
-            Error::Model(format!("Pi Decision returned HTTP {status}: {detail}"))
+            format!("Pi Decision returned HTTP {status}: {detail}")
         }
         (None, None) => fallback(),
     }
@@ -798,24 +798,28 @@ mod tests {
             .clone();
         entry.model.headers.clear();
         let server = tokio::spawn(async move {
-            for (status, body) in [
-                ("429 Too Many Requests", json!({"error":{"message":"retry diagnostic"}}).to_string()),
-                ("400 Bad Request", json!({"error":{
+            for (status, retry_after, body) in [
+                ("429 Too Many Requests", 0, json!({"error":{"message":"retry diagnostic"}}).to_string()),
+                ("400 Bad Request", 0, json!({"error":{
                     "code":"invalid_question", "message":format!("Invalid\nquestion\x1b {} hidden-tail", "a".repeat(600)),
                     "details":{"value":"fixture-decision-key"}
                 }}).to_string()),
-                ("401 Unauthorized", json!({"error":{
+                ("401 Unauthorized", 0, json!({"error":{
                     "code":"echo: Bearer\n fixture-decision-key",
                     "message":"echo: fixture-decision-key"
                 }}).to_string()),
-                ("400 Bad Request", json!({"error":{"message":"x".repeat(17 * 1024)}}).to_string()),
+                ("400 Bad Request", 0, json!({"error":{"message":"x".repeat(17 * 1024)}}).to_string()),
+                ("429 Too Many Requests", 61, json!({"error":{
+                    "code":"rate_limit_exceeded",
+                    "message":"echo: fixture-decision-key"
+                }}).to_string()),
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let (route, headers, _) = request(&mut socket).await;
                 assert_eq!(route, "POST /v1/decision HTTP/1.1\r\n");
                 assert_eq!(headers["authorization"], "Bearer fixture-decision-key");
                 let response = format!(
-                    "HTTP/1.1 {status}\r\nRetry-After-Ms: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nRetry-After: {retry_after}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
@@ -852,6 +856,13 @@ mod tests {
         assert!(
             oversized.ends_with("Pi Decision returned HTTP 400"),
             "{oversized}"
+        );
+        let rejected_delay = terminal_error().await;
+        assert!(
+            rejected_delay.ends_with(
+                "Pi Decision returned HTTP 429 (rate_limit_exceeded): [redacted]. model operation requested a retry delay over 60 seconds"
+            ),
+            "{rejected_delay}"
         );
         server.await.unwrap();
     }

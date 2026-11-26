@@ -2058,7 +2058,9 @@ provider or model `baseUrl`. This API posts the model and classifier context to
 ID. Terminal HTTP errors include bounded diagnostics from the decision error
 envelope with echoed request credentials redacted. With cookies, non-Bearer
 authorization, or sensitive custom headers, diagnostics retain the HTTP status
-and recognized error codes.
+and recognized error codes. When a server requests a retry delay above the
+60-second cap, the terminal error includes the delay rejection and the same
+sanitized HTTP diagnostic.
 Cancellation covers credential loading and the HTTP operation.
 Provider-level `api: "pi-decision"` and profiles
 that only declare operations with a model-level `pi-decision` keep their defaults
