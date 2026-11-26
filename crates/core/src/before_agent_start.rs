@@ -465,6 +465,10 @@ mod tests {
         SettlementIo,
         AllowanceOverrun,
         BudgetUnavailable,
+        RecoveredSummary {
+            id: Uuid,
+            output_tokens: u64,
+        },
         Veto,
     }
 
@@ -545,10 +549,24 @@ mod tests {
 
         async fn record_usage_with_metadata(
             &self,
-            _: Uuid,
+            request_id: Uuid,
             usage: &crate::UsageReport,
             _: &crate::ModelMetadata,
         ) -> Result<()> {
+            if let SummaryOutcome::RecoveredSummary { id, output_tokens } = self.1
+                && request_id == id
+            {
+                assert_eq!(
+                    *usage,
+                    crate::UsageReport::Measured {
+                        usage: crate::Usage {
+                            input_tokens: 24,
+                            output_tokens
+                        },
+                    }
+                );
+                self.0.lock().unwrap().push("settle measured summary");
+            }
             if *usage == crate::UsageReport::Unconfirmed {
                 self.0.lock().unwrap().push("settle unconfirmed summary");
                 if matches!(self.1, SummaryOutcome::SettlementIo) {
@@ -852,9 +870,10 @@ mod tests {
 
     #[tokio::test]
     async fn before_agent_start_distinguishes_unavailable_budget_from_dispatched_overrun() {
-        for summary in [
-            SummaryOutcome::BudgetUnavailable,
-            SummaryOutcome::AllowanceOverrun,
+        for (summary, cancel_on_finish) in [
+            (SummaryOutcome::BudgetUnavailable, false),
+            (SummaryOutcome::AllowanceOverrun, false),
+            (SummaryOutcome::AllowanceOverrun, true),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("session.jsonl");
@@ -869,7 +888,20 @@ mod tests {
                 .unwrap()
                 .open(path)
                 .unwrap();
-            let result = sdk.prompt("new question").await;
+            let controls = sdk.controls();
+            let mut cancelled_after_summary = false;
+            let result = sdk.prompt_with_observer("new question", &mut |event| {
+                if cancel_on_finish
+                    && matches!(event, Notification::Committed(record) if matches!(
+                        record.event, Event::ModelFinished { usage: crate::UsageReport::Measured { usage }, .. }
+                            if usage.output_tokens == 17
+                    ))
+                {
+                    cancelled_after_summary = true;
+                    controls.abort();
+                }
+            }).await;
+            assert_eq!(cancelled_after_summary, cancel_on_finish);
             let seen = trace.0.lock().unwrap();
             if matches!(summary, SummaryOutcome::AllowanceOverrun) {
                 assert!(matches!(result, Err(Error::Budget)), "{result:?}");
@@ -879,6 +911,13 @@ mod tests {
                     record.event, Event::ModelFinished { usage: crate::UsageReport::Measured { usage }, .. }
                         if usage.output_tokens == 17
                 )));
+                assert!(matches!(
+                    journal.records().last().unwrap().event,
+                    Event::Run {
+                        state: RunState::Failed,
+                        ..
+                    }
+                ));
             } else {
                 assert_eq!(result.unwrap(), "answer");
                 assert_eq!(
@@ -891,16 +930,24 @@ mod tests {
 
     #[tokio::test]
     async fn before_agent_start_surfaces_journal_failure_from_failed_compaction_hook() {
-        struct FailingStore(crate::MemoryStore);
+        struct FailingStore {
+            inner: crate::MemoryStore,
+            cancel_on_failure: Option<CancellationToken>,
+        }
         impl crate::SessionStore for FailingStore {
             fn load(&mut self) -> Result<Vec<Record>> {
-                self.0.load()
+                self.inner.load()
             }
             fn append(&mut self, record: &Record) -> Result<()> {
-                if matches!(record.event, Event::CustomMessageQueued { .. }) {
+                if matches!(&record.event, Event::CustomMessageQueued { input }
+                    if input.delivery == CustomMessageDelivery::NextTurn)
+                {
+                    if let Some(cancel) = &self.cancel_on_failure {
+                        cancel.cancel();
+                    }
                     return Err(std::io::Error::other("compaction callback journal failure").into());
                 }
-                self.0.append(record)
+                self.inner.append(record)
             }
         }
 
@@ -930,43 +977,74 @@ mod tests {
             }
         }
 
-        let trace = Arc::new(CompactionTrace(
-            Mutex::default(),
-            SummaryOutcome::ProviderIo,
-        ));
-        let mut registry = Registry::default();
-        registry.register(trace.clone()).unwrap();
-        registry.register(Arc::new(FailureHook)).unwrap();
-        let mut session = Session::with_store(FailingStore(crate::MemoryStore::default())).unwrap();
-        seed_compaction_history(&mut session, false);
-        let agent = Agent {
-            model: trace.as_ref(),
-            model_name: "fixture",
-            registry: &registry,
-            system_prompt: "base prompt",
-            limits: compaction_limits(),
-        };
-        let (_sender, mut inputs) = mpsc::channel::<String>(1);
-        let result = agent
-            .run(
-                &mut session,
-                Some("new question".into()),
-                &mut inputs,
-                &CancellationToken::new(),
-                &mut |_| {},
-            )
-            .await;
-        assert!(
-            matches!(result, Err(Error::Io(error)) if error.to_string() == "compaction callback journal failure")
-        );
-        assert_eq!(
-            *trace.0.lock().unwrap(),
-            [
-                "before compaction",
-                "summary request",
-                "settle unconfirmed summary"
-            ]
-        );
+        for (cancel_during_write, queued_after_turn) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let trace = Arc::new(CompactionTrace(
+                Mutex::default(),
+                SummaryOutcome::ProviderIo,
+            ));
+            let mut registry = Registry::default();
+            registry.register(trace.clone()).unwrap();
+            registry.register(Arc::new(FailureHook)).unwrap();
+            let cancel = CancellationToken::new();
+            let mut session = Session::with_store(FailingStore {
+                inner: crate::MemoryStore::default(),
+                cancel_on_failure: cancel_during_write.then(|| cancel.clone()),
+            })
+            .unwrap();
+            seed_compaction_history(&mut session, false);
+            let queued_id = Uuid::new_v4();
+            if queued_after_turn {
+                crate::agent::queue_custom_message(
+                    &mut session,
+                    crate::QueuedCustomMessage {
+                        id: queued_id,
+                        delivery: CustomMessageDelivery::AfterTurn,
+                        message: message("pending after-turn message"),
+                    },
+                    &mut |_| {},
+                )
+                .unwrap();
+            }
+            let agent = Agent {
+                model: trace.as_ref(),
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "base prompt",
+                limits: compaction_limits(),
+            };
+            let (_sender, mut inputs) = mpsc::channel::<String>(1);
+            let result = agent
+                .run(
+                    &mut session,
+                    Some("new question".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut |_| {},
+                )
+                .await;
+            assert_eq!(cancel.is_cancelled(), cancel_during_write);
+            assert!(
+                matches!(&result, Err(Error::Io(error)) if error.to_string() == "compaction callback journal failure"),
+                "cancel={cancel_during_write}, after-turn queue={queued_after_turn}: {result:?}"
+            );
+            assert_eq!(
+                *trace.0.lock().unwrap(),
+                [
+                    "before compaction",
+                    "summary request",
+                    "settle unconfirmed summary"
+                ]
+            );
+            assert_eq!(
+                session
+                    .queued_custom_messages()
+                    .iter()
+                    .any(|(_, input)| input.id == queued_id),
+                queued_after_turn
+            );
+        }
     }
 
     #[tokio::test]
@@ -1014,6 +1092,46 @@ mod tests {
         );
     }
 
+    fn seed_interrupted_summary(
+        journal: &mut Session,
+        run_id: Uuid,
+        summary_id: Uuid,
+        max_output_tokens: u32,
+    ) -> (u64, u64, u64) {
+        seed_compaction_history(journal, false);
+        journal.set_run_id(Some(run_id));
+        let running = journal
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: Some("new question".into()),
+            })
+            .unwrap()
+            .id;
+        let marker = journal
+            .append(Event::SourceEntry {
+                format: COMPACTION_FORMAT.into(),
+                entry: Value::Null,
+            })
+            .unwrap()
+            .id;
+        let requested = journal
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 2,
+                tools: 0,
+                max_output_tokens,
+                request_id: Some(summary_id),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+                tool_decision: None,
+            })
+            .unwrap()
+            .id;
+        (running, marker, requested)
+    }
+
     #[tokio::test]
     async fn before_agent_start_resume_skips_interrupted_summary_and_starts_original_turn() {
         let directory = tempfile::tempdir().unwrap();
@@ -1022,38 +1140,7 @@ mod tests {
         let summary_id = Uuid::new_v4();
         let (running, marker, requested) = {
             let mut journal = Session::open(&path).unwrap();
-            seed_compaction_history(&mut journal, false);
-            journal.set_run_id(Some(run_id));
-            let running = journal
-                .append(Event::Run {
-                    state: RunState::Running,
-                    initial: Some("new question".into()),
-                })
-                .unwrap()
-                .id;
-            let marker = journal
-                .append(Event::SourceEntry {
-                    format: COMPACTION_FORMAT.into(),
-                    entry: Value::Null,
-                })
-                .unwrap()
-                .id;
-            let requested = journal
-                .append(Event::ModelRequested {
-                    model: "fixture".into(),
-                    messages: 2,
-                    tools: 0,
-                    max_output_tokens: 32,
-                    request_id: Some(summary_id),
-                    context_head: None,
-                    context_sha256: None,
-                    context_transformed: None,
-                    context_configuration_sha256: None,
-                    tool_decision: None,
-                })
-                .unwrap()
-                .id;
-            (running, marker, requested)
+            seed_interrupted_summary(&mut journal, run_id, summary_id, 32)
         };
         let trace = Arc::new(CompactionTrace::default());
         let mut sdk = compaction_builder(&trace)
@@ -1108,6 +1195,76 @@ mod tests {
             content, input_id: Some(id),
         } if *id == run_id && content == "new question"))
         );
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_resume_settles_then_enforces_the_recorded_summary_allowance() {
+        for output_tokens in [8, 9] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            let run_id = Uuid::new_v4();
+            let summary_id = Uuid::new_v4();
+            {
+                let mut journal = Session::open(&path).unwrap();
+                seed_interrupted_summary(&mut journal, run_id, summary_id, 8);
+                journal
+                    .append(Event::ModelFinished {
+                        request_id: summary_id,
+                        metadata: Default::default(),
+                        usage: crate::UsageReport::Measured {
+                            usage: crate::Usage {
+                                input_tokens: 24,
+                                output_tokens,
+                            },
+                        },
+                        failure: None,
+                        partial: String::new(),
+                        reply: None,
+                    })
+                    .unwrap();
+            }
+            let trace = Arc::new(CompactionTrace(
+                Mutex::default(),
+                SummaryOutcome::RecoveredSummary {
+                    id: summary_id,
+                    output_tokens,
+                },
+            ));
+            let mut sdk = compaction_builder(&trace)
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+            assert_eq!(
+                sdk.journal().unwrap().pending_before_agent_start_run(),
+                Some(run_id)
+            );
+            let result = sdk.resume().await;
+            let journal = sdk.journal().unwrap();
+            assert_eq!(journal.pending_before_agent_start_run(), None);
+            let seen = trace.0.lock().unwrap();
+            if output_tokens > 8 {
+                assert!(matches!(result, Err(Error::Budget)), "{result:?}");
+                assert_eq!(*seen, ["settle measured summary"]);
+                assert!(matches!(
+                    journal.records().last().unwrap().event,
+                    Event::Run {
+                        state: RunState::Failed,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(result.unwrap(), "answer");
+                assert_eq!(
+                    *seen,
+                    [
+                        "settle measured summary",
+                        "before_agent_start",
+                        "turn request"
+                    ]
+                );
+            }
+        }
     }
 
     #[tokio::test]

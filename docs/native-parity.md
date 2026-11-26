@@ -5623,10 +5623,11 @@ also stop it. Cancelling preflight or the native agent-start hook stops the run
 before RPC emits `agent_start`. RPC reports a started prompt after compaction
 and the startup hooks complete,
 following [Pi's pinned run startup](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L1958-L1984).
-If a run is
-interrupted during pre-start compaction, recovery settles the original summary
-request when one was recorded, skips the interrupted attempt, and resumes
-preflight on the same run. A committed compaction is retained on resume. An
+If a run is interrupted during pre-start compaction, recovery settles the
+recorded summary request first and checks measured output against the request's
+recorded allowance. A confirmed overrun fails the run. Otherwise, recovery
+skips the interrupted attempt and resumes preflight on the same run. A
+committed compaction is retained on resume. An
 explicit resume with the same run ID requires the branch that contains its
 preflight checkpoints, including any summary request and result.
 

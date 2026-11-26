@@ -1036,9 +1036,9 @@ impl Agent<'_> {
             .extensions
             .iter()
             .any(|ext| ext.handles_agent_before_settle());
-        if cfg!(not(target_family = "wasm")) && recovered.is_none() {
-            Box::pin(self.settle_interrupted_prestart_compaction(session, run_id)).await?;
-        }
+        let recovered_summary_overrun = cfg!(not(target_family = "wasm"))
+            && recovered.is_none()
+            && Box::pin(self.settle_interrupted_prestart_compaction(session, run_id)).await?;
         let branch = session.branch();
         let accepted = branch.iter().any(
             |record| matches!(record.event, Event::User { input_id: Some(id), .. } | Event::UserWithImages { input_id: Some(id), .. } if id == run_id),
@@ -1063,9 +1063,12 @@ impl Agent<'_> {
             },
             observer,
         )?;
-        let mut prior_result = self
-            .resolve_prior_turn_end(session, run_id, cancel, observer)
-            .await;
+        let mut prior_result = if recovered_summary_overrun {
+            Err(Error::Budget)
+        } else {
+            self.resolve_prior_turn_end(session, run_id, cancel, observer)
+                .await
+        };
         session.set_run_id(Some(run_id));
         if prior_result.is_ok() && recovered.is_none() {
             prior_result = crate::before_agent_start::prepare(
@@ -1198,8 +1201,11 @@ impl Agent<'_> {
                 result = Err(error);
             }
             let settled = ensure_settled(session.operations()).is_ok();
-            if settled {
-                apply_settled_after_turn(session, observer)?;
+            if settled
+                && let Err(error) = apply_settled_after_turn(session, observer)
+                && !preflight_failed
+            {
+                return Err(error);
             }
             let mut ended = false;
             if boundary
@@ -2853,11 +2859,12 @@ impl Agent<'_> {
         Err(Error::Budget)
     }
 
+    /// Settle the recorded summary request and report a confirmed allowance overrun.
     async fn settle_interrupted_prestart_compaction(
         &self,
         session: &mut Session,
         run_id: Uuid,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let branch = session.branch();
         // A checkout can rewind context, but it cannot undo a summary dispatch.
         if crate::before_agent_start::compaction_on_another_branch(session, &branch, run_id) {
@@ -2872,12 +2879,16 @@ impl Agent<'_> {
             // earlier, settle the original request and skip the ambiguous work.
             if !following.iter().any(|record| {
                 record.run_id == Some(run_id) && matches!(record.event, Event::Compacted { .. })
-            }) && let Some(id) = following.iter().find_map(|record| match record.event {
-                Event::ModelRequested { request_id, .. } if record.run_id == Some(run_id) => {
-                    request_id
-                }
-                _ => None,
-            }) {
+            }) && let Some((id, allowance)) =
+                following.iter().find_map(|record| match record.event {
+                    Event::ModelRequested {
+                        request_id: Some(id),
+                        max_output_tokens,
+                        ..
+                    } if record.run_id == Some(run_id) => Some((id, max_output_tokens)),
+                    _ => None,
+                })
+            {
                 let (usage, metadata) = following
                     .iter()
                     .find_map(|record| match &record.event {
@@ -2891,9 +2902,11 @@ impl Agent<'_> {
                     })
                     .unwrap_or((UsageReport::Unconfirmed, ModelMetadata::default()));
                 self.settle_usage(id, &usage, &metadata).await?;
+                return Ok(matches!(usage, UsageReport::Measured { usage }
+                    if usage.output_tokens > u64::from(allowance)));
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) async fn compact_before_start<T: Into<AgentInput> + Send>(
@@ -2998,35 +3011,33 @@ impl Agent<'_> {
             },
             observer,
         )?;
-        let summary = self
-            .summarize_prefix(
-                session,
-                &states,
-                SummaryScope {
-                    prestart: Some(PrestartSummary {
-                        history_before,
-                        tokens_before,
-                    }),
-                    retention,
-                    instructions: None,
-                    output_limit: if model_summary_available {
-                        summary_budget
-                    } else {
-                        0
-                    },
-                    cancellation: cancel,
-                    reason: crate::CompactionTrigger::Threshold,
-                    will_retry: false,
-                    skip_without_model: !model_summary_available,
+        self.summarize_prefix(
+            session,
+            &states,
+            SummaryScope {
+                prestart: Some(PrestartSummary {
+                    history_before,
+                    tokens_before,
+                }),
+                retention,
+                instructions: None,
+                output_limit: if model_summary_available {
+                    summary_budget
+                } else {
+                    0
                 },
-                observer,
-                Some(followups),
-            )
-            .await;
+                cancellation: cancel,
+                reason: crate::CompactionTrigger::Threshold,
+                will_retry: false,
+                skip_without_model: !model_summary_available,
+            },
+            observer,
+            Some(followups),
+        )
+        .await?;
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        summary?;
         Ok(true)
     }
 
