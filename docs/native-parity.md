@@ -1885,8 +1885,19 @@ and shut down cleanly. Fullscreen and regular-mode PTY regression checks pass.
 git and local packages. Builds are cached, serialized per source and validated
 before settings change. User and trusted-project declarations support resource
 filters. Packaged extensions, skills, prompts and themes load through the
-normal terminal/CLI/RPC resource paths. TypeScript/npm runtime compatibility is
-outside the requested native Rust equivalence.
+normal terminal/CLI/RPC resource paths.
+
+Upstream Pi uses the `npmCommand` argv array for npm package lookup and
+installation. Native package management uses Cargo and Git for native builds
+and checks executable extensions against the native protocol. Native settings
+edits preserve `npmCommand` as an unknown key, and package operations ignore
+it in user and project settings. A configured `npm:` source in an active
+settings scope makes native `list`, `update`, and package discovery report an
+unsupported-source error. SDK resource snapshots read local files and
+directories granted by the host.
+The host acquires any package resources before granting those paths.
+[Pinned Pi settings schema](https://github.com/earendil-works/pi/blob/524f015b3c951abc4b853ffe4ebd879a9aedd43f/packages/coding-agent/src/core/settings-schema.ts#L301-L305)
+
 Local package theme manifests are read again when resources are resolved, so
 packages indexed by older versions gain their declared themes without a build.
 An explicit Pi `package.json` resource list contributes themes only and prevents
