@@ -1,8 +1,11 @@
 //! Versioned release notices for the native terminal.
+use std::collections::HashSet;
 use std::path::Path;
 
 use pi_rs::Result;
 use serde_json::json;
+
+use super::packages::ExtensionPackage;
 
 pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUNDLED: &str = include_str!("../../../CHANGELOG.md");
@@ -11,6 +14,8 @@ const BUNDLED: &str = include_str!("../../../CHANGELOG.md");
 pub(crate) enum Notice {
     Full(String),
     Condensed(String),
+    ExtensionsFull(String),
+    ExtensionsCondensed(Vec<String>),
 }
 
 type Version = (u64, u64, u64);
@@ -95,6 +100,90 @@ pub(super) fn startup(path: &Path, collapsed: bool) -> Result<Option<Notice>> {
     Ok(notice)
 }
 
+fn saved_package_version(state: &serde_json::Value, key: &str) -> Option<Version> {
+    state["packages"][key].as_str().and_then(version)
+}
+
+pub(super) fn startup_extensions(
+    path: &Path,
+    packages: &[ExtensionPackage],
+    collapsed: bool,
+) -> Result<Option<Notice>> {
+    if packages.is_empty() {
+        return Ok(None);
+    }
+    let saved = super::config::read_object(path)?;
+    let mut seen = HashSet::new();
+    let pending = packages
+        .iter()
+        .filter_map(|package| {
+            let current = version(&package.version)?;
+            if saved_package_version(&saved, &package.key) >= Some(current)
+                || !seen.insert(&package.key)
+            {
+                return None;
+            }
+            let (name, notes) = package.changelog()?;
+            Some((package, current, name, notes))
+        })
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(None);
+    }
+
+    let mut updates = Vec::new();
+    super::config::update_object(path, |state| {
+        let versions = state.entry("packages").or_insert_with(|| json!({}));
+        if !versions.is_object() {
+            *versions = json!({});
+        }
+        for (package, current, name, notes) in pending {
+            let previous = versions[&package.key].as_str().and_then(version);
+            if previous >= Some(current) {
+                continue;
+            }
+            if let Some(previous) = previous {
+                let mut newer = entries(&notes)
+                    .filter(|(entry, _)| previous < *entry && *entry <= current)
+                    .peekable();
+                if newer.peek().is_none() {
+                    continue;
+                }
+                let update = if collapsed {
+                    let label = package.version.trim();
+                    let label = label.strip_prefix('v').unwrap_or(label);
+                    format!("Updated {name} to v{label}.")
+                } else {
+                    let mut escaped = String::new();
+                    for ch in name.chars() {
+                        if matches!(
+                            ch,
+                            '\\' | '*' | '_' | '[' | ']' | '`' | '<' | '>' | '&' | '~' | '!'
+                        ) {
+                            escaped.push('\\');
+                        }
+                        escaped.push(ch);
+                    }
+                    newer
+                        .map(|(_, entry)| format!("## {escaped} {entry}"))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                };
+                updates.push(update);
+            }
+            versions[&package.key] = json!(package.version);
+        }
+        Ok(())
+    })?;
+    Ok(if updates.is_empty() {
+        None
+    } else if collapsed {
+        Some(Notice::ExtensionsCondensed(updates))
+    } else {
+        Some(Notice::ExtensionsFull(updates.join("\n\n")))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +221,75 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn extension_updates_use_installed_versions_and_independent_baselines() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("pi-rs-changelog.json");
+        std::fs::write(&path, r#"{"version":"0.1.0"}"#).unwrap();
+        let root = home.path().join("package");
+        std::fs::create_dir(&root).unwrap();
+        let mut package = ExtensionPackage {
+            key: "extension-a".into(),
+            root,
+            source: "fixture".into(),
+            version: "1.9.0".into(),
+        };
+        let changelog = package.root.join("CHANGELOG.md");
+        std::fs::write(
+            &changelog,
+            "## Unreleased\nDraft\n## 2.0.0\nFuture\n## [1.10.0]\nNew\n## 1.9.1\nPatch\n## 1.9.0\nOld",
+        )
+        .unwrap();
+
+        assert!(
+            startup_extensions(&path, std::slice::from_ref(&package), false)
+                .unwrap()
+                .is_none()
+        );
+        package.version = "1.10.0-beta".into();
+        let mut other = package.clone();
+        other.key = "extension-b".into();
+
+        let Some(Notice::ExtensionsFull(notes)) =
+            startup_extensions(&path, &[package.clone(), package.clone(), other], false).unwrap()
+        else {
+            panic!("expected extension release notes");
+        };
+        assert_eq!(notes, "## fixture [1.10.0]\nNew\n\n## fixture 1.9.1\nPatch");
+        package.version = "1.10.0".into();
+        assert!(
+            startup_extensions(&path, std::slice::from_ref(&package), false)
+                .unwrap()
+                .is_none()
+        );
+
+        package.version = "2.0.0".into();
+        std::fs::remove_file(&changelog).unwrap();
+        assert!(
+            startup_extensions(&path, std::slice::from_ref(&package), true)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(&changelog, "## 2.0.0\nFuture").unwrap();
+        let Some(Notice::ExtensionsCondensed(lines)) =
+            startup_extensions(&path, std::slice::from_ref(&package), true).unwrap()
+        else {
+            panic!("expected condensed extension notes");
+        };
+        assert_eq!(lines, ["Updated fixture to v2.0.0."]);
+        package.version = "1.9.0".into();
+        assert!(
+            startup_extensions(&path, std::slice::from_ref(&package), false)
+                .unwrap()
+                .is_none()
+        );
+        let state = super::super::config::read_object(&path).unwrap();
+        assert_eq!(
+            state,
+            json!({"version":"0.1.0","packages":{"extension-a":"2.0.0","extension-b":"1.10.0-beta"}}),
+        );
     }
 
     #[test]

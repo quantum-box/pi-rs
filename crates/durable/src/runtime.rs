@@ -104,6 +104,8 @@ pub enum Error {
     #[error("reentrant conversation abort")]
     ReentrantAbort,
     #[error("invalid operation: {0}")]
+    CheckpointableSelectionChanged(String),
+    #[error("invalid operation: {0}")]
     Invalid(String),
 }
 
@@ -5608,7 +5610,7 @@ impl Harness {
             {
                 Ok(())
             }
-            _ => Err(Error::Invalid(
+            _ => Err(Error::CheckpointableSelectionChanged(
                 "checkpointable extension selection missing or changed".into(),
             )),
         }

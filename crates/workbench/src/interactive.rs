@@ -4,6 +4,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::config::NoticeKind;
 use crate::ui::{
     editor::Editor,
     images::{self, Cleanup, InlineImage, Renderer},
@@ -39,6 +40,13 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{Cli, Provider, TuiMode, changelog, process::Worker, radius_auth, sessions};
 
+fn plain_notice_text(text: &str) -> String {
+    // Keep U+0085 for transcript search. Span rendering strips it from terminal output.
+    text.chars()
+        .filter(|character| !character.is_control() || matches!(*character, '\n' | '\t' | '\u{85}'))
+        .collect()
+}
+
 // Shell output is displayed separately from the model-facing context framing.
 fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
     // Finish stripping the untrusted output before adding host-generated
@@ -57,14 +65,6 @@ fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
             output.push('\n');
         }
         output.push_str(&status);
-    }
-    if execution.truncated
-        && let Some(path) = &execution.full_output_path
-    {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str(&format!("Output truncated. Full output: {path}"));
     }
     output
 }
@@ -1316,7 +1316,7 @@ struct View {
     theme_settings: Option<ThemeSettings>,
     theme_refresh_requested: bool,
     thinking_settings: Option<ThinkingSettings>,
-    warning_settings_parent: Option<Picker>,
+    toggle_settings_parent: Option<Picker>,
     anthropic_subscription_warning_shown: bool,
     pending_thinking: Option<PendingThinking>,
     session_name: Option<String>,
@@ -1900,15 +1900,7 @@ impl View {
         true
     }
     fn append(&mut self, text: &str) {
-        // Keep U+0085 for transcript search only. Span rendering strips it
-        // before terminal output, as it does for other control characters.
-        let text = text
-            .chars()
-            .filter(|character| {
-                !character.is_control() || matches!(*character, '\n' | '\t' | '\u{85}')
-            })
-            .collect();
-        self.append_entry(Entry::Notice(text));
+        self.append_entry(Entry::Notice(plain_notice_text(text)));
     }
     fn show_status(&mut self, mode: Option<TuiMode>, status: String) {
         if (mode != Some(TuiMode::Regular) || self.regular.committed < self.lines.len())
@@ -2699,17 +2691,22 @@ impl View {
     }
 
     fn observe_cache(&mut self, record: &pi_rs::Record, args: &Cli) {
-        if let Some(notice) = self.cache_stats.observe(record, &args.model_profiles)
-            && args.settings.boolean("showCacheMissNotices") == Some(true)
-        {
-            if matches!(
-                record.event,
-                pi_rs::Event::SourceEntry { .. } | pi_rs::Event::CacheWarm { .. }
-            ) {
-                self.append(&notice);
-            } else {
-                self.lines.push(Entry::Warning(notice));
-            }
+        let Some(text) = self.cache_stats.observe(record, &args.model_profiles) else {
+            return;
+        };
+        if matches!(
+            record.event,
+            pi_rs::Event::SourceEntry { .. } | pi_rs::Event::CacheWarm { .. }
+        ) {
+            self.append_entry(Entry::TranscriptNotice {
+                kind: NoticeKind::CacheWarming,
+                text: plain_notice_text(&text),
+            });
+        } else {
+            self.lines.push(Entry::TranscriptNotice {
+                kind: NoticeKind::CacheMisses,
+                text,
+            });
         }
     }
 
@@ -2823,15 +2820,7 @@ impl View {
         }
     }
 
-    fn show_summary_billing(
-        &mut self,
-        record: &pi_rs::Record,
-        records: &[pi_rs::Record],
-        args: &Cli,
-    ) {
-        if args.settings.boolean("showCacheMissNotices") != Some(true) {
-            return;
-        }
+    fn show_summary_billing(&mut self, record: &pi_rs::Record, records: &[pi_rs::Record]) {
         let Some((usage, metadata)) = record.summary_usage(records) else {
             return;
         };
@@ -2848,9 +2837,10 @@ impl View {
             .and_then(|number| number.as_f64())
             .filter(|cost| *cost >= 0.01)
             .map_or_else(String::new, |cost| format!(" (~${cost:.2})"));
-        self.lines.push(Entry::Warning(format!(
-            "{label}: {tokens} tokens billed{cost}"
-        )));
+        self.lines.push(Entry::TranscriptNotice {
+            kind: NoticeKind::CompactionCosts,
+            text: format!("{label}: {tokens} tokens billed{cost}"),
+        });
     }
 
     fn request_queue_restore(&mut self, worker: &mut Option<Worker>, args: &Cli, report: bool) {
@@ -3119,19 +3109,20 @@ impl View {
                 self.cache_stats.select_provider(args.provider.id());
             }
             self.add_summary(&record, None);
-            self.show_summary_billing(&record, &[], args);
+            self.show_summary_billing(&record, &[]);
             self.observe_cache(&record, args);
             if let Some(count) = self.observe_thinking_drop(&record.event)
-                && args.settings.boolean("showCacheMissNotices") == Some(true)
+                && args.settings.notices().shows(NoticeKind::ReasoningDrops)
             {
                 let noun = if count == 1 {
                     "thinking block"
                 } else {
                     "thinking blocks"
                 };
-                self.lines.push(Entry::Warning(format!(
-                    "Anthropic dropped {count} {noun} (details in session)"
-                )));
+                self.lines.push(Entry::TranscriptNotice {
+                    kind: NoticeKind::ReasoningDrops,
+                    text: format!("Anthropic dropped {count} {noun} (details in session)"),
+                });
             }
         }
     }
@@ -3284,7 +3275,7 @@ impl View {
                         render_call_id: None,
                         rendered: None,
                     });
-                    self.finish_tool(&id, &outcome);
+                    self.finish_tool(&id, &outcome, None);
                 }
                 pi_rs::Event::BashExecution { execution } => {
                     self.lines.push(Entry::Tool {
@@ -3301,7 +3292,11 @@ impl View {
                         failed: execution.cancelled
                             || execution.exit_code.is_some_and(|code| code != 0),
                         finished: true,
-                        parts: Vec::new(),
+                        parts: execution
+                            .truncation_note()
+                            .map(ToolPart::TruncationNotice)
+                            .into_iter()
+                            .collect(),
                         numbered_diff: false,
                         render_records: None,
                         render_call_id: None,
@@ -3377,12 +3372,12 @@ impl View {
                     outcome,
                 } => {
                     self.track_tool_render(&operation_id.to_string(), record.id, false);
-                    self.finish_tool(&operation_id.to_string(), outcome);
+                    self.finish_tool(&operation_id.to_string(), outcome, None);
                 }
                 _ => {}
             }
             self.add_summary(record, Some(session));
-            self.show_summary_billing(record, records, args);
+            self.show_summary_billing(record, records);
             self.observe_cache(record, args);
             self.observe_thinking_drop(&record.event);
         }
@@ -3444,7 +3439,12 @@ impl View {
             rendered: None,
         });
     }
-    fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
+    fn finish_tool(
+        &mut self,
+        operation: &str,
+        outcome: &pi_rs::Outcome,
+        truncation_notice: Option<String>,
+    ) {
         if self.model_operations.remove(operation) {
             if let Some(usage) = pi_rs_extensions::codemode::ModelUsage::from_outcome(outcome) {
                 self.tokens = self.tokens.saturating_add(usage.total_tokens);
@@ -3480,6 +3480,7 @@ impl View {
                     "[{model} does not support images; it saw a placeholder instead]"
                 )));
             }
+            rendered_parts.extend(truncation_notice.map(ToolPart::TruncationNotice));
             *parts = rendered_parts;
             let diff = match outcome {
                 pi_rs::Outcome::SucceededWithDetails { details, .. }
@@ -3595,12 +3596,21 @@ render_call_id: None,
             }
             Some("bash_execution_end") => {
                 self.shell_running = false;
-                let outcome = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
-                    Ok(execution) if !execution.cancelled && execution.exit_code.is_none_or(|code| code == 0) => pi_rs::Outcome::Succeeded(shell_display_output(&execution)),
-                    Ok(execution) => pi_rs::Outcome::TextResult { output: shell_display_output(&execution), details: None, is_error: true },
-                    Err(_) => pi_rs::Outcome::Failed(value["error"].as_str().unwrap_or("Shell execution failed").into()),
+                let (outcome, note) = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
+                    Ok(execution) => (
+                        pi_rs::Outcome::TextResult {
+                            output: shell_display_output(&execution),
+                            details: None,
+                            is_error: execution.cancelled || execution.exit_code.is_some_and(|code| code != 0),
+                        },
+                        execution.truncation_note(),
+                    ),
+                    Err(_) => (
+                        pi_rs::Outcome::Failed(value["error"].as_str().unwrap_or("Shell execution failed").into()),
+                        None,
+                    ),
                 };
-                self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome);
+                self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome, note);
             }
             Some("auto_retry_start") => {
                 self.phase = Some("再試行待ち");
@@ -3787,6 +3797,7 @@ render_call_id: None,
                             self.finish_tool(
                                 event["operation_id"].as_str().unwrap_or_default(),
                                 &outcome,
+                                None,
                             );
                         }
                     }
@@ -4405,6 +4416,7 @@ render_call_id: None,
     fn base_transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'static> {
         TranscriptOptions {
             hidden_thinking_label: None,
+            notices: args.settings.notices(),
             image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
                 .then(|| args.settings.terminal_image_width()),
             padding: args.settings.output_padding(),
@@ -5950,18 +5962,21 @@ pub(super) async fn run(
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
         ..View::default()
     };
-    {
+    let changelog_path = super::config::agent_dir().join("pi-rs-changelog.json");
+    let mut extension_changelog_session = {
         let session = Session::open(&args.session)?;
         view.restore_session(&args, &session)?;
-        if session.current_messages().is_empty()
+        let empty = session.current_messages().is_empty();
+        if empty
             && let Ok(Some(notice)) = changelog::startup(
-                &super::config::agent_dir().join("pi-rs-changelog.json"),
+                &changelog_path,
                 args.settings.boolean("collapseChangelog").unwrap_or(false),
             )
         {
             view.append_entry(Entry::Changelog(notice));
         }
-    }
+        empty.then(|| args.session.clone())
+    };
     view.resources = initial_resources;
     if args.trust_pending {
         slash("/trust", &mut args, &mut view, None)?;
@@ -6347,8 +6362,19 @@ pub(super) async fn run(
                 view.request_started = Some(Instant::now());
             }
             let events: Vec<_> = active.drain_events();
-            for value in events {
+            for mut value in events {
                 if value["type"] == "backend_ready" {
+                    if extension_changelog_session.take().as_ref() == Some(&args.session)
+                        && let Ok(packages) =
+                            serde_json::from_value::<Vec<_>>(value["extension_packages"].take())
+                        && let Ok(Some(notice)) = changelog::startup_extensions(
+                            &changelog_path,
+                            &packages,
+                            args.settings.boolean("collapseChangelog").unwrap_or(false),
+                        )
+                    {
+                        view.append_entry(Entry::Changelog(notice));
+                    }
                     active.message_renderer_types =
                         serde_json::from_value(value["custom_message_renderers"].clone())
                             .unwrap_or_default();
@@ -7302,8 +7328,8 @@ pub(super) async fn run(
                             view.picker = Some(picker);
                         }
                         Input::Cancel => {
-                            if picker.title == "Warnings"
-                                && let Some(mut parent) = view.warning_settings_parent.take()
+                            if picker.is_toggle_settings_submenu()
+                                && let Some(mut parent) = view.toggle_settings_parent.take()
                             {
                                 parent.refresh_settings(settings_items(
                                     &args,
@@ -7452,11 +7478,17 @@ pub(super) async fn run(
                                     if range.start == 0 && view.editor.text.starts_with('/'));
                             let settings = picker.title == "Settings";
                             if settings
-                                && matches!(&selection, Selection::EditSetting(name) if name == "warnings")
+                                && let Selection::EditSetting(name) = &selection
+                                && matches!(name.as_str(), "warnings" | "notices")
                             {
-                                view.warning_settings_parent = Some(picker);
+                                let title = if name == "warnings" {
+                                    "Warnings"
+                                } else {
+                                    "Notices"
+                                };
+                                view.toggle_settings_parent = Some(picker);
                                 view.picker =
-                                    Some(Picker::new("Warnings", warning_settings_items(&args)));
+                                    Some(Picker::new(title, toggle_settings_items(&args, title)));
                                 continue;
                             }
                             if settings
@@ -7689,11 +7721,11 @@ pub(super) async fn run(
                             }
                             let result =
                                 select(selection, &mut args, &mut view, &mut theme, &mut worker);
-                            if settings || picker.title == "Warnings" {
+                            if settings || picker.is_toggle_settings_submenu() {
                                 let items = if settings {
                                     settings_items(&args, &view, worker.as_ref())
                                 } else {
-                                    warning_settings_items(&args)
+                                    toggle_settings_items(&args, &picker.title)
                                 };
                                 picker.refresh_settings(items);
                                 if let Err(error) = result {
@@ -9512,12 +9544,30 @@ fn start_thinking_levels(
     Ok(receiver)
 }
 
-fn warning_settings_items(args: &Cli) -> Vec<Item> {
-    let enabled = args.settings.warn_anthropic_extra_usage();
-    vec![Item {
-        label: format!("Anthropic extra usage · {enabled}"),
-        selection: Selection::Setting("warnings.anthropicExtraUsage".into(), json!(!enabled)),
-    }]
+fn toggle_settings_items(args: &Cli, title: &str) -> Vec<Item> {
+    if title == "Warnings" {
+        let enabled = args.settings.warn_anthropic_extra_usage();
+        return vec![Item {
+            label: format!("Anthropic extra usage · {enabled}"),
+            selection: Selection::Setting("warnings.anthropicExtraUsage".into(), json!(!enabled)),
+        }];
+    }
+    let notices = args.settings.notices();
+    [
+        (NoticeKind::CacheMisses, "Cache misses"),
+        (NoticeKind::CacheWarming, "Cache warming"),
+        (NoticeKind::CompactionCosts, "Compaction costs"),
+        (NoticeKind::ReasoningDrops, "Reasoning drops"),
+    ]
+    .into_iter()
+    .map(|(kind, label)| {
+        let enabled = notices.shows(kind);
+        Item {
+            label: format!("{label} · {enabled}"),
+            selection: Selection::Setting(format!("notices.{}", kind.key()), json!(!enabled)),
+        }
+    })
+    .collect()
 }
 
 fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item> {
@@ -9766,20 +9816,6 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         },
         Item {
             label: format!(
-                "Cache miss notices · {}",
-                if args.settings.boolean("showCacheMissNotices") == Some(true) {
-                    "true"
-                } else {
-                    "false"
-                }
-            ),
-            selection: Selection::Setting(
-                "showCacheMissNotices".into(),
-                json!(args.settings.boolean("showCacheMissNotices") != Some(true)),
-            ),
-        },
-        Item {
-            label: format!(
                 "Collapse changelog · {}",
                 args.settings.boolean("collapseChangelog").unwrap_or(false)
             ),
@@ -9831,6 +9867,10 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         Item {
             label: "Warnings · configure".into(),
             selection: Selection::EditSetting("warnings".into()),
+        },
+        Item {
+            label: "Notices · configure".into(),
+            selection: Selection::EditSetting("notices".into()),
         },
         Item {
             label: format!("Default thinking level per model · {thinking_summary}"),
@@ -10247,6 +10287,9 @@ fn select(
             } else if let Some(member) = key.strip_prefix("warnings.") {
                 args.settings
                     .set_user_member("warnings", member, value.clone())?;
+            } else if let Some(member) = key.strip_prefix("notices.") {
+                args.settings
+                    .set_user_member("notices", member, value.clone())?;
             } else if key == "theme" {
                 let next = load_resolved_theme(
                     value
@@ -11343,6 +11386,131 @@ mod tests {
     }
 
     #[test]
+    fn transcript_notice_settings_render_each_kind_independently() {
+        use super::*;
+        use clap::Parser;
+        use pi_rs::{AssistantDiagnostic, ModelMetadata, Usage, UsageReport};
+
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("settings.json");
+        let mut args = Cli::parse_from(["pi", "--offline"]);
+        std::fs::write(&user, r#"{"showCacheMissNotices":true}"#).unwrap();
+        args.settings =
+            crate::config::Settings::load_from_paths(directory.path(), false, &user).unwrap();
+        let mut view = View::default();
+        let usage = Usage {
+            input_tokens: 25_000,
+            output_tokens: 1,
+        };
+        let request_id = uuid::Uuid::nil();
+        let records = [
+            pi_rs::Event::CacheWarm {
+                metadata: ModelMetadata::default(),
+                usage,
+                note: Some("fixture warm".into()),
+            },
+            pi_rs::Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    diagnostics: AssistantDiagnostic::from_pi_diagnostics(&json!([{
+                        "type":"anthropic_input_transformations", "timestamp":0,
+                        "details":{"transformations":[{"type":"thinking_dropped"}]}
+                    }])),
+                    ..ModelMetadata::default()
+                },
+                usage: UsageReport::Measured { usage },
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            },
+            pi_rs::Event::Assistant {
+                content: "fixture response".into(),
+                invocations: vec![],
+                usage: Some(usage),
+                request_id: Some(request_id),
+            },
+            pi_rs::Event::Compacted {
+                summary: "fixture summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: Some(25_000),
+                states: Default::default(),
+                usage: Some(Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                }),
+                usage_metadata: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| pi_rs::Record {
+            version: 1,
+            id: (index + 1) as u64,
+            parent: Some(index as u64),
+            event,
+            timestamp: None,
+            run_id: None,
+        });
+        for record in records {
+            view.receive_worker(json!({"type":"record","record":record}), &mut args);
+        }
+        let imported = pi_rs::Record {
+            version: 1,
+            id: 5,
+            parent: Some(4),
+            timestamp: None,
+            run_id: None,
+            event: pi_rs::Event::SourceEntry {
+                format: "pi".into(),
+                entry: json!({"type":"usage", "kind":"cache_warm", "note":"imported warm", "usage":{"input":2}}),
+            },
+        };
+        view.observe_cache(&imported, &args);
+
+        let cases = [
+            (NoticeKind::CacheMisses, "25k tokens re-billed"),
+            (NoticeKind::CacheWarming, "fixture warm"),
+            (NoticeKind::CacheWarming, "imported warm"),
+            (NoticeKind::CompactionCosts, "Compaction: 12 tokens billed"),
+            (
+                NoticeKind::ReasoningDrops,
+                "Anthropic dropped 1 thinking block",
+            ),
+        ];
+        let theme = Theme::system();
+        for enabled in [
+            None,
+            Some(NoticeKind::CacheMisses),
+            Some(NoticeKind::CacheWarming),
+            Some(NoticeKind::CompactionCosts),
+            Some(NoticeKind::ReasoningDrops),
+        ] {
+            let notices = enabled.map_or_else(|| json!({}), |kind| json!({(kind.key()):true}));
+            std::fs::write(&user, json!({"notices":notices}).to_string()).unwrap();
+            args.settings =
+                crate::config::Settings::load_from_paths(directory.path(), false, &user).unwrap();
+            let options = view.base_transcript_options(&args, false);
+            let transcript = view
+                .lines
+                .iter()
+                .flat_map(|entry| entry.render(&theme, 100, true, true, options))
+                .flat_map(|line| line.spans)
+                .map(|span| span.text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            for (kind, text) in cases {
+                assert_eq!(
+                    transcript.contains(text),
+                    enabled == Some(kind),
+                    "{text}: {transcript}"
+                );
+            }
+        }
+        assert_eq!(view.cache_stats.missed_tokens, 25_000);
+    }
+
+    #[test]
     fn subscription_warning_respects_settings_and_only_appears_once() {
         use clap::Parser;
 
@@ -12097,6 +12265,7 @@ mod tests {
                 data: json!({"content":[{"type":"text", "text":"Read image file [image/png]"}]}),
                 details: json!({"imageUnsupportedByModel":"text-only"}),
             },
+            None,
         );
         let theme = Theme::system();
         let entry = view.lines.last().unwrap();
@@ -13744,11 +13913,7 @@ exit {exit}
             shells,
             [
                 ("bash", "hi\n", false),
-                (
-                    "bash (excluded)",
-                    "bad\n(exit 1)\nOutput truncated. Full output: /tmp/output",
-                    true
-                ),
+                ("bash (excluded)", "bad\n(exit 1)", true),
                 ("bash", "(cancelled)", true)
             ]
         );
@@ -13767,6 +13932,7 @@ exit {exit}
             .flat_map(|line| line.spans.into_iter().map(|span| span.text))
             .collect::<String>();
         assert!(rendered.contains("echo hi") && rendered.contains("hi"));
+        assert!(rendered.contains("Output truncated. Full output: /tmp/output"));
         assert!(!rendered.contains("Ran `") && !rendered.contains("```"));
         let original = imported
             .records()
@@ -13793,6 +13959,30 @@ exit {exit}
         assert!(
             matches!(view.lines.last(), Some(Entry::Tool { output, failed: true, finished: true, .. }) if output == "bad\n(exit 1)")
         );
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"truncated","command":"echo long"}),
+        );
+        let output = format!("{}final shell line", "preview line\n".repeat(12));
+        view.receive(&json!({"type":"bash_execution_end","executionId":"truncated","data":{"command":"echo long","output":output,"exitCode":0,"cancelled":false,"truncated":true}}));
+        for expanded in [false, true] {
+            let rendered = view
+                .lines
+                .last()
+                .unwrap()
+                .render(
+                    &Theme::system(),
+                    100,
+                    expanded,
+                    true,
+                    TranscriptOptions::default(),
+                )
+                .into_iter()
+                .flat_map(|row| row.spans.into_iter().map(|span| span.text))
+                .collect::<String>();
+            assert!(rendered.contains("Output truncated"));
+            assert!(rendered.contains("preview line"));
+            assert_eq!(rendered.contains("final shell line"), expanded);
+        }
     }
 
     #[test]
@@ -14613,7 +14803,11 @@ exit {exit}
         );
 
         view.track_tool_render(&operation, 3, false);
-        view.finish_tool(&operation, &pi_rs::Outcome::Succeeded("completed".into()));
+        view.finish_tool(
+            &operation,
+            &pi_rs::Outcome::Succeeded("completed".into()),
+            None,
+        );
         view.receive(&update("late"));
         assert!(view.partial_tool_results.is_empty());
         assert!(matches!(&view.lines[0], super::Entry::Tool {

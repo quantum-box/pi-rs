@@ -479,9 +479,10 @@ with an explicit replay policy. The adapter journals text blocks and `details`
 from `ToolHost::report_progress` before acknowledging the update. The final
 outcome comes from the invoked tool. The opt-in `checkpointable_tool` adapter
 also exposes explicitly registered children through the ordinary ToolHost.
-It admits requests in call order, reattaches by that order on replay, and
-returns each result in the corresponding call position. Rich child results
-use the structured outcome envelope. A timeout or cancellation after
+It assigns each registered call a replay position before waiting to enqueue.
+Cancellation before admission leaves later calls at the same positions, so
+they reconnect to their durable results on replay. Rich child results use
+the structured outcome envelope. A timeout or cancellation after
 admission reports uncertainty. UI and extension state remain unavailable.
 The existing `start_child` method stages the child with
 the parent's transition, including for unsafe checkpointable parents.
