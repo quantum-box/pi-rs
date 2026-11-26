@@ -93,6 +93,15 @@ async fn registry_and_sdk_report_owners_sources_and_active_selection() {
     assert_eq!(info[1].extension_id, "builtin");
     assert!(info[1].extension_source_path.is_none());
     assert!(registry.has_tool("zeta"));
+    for item in &info {
+        assert_eq!(
+            registry.registered_tool(&item.spec.name).as_ref(),
+            Some(item)
+        );
+    }
+    for unknown in ["Zeta", " zeta", "missing", ""] {
+        assert_eq!(registry.registered_tool(unknown), None);
+    }
     assert_eq!(
         registry
             .active_tool_specs()
@@ -109,6 +118,9 @@ async fn registry_and_sdk_report_owners_sources_and_active_selection() {
         .unwrap();
     assert_eq!(session.registered_tool_info(), info);
     assert_eq!(session.tools().len(), 3);
+    assert_eq!(session.registered_tool("alpha").as_ref(), Some(&info[0]));
+    assert_eq!(session.registered_tool("zeta").as_ref(), Some(&info[2]));
+    assert_eq!(session.registered_tool("missing"), None);
 }
 
 #[test]
@@ -138,7 +150,11 @@ fn metadata_tracks_replacement_and_retain_without_stale_owners() {
     );
     assert!(!info[1].active);
     assert!(info[0].active);
+    assert_eq!(registry.registered_tool("old"), None);
+    assert_eq!(registry.registered_tool("new").as_ref(), Some(&info[1]));
     registry.retain_tools(|tool| tool.name == "new");
     assert_eq!(registry.registered_tool_info().len(), 1);
     assert_eq!(registry.registered_tool_info()[0].spec.name, "new");
+    assert_eq!(registry.registered_tool("keep"), None);
+    assert_eq!(registry.registered_tool("new").as_ref(), Some(&info[1]));
 }

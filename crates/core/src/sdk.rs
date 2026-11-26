@@ -1820,6 +1820,14 @@ impl AgentSession {
     pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
         self.registry.registered_tool_info()
     }
+
+    /// Look up a configured tool by its exact registered name, including inactive tools.
+    /// Like the full inventory, this describes the session's configured registry,
+    /// without per-request refreshes or authorization decisions.
+    pub fn registered_tool(&self, name: &str) -> Option<crate::RegisteredToolInfo> {
+        self.registry.registered_tool(name)
+    }
+
     /// Snapshot the configured tool renderer chain for host presentation.
     pub fn tool_renderers(&self) -> crate::ToolRendererRegistry {
         self.registry.tool_renderers()
