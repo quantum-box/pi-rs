@@ -217,6 +217,127 @@ fn current_documents_follow_session_membership_and_keep_incarnations_across_migr
     assert_eq!(reopened.value, new.initial);
 }
 
+#[tokio::test]
+async fn shared_current_document_watch_follows_retirement_recreation_and_source_close() {
+    use pi_rs_durable::{
+        document::SessionDocument, runtime::ViewWatchEnd, session_membership::SessionMembership,
+    };
+    use std::{num::NonZeroU32, time::Duration};
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let root = harness.create_conversation(config()).unwrap();
+        let sibling = harness.create_conversation(config()).unwrap();
+        let store = Store::open(&path).unwrap();
+        let memberships = SessionMembership::new(&store);
+        let session = memberships.create().unwrap();
+        memberships.enroll(session, root).unwrap();
+        memberships.enroll(session, sibling).unwrap();
+        let definition = SessionDocument {
+            kind: "shared".into(),
+            version: NonZeroU32::MIN,
+            initial: object(1),
+        };
+        let interval = Duration::from_millis(1);
+        let cancellation = pi_rs_core::CancellationToken::new();
+        assert!(
+            harness
+                .watch_session_document(root, &definition, "", interval, cancellation.clone())
+                .unwrap()
+                .is_none()
+        );
+        harness
+            .session_transaction(sibling, |tx| {
+                tx.edit_session_document(&definition, "", |_| Ok(()))
+            })
+            .unwrap();
+        let mut watch = harness
+            .watch_session_document(root, &definition, "", interval, cancellation.clone())
+            .unwrap()
+            .unwrap();
+        let initial = watch.value().clone();
+        assert_eq!(initial.value, object(1));
+
+        harness
+            .session_transaction(sibling, |tx| {
+                tx.edit_session_document(&definition, "", |doc| {
+                    *doc = object(2);
+                    Ok(())
+                })
+            })
+            .unwrap();
+        let update = watch.next().await.unwrap().unwrap();
+        assert_eq!(update.value.value, object(2));
+        assert!(!update.retired);
+        assert_eq!(initial.value, object(1));
+
+        harness
+            .session_transaction(sibling, |tx| tx.retire_session_document(&definition, ""))
+            .unwrap();
+        let retirement = watch.next().await.unwrap().unwrap();
+        assert!(retirement.retired);
+        assert_eq!(retirement.value.incarnation, initial.incarnation);
+        assert!(watch.end_reason().is_none());
+
+        harness
+            .session_transaction(sibling, |tx| {
+                tx.edit_session_document(&definition, "", |_| Ok(()))
+            })
+            .unwrap();
+        let recreation = watch.next().await.unwrap().unwrap();
+        assert!(!recreation.retired);
+        assert_ne!(recreation.value.incarnation, initial.incarnation);
+
+        harness
+            .session_transaction(sibling, |tx| {
+                tx.retire_session_document(&definition, "")?;
+                tx.edit_session_document(&definition, "", |doc| {
+                    *doc = object(3);
+                    Ok(())
+                })
+            })
+            .unwrap();
+        let folded = watch.next().await.unwrap().unwrap();
+        assert!(folded.retired);
+        assert_eq!(folded.value.value, object(3));
+        assert_ne!(folded.value.incarnation, recreation.value.incarnation);
+
+        let mut revoked = harness
+            .watch_session_document(sibling, &definition, "", interval, cancellation.clone())
+            .unwrap()
+            .unwrap();
+        memberships.revoke(session, sibling).unwrap();
+        assert!(revoked.next().await.unwrap().is_none());
+        assert_eq!(revoked.end_reason(), Some(&ViewWatchEnd::Ended));
+
+        let mut aborted = harness
+            .watch_session_document(root, &definition, "", interval, cancellation.clone())
+            .unwrap()
+            .unwrap();
+        cancellation.cancel();
+        assert!(aborted.next().await.unwrap().is_none());
+        assert_eq!(aborted.end_reason(), Some(&ViewWatchEnd::Aborted));
+        let mut closed = harness
+            .watch_session_document(
+                root,
+                &definition,
+                "",
+                interval,
+                pi_rs_core::CancellationToken::new(),
+            )
+            .unwrap()
+            .unwrap();
+        drop(harness);
+        let _reopened = Harness::open_paused(&path, options()).unwrap();
+        assert!(closed.next().await.unwrap().is_none());
+        assert_eq!(closed.end_reason(), Some(&ViewWatchEnd::Ended));
+    })
+    .await
+    .expect("session document watch must not stall");
+}
+
 #[test]
 fn typed_document_edits_keep_fields_and_commit_with_entries() {
     #[derive(serde::Serialize, serde::Deserialize)]

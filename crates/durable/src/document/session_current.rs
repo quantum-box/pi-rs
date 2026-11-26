@@ -1,8 +1,13 @@
 //! Whole current values for documents shared by members of one session.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
-use durable_store::{Check, Expected, Mutation, Store};
+use durable_store::{Check, Expected, Mutation, Store, owner::OwnedStore};
+use pi_rs_core::CancellationToken;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -25,6 +30,49 @@ struct StoredDocument {
     value: Option<Map<String, Value>>,
 }
 
+impl StoredDocument {
+    fn validate(&self, binding: &StoredDocumentDefinition) -> Result<(), Error> {
+        if self.definition.schema != binding.schema
+            || self.definition.initial_digest != binding.initial_digest
+            || self.value.is_some() != self.definition.incarnation.is_some()
+            || self
+                .definition
+                .incarnation
+                .as_ref()
+                .is_some_and(Uuid::is_nil)
+        {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        Ok(())
+    }
+
+    fn typed<T: DeserializeOwned + Serialize>(
+        &self,
+    ) -> Result<Option<DefinedDocumentValue<T>>, Error> {
+        let Some(value) = &self.value else {
+            return Ok(None);
+        };
+        let value = Value::Object(value.clone());
+        let typed = serde::Deserialize::deserialize(&value)?;
+        if serde_json::to_value(&typed)? != value {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        Ok(Some(DefinedDocumentValue {
+            incarnation: self
+                .definition
+                .incarnation
+                .ok_or(Error::InvalidDocumentDefinition)?,
+            value: typed,
+        }))
+    }
+}
+
+fn storage_key(session: Uuid, kind: &str, key: &str) -> Result<Vec<u8>, Error> {
+    let mut storage_key = b"durable/session-current-document/v1/".to_vec();
+    storage_key.extend(serde_json::to_vec(&(session, kind, key))?);
+    Ok(storage_key)
+}
+
 struct Staged {
     expected: Expected,
     original: Option<StoredDocument>,
@@ -35,24 +83,11 @@ impl Staged {
     fn read<T: DeserializeOwned + Serialize>(
         &self,
     ) -> Result<Option<DefinedDocumentValue<T>>, Error> {
-        let Some(record) = &self.current else {
-            return Ok(None);
-        };
-        let Some(value) = &record.value else {
-            return Ok(None);
-        };
-        let value = Value::Object(value.clone());
-        let typed = serde::Deserialize::deserialize(&value)?;
-        if serde_json::to_value(&typed)? != value {
-            return Err(Error::InvalidDocumentDefinition);
-        }
-        Ok(Some(DefinedDocumentValue {
-            incarnation: record
-                .definition
-                .incarnation
-                .ok_or(Error::InvalidDocumentDefinition)?,
-            value: typed,
-        }))
+        self.current
+            .as_ref()
+            .map(StoredDocument::typed)
+            .transpose()
+            .map(Option::flatten)
     }
 }
 
@@ -86,8 +121,7 @@ impl<'a> SessionDocuments<'a> {
             )?);
         }
         let (session, _) = self.scope.as_ref().expect("resolved scope");
-        let mut storage_key = b"durable/session-current-document/v1/".to_vec();
-        storage_key.extend(serde_json::to_vec(&(*session, &definition.kind, key))?);
+        let storage_key = storage_key(*session, &definition.kind, key)?;
         let staged = match self.staged.entry(storage_key) {
             std::collections::hash_map::Entry::Occupied(staged) => staged.into_mut(),
             std::collections::hash_map::Entry::Vacant(slot) => {
@@ -106,17 +140,8 @@ impl<'a> SessionDocuments<'a> {
                 })
             }
         };
-        if let Some(record) = &staged.current
-            && (record.definition.schema != binding.schema
-                || record.definition.initial_digest != binding.initial_digest
-                || record.value.is_some() != record.definition.incarnation.is_some()
-                || record
-                    .definition
-                    .incarnation
-                    .as_ref()
-                    .is_some_and(Uuid::is_nil))
-        {
-            return Err(Error::InvalidDocumentDefinition);
+        if let Some(record) = &staged.current {
+            record.validate(&binding)?;
         }
         Ok((staged, binding))
     }
@@ -216,5 +241,192 @@ impl<'a> SessionDocuments<'a> {
             }
         }
         Ok(changed)
+    }
+}
+
+/// The latest committed session document and whether the previously observed
+/// incarnation retired. A retirement without replacement carries the last value.
+pub struct SessionDocumentUpdate<T> {
+    pub value: Arc<DefinedDocumentValue<T>>,
+    pub retired: bool,
+}
+
+/// Pull watch over the current document at a session address. It coalesces
+/// commits and holds no reference that can keep the session's store open.
+pub struct SessionDocumentWatch<T> {
+    owner: Weak<OwnedStore>,
+    source_closed: CancellationToken,
+    cancelled: CancellationToken,
+    conversation: Uuid,
+    scope: [Check; 2],
+    key: Vec<u8>,
+    binding: StoredDocumentDefinition,
+    interval: Duration,
+    version: u64,
+    value: Arc<DefinedDocumentValue<T>>,
+    present: bool,
+    end: Option<crate::runtime::ViewWatchEnd>,
+}
+
+impl<T: DeserializeOwned + Serialize> SessionDocumentWatch<T> {
+    pub(crate) fn attach(
+        owner: &Arc<OwnedStore>,
+        source_closed: CancellationToken,
+        conversation: Uuid,
+        definition: &SessionDocument<T>,
+        key: &str,
+        interval: Duration,
+        cancelled: CancellationToken,
+    ) -> Result<Option<Self>, Error> {
+        if interval.is_zero() {
+            return Err(Error::InvalidSessionAdmission(
+                "session document watch interval must be nonzero".into(),
+            ));
+        }
+        let store = owner.store();
+        let (binding, _) =
+            defined_document_binding(&definition.kind, definition.version, &definition.initial)?;
+        for _ in 0..128 {
+            if cancelled.is_cancelled() || source_closed.is_cancelled() {
+                return Ok(None);
+            }
+            let before = store.commit_sequence()?;
+            let (session, scope) = crate::session_membership::document_scope(store, conversation)?;
+            let key = storage_key(session, &definition.kind, key)?;
+            let entry = store.get(&key)?;
+            if store.commit_sequence()? != before {
+                continue;
+            }
+            let Some(entry) = entry else { return Ok(None) };
+            let record: StoredDocument = serde_json::from_slice(&entry.value)?;
+            record.validate(&binding)?;
+            let Some(value) = record.typed()? else {
+                return Ok(None);
+            };
+            return Ok(Some(Self {
+                owner: Arc::downgrade(owner),
+                source_closed,
+                cancelled,
+                conversation,
+                scope,
+                key,
+                binding,
+                interval,
+                version: entry.version,
+                value: Arc::new(value),
+                present: true,
+                end: None,
+            }));
+        }
+        Err(Error::InvalidSessionAdmission(
+            "could not capture a stable session document snapshot".into(),
+        ))
+    }
+
+    /// The acquisition value, or the last value delivered by `next`.
+    pub fn value(&self) -> &Arc<DefinedDocumentValue<T>> {
+        &self.value
+    }
+
+    pub fn end_reason(&self) -> Option<&crate::runtime::ViewWatchEnd> {
+        self.end.as_ref()
+    }
+
+    pub fn stop(&mut self) {
+        self.end
+            .get_or_insert(crate::runtime::ViewWatchEnd::Stopped);
+    }
+
+    fn latest(&self, store: &Store) -> Result<Option<durable_store::Entry>, Error> {
+        let before = store.commit_sequence()?;
+        let entry = store.get(&self.key)?;
+        let (_, checks) = crate::session_membership::document_scope(store, self.conversation)?;
+        if checks != self.scope {
+            return Err(Error::InvalidSessionAdmission(
+                "session document watch membership changed".into(),
+            ));
+        }
+        if store.commit_sequence()? != before {
+            return Ok(None);
+        }
+        Ok(Some(entry.ok_or(Error::InvalidDocumentDefinition)?))
+    }
+
+    fn update(
+        &mut self,
+        entry: durable_store::Entry,
+    ) -> Result<Option<SessionDocumentUpdate<T>>, Error> {
+        if entry.version == self.version {
+            return Ok(None);
+        }
+        let record: StoredDocument = serde_json::from_slice(&entry.value)?;
+        record.validate(&self.binding)?;
+        let value: Option<DefinedDocumentValue<T>> = record.typed()?;
+        let retired = self.present
+            && value
+                .as_ref()
+                .is_none_or(|value| value.incarnation != self.value.incarnation);
+        self.present = value.is_some();
+        self.version = entry.version;
+        if let Some(value) = value {
+            self.value = Arc::new(value);
+        } else if !retired {
+            return Ok(None);
+        }
+        Ok(Some(SessionDocumentUpdate {
+            value: self.value.clone(),
+            retired,
+        }))
+    }
+
+    /// Wait for a new value or retirement. Dropping the pending read leaves
+    /// the watch open. Revoking the acquisition membership ends the watch.
+    pub async fn next(&mut self) -> Result<Option<SessionDocumentUpdate<T>>, Error> {
+        use crate::runtime::ViewWatchEnd;
+
+        while self.end.is_none() {
+            if self.cancelled.is_cancelled() {
+                self.end = Some(ViewWatchEnd::Aborted);
+                break;
+            }
+            if self.source_closed.is_cancelled() {
+                self.end = Some(ViewWatchEnd::Ended);
+                break;
+            }
+            let Some(owner) = self.owner.upgrade() else {
+                self.end = Some(ViewWatchEnd::Ended);
+                break;
+            };
+            let entry = self.latest(owner.store());
+            drop(owner);
+            let result = match entry {
+                Ok(Some(entry))
+                    if !self.source_closed.is_cancelled() && !self.cancelled.is_cancelled() =>
+                {
+                    self.update(entry)
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => Ok(None),
+                Err(Error::InvalidSessionAdmission(_)) => {
+                    self.end = Some(ViewWatchEnd::Ended);
+                    break;
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(Some(update)) => return Ok(Some(update)),
+                Ok(None) => (),
+                Err(error) => {
+                    self.end = Some(ViewWatchEnd::Failed(error.to_string()));
+                    return Err(error);
+                }
+            }
+            tokio::select! {
+                _ = self.cancelled.cancelled() => {}
+                _ = self.source_closed.cancelled() => {}
+                _ = tokio::time::sleep(self.interval) => {}
+            }
+        }
+        Ok(None)
     }
 }

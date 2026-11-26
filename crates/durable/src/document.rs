@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
 pub(crate) mod session_current;
-pub use session_current::SessionDocument;
+pub use session_current::{SessionDocument, SessionDocumentUpdate, SessionDocumentWatch};
 
 const PREFIX: &[u8] = b"durable/document/";
 const OPS_PREFIX: &[u8] = b"durable/document-operations/v1/";
