@@ -58,7 +58,7 @@ fn legacy_child_batch(
 
 #[test]
 fn display_entry_forks_use_original_commit_and_reopen() {
-    use crate::document::{Address, Documents, Transaction};
+    use crate::document::{Address, Documents, ForkPolicy, Transaction};
     use durable_store::Store;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
@@ -83,6 +83,18 @@ fn display_entry_forks_use_original_commit_and_reopen() {
         serde_json::json!({"n":1}).as_object().unwrap(),
     )
     .unwrap();
+    let current_address = Address {
+        name: "current-state".into(),
+        ..address.clone()
+    };
+    tx.put(
+        &current_address,
+        Expected::Missing,
+        serde_json::json!({"n":10}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.set_fork_policy(&current_address, Expected::Missing, &ForkPolicy::Current)
+        .unwrap();
     tx.commit(&db).unwrap();
     let first = h
         .submit_write(
@@ -148,7 +160,34 @@ fn display_entry_forks_use_original_commit_and_reopen() {
         .value["n"],
         2
     );
-    assert!(h.fork_by_display_entry_id(child, first).is_err());
+    let regular_fork = h.fork(child2).unwrap();
+    let regular_current = Address {
+        scope: regular_fork.to_string(),
+        ..current_address.clone()
+    };
+    let mut tx = Transaction::new();
+    tx.put(
+        &regular_current,
+        Expected::Version(h.document(&regular_current).unwrap().unwrap().version),
+        serde_json::json!({"n":77}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let inherited = h.fork_by_display_entry_id(regular_fork, first).unwrap();
+    let inherited_state = h.conversation(inherited).unwrap();
+    assert_eq!(inherited_state.application_writes.len(), 1);
+    assert_eq!(inherited_state.application_writes[0].id, first);
+    assert_eq!(
+        h.document(&Address {
+            scope: inherited.to_string(),
+            ..current_address
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        77
+    );
+    assert!(h.fork_by_display_entry_id(child, second).is_err());
     let local = h
         .submit_write(
             child,
@@ -182,6 +221,24 @@ fn display_entry_forks_use_original_commit_and_reopen() {
         .value["n"],
         1
     );
+    let inherited = h.fork_by_display_entry_id(descendant, first).unwrap();
+    let state = h.conversation(inherited).unwrap();
+    assert_eq!(state.application_writes.len(), 1);
+    assert_eq!(state.application_writes[0].id, first);
+    assert_eq!(state.config.model, "old");
+    let lineage = display_fork_origin_key(child);
+    let stored = db.get(&lineage).unwrap().unwrap();
+    db.commit(
+        &[Check {
+            key: lineage.clone(),
+            expected: Expected::Version(stored.version),
+        }],
+        &[Mutation::Put {
+            key: lineage,
+            value: stored.value,
+        }],
+    )
+    .unwrap();
     assert!(h.fork_by_display_entry_id(child, first).is_err());
 }
 
