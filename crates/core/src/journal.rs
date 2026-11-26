@@ -2031,13 +2031,14 @@ impl Session {
         Ok(())
     }
 
-    /// Commit a native fallback in one record, even on an imported Pi head.
+    /// Commit a native model selection in one record, even on an imported Pi head.
     /// A distinct timestamp preserves the existing imported-conversion marker
     /// understood by older journal and RPC readers.
     pub(crate) fn select_provider_model_atomic(
         &mut self,
         provider: &str,
         model: &str,
+        thinking: Option<&str>,
     ) -> Result<()> {
         if provider.trim().is_empty() || model.trim().is_empty() {
             return Err(Error::Config("provider or model name is empty".into()));
@@ -2045,7 +2046,7 @@ impl Session {
         self.append_inner(
             Event::ModelSelected {
                 model: model.into(),
-                thinking: None,
+                thinking: thinking.map(str::to_owned),
                 provider: Some(provider.into()),
             },
             false,
@@ -2444,7 +2445,7 @@ impl Session {
         }
     }
 
-    fn pending_tree_trigger_handoff(&self) -> Option<(u64, u64)> {
+    pub(crate) fn pending_tree_trigger_handoff(&self) -> Option<(u64, u64)> {
         self.records.iter().rev().find_map(|record| {
             let Event::TreeTriggerHandoff { return_to, .. } = record.event else {
                 return None;

@@ -60,6 +60,37 @@ cloned catalogs and existing sessions retain their original bindings. Hosts
 needing automatic fallback can provide their own `HistoricalModelResolver`.
 This provider-neutral API does not depend on Tauri or a desktop runtime.
 
+## Model cycling
+
+Call `AgentSession::cycle_model` with the current ordered snapshot of models
+your host authorizes and, optionally, its ordered scope. A nonempty scope is
+filtered by exact, case-sensitive provider and model pairs. It stays in effect
+even if every scoped entry is unavailable. An empty scope uses snapshot order.
+Cycling wraps in either direction. If the current model is absent, forward
+selects the first eligible model and backward selects the last, even when only
+one is eligible. The active journal selection supplies the current identity.
+An empty list or a lone current model returns `Ok(None)` without binding a
+client, writing a selection, or running selection hooks.
+
+The SDK asks the host to bind only the chosen model. It passes the requested
+thinking level with the explicit scoped level first, followed by the snapshot's
+per-model default, the host global default, and the current session level. The
+SDK uses its implicit `off` when none is set. The binding callback should return
+a client configured for the effective level and that level after applying
+provider capabilities. A host can use
+`ModelCatalog::get` for a prebuilt client. Hosts that use the native workbench
+factory can prepare clients using `ModelClientFactory` before passing the
+snapshot. The SDK performs no discovery or credential lookup during selection.
+Historical client lookup still uses provider and model identity. If an adapter
+needs to restore the historical thinking level, the host owns that configuration.
+
+The SDK records the chosen model and effective thinking level together in the
+session journal, then delivers selection hooks with source `cycle`. A host owns
+the scope and any application-wide defaults, including whether to persist the
+new model to settings. See the
+[pinned upstream cycling implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2701-L2774)
+for the reference ordering and scope behavior.
+
 ## Native quickstart
 
 The [Ollama SDK example](../crates/ollama/examples/sdk_chat.rs) creates an
