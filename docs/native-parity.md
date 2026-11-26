@@ -2048,9 +2048,14 @@ Codemode accepts configured `pi-classifier` models and uses Pi's
 probabilities, provider usage and the classifier retry policy. Native endpoint
 credential binding and image validation apply. Radius classifier models are
 discovered from the active account's gateway configuration during available-model
-lookups and explicit resolution. Unfiltered and offline lists use the matching
-cached catalog when the current account can be identified without running a
-credential command.
+lookups and explicit resolution. They advertise `pi-decision` and append
+`/decision` to the gateway catalog's `baseUrl`, preserving its path prefix.
+Discovery and dispatch share the active gateway credential, and the catalog
+base must match that gateway's origin. Discovery and dispatch reject redirects.
+Each discovered decision sends one POST. A failed POST returns an error without
+retrying or trying a legacy route. Unfiltered and offline lists use the
+matching cached catalog when the current account can be identified without
+running a credential command.
 
 Codemode also accepts explicitly configured `pi-decision` classifiers with a
 provider or model `baseUrl`. This API posts the model and classifier context to
@@ -2061,11 +2066,13 @@ loading and the HTTP operation. A provider-level `api: "pi-decision"` configures
 the decision profile without changing the provider's bundled chat or operation
 routes. Chat models in that profile use their own explicit chat API and `baseUrl`.
 The decision profile's credentials and headers stay on the operation routes.
-The legacy `pi-classifier` API and automatic Radius discovery keep their
-`/classify` route. Pi Decision uses the existing endpoint-bound credentials
+Configured classifiers use the existing endpoint-bound credentials
 and headers, HTTP limits, and classifier retry policy. A built-in provider name
-supplies neither an implicit decision URL nor ambient credentials for it.
-[Pinned Pi Decision protocol](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/src/api/pi-decision.ts#L16-L46)
+supplies neither an implicit decision URL nor ambient credentials for it. An
+explicitly configured Radius classifier with the same ID takes precedence over
+discovery, including a legacy `pi-classifier` entry for `/classify`.
+[Pinned Radius discovery](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/src/providers/radius-config.ts#L87-L102)
+· [Pinned Pi Decision protocol](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/src/api/pi-decision.ts#L151-L178)
 
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,

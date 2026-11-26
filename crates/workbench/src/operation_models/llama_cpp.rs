@@ -187,6 +187,7 @@ impl Server<'_> {
             self.headers,
             &payload,
             Api::LlamaCppClassifier,
+            true,
         )
         .await
     }
