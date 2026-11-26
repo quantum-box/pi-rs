@@ -9,6 +9,37 @@ use super::tool_output::{
     Limit, MAX_BYTES as DISPLAY_BYTES, MAX_LINES as DISPLAY_LINES, Truncation, format_size,
 };
 
+/// Format the current shell tool's progress warning for terminal rendering.
+#[doc(hidden)]
+pub fn shell_progress_notice(details: &Value) -> Option<String> {
+    let mut warnings = Vec::new();
+    let string = |key: &str| details[key].as_str().filter(|value| !value.is_empty());
+    if let Some(path) = string("fullOutputPath") {
+        warnings.push(format!("Full output: {path}"));
+    } else if let Some(error) = string("fullOutputError") {
+        warnings.push(format!("Could not save the full output: {error}"));
+    }
+    let truncation = &details["truncation"];
+    if truncation["truncated"] == true
+        && let Some(shown) = truncation["outputLines"].as_u64()
+    {
+        if truncation["truncatedBy"] == "lines" {
+            if let Some(total) = truncation["totalLines"].as_u64() {
+                warnings.push(format!("Truncated: showing {shown} of {total} lines"));
+            }
+        } else {
+            let limit = truncation["maxBytes"]
+                .as_u64()
+                .unwrap_or(DISPLAY_BYTES as u64);
+            warnings.push(format!(
+                "Truncated: {shown} lines shown ({} limit)",
+                format_size(limit)
+            ));
+        }
+    }
+    (!warnings.is_empty()).then(|| format!("[{}]", warnings.join(". ")))
+}
+
 const SCRIPT_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]

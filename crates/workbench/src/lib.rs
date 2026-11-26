@@ -55,6 +55,8 @@ pub mod prompt_template_arguments;
 pub mod resource_factory;
 mod shell_config;
 mod shell_output;
+#[doc(hidden)]
+pub use shell_output::shell_progress_notice;
 pub mod skill_resources;
 pub mod template_resources;
 mod text_edit;
