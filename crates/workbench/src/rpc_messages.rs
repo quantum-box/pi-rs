@@ -179,16 +179,21 @@ pub(super) fn last_assistant_text(session: &Session) -> Option<String> {
 pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let branch = session.branch();
     let entries = session.current_message_entries();
-    let projection = Projection::new(branch.iter().copied());
+    let mut projection = Projection::new(branch.iter().copied());
     let mut imported_entries = HashMap::new();
     let mut import = None;
     let mut edited = HashSet::new();
     let mut partial_edits = HashMap::new();
     let compaction = latest_compaction(&branch);
     let aborted = aborted_partial_records(&branch, compaction);
+    let mut has_imported_shell_error = false;
     for record in &branch {
         if let Event::SourceEntry { format, entry } = &record.event {
             import = (format == "pi").then_some(entry);
+            has_imported_shell_error |= import.is_some_and(|entry| {
+                let message = &entry["message"];
+                message["role"] == "bashExecution" && message["fullOutputError"].is_string()
+            });
         } else if let Some(source) = import
             && !matches!(record.event, Event::ModelFinished { .. })
         {
@@ -205,6 +210,10 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             edited.insert(*target);
             partial_edits.insert(*target, replacement);
         }
+    }
+    if has_imported_shell_error {
+        projection.verified_pi_conversions =
+            session.validated_pi_conversion_counts().unwrap_or_default();
     }
     let mut extra_messages = branch
         .into_iter()
@@ -242,6 +251,7 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                     session.records(),
                     record,
                     Some(MetadataSource::Session(session)),
+                    &projection.verified_pi_conversions,
                 )?,
             };
             Some((record.id, value))
@@ -358,6 +368,7 @@ pub(super) struct Projection {
     models: HashMap<u64, u64>,
     request_identities: HashMap<u64, u64>,
     tools: HashMap<Uuid, (u64, usize)>,
+    verified_pi_conversions: BTreeMap<u64, u64>,
 }
 
 impl Projection {
@@ -591,7 +602,9 @@ impl Projection {
                 is_error: outcome.is_error(),
                 is_structured: Some(outcome.is_structured()),
             },
-            Event::BashExecution { .. } => return shell_message(records, record, metadata),
+            Event::BashExecution { .. } => {
+                return shell_message(records, record, metadata, &self.verified_pi_conversions);
+            }
             Event::SystemCheckpoint { content, .. } => Message::System {
                 content: content.clone(),
             },
@@ -642,7 +655,8 @@ impl Projection {
             }
             Message::User { content } => match &record.event {
                 Event::BashExecution { .. } => {
-                    shell_message(records, record, metadata).expect("shell record")
+                    shell_message(records, record, metadata, &self.verified_pi_conversions)
+                        .expect("shell record")
                 }
                 Event::BranchSummary { summary, from, .. } => {
                     json!({"role":"branchSummary","summary":summary,"fromId":from.map(|id| id.to_string()),"timestamp":timestamp})
@@ -921,6 +935,7 @@ fn shell_message(
     records: &[Record],
     record: &Record,
     metadata: Option<MetadataSource<'_>>,
+    verified_pi_conversions: &BTreeMap<u64, u64>,
 ) -> Option<Value> {
     let Event::BashExecution { execution } = &record.event else {
         return None;
@@ -933,6 +948,13 @@ fn shell_message(
         .and_then(|value| value["fullOutputError"].as_str())
         .or_else(|| {
             let parent = records.get(record.parent?.checked_sub(1)? as usize)?;
+            // A Pi shell entry converts into exactly one adjacent record.
+            // Later native children can share the same parent.
+            if parent.id.checked_add(1) != Some(record.id)
+                || verified_pi_conversions.get(&parent.id) != Some(&1)
+            {
+                return None;
+            }
             match &parent.event {
                 Event::SourceEntry { format, entry }
                     if format == "pi" && entry["message"]["role"] == "bashExecution" =>
@@ -994,7 +1016,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn imported_shell_save_error_is_projected_from_its_legacy_source_entry() {
+    fn imported_shell_save_error_is_only_projected_on_its_verified_conversion() {
         let mut fixture = tempfile::NamedTempFile::new().unwrap();
         for entry in [
             json!({"type":"session","version":3}),
@@ -1005,7 +1027,9 @@ mod tests {
         ] {
             writeln!(fixture, "{entry}").unwrap();
         }
-        let session = super::super::session_import::read(fixture.path()).unwrap();
+        let mut session = super::super::session_import::read(fixture.path()).unwrap();
+        let imported = session.head();
+        let source = session.records().last().unwrap().parent.unwrap();
         let (messages, _) = snapshot(&session);
         let result = messages
             .iter()
@@ -1015,6 +1039,34 @@ mod tests {
         assert_eq!(result["exitCode"], 19);
         assert_eq!(result["fullOutputError"], "disk full");
         assert!(result["fullOutputPath"].is_null());
+
+        session.checkout(source).unwrap();
+        for exclude_from_context in [false, true] {
+            session
+                .append_local_bash_result(pi_rs::BashExecution {
+                    command: "native fixture".into(),
+                    output: "native tail".into(),
+                    exit_code: Some(23),
+                    cancelled: false,
+                    truncated: true,
+                    full_output_path: None,
+                    exclude_from_context,
+                })
+                .unwrap();
+            assert_eq!(session.records().last().unwrap().parent, Some(source));
+            let (messages, _) = snapshot(&session);
+            let [message] = messages.as_slice() else {
+                panic!("expected only the native shell result, got {messages:?}");
+            };
+            assert_eq!(message["command"], "native fixture");
+            assert_eq!(message["output"], "native tail");
+            assert!(message.get("fullOutputError").is_none());
+            session.checkout(source).unwrap();
+        }
+
+        session.checkout(imported).unwrap();
+        let (messages, _) = snapshot(&session);
+        assert_eq!(messages[0]["fullOutputError"], "disk full");
     }
 
     #[test]
