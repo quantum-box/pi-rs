@@ -1,4 +1,4 @@
-//! Rehearse v3-to-v4 migration and rollback on independent SQLite files.
+//! Rehearse migration from a standard or v3 store to v4 on independent SQLite files.
 
 #[cfg(unix)]
 mod unix {
@@ -21,6 +21,7 @@ mod unix {
 
     #[derive(Serialize)]
     pub(super) struct Report {
+        source_graph_protocol: Option<i64>,
         cutoff_rows: Counts,
         backup_bytes: u64,
         backup_ms: u128,
@@ -35,12 +36,20 @@ mod unix {
         )?)
     }
 
-    fn protocol(connection: &Connection) -> Result<i64> {
-        Ok(connection.query_row(
+    fn protocol(connection: &Connection) -> Result<Option<i64>> {
+        let has_protocol: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='durable_graph_protocol')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_protocol {
+            return Ok(None);
+        }
+        Ok(Some(connection.query_row(
             "SELECT version FROM durable_graph_protocol WHERE id=1",
             [],
             |row| row.get(0),
-        )?)
+        )?))
     }
 
     fn check_integrity(connection: &Connection) -> Result<()> {
@@ -86,7 +95,7 @@ mod unix {
         Ok((counts, digest.finalize().into()))
     }
 
-    fn open_v3_connection(path: &Path) -> Result<Connection> {
+    fn open_legacy_connection(path: &Path) -> Result<Connection> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         connection.create_scalar_function(
             "pi_graph_protocol_v3",
@@ -101,13 +110,22 @@ mod unix {
     /// Keep the three independent output copies for operator inspection.
     pub(super) fn run(input: &Path, directory: &Path) -> Result<Report> {
         let input = open_read_only(input)?;
-        if protocol(&input)? != 3 {
-            return Err("expected a v3 Durable SQLite source".into());
-        }
+        let source_graph_protocol = protocol(&input)?;
+        let (backup_name, restored_name) = match source_graph_protocol {
+            None => ("backup-default.sqlite", "restored-default.sqlite"),
+            Some(3) => ("backup-v3.sqlite", "restored-v3.sqlite"),
+            Some(_) => return Err("expected a standard or v3 Durable SQLite source".into()),
+        };
+        input.query_row(
+            "SELECT version FROM durable_store_meta WHERE id=1",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        input.prepare("SELECT key,value,version FROM durable_store_entries")?;
         fs::create_dir(directory)?;
-        let backup = directory.join("backup-v3.sqlite");
+        let backup = directory.join(backup_name);
         let migrated = directory.join("migrated-v4.sqlite");
-        let restored = directory.join("restored-v3.sqlite");
+        let restored = directory.join(restored_name);
 
         let started = Instant::now();
         input.execute(
@@ -117,7 +135,7 @@ mod unix {
         let backup_ms = started.elapsed().as_millis();
         let backup_bytes = fs::metadata(&backup)?.len();
         let baseline = open_read_only(&backup)?;
-        if protocol(&baseline)? != 3 {
+        if protocol(&baseline)? != source_graph_protocol {
             return Err("source protocol changed before the backup cut".into());
         }
         check_integrity(&baseline)?;
@@ -125,14 +143,14 @@ mod unix {
         drop(baseline);
 
         fs::copy(&backup, &migrated)?;
-        let legacy = open_v3_connection(&migrated)?;
+        let legacy = open_legacy_connection(&migrated)?;
         let started = Instant::now();
         let store = Store::open(&migrated)?;
         drop(store);
         let store = Store::open(&migrated)?;
         let migrate_and_reopen_ms = started.elapsed().as_millis();
         let migrated_read = open_read_only(&migrated)?;
-        if protocol(&migrated_read)? != 4 || fingerprint(&migrated_read)? != snapshot {
+        if protocol(&migrated_read)? != Some(4) || fingerprint(&migrated_read)? != snapshot {
             return Err("the reopened v4 store differs from the backup cut".into());
         }
         check_integrity(&migrated_read)?;
@@ -143,7 +161,7 @@ mod unix {
         while store.get(&probe)?.is_some() {
             probe.push(b'/');
         }
-        // A legacy connection has the v3 function but lacks the v4 write gate.
+        // The legacy connection can write the source format and lacks the v4 write gate.
         let rejected = legacy.execute(
             "INSERT INTO durable_store_entries(key,value,version) VALUES (?1,X'31',?2)",
             params![
@@ -156,7 +174,7 @@ mod unix {
         );
         if !matches!(rejected, Err(rusqlite::Error::SqliteFailure(_, Some(ref message))) if message.contains("pi_graph_protocol_v4"))
         {
-            return Err("stale v3 write was not rejected by the v4 guard".into());
+            return Err("stale legacy write was not rejected by the v4 guard".into());
         }
         drop(legacy);
         store.commit(
@@ -173,7 +191,7 @@ mod unix {
 
         let started = Instant::now();
         fs::copy(&backup, &restored)?;
-        let mut restored = open_v3_connection(&restored)?;
+        let mut restored = open_legacy_connection(&restored)?;
         check_integrity(&restored)?;
         let probe_exists = restored
             .query_row(
@@ -183,7 +201,10 @@ mod unix {
             )
             .optional()?
             .is_some();
-        if protocol(&restored)? != 3 || fingerprint(&restored)? != snapshot || probe_exists {
+        if protocol(&restored)? != source_graph_protocol
+            || fingerprint(&restored)? != snapshot
+            || probe_exists
+        {
             return Err("restoration did not return to the backup cut".into());
         }
         let transaction = restored.transaction()?;
@@ -196,6 +217,7 @@ mod unix {
         let restore_and_verify_ms = started.elapsed().as_millis();
 
         Ok(Report {
+            source_graph_protocol,
             cutoff_rows: snapshot.0,
             backup_bytes,
             backup_ms,
@@ -209,11 +231,11 @@ mod unix {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.as_slice() == ["--help"] {
-        println!("Usage: durable-graph-rehearsal V3_BACKUP.sqlite NEW_OUTPUT_DIRECTORY");
+        println!("Usage: durable-graph-rehearsal SOURCE.sqlite NEW_OUTPUT_DIRECTORY");
         return Ok(());
     }
     let [source, directory] = args.as_slice() else {
-        return Err("usage: durable-graph-rehearsal V3_BACKUP.sqlite NEW_OUTPUT_DIRECTORY".into());
+        return Err("usage: durable-graph-rehearsal SOURCE.sqlite NEW_OUTPUT_DIRECTORY".into());
     };
     let result = unix::run(source.as_ref(), directory.as_ref())?;
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -230,8 +252,7 @@ mod tests {
     use super::unix::run;
     use rusqlite::{params, Connection};
 
-    #[test]
-    fn rehearsal_uses_separate_files_and_rejects_reusing_output() {
+    fn verify_rehearsal(v3: bool, backup_name: &str, restore_name: &str) {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.sqlite");
         let output = dir.path().join("report");
@@ -240,9 +261,7 @@ mod tests {
             connection.execute_batch(
                 "CREATE TABLE durable_store_meta(id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
                  INSERT INTO durable_store_meta VALUES(1,1);
-                 CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;
-                 CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=3));
-                 INSERT INTO durable_graph_protocol VALUES(1,3);",
+                 CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;",
             ).unwrap();
             connection
                 .execute(
@@ -250,25 +269,31 @@ mod tests {
                     params![b"fixture/original".as_slice(), b"fixture value".as_slice()],
                 )
                 .unwrap();
-            for (name, operation) in [
-                ("insert", "INSERT"),
-                ("update", "UPDATE"),
-                ("delete", "DELETE"),
-            ] {
-                connection.execute_batch(&format!(
-                    "CREATE TRIGGER durable_graph_protocol_{name} BEFORE {operation} ON durable_store_entries
-                     BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;",
-                )).unwrap();
+            if v3 {
+                connection.execute_batch(
+                    "CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=3));
+                     INSERT INTO durable_graph_protocol VALUES(1,3);",
+                ).unwrap();
+                for (name, operation) in [
+                    ("insert", "INSERT"),
+                    ("update", "UPDATE"),
+                    ("delete", "DELETE"),
+                ] {
+                    connection.execute_batch(&format!(
+                        "CREATE TRIGGER durable_graph_protocol_{name} BEFORE {operation} ON durable_store_entries
+                         BEGIN SELECT CASE WHEN pi_graph_protocol_v3() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;",
+                    )).unwrap();
+                }
             }
         }
         let original = std::fs::read(&source).unwrap();
         let report = serde_json::to_value(run(&source, &output).unwrap()).unwrap();
         assert_eq!(report["cutoff_rows"]["rows"], 1);
-        for file in [
-            "backup-v3.sqlite",
-            "migrated-v4.sqlite",
-            "restored-v3.sqlite",
-        ] {
+        assert_eq!(
+            report["source_graph_protocol"],
+            serde_json::json!(v3.then_some(3)),
+        );
+        for file in [backup_name, "migrated-v4.sqlite", restore_name] {
             assert!(output.join(file).is_file());
         }
         assert!(run(&source, &output).is_err());
@@ -276,5 +301,29 @@ mod tests {
         assert!(run(&output.join("migrated-v4.sqlite"), &rejected).is_err());
         assert!(!rejected.exists());
         assert_eq!(std::fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    fn rehearsal_rejects_an_unrelated_sqlite_database_before_copying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("unrelated.sqlite");
+        let output = dir.path().join("report");
+        Connection::open(&source)
+            .unwrap()
+            .execute_batch("CREATE TABLE unrelated (value TEXT)")
+            .unwrap();
+
+        assert!(run(&source, &output).is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn standard_rehearsal_restores_the_unversioned_source_format() {
+        verify_rehearsal(false, "backup-default.sqlite", "restored-default.sqlite");
+    }
+
+    #[test]
+    fn v3_rehearsal_uses_separate_files_and_rejects_reusing_output() {
+        verify_rehearsal(true, "backup-v3.sqlite", "restored-v3.sqlite");
     }
 }
