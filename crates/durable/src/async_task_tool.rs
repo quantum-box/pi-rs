@@ -1064,7 +1064,7 @@ struct ForegroundArguments {
 
 enum OrdinaryChild {
     Task(AsyncTaskCall),
-    Foreground(crate::owned_subagent::Admission),
+    Foreground(Box<crate::owned_subagent::Admission>),
 }
 
 impl ForegroundSubagent {
@@ -1307,7 +1307,7 @@ impl DurableAsyncTool for CheckpointableTool {
                         }
                         let child = match self.foreground.as_ref().filter(|_| name == FOREGROUND_SUBAGENT) {
                             Some(foreground) => match foreground.request(arguments) {
-                                Ok(request) => host.start_foreground_subagent(request).await.map(OrdinaryChild::Foreground),
+                                Ok(request) => host.start_foreground_subagent(request).await.map(|child| OrdinaryChild::Foreground(Box::new(child))),
                                 Err(reason) => Err(reason),
                             },
                             None => host.start_child_now(&key, &name, arguments).await.map(OrdinaryChild::Task),
