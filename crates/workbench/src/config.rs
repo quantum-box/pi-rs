@@ -4,6 +4,8 @@ use serde_json::{Map, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub(super) const DEFAULT_CODE_BLOCK_INDENT: &str = "  ";
+
 pub fn agent_dir() -> PathBuf {
     pi_rs_workbench::agent_dir()
 }
@@ -510,6 +512,10 @@ impl Settings {
     pub fn enable_skill_commands(&self) -> bool {
         self.boolean("enableSkillCommands").unwrap_or(true)
     }
+    pub fn terminal_true_color(&self) -> Option<bool> {
+        // Like Pi, other JSON values leave capability detection in charge.
+        self.value["terminal"]["trueColor"].as_bool()
+    }
     pub fn terminal_progress(&self) -> bool {
         self.value["terminal"]["showTerminalProgress"]
             .as_bool()
@@ -533,6 +539,12 @@ impl Settings {
             .as_f64()
             .map_or(60, |width| width.min(f64::from(u16::MAX)) as usize)
     }
+    pub fn code_block_indent(&self) -> &str {
+        self.value["markdown"]["codeBlockIndent"]
+            .as_str()
+            .unwrap_or(DEFAULT_CODE_BLOCK_INDENT)
+    }
+
     pub fn mermaid_mode(&self) -> &str {
         self.value["markdown"]["mermaid"]
             .as_str()
@@ -1356,6 +1368,22 @@ mod tests {
         }
         std::fs::write(&user, r#"{"cacheWarming":"unknown"}"#).unwrap();
         assert!(super::Settings::load_from_paths(root.path(), true, &user).is_err());
+    }
+
+    #[test]
+    fn true_color_setting_only_accepts_booleans_in_effective_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("settings.json");
+        let workspace = directory.path().join("project");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        let project = workspace.join(".pi/settings.json");
+        std::fs::write(&user, br#"{"terminal":{"trueColor":true}}"#).unwrap();
+        std::fs::write(&project, br#"{"terminal":{"trueColor":false}}"#).unwrap();
+        let load = |trusted| super::Settings::load_from_paths(&workspace, trusted, &user).unwrap();
+        assert_eq!(load(false).terminal_true_color(), Some(true));
+        assert_eq!(load(true).terminal_true_color(), Some(false));
+        std::fs::write(project, br#"{"terminal":{"trueColor":"auto"}}"#).unwrap();
+        assert_eq!(load(true).terminal_true_color(), None);
     }
 
     #[test]
@@ -2862,6 +2890,27 @@ mod tests {
         assert_eq!(settings.thinking_for_model("ollama", "b"), Some("max"));
         assert_eq!(settings.thinking_for_model("ollama", "c"), Some("low"));
         validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+    }
+
+    #[test]
+    fn markdown_code_block_indent_accepts_empty_and_custom_prefixes() {
+        let path = Path::new("settings.json");
+        assert_eq!(Settings::default().code_block_indent(), "  ");
+        for indent in ["", "· "] {
+            let settings = Settings {
+                value: json!({"markdown":{"codeBlockIndent":indent}}),
+                ..Settings::default()
+            };
+            validate_settings(settings.value(), path).unwrap();
+            assert_eq!(settings.code_block_indent(), indent);
+        }
+        let invalid = json!({"markdown":{"codeBlockIndent":2}});
+        assert!(
+            validate_settings(&invalid, path)
+                .unwrap_err()
+                .to_string()
+                .contains("/markdown/codeBlockIndent")
+        );
     }
 
     #[test]

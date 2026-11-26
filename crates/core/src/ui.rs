@@ -253,6 +253,14 @@ pub struct UiComponentAction {
     pub label: Option<String>,
 }
 
+/// A theme available from the current frontend. Embedded themes have no file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiThemeInfo {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<std::path::PathBuf>,
+}
+
 /// Configure the indicator shown while the interactive agent is working.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -368,6 +376,8 @@ pub enum UiRequest {
         text: String,
     },
     GetEditorText,
+    /// List the frontend's built-in and loaded file themes.
+    GetAllThemes,
     /// Read the terminal's current tool output expansion state.
     GetToolsExpanded,
     /// Change tool output expansion for the current terminal session.
@@ -476,6 +486,9 @@ impl UiRequest {
             (_, UiResponse::Cancelled) => true,
             (Self::Select { options, .. }, UiResponse::Text(value)) => options.contains(value),
             (Self::Confirm { .. } | Self::GetToolsExpanded, UiResponse::Confirmed(_)) => true,
+            (Self::GetAllThemes, UiResponse::Themes(themes)) => {
+                serde_json::to_vec(themes).is_ok_and(|value| value.len() <= 1024 * 1024)
+            }
             (Self::Custom { actions, .. }, UiResponse::Text(value)) => {
                 actions.iter().any(|action| &action.value == value)
             }
@@ -495,6 +508,7 @@ impl UiRequest {
                 | Self::Editor { .. }
                 | Self::Custom { .. }
                 | Self::GetEditorText
+                | Self::GetAllThemes
                 | Self::GetToolsExpanded
         )
     }
@@ -505,6 +519,7 @@ impl UiRequest {
 pub enum UiResponse {
     Text(String),
     Confirmed(bool),
+    Themes(Vec<UiThemeInfo>),
     Cancelled,
 }
 
@@ -520,6 +535,22 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn theme_list_uses_typed_responses_without_requiring_file_paths() {
+        let wire = serde_json::json!({"method":"getAllThemes"});
+        let request: UiRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        assert!(request.needs_response());
+
+        let wire =
+            serde_json::json!([{"name":"system"},{"name":"custom","path":"themes/custom.json"}]);
+        let response: UiResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&response).unwrap(), wire);
+        assert!(request.accepts_response(&response));
+        assert!(!request.accepts_response(&UiResponse::Confirmed(true)));
+        assert!(!UiRequest::GetEditorText.accepts_response(&response));
+    }
+
     #[test]
     fn paste_to_editor_uses_the_pi_request_without_opening_a_dialog() {
         let value = serde_json::json!({"method":"pasteToEditor","text":"a\r\nb"});
