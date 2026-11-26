@@ -1090,13 +1090,16 @@ async fn wait_signal_sleep(path: &std::path::Path, key: &str) -> pi_rs_durable::
 #[ignore = "manual cross-build database rehearsal"]
 async fn graph_rehearsal_with_parked_conversations() {
     use pi_rs_durable::{
-        document::{Address, ForkPolicy},
+        document::{Address, ConversationDocument, DefinedDocumentFork, ForkPolicy},
         runtime::{Error as RuntimeError, ProgressHistoryCursor, UnifiedHistoryCursor},
         task::{TaskOwner, TaskState, WaitFor},
         task_store::{SignalResult, TaskStore},
     };
     use serde::{Deserialize, Serialize};
-    use std::{num::NonZeroUsize, path::PathBuf};
+    use std::{
+        num::{NonZeroU32, NonZeroUsize},
+        path::PathBuf,
+    };
     use uuid::Uuid;
 
     struct StreamingModel;
@@ -1111,6 +1114,29 @@ async fn graph_rehearsal_with_parked_conversations() {
         }
     }
 
+    #[derive(Clone, Serialize, Deserialize)]
+    struct RehearsalDocument {
+        count: u32,
+    }
+    #[derive(Clone, Serialize, Deserialize)]
+    struct MigratedDocument {
+        label: String,
+    }
+    let typed = ConversationDocument {
+        kind: "typed-rehearsal".into(),
+        version: NonZeroU32::MIN,
+        initial: RehearsalDocument { count: 0 },
+        fork: DefinedDocumentFork::AsOf,
+    };
+    let typed_v2 = ConversationDocument {
+        kind: typed.kind.clone(),
+        version: NonZeroU32::new(2).unwrap(),
+        initial: MigratedDocument {
+            label: String::new(),
+        },
+        fork: DefinedDocumentFork::AsOf,
+    };
+
     #[derive(Serialize, Deserialize)]
     struct Cut {
         conversation: Uuid,
@@ -1122,6 +1148,8 @@ async fn graph_rehearsal_with_parked_conversations() {
         sequences: Vec<u64>,
         progress: ProgressHistoryCursor,
         progress_frames: Vec<Value>,
+        typed: Uuid,
+        typed_child: Uuid,
     }
     let frame = |record: &pi_rs_durable::runtime::ProgressHistoryFrame| json!({"cursor":record.cursor, "sequence":record.commit_sequence, "changes":record.changes});
     let directory =
@@ -1205,11 +1233,16 @@ async fn graph_rehearsal_with_parked_conversations() {
             scheduler
                 .select_extensions(id, vec!["b".into(), "a".into()])
                 .unwrap();
-            scheduler
+            let original = scheduler
                 .session_transaction(id, |tx| {
                     let doc = address(id, "version");
                     tx.put_document(&doc, json!({"value":"before"}).as_object().unwrap().clone())?;
-                    tx.set_document_fork_policy(&doc, ForkPolicy::Copy)
+                    tx.set_document_fork_policy(&doc, ForkPolicy::Copy)?;
+                    tx.edit_defined_document(&typed, "phase", |value| {
+                        value.count = 1;
+                        Ok(())
+                    })?;
+                    Ok(tx.defined_document(&typed, "phase")?.unwrap().incarnation)
                 })
                 .unwrap();
             let progress = scheduler.progress_history_from_now(id).unwrap();
@@ -1228,12 +1261,24 @@ async fn graph_rehearsal_with_parked_conversations() {
                 .unwrap()
                 .id;
             let child = scheduler.fork_by_entry_id(id, entry).unwrap();
+            let original_child = scheduler
+                .session_transaction(child, |tx| {
+                    let document = tx.defined_document(&typed, "phase")?.unwrap();
+                    assert_eq!(document.value.count, 1);
+                    Ok(document.incarnation)
+                })
+                .unwrap();
+            assert_ne!(original, original_child);
             scheduler
                 .session_transaction(id, |tx| {
                     tx.put_document(
                         &address(id, "version"),
                         json!({"value":"at backup"}).as_object().unwrap().clone(),
-                    )
+                    )?;
+                    tx.edit_defined_document(&typed, "phase", |value| {
+                        value.count = 2;
+                        Ok(())
+                    })
                 })
                 .unwrap();
             let history = scheduler.unified_history_start(id, false).unwrap();
@@ -1257,6 +1302,8 @@ async fn graph_rehearsal_with_parked_conversations() {
                     .collect(),
                 progress,
                 progress_frames: progress_page.records.iter().map(frame).collect(),
+                typed: original,
+                typed_child: original_child,
             });
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1306,8 +1353,25 @@ async fn graph_rehearsal_with_parked_conversations() {
                 .value["value"],
             "at backup"
         );
+        let original = scheduler
+            .session_transaction(id, |tx| Ok(tx.defined_document(&typed, "phase")?.unwrap()))
+            .unwrap();
+        assert_eq!(original.incarnation, cut.typed);
+        assert_eq!(original.value.count, 2);
         let new_fork = scheduler.fork_by_entry_id(id, cut.entry).unwrap();
         for child in [cut.child, new_fork] {
+            let inherited = scheduler
+                .session_transaction(child, |tx| {
+                    Ok(tx.defined_document(&typed, "phase")?.unwrap())
+                })
+                .unwrap();
+            assert_eq!(inherited.value.count, 1);
+            if child == cut.child {
+                assert_eq!(inherited.incarnation, cut.typed_child);
+            } else {
+                assert_ne!(inherited.incarnation, cut.typed_child);
+                assert_ne!(inherited.incarnation, cut.typed);
+            }
             assert_eq!(
                 scheduler
                     .document(&address(child, "version"))
@@ -1327,6 +1391,25 @@ async fn graph_rehearsal_with_parked_conversations() {
                 .unwrap(),
             cut.submission
         );
+        scheduler
+            .session_transaction(id, |tx| {
+                tx.migrate_defined_document(&typed, &typed_v2, "phase", |old| {
+                    Ok(MigratedDocument {
+                        label: old.count.to_string(),
+                    })
+                })?;
+                let migrated = tx.defined_document(&typed_v2, "phase")?.unwrap();
+                assert_eq!(migrated.incarnation, cut.typed);
+                assert_eq!(migrated.value.label, "2");
+                assert!(tx.retire_defined_document(&typed_v2, "phase")?);
+                assert!(tx.defined_document(&typed_v2, "phase")?.is_none());
+                tx.edit_defined_document(&typed_v2, "phase", |_| Ok(()))?;
+                let recreated = tx.defined_document(&typed_v2, "phase")?.unwrap();
+                assert_ne!(recreated.incarnation, cut.typed);
+                assert!(recreated.value.label.is_empty());
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(wait_key(id, "first").await, cut.task);
         assert_eq!(
             driver

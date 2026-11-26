@@ -604,6 +604,20 @@ the saved cursors and original document values. This run covers recovery
 behavior at the fixture's scale. The scan-budget results still support keeping
 both experimental features opt-in.
 
+The typed-document extension of this rehearsal was run against `main`
+`0a34d4e8d` and the migration tooling. The standard source contained 32
+conversations, 16 parked tasks, and 64 documents, with 720 live rows and a
+1,323,008-byte backup. Backup, migration and reopen, and restore verification
+measured 4 ms, 5 ms, and 19 ms on macOS. Both copies retained the original
+document incarnations and branch-local values, and a new historical fork
+received a distinct incarnation. Both copies migrated the document schema
+without changing its incarnation and assigned a new incarnation on retirement
+and recreation. All parked tasks resumed, the standard build rejected the v4
+copy, and the source SHA-256 stayed unchanged. These timings describe the
+fixture. Both experimental features remain opt-in because of the scan limits
+measured above and the requirement to have a pre-migration backup to restore
+a database for the standard build.
+
 Run the ignored fixture against a new temporary directory on Unix.
 
 ```sh
