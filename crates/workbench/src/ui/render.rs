@@ -379,6 +379,7 @@ pub struct TranscriptOptions<'a> {
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
     pub code_block_indent: Option<&'a str>,
+    pub hyperlinks: bool,
     pub hidden_thinking_label: Option<&'a str>,
     pub expand_key: Option<crossterm::event::KeyEvent>,
 }
@@ -493,7 +494,7 @@ impl Entry {
                             inner,
                             0,
                             options.mermaid,
-                            *HYPERLINKS,
+                            options.hyperlinks,
                             false,
                         ));
                         lines.push(Line::default());
@@ -1413,8 +1414,9 @@ fn tmux_hyperlinks() -> bool {
     }
 }
 
-static HYPERLINKS: LazyLock<bool> =
-    LazyLock::new(|| detect_hyperlinks(|name| std::env::var(name).ok(), tmux_hyperlinks));
+pub(crate) fn detect_terminal_hyperlinks() -> bool {
+    detect_hyperlinks(|name| std::env::var(name).ok(), tmux_hyperlinks)
+}
 
 #[derive(Default)]
 struct Table {
@@ -1607,6 +1609,20 @@ fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
 
 fn safe_hyperlink(url: &str) -> bool {
     !url.is_empty() && !url.chars().any(char::is_control)
+}
+
+fn osc8_destination(enabled: bool, url: &str) -> Option<String> {
+    // Wrapping opens the destination again on each line. Use Pi's UTF-16
+    // length limit before attaching it to any span that could be wrapped.
+    const MAX_HYPERLINK_URL_LENGTH: usize = 8192;
+    (enabled
+        && url
+            .encode_utf16()
+            .take(MAX_HYPERLINK_URL_LENGTH + 1)
+            .count()
+            <= MAX_HYPERLINK_URL_LENGTH
+        && safe_hyperlink(url))
+    .then(|| url.to_owned())
 }
 
 // Parser formatting can split a local part across text events. Do not link a
@@ -2050,7 +2066,7 @@ fn transcript_markdown(
         0,
         MarkdownOptions {
             mermaid: options.mermaid,
-            hyperlinks: *HYPERLINKS,
+            hyperlinks: options.hyperlinks,
             preserve_source,
             code_block_indent: options
                 .code_block_indent
@@ -3113,9 +3129,9 @@ fn markdown_plain_at_depth(
                     );
                     span.bold = bold > 0 || heading > 0;
                     span.underline = heading == 1 || !links.is_empty();
-                    span.hyperlink = links.last().and_then(|(url, _, _)| {
-                        (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
-                    });
+                    span.hyperlink = links
+                        .last()
+                        .and_then(|(url, _, _)| osc8_destination(hyperlinks, url));
                     span.italic = italic > 0;
                     span.thinking_link = heading == 0 && !links.is_empty();
                     span.strikethrough = strikethrough > 0;
@@ -3161,8 +3177,7 @@ fn markdown_plain_at_depth(
                             link.thinking_link = heading == 0;
                             link.dim = theme.is_dim("mdLink");
                             link.underline = true;
-                            link.hyperlink =
-                                (hyperlinks && safe_hyperlink(&url)).then(|| url.clone());
+                            link.hyperlink = osc8_destination(hyperlinks, &url);
                             spans.push(link);
                             if (!hyperlinks || !safe_hyperlink(&url))
                                 && label != url
@@ -3202,9 +3217,9 @@ fn markdown_plain_at_depth(
                 );
                 span.bold = bold > 0 || heading > 0;
                 span.underline = heading == 1 || !links.is_empty();
-                span.hyperlink = links.last().and_then(|(url, _, _)| {
-                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
-                });
+                span.hyperlink = links
+                    .last()
+                    .and_then(|(url, _, _)| osc8_destination(hyperlinks, url));
                 span.italic = italic > 0;
                 span.thinking_link = heading == 0 && !links.is_empty();
                 span.strikethrough = strikethrough > 0;
@@ -3272,9 +3287,9 @@ fn markdown_plain_at_depth(
                 }
                 let mut span = Span::themed(text, theme, "mdCode");
                 span.underline = heading == 1 || !links.is_empty();
-                span.hyperlink = links.last().and_then(|(url, _, _)| {
-                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
-                });
+                span.hyperlink = links
+                    .last()
+                    .and_then(|(url, _, _)| osc8_destination(hyperlinks, url));
                 span.bold = bold > 0 || heading > 0;
                 span.italic = italic > 0;
                 span.strikethrough = strikethrough > 0;
@@ -3310,9 +3325,9 @@ fn markdown_plain_at_depth(
                         label.push_str(&continuation);
                     }
                     let mut span = Span::themed(continuation, theme, "text");
-                    span.hyperlink = links.last().and_then(|(url, _, _)| {
-                        (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
-                    });
+                    span.hyperlink = links
+                        .last()
+                        .and_then(|(url, _, _)| osc8_destination(hyperlinks, url));
                     spans.push(span);
                 }
             }
@@ -6560,6 +6575,48 @@ mod tests {
             assert!(!output.contains(" (https://example.com)"));
         }
         assert!(!safe_hyperlink("https://example.com/\x1b]0;bad"));
+    }
+
+    #[test]
+    fn osc8_skips_oversized_destinations_and_keeps_link_text() {
+        let theme = Theme::system();
+        let long_url = format!("https://example.com/{}", "x".repeat(20_000));
+        for (source, visible) in [
+            (long_url.clone(), long_url.as_str()),
+            (format!("[**documentation**]({long_url})"), "documentation"),
+        ] {
+            let lines = markdown_at_depth(
+                &source,
+                &theme,
+                80,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            let mut bytes = Vec::new();
+            for line in &lines {
+                line.draw(&mut bytes, 80, ColorMode::TrueColor).unwrap();
+            }
+            assert!(!String::from_utf8(bytes).unwrap().contains("\x1b]8;"));
+            assert_eq!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .map(|span| span.text.as_str())
+                    .collect::<String>(),
+                visible
+            );
+        }
+
+        let prefix = "https://example.com/";
+        let at_limit = format!("{prefix}{}", "🌐".repeat((8192 - prefix.len()) / 2));
+        assert_eq!(at_limit.encode_utf16().count(), 8192);
+        assert_eq!(
+            osc8_destination(true, &at_limit).as_deref(),
+            Some(at_limit.as_str())
+        );
+        assert!(osc8_destination(true, &format!("{at_limit}x")).is_none());
     }
 
     #[test]

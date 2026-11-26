@@ -1,4 +1,5 @@
 //! Terminal presentation over the same journaled CLI used by automation.
+use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -1353,6 +1354,7 @@ struct View {
     async_transitions: bool,
     pending_transition: Option<std::sync::mpsc::Receiver<Result<Cli>>>,
     regular: RegularState,
+    detected_hyperlinks: Cell<Option<bool>>,
     graphics: Renderer,
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
     pending_terminal_title: Option<String>,
@@ -4598,9 +4600,20 @@ render_call_id: None,
     }
 
     fn base_transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'static> {
+        let hyperlinks = if let Some(enabled) = args.settings.terminal_hyperlinks() {
+            self.detected_hyperlinks.set(None);
+            enabled
+        } else if let Some(detected) = self.detected_hyperlinks.get() {
+            detected
+        } else {
+            let detected = crate::ui::render::detect_terminal_hyperlinks();
+            self.detected_hyperlinks.set(Some(detected));
+            detected
+        };
         TranscriptOptions {
             hidden_thinking_label: None,
             code_block_indent: None,
+            hyperlinks,
             notices: args.settings.notices(),
             inline_images: self.inline_image_options(args),
             padding: args.settings.output_padding(),

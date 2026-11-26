@@ -1110,6 +1110,10 @@ nonempty `ALACRITTY_WINDOW_ID` when it uses `TERM=xterm-256color`, matching Pi
 v1.6.0 even when `TERM_PROGRAM` is unset.
 Empty terminal-identification environment variables do not advertise OSC 8
 support or indicate a tmux session.
+On hyperlink-capable terminals, destinations beyond Pi's 8,192 UTF-16 unit
+limit retain their visible link text without OSC 8. Wrapping therefore cannot
+repeat a very long destination on every line.
+[Pinned Pi hyperlink limit](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/tui/src/terminal-image.ts#L795-L815)
 Bare HTTP, HTTPS and FTP URLs, `www.` links and email addresses receive link
 styling and the same terminal-dependent behavior. Bare URLs stop before CJK
 punctuation while explicit links retain it in their destination. Markdown
@@ -3966,9 +3970,21 @@ stream close event and reports errors from that event. Rust's standard file
 drop has no error result. A path in a live progress snapshot refers to a spill
 that is still being written.
 
-User-initiated shell execution also retains its bounded output and exit status.
-Its journal and RPC result do not yet expose the separate save error.
+User-initiated shell execution keeps its bounded output and exit status and exposes
+`fullOutputError` in the RPC completion and shell history when truncated
+output could not be saved. Native execution, extension streaming operations,
+and extension-supplied results use the same projection. Successful spills
+provide the file path. Small output has no save error, including when raw
+terminal control bytes triggered an unsuccessful spill attempt.
+
+Native journal metadata stores up to 4 KiB of save failure detail. Older
+stores without metadata support still record the original shell execution,
+and imported Pi history can read the detail from its source entry. The Rust
+`BashExecution` and `UserBashResult` fields retain their existing shape.
 [Pi shell output accumulator](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/tools/output-accumulator.ts)
+[Pi user shell executor](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/bash-executor.ts)
+[Pi session recording](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts)
+[Pi RPC shell completion](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/rpc/rpc-mode.ts)
 
 ### Grep context and line-limit checkpoint
 
@@ -6244,6 +6260,16 @@ continuations and session restarts. Text and summary fragments are combined
 into their logical blocks, and encrypted blocks stay separate. Replay is
 bound to the original endpoint and model. A loopback RPC check exercised
 restart, encrypted-only thinking and a switch to a different model endpoint.
+
+### Terminal hyperlink capability
+
+An explicit boolean in `terminal.hyperlinks` takes precedence over
+`PI_HYPERLINKS` and automatic terminal detection. Use `"auto"` for automatic
+detection. Existing non-boolean values in `terminal.hyperlinks` and
+`terminal.trueColor` are preserved and use automatic detection too.
+Both transcript modes redraw Markdown links after `/reload`. Returning from
+a boolean hyperlink override to automatic mode refreshes detection, including
+the tmux client capability probe. Subsequent draws reuse the detected result.
 
 ### Terminal color capability
 
