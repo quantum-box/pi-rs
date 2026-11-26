@@ -44,6 +44,7 @@ pub mod mcp_refresh;
 mod mcp_resource_compat;
 pub mod model_factory;
 pub mod model_file;
+mod model_thinking_levels;
 #[doc(hidden)]
 pub mod native_pi_messages;
 #[doc(hidden)]
