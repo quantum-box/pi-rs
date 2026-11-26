@@ -1186,6 +1186,25 @@ pub struct UserBashResult {
     pub full_output_path: Option<String>,
 }
 
+/// Additional presentation data for the native shell host. The legacy result
+/// type remains usable by extensions that do not supply save failure detail.
+#[doc(hidden)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserBashResultWithOutputError {
+    #[serde(flatten)]
+    pub result: UserBashResult,
+    #[serde(default, deserialize_with = "deserialize_output_save_error")]
+    pub full_output_error: Option<String>,
+}
+
+fn deserialize_output_save_error<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.as_str().map(str::to_owned))
+}
+
 /// The first extension that handles a user command can replace its result or execution.
 pub enum UserBashReplacement {
     Result(UserBashResult),
@@ -1426,6 +1445,22 @@ pub trait Extension: Send + Sync {
         _host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<Option<UserBashResult>> {
         self.user_bash(event, state).await
+    }
+
+    #[doc(hidden)]
+    async fn user_bash_with_output_error(
+        &self,
+        event: &UserBashEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<UserBashResultWithOutputError>> {
+        Ok(self
+            .user_bash_with_host(event, state, host)
+            .await?
+            .map(|result| UserBashResultWithOutputError {
+                result,
+                full_output_error: None,
+            }))
     }
 
     /// Opt in to selecting a custom streaming implementation of user shell execution.
@@ -2929,8 +2964,10 @@ impl Registry {
         states: &ExtensionStates,
         cancel: &CancellationToken,
     ) -> Result<Option<UserBashReplacement>> {
-        self.prepare_user_bash_inner(event, states, cancel, None)
-            .await
+        Ok(self
+            .prepare_user_bash_inner(event, states, cancel, None)
+            .await?
+            .map(|(replacement, _)| replacement))
     }
 
     pub async fn prepare_user_bash_with_host(
@@ -2940,6 +2977,20 @@ impl Registry {
         cancel: &CancellationToken,
         host: Arc<dyn ToolHost>,
     ) -> Result<Option<UserBashReplacement>> {
+        Ok(self
+            .prepare_user_bash_with_output_error(event, states, cancel, host)
+            .await?
+            .map(|(replacement, _)| replacement))
+    }
+
+    #[doc(hidden)]
+    pub async fn prepare_user_bash_with_output_error(
+        &self,
+        event: &UserBashEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        host: Arc<dyn ToolHost>,
+    ) -> Result<Option<(UserBashReplacement, Option<String>)>> {
         self.prepare_user_bash_inner(event, states, cancel, Some(host))
             .await
     }
@@ -2950,17 +3001,27 @@ impl Registry {
         states: &ExtensionStates,
         cancel: &CancellationToken,
         host: Option<Arc<dyn ToolHost>>,
-    ) -> Result<Option<UserBashReplacement>> {
+    ) -> Result<Option<(UserBashReplacement, Option<String>)>> {
         for extension in &self.extensions {
             let state = states.get(extension.id());
             if extension.handles_user_bash() {
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = async { match &host { Some(host) => extension.user_bash_with_host(event, state, host.clone()).await, None => extension.user_bash(event, state).await } } => result,
+                    result = async {
+                        match &host {
+                            Some(host) => extension.user_bash_with_output_error(event, state, host.clone()).await,
+                            None => Ok(extension.user_bash(event, state).await?.map(|result| {
+                                UserBashResultWithOutputError { result, full_output_error: None }
+                            })),
+                        }
+                    } => result,
                 };
                 if let Some(result) = hook(extension.as_ref(), result)? {
-                    return Ok(Some(UserBashReplacement::Result(result)));
+                    return Ok(Some((
+                        UserBashReplacement::Result(result.result),
+                        result.full_output_error,
+                    )));
                 }
             }
             if extension.handles_user_bash_operations() {
@@ -2970,10 +3031,13 @@ impl Registry {
                     result = async { match &host { Some(host) => extension.user_bash_operations_with_host(event, state, host.clone()).await, None => extension.user_bash_operations(event, state).await } } => result,
                 };
                 if hook(extension.as_ref(), result)? {
-                    return Ok(Some(UserBashReplacement::Operations {
-                        extension: extension.clone(),
-                        state: state.cloned(),
-                    }));
+                    return Ok(Some((
+                        UserBashReplacement::Operations {
+                            extension: extension.clone(),
+                            state: state.cloned(),
+                        },
+                        None,
+                    )));
                 }
             }
         }

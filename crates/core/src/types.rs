@@ -1752,6 +1752,20 @@ impl BashExecution {
         })
     }
 
+    /// Keep save failure detail only when output is missing and no complete file exists.
+    #[doc(hidden)]
+    pub fn output_save_error<'a>(&self, error: Option<&'a str>) -> Option<&'a str> {
+        if !self.truncated || self.full_output_path.is_some() {
+            return None;
+        }
+        let error = error.filter(|error| !error.is_empty())?;
+        let mut end = error.len().min(4096);
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        Some(&error[..end])
+    }
+
     pub fn context_text(&self) -> String {
         let mut text = format!("Ran `{}`\n", self.command);
         if self.output.is_empty() {
