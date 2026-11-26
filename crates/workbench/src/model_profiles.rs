@@ -4605,8 +4605,13 @@ mod tests {
         let profiles = Profiles::default();
         let provider = profiles.provider("mistral").unwrap();
         assert_eq!(provider.adapter(), Adapter::MistralConversations);
-        assert_eq!(profiles.model_ids(&provider).len(), 34);
-        assert_eq!(profiles.model_ids(&provider)[0], "devstral-medium-latest");
+        let models = profiles.model_ids(&provider);
+        assert_eq!(models.len(), 34);
+        assert_eq!(models[0], "devstral-medium-latest");
+        assert_eq!(
+            crate::model_selection::default_for_provider(&provider, &models).map(String::as_str),
+            Some("mistral-medium-latest"),
+        );
         assert_eq!(
             profiles.endpoint(&provider),
             "https://api.mistral.ai/v1/chat/completions"

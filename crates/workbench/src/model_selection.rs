@@ -60,7 +60,7 @@ const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
     ("cerebras", "gpt-oss-120b"),
     ("zai", "glm-5.3"),
     ("zai-coding-cn", "glm-5.3"),
-    ("mistral", "devstral-medium-latest"),
+    ("mistral", "mistral-medium-latest"),
     ("minimax", "MiniMax-M3"),
     ("minimax-cn", "MiniMax-M3"),
     ("moonshotai", "kimi-k2.7-code"),
