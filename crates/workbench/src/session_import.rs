@@ -16,17 +16,34 @@ pub fn read(path: &Path) -> Result<Session> {
     if text.len() > 128 * 1024 * 1024 {
         return Err(Error::Session("import exceeds 128 MiB".into()));
     }
-    let entries = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            if line.len() > 16 * 1024 * 1024 {
-                return Err(Error::Session("imported entry exceeds 16 MiB".into()));
+    let mut entries = Vec::new();
+    let mut leading_error = None;
+    let mut recover_pi = false;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        if line.len() > 16 * 1024 * 1024 {
+            return Err(Error::Session("imported entry exceeds 16 MiB".into()));
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(entry) => {
+                if entries.is_empty() {
+                    recover_pi = has_pi_header(&entry);
+                    if !recover_pi && let Some(error) = leading_error.take() {
+                        return Err(Error::from(error));
+                    }
+                }
+                entries.push(entry);
             }
-            Ok(serde_json::from_str::<Value>(line)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
+            Err(_) if recover_pi => {}
+            Err(error) if entries.is_empty() => {
+                leading_error.get_or_insert(error);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     if entries.is_empty() {
+        if let Some(error) = leading_error {
+            return Err(error.into());
+        }
         return Err(Error::Session("imported session is empty".into()));
     }
     if entries
@@ -37,6 +54,10 @@ pub fn read(path: &Path) -> Result<Session> {
     } else {
         Session::from_serialized_records(entries)
     }
+}
+
+pub(super) fn has_pi_header(entry: &Value) -> bool {
+    entry["type"] == "session" && entry["id"].is_string()
 }
 
 // Source entries form an append-only forest. Binary lifting lets repeated

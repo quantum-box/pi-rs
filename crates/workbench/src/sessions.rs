@@ -138,12 +138,24 @@ fn stored_ids(path: &Path) -> Option<(String, Option<String>)> {
     use std::io::{BufRead, Read};
     let mut line = String::new();
     let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
-    reader
-        .by_ref()
-        .take(1024 * 1024)
-        .read_line(&mut line)
-        .ok()?;
-    let record: serde_json::Value = serde_json::from_str(&line).ok()?;
+    let mut header_scan = reader.by_ref().take(1024 * 1024);
+    let mut skipped_malformed = false;
+    let record: serde_json::Value = loop {
+        line.clear();
+        if header_scan.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(&line) {
+            Ok(entry) => break entry,
+            Err(_) => skipped_malformed = true,
+        }
+    };
+    if skipped_malformed && !super::session_import::has_pi_header(&record) {
+        return None;
+    }
     let Some(native_id) = record["event"]["session_id"].as_str() else {
         return record["id"].as_str().map(|id| (id.to_owned(), None));
     };
@@ -1503,6 +1515,47 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), before);
         std::fs::copy(&output, root.path().join("duplicate.jsonl")).unwrap();
         assert!(resolve_reference(Path::new("legacy-resume-id"), root.path()).is_err());
+    }
+
+    #[test]
+    fn malformed_pi_lines_are_skipped_in_reopened_sessions_and_id_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("recovered.jsonl");
+        let source = concat!(
+            "invalid leading record\n",
+            "{\"type\":\"session\",\"version\":3,\"id\":\"recovered-id\"}\n",
+            "{\"type\":\"message\",\"id\":\"first\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"first prompt\"}}\n",
+            "{\"type\":\"message\",\n",
+            "{\"type\":\"message\",\"id\":\"second\",\"parentId\":\"first\",\"message\":{\"role\":\"user\",\"content\":\"second prompt\"}}\n",
+            "{"
+        );
+        std::fs::write(&path, source).unwrap();
+        assert_eq!(
+            resolve_reference(Path::new("recovered-id"), root.path()).unwrap(),
+            path
+        );
+        let session = super::super::session_import::read(&path).unwrap();
+        assert_eq!(session.external_session_id(), "recovered-id");
+        assert_eq!(
+            session
+                .branch()
+                .into_iter()
+                .filter_map(|record| match &record.event {
+                    Event::User { content, .. } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["first prompt", "second prompt"]
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+
+        let native_path = root.path().join("native.jsonl");
+        session.export_jsonl(&native_path).unwrap();
+        let native = std::fs::read_to_string(&native_path).unwrap();
+        for damaged in [format!("invalid\n{native}"), format!("{native}{{")] {
+            std::fs::write(&native_path, damaged).unwrap();
+            assert!(super::super::session_import::read(&native_path).is_err());
+        }
     }
     #[tokio::test]
     async fn radius_share_uses_configured_proxy() {
