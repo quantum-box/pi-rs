@@ -11206,3 +11206,123 @@ async fn mcp_oauth_login_uses_workbench_proxy_setting_and_no_proxy() {
         );
     }
 }
+
+#[test]
+fn before_agent_start_cli_resumes_legacy_plan_on_the_same_run_id() {
+    use pi_rs::{Event, Record, RunState};
+    for invocation in [&["--mode", "text", "resume"][..], &["--print"][..]] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = root.join("session.jsonl");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(
+            root.join("models.json"),
+            json!({"providers":{"preflight":{
+                "api":"openai-completions", "baseUrl":endpoint, "apiKey":"fixture",
+                "models":[{"id":"fixture", "contextWindow":65536, "maxTokens":4096}]
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let run_id = uuid::Uuid::new_v4();
+        let record = |id, parent, run_id, event| Record {
+            id,
+            parent,
+            run_id,
+            event,
+            version: 3,
+            timestamp: None,
+        };
+        Session::from_records(vec![
+            record(
+                1,
+                None,
+                None,
+                Event::Created {
+                    session_id: uuid::Uuid::new_v4(),
+                },
+            ),
+            record(
+                2,
+                Some(1),
+                Some(run_id),
+                Event::Run {
+                    state: RunState::Running,
+                    initial: Some("original input".into()),
+                },
+            ),
+            record(
+                3,
+                Some(2),
+                Some(run_id),
+                Event::SourceEntry {
+                    format: "pi-rs:before-agent-start-v1".into(),
+                    entry: json!({"systemPrompt":"saved override", "messages":[]}),
+                },
+            ),
+        ])
+        .unwrap()
+        .export_jsonl(&path)
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("POST /v1/chat/completions "));
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            serde_json::from_slice::<Value>(&body).unwrap()
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi-rs"))
+            .current_dir(root)
+            .env("PI_RS_HOME", root)
+            .arg("--session")
+            .arg(&path)
+            .args([
+                "--provider",
+                "preflight",
+                "--model",
+                "fixture",
+                "--offline",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+            ])
+            .args(invocation)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{invocation:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body = server.join().unwrap();
+        assert_eq!(body["messages"][0]["content"], "saved override");
+        assert_eq!(body["messages"][1]["content"], "original input");
+        let journal = Session::open(&path).unwrap();
+        assert!(
+            journal
+                .records()
+                .iter()
+                .any(|record| record.run_id == Some(run_id)
+                    && matches!(
+                        record.event,
+                        Event::Run {
+                            state: RunState::Completed,
+                            ..
+                        }
+                    ))
+        );
+    }
+}

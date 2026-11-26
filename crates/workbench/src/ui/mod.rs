@@ -1,3 +1,4 @@
+pub mod color;
 pub mod dialog;
 pub mod diff;
 pub mod editor;

@@ -228,6 +228,197 @@ fn auth_login_sigint_exits_while_waiting_for_browser_authorization() {
 }
 
 #[test]
+fn bug_report_completion_consent_and_branch_export_in_both_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            br#"{"relay":{"type":"api_key","key":"test-credential-value"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            br#"{"defaultModel":"test-settings-value"}"#,
+        )
+        .unwrap();
+        let session_path = root.path().join("session.jsonl");
+        let saved_workspace = root.path().join("saved-workspace");
+        std::fs::create_dir(&saved_workspace).unwrap();
+        let mut session = pi_rs::Session::open(&session_path).unwrap();
+        session.set_working_directory(&saved_workspace).unwrap();
+        let anchor = session.head();
+        session
+            .append_user_with_images("inactive branch fixture".into(), vec![], None)
+            .unwrap();
+        session.checkout(anchor).unwrap();
+        session
+            .append_user_with_images("active branch fixture".into(), vec![], None)
+            .unwrap();
+        let session_id = session.session_id();
+        drop(session);
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(size),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let _process = Process(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(root.path())
+                .env("PI_RS_HOME", &home)
+                .env("PI_RS_BUG_TEST_SECRET", "test-environment-value")
+                .env("TERM", "xterm-256color")
+                .args([
+                    "--no-trust",
+                    "--no-mcp",
+                    "--no-extensions",
+                    "--offline",
+                    "--provider",
+                    "ollama",
+                    "--model",
+                    "fixture",
+                    "--tui-mode",
+                    mode,
+                    "--session",
+                ])
+                .arg(&session_path)
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+        let archives = || {
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "zip"))
+                .collect::<Vec<_>>()
+        };
+        output_until(&mut master, |text| text.contains("Enter to send"));
+        let journal = std::fs::read(&session_path).unwrap();
+        master.write_all(b"/bu\t").unwrap();
+        output_until(&mut master, |text| text.contains("/bug"));
+        master.write_all(b" cancelled description\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Metadata and diagnostics only")
+        });
+        assert!(archives().is_empty());
+        master.write_all(b"\x1b").unwrap();
+        output_until(&mut master, |text| text.contains("Bug report cancelled"));
+        assert!(archives().is_empty());
+
+        master.write_all(b"/bug example description\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Include current-branch transcript")
+        });
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| text.contains("Bug report exported to:"));
+        let paths = archives();
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o077, 0);
+        let mut archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 2);
+        assert!(archive.by_name("session.jsonl").is_err());
+        let mut metadata = String::new();
+        archive
+            .by_name("report.json")
+            .unwrap()
+            .read_to_string(&mut metadata)
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(report["description"], "example description");
+        assert_eq!(report["sessionId"], session_id.to_string());
+        assert_eq!(report["transcriptIncluded"], false);
+        let mut diagnostics = String::new();
+        archive
+            .by_name("diagnostics.json")
+            .unwrap()
+            .read_to_string(&mut diagnostics)
+            .unwrap();
+        let details: serde_json::Value = serde_json::from_str(&diagnostics).unwrap();
+        assert_eq!(details["userMessages"], 1);
+        for marker in [
+            "active branch fixture",
+            "inactive branch fixture",
+            "test-credential-value",
+            "test-settings-value",
+            "test-environment-value",
+            "cancelled description",
+        ] {
+            assert!(!metadata.contains(marker) && !diagnostics.contains(marker));
+        }
+        drop(archive);
+        std::fs::remove_file(path).unwrap();
+
+        master.write_all(b"/bug\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Include current-branch transcript")
+        });
+        master.write_all(b"\x1b[B\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Bug report exported to:") && !archives().is_empty()
+        });
+        let paths = archives();
+        assert_eq!(paths.len(), 1);
+        let mut archive = zip::ZipArchive::new(File::open(&paths[0]).unwrap()).unwrap();
+        assert_eq!(archive.len(), 3);
+        let report: serde_json::Value =
+            serde_json::from_reader(archive.by_name("report.json").unwrap()).unwrap();
+        assert!(report["description"].is_null());
+        assert_eq!(report["transcriptIncluded"], true);
+        let mut file = archive.by_name("session.jsonl").unwrap();
+        assert_eq!(file.unix_mode().unwrap() & 0o777, 0o600);
+        let mut transcript = String::new();
+        file.read_to_string(&mut transcript).unwrap();
+        let records = transcript
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let branch = pi_rs::Session::from_serialized_records(records).unwrap();
+        assert_eq!(branch.current_messages().len(), 1);
+        assert!(transcript.contains("active branch fixture"));
+        assert!(!transcript.contains("inactive branch fixture"));
+        assert_eq!(std::fs::read(&session_path).unwrap(), journal);
+        assert!(!saved_workspace.read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "zip")
+        }));
+    }
+}
+
+#[test]
 fn typing_redraws_in_a_synchronized_frame() {
     for mode in ["regular", "fullscreen"] {
         let root = tempfile::tempdir().unwrap();
@@ -445,6 +636,116 @@ fn reload_applies_saved_theme_changes_without_overriding_cli_selection() {
 }
 
 #[test]
+fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
+    const RGB: &str = "\x1b[38;2;255;0;0m";
+    const INDEXED: &str = "\x1b[38;5;196m";
+    const RGB_BG: &str = "\x1b[48;2;128;128;128m";
+    const INDEXED_BG: &str = "\x1b[48;5;244m";
+    const TRANSCRIPT: &str = "committed color fixture";
+    for mode in ["regular", "fullscreen"] {
+        for (configured, env, before, after) in
+            [(false, "1", INDEXED, RGB), (true, "0", RGB, INDEXED)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            std::fs::create_dir_all(home.join("themes")).unwrap();
+            let session_path = root.path().join("session.jsonl");
+            pi_rs::Session::open(&session_path)
+                .unwrap()
+                .append_user_with_images(TRANSCRIPT.into(), vec![], None)
+                .unwrap();
+            let settings = home.join("settings.json");
+            std::fs::write(
+                &settings,
+                serde_json::json!({"theme":"color-fixture","terminal":{"trueColor":configured}})
+                    .to_string(),
+            )
+            .unwrap();
+            let mut theme: serde_json::Value =
+                serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+            theme["name"] = serde_json::json!("color-fixture");
+            theme["colors"]["border"] = serde_json::json!("#ff0000");
+            theme["colors"]["userMessageBg"] = serde_json::json!("#808080");
+            std::fs::write(home.join("themes/color-fixture.json"), theme.to_string()).unwrap();
+
+            let mut master_fd = -1;
+            let mut slave_fd = -1;
+            let mut size = libc::winsize {
+                ws_row: 32,
+                ws_col: 110,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master_fd,
+                        &mut slave_fd,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::addr_of_mut!(size),
+                    )
+                },
+                0
+            );
+            let mut master = unsafe { File::from_raw_fd(master_fd) };
+            let slave = unsafe { File::from_raw_fd(slave_fd) };
+            let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+            assert_eq!(
+                unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+            let _process = Process(
+                Command::new(env!("CARGO_BIN_EXE_pi"))
+                    .current_dir(root.path())
+                    .env("PI_RS_HOME", &home)
+                    .env("TERM", "xterm-256color")
+                    .env("PI_TRUE_COLOR", env)
+                    .env_remove("NO_COLOR")
+                    .args([
+                        "--offline",
+                        "--no-trust",
+                        "--no-mcp",
+                        "--no-extensions",
+                        "--tui-mode",
+                        mode,
+                        "--session",
+                    ])
+                    .arg(&session_path)
+                    .stdin(Stdio::from(slave.try_clone().unwrap()))
+                    .stdout(Stdio::from(slave.try_clone().unwrap()))
+                    .stderr(Stdio::from(slave))
+                    .spawn()
+                    .unwrap(),
+            );
+            output_until(&mut master, |text| {
+                assert!(
+                    !text.contains(after),
+                    "unexpected color mode before reload in {mode}"
+                );
+                if before == INDEXED {
+                    assert!(!text.contains("\x1b[38;2;") && !text.contains("\x1b[48;2;"));
+                }
+                let background = if configured { RGB_BG } else { INDEXED_BG };
+                text.contains("Enter to send")
+                    && text.contains(TRANSCRIPT)
+                    && text.contains(before)
+                    && text.contains(background)
+            });
+            std::fs::write(&settings, br#"{"theme":"color-fixture"}"#).unwrap();
+            master.write_all(b"/reload\r").unwrap();
+            output_until(&mut master, |text| {
+                let background = if configured { INDEXED_BG } else { RGB_BG };
+                text.contains("Reloaded settings")
+                    && text.contains(TRANSCRIPT)
+                    && text.contains(after)
+                    && text.contains(background)
+            });
+        }
+    }
+}
+
+#[test]
 fn initial_appearance_report_keeps_late_color_replies() {
     let root = tempfile::tempdir().unwrap();
     let mut master_fd = -1;
@@ -488,6 +789,7 @@ fn initial_appearance_report_keeps_late_color_replies() {
         .env("PI_RS_HOME", root.path().join("home"))
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
+        .env_remove("PI_TRUE_COLOR")
         .env_remove("NO_COLOR")
         .args([
             "--no-trust",
@@ -946,6 +1248,93 @@ fn debug_command_and_global_shortcut_write_session_snapshots() {
     });
     master.write_all(b"\x1b").unwrap();
     output_until(&mut master, |text| text.contains("Enter to send"));
+}
+
+#[test]
+fn startup_extension_lists_an_explicit_theme_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let theme_path = root.path().join("explicit-theme.json");
+    let mut theme: serde_json::Value =
+        serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+    theme["name"] = serde_json::json!("startup-fixture-theme");
+    std::fs::write(&theme_path, format!("\u{feff}{theme}")).unwrap();
+    let extension = root.path().join("theme-catalog");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request = json.load(sys.stdin)
+    result = {'id':'theme-catalog','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True} if request['type'] == 'describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame = json.loads(sys.stdin.readline())
+    if frame['request']['event']['type'] == 'session_start':
+        print(json.dumps({'type':'ui','request':{'method':'getAllThemes'}}), flush=True)
+        response = json.loads(sys.stdin.readline())['Ok']
+        assert response[0] == {'name':'system'}, response
+        expected = os.path.realpath(os.environ['PI_TEST_THEME_PATH'])
+        assert {'name':'startup-fixture-theme','path':expected} in response, response
+        print(json.dumps({'type':'ui','request':{'method':'notify','message':'Startup theme catalog verified'}}), flush=True)
+        assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .arg("--theme")
+            .arg(&theme_path)
+            .args(["--use-theme", "startup-fixture-theme"])
+            .arg("--extension")
+            .arg(&extension)
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("PI_TEST_THEME_PATH", &theme_path)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| {
+        text.contains("Startup theme catalog verified")
+    });
 }
 
 #[test]
