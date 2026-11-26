@@ -1328,6 +1328,12 @@ fn write_json_with_guard(
     Ok(())
 }
 
+#[cfg(all(test, windows))]
+std::thread_local! {
+    static AUTH_REPLACE_BLOCKING_READER: std::cell::RefCell<Option<(PathBuf, std::fs::File)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(windows)]
 fn persist_locked_auth(
     mut file: tempfile::NamedTempFile,
@@ -1350,6 +1356,13 @@ fn persist_locked_auth(
                     Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
                 ) && Instant::now() < deadline =>
             {
+                #[cfg(test)]
+                AUTH_REPLACE_BLOCKING_READER.with(|reader| {
+                    let mut reader = reader.borrow_mut();
+                    if reader.as_ref().is_some_and(|(target, _)| target == path) {
+                        drop(reader.take());
+                    }
+                });
                 file = error.file;
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -1400,11 +1413,10 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
-
     #[cfg(windows)]
     #[test]
     fn auth_update_retries_atomic_replacement_while_a_reader_has_the_file_open() {
-        use super::{Error, read_object, update_object, write_json};
+        use super::{AUTH_REPLACE_BLOCKING_READER, Error, read_object, update_object, write_json};
         use serde_json::{Value, json};
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
@@ -1422,20 +1434,19 @@ mod tests {
             Err(Error::Io(error)) if matches!(error.raw_os_error(), Some(5 | 32))
         ));
 
-        let (writing, ready) = std::sync::mpsc::channel();
-        let release = std::thread::spawn(move || {
-            if ready.recv().is_ok() {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            drop(reader);
+        // Keep the reader open through serialization and sync. Only a real
+        // sharing error from the locked persist attempt releases it.
+        let resolved = super::super::auth_lock::resolved_auth_path(&path).unwrap();
+        AUTH_REPLACE_BLOCKING_READER.with(|slot| {
+            assert!(slot.replace(Some((resolved, reader))).is_none());
         });
-        let result = update_object(&path, move |data| {
+        let result = update_object(&path, |data| {
             data.insert("new".into(), Value::Bool(true));
-            writing.send(()).unwrap();
             Ok(())
         });
-        release.join().unwrap();
+        let remaining_reader = AUTH_REPLACE_BLOCKING_READER.with(|slot| slot.take());
         result.unwrap();
+        assert!(remaining_reader.is_none(), "locked persist never retried");
         assert_eq!(
             read_object(&path).unwrap(),
             json!({"old": true, "new": true})
