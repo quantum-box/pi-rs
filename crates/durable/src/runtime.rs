@@ -2538,6 +2538,14 @@ impl Conversation {
             .any(|s| s.status == Status::Queued && !self.held_inputs.contains(&s.id))
     }
 
+    /// The primary input for the current run, including while recovering it.
+    pub fn running_submission(&self) -> Option<&Submission> {
+        let active = self.active?;
+        self.submissions
+            .iter()
+            .find(|submission| submission.id == active && submission.status == Status::Running)
+    }
+
     /// Current model request identity for a submission placed in this run.
     pub fn model_request_id(&self, submission: Uuid) -> Option<Uuid> {
         match self.phase {
@@ -27824,43 +27832,57 @@ fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
     let mut follow = false;
     let mut placed = false;
     let mut continued_failure = false;
-    for submission in &mut c.submissions {
-        if submission.status != Status::Queued
-            || (starting_run && c.held_inputs.contains(&submission.id))
-        {
-            continue;
+    // Start a run from runnable input first. Once it has an owner, include
+    // held steering in that first model request under the same queue limit.
+    let passes: &[bool] = if starting_run && !c.held_inputs.is_empty() {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &held_steering in passes {
+        if held_steering && !placed {
+            break;
         }
-        let mode = c
-            .input_modes
-            .get(&submission.id)
-            .copied()
-            .unwrap_or(InputMode::FollowUp);
-        let (seen, setting) = match mode {
-            InputMode::Steer => (&mut steer, c.queue_modes.steering_mode),
-            InputMode::FollowUp if final_boundary => (&mut follow, c.queue_modes.follow_up_mode),
-            InputMode::FollowUp => continue,
-        };
-        if *seen && setting == QueueMode::OneAtATime {
-            continue;
-        }
-        *seen = true;
-        placed = true;
-        continued_failure |= c.failure_continuation_inputs.contains(&submission.id);
-        submission.status = Status::Running;
-        c.held_inputs.remove(&submission.id);
-        c.active.get_or_insert(submission.id);
-        let message = Message::User {
-            content: submission.content.clone(),
-        };
-        let index = c.messages.len();
-        c.messages.push(message.clone());
-        if let Some(binding) = &submission.input_blocks {
-            c.content_blocks.insert(index, binding.clone());
-        }
-        if let Some(proof) = &mut c.block_reset_proof {
-            proof.messages.push(message);
+        for submission in &mut c.submissions {
+            if submission.status != Status::Queued
+                || (starting_run && c.held_inputs.contains(&submission.id) != held_steering)
+            {
+                continue;
+            }
+            let mode = c
+                .input_modes
+                .get(&submission.id)
+                .copied()
+                .unwrap_or(InputMode::FollowUp);
+            let (seen, setting) = match mode {
+                InputMode::Steer => (&mut steer, c.queue_modes.steering_mode),
+                InputMode::FollowUp if final_boundary && !held_steering => {
+                    (&mut follow, c.queue_modes.follow_up_mode)
+                }
+                InputMode::FollowUp => continue,
+            };
+            if *seen && setting == QueueMode::OneAtATime {
+                continue;
+            }
+            *seen = true;
+            placed = true;
+            continued_failure |= c.failure_continuation_inputs.contains(&submission.id);
+            submission.status = Status::Running;
+            c.held_inputs.remove(&submission.id);
+            c.active.get_or_insert(submission.id);
+            let message = Message::User {
+                content: submission.content.clone(),
+            };
+            let index = c.messages.len();
+            c.messages.push(message.clone());
             if let Some(binding) = &submission.input_blocks {
-                proof.blocks.insert(index, binding.clone());
+                c.content_blocks.insert(index, binding.clone());
+            }
+            if let Some(proof) = &mut c.block_reset_proof {
+                proof.messages.push(message);
+                if let Some(binding) = &submission.input_blocks {
+                    proof.blocks.insert(index, binding.clone());
+                }
             }
         }
     }

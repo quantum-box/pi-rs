@@ -213,12 +213,18 @@ pub(super) async fn run(
         .iter()
         .filter(|input| !matches!(input.status, Status::Queued | Status::Running))
         .map(|input| input.id)
-        .collect();
+        .collect::<HashSet<_>>();
+    let mut active = state
+        .running_submission()
+        .map(|input| {
+            seen.insert(input.id);
+            Turn::start(input)
+        })
+        .transpose()?;
     let mut watching = state.has_runnable_input();
     if watching {
         scheduler.schedule(id);
     }
-    let mut active = None;
     let mut input = input_reader();
     let mut input_open = true;
     let mut poll = tokio::time::interval(Duration::from_millis(50));
@@ -585,6 +591,14 @@ fn publish_turns(
                     }
             }) else {
                 return Ok(());
+            };
+            let input = if input.status == Status::Running {
+                state
+                    .running_submission()
+                    .filter(|primary| !seen.contains(&primary.id))
+                    .unwrap_or(input)
+            } else {
+                input
             };
             seen.insert(input.id);
             *active = Some(Turn::start(input)?);

@@ -37,6 +37,8 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             "image prompt answer",
             "idle queue start answer",
             "staged image answer",
+            "partial before kill",
+            "reopened live answer",
         ]
         .into_iter()
         .enumerate()
@@ -102,14 +104,14 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
                 partial.len() + final_event.len(),
             ).unwrap();
-            if matches!(index, 0 | 2 | 3 | 4 | 7) {
+            if matches!(index, 0 | 2 | 3 | 4 | 7 | 16 | 17) {
                 socket.flush().unwrap();
                 finish_first_rx
                     .recv_timeout(Duration::from_secs(10))
                     .unwrap();
             }
             let result = socket.write_all(final_event.as_bytes());
-            if index != 3 {
+            if !matches!(index, 3 | 16) {
                 result.unwrap();
             }
         }
@@ -430,16 +432,22 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
                 );
                 writeln!(
                     stdin,
+                    r#"{{"type":"steer","id":"stage-after-failure","message":"held steering for retained queue"}}"#
+                )
+                .unwrap();
+                writeln!(
+                    stdin,
                     r#"{{"type":"prompt","id":"resume","message":"new prompt resumes queue"}}"#
                 )
                 .unwrap();
             }
-            ends.push(
-                frame["messages"][1]["content"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned(),
-            );
+            let answer = frame["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["role"] == "assistant")
+                .expect("the run must report its assistant answer");
+            ends.push(answer["content"][0]["text"].as_str().unwrap().to_owned());
             if ends.len() == 5 {
                 break;
             }
@@ -549,6 +557,81 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     assert_eq!(users[2][0]["text"], "idle image");
     assert_eq!(users[2][1], image);
 
+    let staged_restart =
+        rpc_batch(&[json!({"type":"steer", "message":"steering for reopened prompt"})]);
+    assert_eq!(staged_restart.len(), 1);
+    assert_eq!(staged_restart[0]["data"]["disposition"], "queued");
+
+    let mut interrupted = command(&endpoint, &["--conversation", id, "--rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = interrupted.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"type":"prompt","message":"interrupted prompt owner"})
+    )
+    .unwrap();
+    let partial = BufReader::new(interrupted.stdout.take().unwrap())
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+        .any(|frame| frame["assistantMessageEvent"]["delta"] == "partial before kill");
+    assert!(
+        partial,
+        "the original run must publish a live partial before being killed"
+    );
+    interrupted.kill().unwrap();
+    assert!(!interrupted.wait().unwrap().success());
+    drop(stdin);
+    finish_first_tx.send(()).unwrap();
+
+    let mut resumed = command(&endpoint, &["--conversation", id, "--rpc"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut resumed_inputs = Vec::new();
+    let mut live = false;
+    let mut finished = None;
+    for line in BufReader::new(resumed.stdout.take().unwrap()).lines() {
+        let event: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if event["type"] == "message_start" && event["message"]["role"] == "user" {
+            resumed_inputs.push(
+                event["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        if event["assistantMessageEvent"]["delta"] == "reopened live answer" {
+            assert!(!live);
+            live = true;
+            finish_first_tx.send(()).unwrap();
+        }
+        if event["type"] == "agent_end" {
+            finished = Some(event);
+        }
+    }
+    let resumed = resumed.wait_with_output().unwrap();
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(
+        resumed_inputs,
+        ["interrupted prompt owner", "steering for reopened prompt"]
+    );
+    assert!(
+        live,
+        "the resumed prompt must own and publish its live generation"
+    );
+    assert_eq!(finished.unwrap()["success"], true);
+
     let bodies = worker.join().unwrap();
     assert_eq!(bodies[0]["model"], "fixture");
     let input = bodies[1]["input"].to_string();
@@ -572,6 +655,11 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         bodies[11]["input"]
             .to_string()
             .contains("new prompt resumes queue")
+    );
+    assert!(
+        bodies[10]["input"]
+            .to_string()
+            .contains("held steering for retained queue")
     );
     let image_url = format!("data:image/png;base64,{image_data}");
     for index in [8, 12, 13] {
