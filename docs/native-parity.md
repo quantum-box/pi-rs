@@ -5906,6 +5906,16 @@ Codemode lists classifier and image entries using `models.getModelsOfType`,
 One classifiers with `models.classify` and OpenRouter image models with
 `models.generateImages`. Model credentials remain in the native host and
 provider responses enter the same journal as other nested tool calls.
+Pass `{ aspectRatio: "16:9", size: "2K" }` as an optional third argument to
+`models.generateImages`. Codemode resolves the model and checks the input
+before validating options. It trims non-empty strings and rejects unknown
+keys. OpenRouter receives `image_config.aspect_ratio` and
+`image_config.image_size` for the fields supplied. Omitted, null, or empty
+options leave the payload without `image_config`. The provider determines
+supported ratios and sizes and can return a normal image error result.
+[Pinned Pi validation](https://github.com/earendil-works/pi/blob/c863bdf19c4b18af6491935248972e763e10ef33/packages/coding-agent/src/extensions/codemode/execute.ts#L261-L290)
+· [Pinned OpenRouter mapping](https://github.com/earendil-works/pi/blob/c863bdf19c4b18af6491935248972e763e10ef33/packages/ai/src/api/openrouter-images.ts#L165-L181)
+
 Codemode also lists and runs GitHub Copilot's `microsoft-decision-1` classifier
 from Pi 1.6.0 via `/v1/systemone`. A saved Copilot subscription, a key saved
 for the official Copilot chat endpoint, or `COPILOT_GITHUB_TOKEN` makes it available. Discovery does not refresh the
