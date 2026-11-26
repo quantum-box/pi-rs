@@ -5493,6 +5493,14 @@ a model turn, except `NextTurn`, which is queued, and
 also its run ID. Reopening a session resumes an interrupted triggered run with
 that same ID and does not redeliver its message or repeat a recorded answer.
 Reentrant sends are serviced by the journal owner while the callback waits.
+
+Pi awaits each `agent_start` handler in extension order before proceeding.
+In pi-rs, each active `agent_start` handler can use its host for plain and keyed
+messages while the callback is live. Return, timeout, or cancellation expires
+that host and discards its queued requests that have yet to reach the journal.
+[Pi agent event dispatch](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L1371-L1376)
+[Pi extension runner](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/extensions/runner.ts#L1108-L1136)
+
 Separately built extensions negotiate the individual callback capabilities.
 Messages queued by `session_before_tree` are session-wide: they survive a
 checkout, reopening, and an exported fork, and are consumed once across branch
