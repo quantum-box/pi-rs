@@ -26,7 +26,6 @@ pub struct Entry {
     pub version: u64,
 }
 pub type KeyedEntry = (Vec<u8>, Entry);
-pub type PutCommit = (u64, Vec<Vec<u8>>);
 pub type MetadataPage = (Option<Entry>, Vec<KeyedEntry>);
 pub type DocumentChange = (Vec<u8>, Option<Entry>);
 pub type DocumentCommit = (u64, Vec<DocumentChange>);
@@ -1716,15 +1715,14 @@ impl Store {
         Ok(result)
     }
 
-    /// Read the keys put under a prefix in complete commit frames. This reads
-    /// the commit index, so overwritten values need not be retained.
-    pub fn scoped_put_commits(
+    /// Locate commits with puts under a prefix without loading their keys.
+    pub fn scoped_put_commit_positions(
         &self,
         prefix: &[u8],
         after: u64,
         through: u64,
         limit: usize,
-    ) -> Result<Vec<PutCommit>, Error> {
+    ) -> Result<Vec<u64>, Error> {
         if prefix.is_empty() || limit == 0 || limit > 256 || after > through {
             return Err(Error::InvalidSnapshot);
         }
@@ -1734,31 +1732,44 @@ impl Store {
         }
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         let mut stmt = conn.prepare(
-            "WITH chosen AS (
-                 SELECT DISTINCT sequence FROM durable_commit_versions
-                 WHERE key >= ?1 AND key < ?2 AND sequence > ?3 AND sequence <= ?4
-                 ORDER BY sequence LIMIT ?5
-             )
-             SELECT sequence, key, length(key) FROM durable_commit_versions
-             WHERE key >= ?1 AND key < ?2 AND sequence IN chosen ORDER BY sequence, key",
+            "SELECT DISTINCT sequence FROM durable_commit_versions
+             WHERE key >= ?1 AND key < ?2 AND sequence > ?3 AND sequence <= ?4
+             ORDER BY sequence LIMIT ?5",
         )?;
-        let mut rows = stmt.query(params![prefix, end, after, through, limit])?;
-        let mut result: Vec<PutCommit> = Vec::new();
+        let rows = stmt.query_map(params![prefix, end, after, through, limit], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Read one complete key-only frame from the immutable put index. Payloads
+    /// need not be retained, and an oversized frame does not affect earlier ones.
+    pub fn scoped_put_keys_at_commit(
+        &self,
+        prefix: &[u8],
+        sequence: u64,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        if prefix.is_empty() || sequence == 0 || sequence > i64::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let end = prefix_end(prefix).ok_or(Error::InvalidSnapshot)?;
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT key, length(key) FROM durable_commit_versions
+             WHERE key >= ?1 AND key < ?2 AND sequence = ?3 ORDER BY key LIMIT 257",
+        )?;
+        let mut rows = stmt.query(params![prefix, end, sequence])?;
+        let mut keys = Vec::new();
         let mut bytes = 0usize;
         while let Some(row) = rows.next()? {
-            let sequence = row.get(0)?;
-            if result.last().is_none_or(|(last, _)| *last != sequence) {
-                result.push((sequence, Vec::new()));
-                bytes = 0;
-            }
-            let (_, keys) = result.last_mut().expect("commit frame exists");
-            bytes = bytes.saturating_add(row.get::<_, usize>(2)?);
+            bytes = bytes.saturating_add(row.get::<_, usize>(1)?);
             if keys.len() >= 256 || bytes > MAX_SCOPED_DOCUMENT_FRAME_BYTES {
                 return Err(Error::DocumentFrameTooLarge);
             }
-            keys.push(row.get(1)?);
+            keys.push(row.get(0)?);
         }
-        Ok(result)
+        if keys.is_empty() {
+            return Err(Error::InvalidSnapshot);
+        }
+        Ok(keys)
     }
 
     /// Read one complete immutable scoped revision selected for a history page.

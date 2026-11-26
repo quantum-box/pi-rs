@@ -225,67 +225,94 @@ fn storage_key(session: Uuid, kind: &str, key: &str) -> Result<Vec<u8>, Error> {
     Ok(storage_key)
 }
 
-pub(crate) fn session_changes(
-    store: &Store,
+pub(crate) struct SessionHistoryScope {
     conversation: Uuid,
-    after: u64,
-    through: u64,
-    limit: usize,
-) -> Result<Vec<(u64, Vec<super::Address>)>, Error> {
-    use crate::session_membership::optional_document_scope;
+    session: Uuid,
+    checks: [Check; 2],
+    prefix: Vec<u8>,
+}
 
-    let Some(scope) = optional_document_scope(store, conversation)? else {
-        return Ok(Vec::new());
-    };
-    let session = scope.0;
-    let member = &scope.1[0];
-    let Expected::Version(version) = &member.expected else {
-        return Err(Error::InvalidDocumentDefinition);
-    };
-    // Membership grants access from its own admission, not to earlier changes.
-    // A legacy membership without tracked order predates the tracked history.
-    let admission = store
-        .commit_for_version(&member.key, *version)?
-        .unwrap_or(0);
-    if admission > through {
-        return Ok(Vec::new());
+impl SessionHistoryScope {
+    pub(crate) fn capture(
+        store: &Store,
+        conversation: Uuid,
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<Option<(Self, Vec<u64>)>, Error> {
+        let Some((session, checks)) =
+            crate::session_membership::optional_document_scope(store, conversation)?
+        else {
+            return Ok(None);
+        };
+        let member = &checks[0];
+        let Expected::Version(version) = &member.expected else {
+            return Err(Error::InvalidDocumentDefinition);
+        };
+        // A legacy membership without tracked order predates the tracked history.
+        let admission = store
+            .commit_for_version(&member.key, *version)?
+            .unwrap_or(0);
+        if admission > through {
+            return Ok(None);
+        }
+        let prefix = [SESSION_PREFIX, format!("[\"{session}\",").as_bytes()].concat();
+        let positions = store.scoped_put_commit_positions(
+            &prefix,
+            after.max(admission.saturating_sub(1)),
+            through,
+            limit,
+        )?;
+        if positions.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((
+            Self {
+                conversation,
+                session,
+                checks,
+                prefix,
+            },
+            positions,
+        )))
     }
-    let prefix = [SESSION_PREFIX, format!("[\"{session}\",").as_bytes()].concat();
-    let commits = store.scoped_put_commits(
-        &prefix,
-        after.max(admission.saturating_sub(1)),
-        through,
-        limit,
-    )?;
-    // Check the same proof again before exposing addresses. Revocation or
-    // re-enrollment also changes the member version when the session is the same.
-    if optional_document_scope(store, conversation)? != Some(scope) {
-        return Ok(Vec::new());
-    }
-    commits
-        .into_iter()
-        .map(|(sequence, keys)| {
-            let addresses = keys
-                .into_iter()
-                .map(|key| {
-                    let encoded = key
-                        .strip_prefix(SESSION_PREFIX)
-                        .ok_or(Error::InvalidDocumentDefinition)?;
-                    let (owner, name, family) =
-                        serde_json::from_slice::<(Uuid, String, String)>(encoded)?;
-                    if owner != session || storage_key(session, &name, &family)? != key {
-                        return Err(Error::InvalidDocumentDefinition);
-                    }
-                    Ok(super::Address {
-                        scope: session.to_string(),
-                        name,
-                        key: family,
-                    })
+
+    pub(crate) fn addresses(
+        &self,
+        store: &Store,
+        sequence: u64,
+    ) -> Result<Vec<super::Address>, Error> {
+        store
+            .scoped_put_keys_at_commit(&self.prefix, sequence)?
+            .into_iter()
+            .map(|key| {
+                let encoded = key
+                    .strip_prefix(SESSION_PREFIX)
+                    .ok_or(Error::InvalidDocumentDefinition)?;
+                let (session, name, family) =
+                    serde_json::from_slice::<(Uuid, String, String)>(encoded)?;
+                if session != self.session || storage_key(session, &name, &family)? != key {
+                    return Err(Error::InvalidDocumentDefinition);
+                }
+                Ok(super::Address {
+                    scope: session.to_string(),
+                    name,
+                    key: family,
                 })
-                .collect::<Result<_, Error>>()?;
-            Ok((sequence, addresses))
-        })
-        .collect()
+            })
+            .collect()
+    }
+
+    pub(crate) fn validate(self, store: &Store) -> Result<(), Error> {
+        // Re-enrollment creates a different version even in the same session.
+        let current = crate::session_membership::optional_document_scope(store, self.conversation)?;
+        let [member, session] = self.checks;
+        let key = member.key.clone();
+        if current != Some((self.session, [member, session])) {
+            return Err(durable_store::Error::Conflict { key }.into());
+        }
+        Ok(())
+    }
 }
 
 struct Staged {

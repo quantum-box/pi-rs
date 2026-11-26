@@ -611,6 +611,64 @@ fn unified_history_scopes_shared_documents_to_the_current_membership() {
     assert_eq!(changes(&harness), [first]);
 }
 
+#[test]
+fn oversized_current_document_frames_do_not_block_earlier_history_pages() {
+    use pi_rs_durable::{
+        document::{LatestConversationDocument, LatestDocumentFork, SessionDocument},
+        session_membership::SessionMembership,
+    };
+    use std::num::{NonZeroU32, NonZeroUsize};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let store = Store::open(&path).unwrap();
+    let members = SessionMembership::new(&store);
+    let latest = LatestConversationDocument {
+        kind: "latest".into(),
+        version: NonZeroU32::MIN,
+        initial: object(1),
+        fork: LatestDocumentFork::Current,
+    };
+    let shared = SessionDocument {
+        kind: "shared".into(),
+        version: NonZeroU32::MIN,
+        initial: object(1),
+    };
+    for shared_only in [false, true] {
+        let conversation = harness.create_conversation(config()).unwrap();
+        let session = members.create().unwrap();
+        members.enroll(session, conversation).unwrap();
+        harness
+            .session_transaction(conversation, |tx| {
+                for index in 0..257 {
+                    let key = index.to_string();
+                    if shared_only {
+                        tx.edit_session_document(&shared, &key, |_| Ok(()))?;
+                    } else {
+                        tx.edit_latest_document(&latest, &key, |_| Ok(()))?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let cursor = harness.unified_history_start(conversation, false).unwrap();
+        let page = harness.unified_history(&cursor, NonZeroUsize::MIN).unwrap();
+        assert!(page.has_more);
+        assert!(!page.commits[0].snapshots.is_empty());
+        assert!(page.commits[0].latest_document_changes.is_empty());
+        assert!(page.commits[0].session_document_changes.is_empty());
+        let result = harness.unified_history(&page.next, NonZeroUsize::MIN);
+        assert!(matches!(
+            result,
+            Err(Error::Storage(durable_store::Error::DocumentFrameTooLarge)
+                | Error::Document(DocumentError::Store(
+                    durable_store::Error::DocumentFrameTooLarge
+                )))
+        ));
+    }
+}
+
 #[tokio::test]
 async fn latest_conversation_watch_tracks_its_address_and_delivers_replacements() {
     use pi_rs_durable::{
