@@ -2,7 +2,7 @@
 use crate::runtime::time as platform_time;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -54,6 +54,26 @@ pub enum SessionEvent {
         run_id: Uuid,
         message: String,
     },
+}
+
+/// A live partial tool result for presentation. Arguments and results may contain private data.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ToolProgressUpdate {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    /// The scheduler's bounded argument preview, or null when unavailable.
+    pub args: serde_json::Value,
+    pub partial_result: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
+}
+
+struct SessionEvents {
+    regular: broadcast::Sender<SessionEvent>,
+    // In-flight observers can outlive close. Only the session owns this sender.
+    tool_progress: broadcast::WeakSender<Arc<ToolProgressUpdate>>,
 }
 
 /// A configured extension command for native host command pickers.
@@ -485,7 +505,7 @@ pub struct SessionControl {
     retry: crate::RetryControl,
     input_hooks: Arc<Mutex<InputHooks>>,
     input_order: Arc<InputAdmission>,
-    events: broadcast::WeakSender<SessionEvent>,
+    events: Weak<SessionEvents>,
     tool_timeout: std::time::Duration,
 }
 
@@ -1489,8 +1509,12 @@ impl SessionBuilder {
             None => true,
         };
         let (sender, input) = mpsc::channel(32);
-        let (events, _) = broadcast::channel(64);
-        let weak_events = events.downgrade();
+        let (tool_progress, _) = broadcast::channel(32);
+        let events = Arc::new(SessionEvents {
+            regular: broadcast::channel(64).0,
+            tool_progress: tool_progress.downgrade(),
+        });
+        let weak_events = Arc::downgrade(&events);
         let tool_timeout = self.limits.tool_timeout;
         let auto_compaction = session.auto_compaction_control();
         let retry = session.retry_control();
@@ -1529,6 +1553,7 @@ impl SessionBuilder {
             session,
             input,
             events: Some(events),
+            tool_progress: Some(tool_progress),
             control: SessionControl {
                 scope: None,
                 owner,
@@ -1566,7 +1591,8 @@ pub struct AgentSession {
     session: Arc<tokio::sync::Mutex<Session>>,
     input: Arc<tokio::sync::Mutex<mpsc::Receiver<crate::AgentInput>>>,
     control: SessionControl,
-    events: Option<broadcast::Sender<SessionEvent>>,
+    events: Option<Arc<SessionEvents>>,
+    tool_progress: Option<broadcast::Sender<Arc<ToolProgressUpdate>>>,
     closed: bool,
     pending_start: PendingStart,
     session_file: Option<PathBuf>,
@@ -1751,12 +1777,24 @@ impl AgentSession {
     /// A slow subscriber receives a broadcast lag error instead of blocking execution.
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         match &self.events {
-            Some(events) => events.subscribe(),
+            Some(events) => events.regular.subscribe(),
             None => {
                 let (sender, receiver) = broadcast::channel(1);
                 drop(sender);
                 receiver
             }
+        }
+    }
+    /// Subscribe to live partial results for direct and control-triggered tool calls.
+    ///
+    /// Subscribe before starting work. The stream is transient and retains up to
+    /// 32 updates. Slow receivers get a broadcast lag error and never hold up a
+    /// tool. The stream closes on session close or drop. Final results and
+    /// durable records remain available through [`Self::subscribe`].
+    pub fn subscribe_tool_progress(&self) -> broadcast::Receiver<Arc<ToolProgressUpdate>> {
+        match &self.tool_progress {
+            Some(progress) => progress.subscribe(),
+            None => broadcast::channel(1).1,
         }
     }
     /// The stable, Pi-visible session ID. Imported journals can retain an
@@ -3861,6 +3899,7 @@ impl AgentSession {
             return Ok(());
         }
         self.closed = true;
+        drop(self.tool_progress.take());
         self.control.owner.closed.cancel();
         self.control.abort();
         {
@@ -3893,7 +3932,7 @@ impl AgentSession {
             Ok(())
         };
         if let Some(events) = self.events.take() {
-            let _ = events.send(SessionEvent::Closed);
+            let _ = events.regular.send(SessionEvent::Closed);
         }
         notification_result.and(result)
     }
@@ -4179,7 +4218,29 @@ impl Drop for ActiveRun {
         *self.state.lock().expect("session control") = None;
     }
 }
-fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_>) {
+fn emit(events: &SessionEvents, notification: &Notification<'_>) {
+    if let Notification::ToolProgress(crate::LifecycleEvent::ToolExecutionUpdate {
+        tool_call_id,
+        tool_name,
+        args,
+        partial_result,
+        parent_tool_call_id,
+    }) = notification
+    {
+        if let Some(progress) = events.tool_progress.upgrade()
+            && progress.receiver_count() != 0
+        {
+            let _ = progress.send(Arc::new(ToolProgressUpdate {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                args: args.clone(),
+                partial_result: partial_result.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+            }));
+        }
+        return;
+    }
+    let events = &events.regular;
     if events.receiver_count() == 0 {
         return;
     }

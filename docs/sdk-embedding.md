@@ -238,6 +238,35 @@ credential, and network policies. The SDK's session state is not a sandbox.
 See [Tauri's state guide](https://v2.tauri.app/develop/state-management/) and
 [command guide](https://v2.tauri.app/develop/calling-rust/).
 
+### Live tool results
+
+Subscribe with `AgentSession::subscribe_tool_progress()` before starting work.
+Direct prompts and runs started through cloned controls publish owned
+`Arc<ToolProgressUpdate>` values with the tool call ID, name, argument preview,
+partial result, and parent call ID for nested tools. The payload
+keeps the result format supplied by the tool. Hosts can use it to update their
+tool renderer while the call is running. Final results still arrive as
+committed records on `AgentSession::subscribe()`.
+
+The progress stream retains up to 32 updates per session. A slow subscription
+reports `RecvError::Lagged` and can then continue with the retained updates.
+Closing or dropping the session closes the stream after buffered updates are
+drained. Progress is transient and reopening the journal cannot replay it.
+
+In Tauri, create the receiver while you have access to the managed session,
+then release the state lock before reading the stream. An authorized frontend
+can provide a `tauri::ipc::Channel<ToolProgressUpdate>` to a host command.
+The forwarding task can send `update.as_ref().clone()` through that channel
+after applying the host's disclosure policy. Arguments and partial results may
+contain private data. Handle lag by resuming with the newest available updates
+and reconcile the display with the final committed result. Stop forwarding
+when the channel disconnects or the SDK receiver closes.
+
+This is a Rust API in `pi-rs-core` and also compiles for `wasm32-unknown-unknown`.
+The JavaScript browser SDK uses a separate `wasm-bindgen` wrapper around the core
+session. Its prompt and resume methods return promises for completed answers,
+and its current bindings do not expose this subscription.
+
 ## Browser WASM status
 
 The standalone `pi-rs-tool-arguments` crate isolates complete tool-argument
