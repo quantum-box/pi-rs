@@ -2069,7 +2069,23 @@ when execution has no deadline; a shorter script or host deadline and
 cancellation stop the wait sooner. An admission failure reports the wall time
 and that the script did not start. As in Pi 1.6.0, it reports the configured
 deadline when a script times out or the shared worker count when the pool
-stays busy for 60 seconds. `PI_CODEMODE_MAX_WORKERS` is re-read when
+stays busy for 60 seconds. The same absolute deadline applies while the
+admitted job is queued in the blocking executor. Expiry at that stage returns
+without waiting for the queue to drain and releases the reserved slot. Once
+execution starts, it keeps its slot through shutdown and output formatting.
+Caller cancellation while formatting is queued returns immediately and releases
+the reserved slot. An active formatter keeps the slot until it exits.
+Unpublished transcripts are removed. A deadline interrupt in QuickJS and a
+timeout awaiting a tool report the effective timeout in milliseconds. Nested
+calls receive cancellation when execution settles, before formatting. Error
+replies preserve partial text and inline images within the output limits and
+discard uncommitted store writes. Text-only errors retain the existing failed outcome. The session
+scheduler can still settle a host-wide tool timeout or cancellation before
+Codemode publishes the reply.
+[Pinned Codemode worker deadline](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/codemode/src/runtime/execution.ts)
+[Pinned coding-agent result formatting](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/extensions/codemode/execute.ts)
+
+`PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
 running. Positive integer values accept Pi's numeric forms, including
 JavaScript whitespace, decimal notation and radix prefixes. Reducing the limit does not interrupt
