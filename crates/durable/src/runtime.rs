@@ -10680,14 +10680,21 @@ impl Harness {
             cursor,
             limit,
             false,
-            |source, observation, skip_messages| {
-                if skip_messages {
-                    Ok(Vec::new())
+            |source, observation, skip_messages, cutoff| {
+                let mut entries = if skip_messages {
+                    Vec::new()
                 } else {
-                    self.session_messages_in_observation(source, observation)
+                    self.session_messages_in_observation(source, observation)?
+                };
+                if let Some(cutoff) = cutoff {
+                    let index = entries
+                        .iter()
+                        .position(|entry| entry.history.id == cutoff)
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    entries.truncate(index + 1);
                 }
+                Ok(entries)
             },
-            |entry| entry.history.id,
         )?;
         Ok(SessionMessagePage { entries, older })
     }
@@ -10709,15 +10716,15 @@ impl Harness {
             &cursor.0,
             limit,
             true,
-            |source, observation, skip_seed_entries| {
+            |source, observation, skip_seed_entries, cutoff| {
                 self.session_entries_in_observation(
                     source,
                     observation,
                     skip_seed_entries,
                     cursor.0.include_custom_entries,
+                    cutoff,
                 )
             },
-            SessionEntry::id,
         )?;
         Ok(SessionEntryPage {
             entries,
@@ -10835,8 +10842,7 @@ impl Harness {
         cursor: &SessionMessageCursor,
         limit: std::num::NonZeroUsize,
         include_metadata: bool,
-        read_entries: impl Fn(Uuid, u64, bool) -> Result<Vec<E>, Error>,
-        entry_id: impl Fn(&E) -> Uuid,
+        read_entries: impl Fn(Uuid, u64, bool, Option<Uuid>) -> Result<Vec<E>, Error>,
     ) -> Result<(Vec<E>, Option<SessionMessageCursor>), Error> {
         if limit.get() > 256 {
             return Err(Error::Invalid(
@@ -10875,15 +10881,12 @@ impl Harness {
             // Its source supplies the original occurrences.
             let skip_seed_entries =
                 position.observation == 1 && self.fork_parent(position.source)?.is_some();
-            let mut messages =
-                read_entries(position.source, position.observation, skip_seed_entries)?;
-            if let Some(cutoff) = position.cutoff {
-                let index = messages
-                    .iter()
-                    .position(|entry| entry_id(entry) == cutoff)
-                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                messages.truncate(index + 1);
-            }
+            let mut messages = read_entries(
+                position.source,
+                position.observation,
+                skip_seed_entries,
+                position.cutoff,
+            )?;
             let remaining = messages
                 .len()
                 .checked_sub(position.consumed)
@@ -10996,6 +10999,7 @@ impl Harness {
         observation: u64,
         skip_seed_entries: bool,
         include_custom_entries: bool,
+        cutoff: Option<Uuid>,
     ) -> Result<Vec<SessionEntry>, Error> {
         let record = self.session_observation(source, observation)?;
         let mut entries = Vec::new();
@@ -11026,7 +11030,49 @@ impl Harness {
                 observation: record.cursor,
             }));
         }
+        if let Some(cutoff) = cutoff {
+            let index = entries
+                .iter()
+                .position(|entry| entry.id() == cutoff)
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let mut tail = entries.split_off(index + 1);
+            if let SessionEntry::Message(message) = &entries[index] {
+                tail.retain(|entry| matches!(entry, SessionEntry::Custom { .. }));
+                self.retain_message_cut_writes(source, &record, message, &mut tail)?;
+                entries.extend(tail);
+            }
+        }
         Ok(entries)
+    }
+
+    // A reset can place custom writes in the same observation as several
+    // message boundaries. Keep the writes from the exact authenticated cut.
+    fn retain_message_cut_writes(
+        &self,
+        source: Uuid,
+        record: &crate::observer::Record,
+        message: &SessionMessageEntry,
+        writes: &mut Vec<SessionEntry>,
+    ) -> Result<(), Error> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let _scope = ResetProofScope::enter();
+        let position = self.original_occurrence_position(&message.history, &message.message)?;
+        let anchor: Option<crate::transcript::Cursor> =
+            serde_json::from_value(record.value.get("_transcript").cloned().unwrap_or_default())?;
+        if anchor.as_ref() != Some(&position.cursor) {
+            let (state, _, _) =
+                self.prove_failure_reset_cut(source, &position.cursor, record.cursor.0)?;
+            let retained: HashSet<_> = state
+                .application_writes
+                .into_iter()
+                .filter(|write| write.placed && !write.withdrawn)
+                .map(|write| write.id)
+                .collect();
+            writes.retain(|entry| retained.contains(&entry.id()));
+        }
+        Ok(())
     }
 
     fn session_custom_entries(
