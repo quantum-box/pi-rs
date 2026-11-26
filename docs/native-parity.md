@@ -940,6 +940,17 @@ results stay on the existing record stream. The JavaScript browser wrapper
 continues to return completed prompt and resume results.
 [Pinned Pi event dispatch](https://github.com/earendil-works/pi/blob/bf3f6a2228710cf457604f74b0aceb7bcc8a6b9e/packages/coding-agent/src/core/agent-session.ts#L1209-L1213)
 
+### SDK assistant content streaming
+
+Native Rust hosts can opt in to ordered, indexed text and reasoning starts,
+deltas, and ends through `AgentSession::subscribe_assistant_content()`. Model
+request UUIDs distinguish attempts when a retry reuses an item index. The
+subscription includes image prompts and control-triggered runs and delivers
+only item events supplied by the provider. The journal remains the source of
+committed assistant content. The JavaScript browser wrapper exposes completed
+prompt and resume results.
+[Pinned Pi assistant event forwarding](https://github.com/earendil-works/pi/blob/bf3f6a2228710cf457604f74b0aceb7bcc8a6b9e/packages/agent/src/agent-loop.ts#L424-L449)
+
 ### Executable cross-tool renderers
 
 Executable extensions advertise ordered exact and prefix matches for tool

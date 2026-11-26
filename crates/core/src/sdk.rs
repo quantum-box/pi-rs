@@ -70,10 +70,46 @@ pub struct ToolProgressUpdate {
     pub parent_tool_call_id: Option<String>,
 }
 
+/// One live provider text or reasoning item update, scoped to its model request.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct AssistantContentEvent {
+    /// Changes on a retry or subsequent model request.
+    pub request_id: Uuid,
+    /// The provider's item index within this request.
+    pub index: u64,
+    pub update: AssistantContentUpdate,
+}
+
+/// Lifecycle update for a provider item. End content is the complete item text.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum AssistantContentUpdate {
+    TextStart,
+    TextDelta { delta: String },
+    TextEnd { content: String },
+    ReasoningStart { redacted: bool },
+    ReasoningDelta { delta: String },
+    ReasoningEnd { content: String },
+}
+
 struct SessionEvents {
     regular: broadcast::Sender<SessionEvent>,
-    // In-flight observers can outlive close. Only the session owns this sender.
+    // In-flight observers can outlive close. Only the session owns these senders.
     tool_progress: broadcast::WeakSender<Arc<ToolProgressUpdate>>,
+    assistant_content: broadcast::WeakSender<Arc<AssistantContentEvent>>,
+}
+
+impl SessionEvents {
+    fn assistant_content_target(
+        &self,
+    ) -> Option<(broadcast::Sender<Arc<AssistantContentEvent>>, Uuid)> {
+        let request_id = crate::agent::assistant_content_request_id()?;
+        let sender = self.assistant_content.upgrade()?;
+        (sender.receiver_count() != 0).then_some((sender, request_id))
+    }
 }
 
 /// A configured extension command for native host command pickers.
@@ -954,13 +990,13 @@ impl SessionControl {
                 limits: config.limits,
             };
             let result = agent
-                .run_correlated(
+                .run_correlated_with_events(
                     &mut journal,
                     trigger_id,
                     None,
                     &mut inputs,
                     &active.token,
-                    &mut observe,
+                    &mut |event| emit_run_event(&events, self, &event),
                 )
                 .await;
             let final_inputs = active.finish_inputs(&mut journal, &mut inputs, &mut observe);
@@ -1510,9 +1546,11 @@ impl SessionBuilder {
         };
         let (sender, input) = mpsc::channel(32);
         let (tool_progress, _) = broadcast::channel(32);
+        let (assistant_content, _) = broadcast::channel(64);
         let events = Arc::new(SessionEvents {
             regular: broadcast::channel(64).0,
             tool_progress: tool_progress.downgrade(),
+            assistant_content: assistant_content.downgrade(),
         });
         let weak_events = Arc::downgrade(&events);
         let tool_timeout = self.limits.tool_timeout;
@@ -1554,6 +1592,7 @@ impl SessionBuilder {
             input,
             events: Some(events),
             tool_progress: Some(tool_progress),
+            assistant_content: Some(assistant_content),
             control: SessionControl {
                 scope: None,
                 owner,
@@ -1593,6 +1632,7 @@ pub struct AgentSession {
     control: SessionControl,
     events: Option<Arc<SessionEvents>>,
     tool_progress: Option<broadcast::Sender<Arc<ToolProgressUpdate>>>,
+    assistant_content: Option<broadcast::Sender<Arc<AssistantContentEvent>>>,
     closed: bool,
     pending_start: PendingStart,
     session_file: Option<PathBuf>,
@@ -1797,6 +1837,20 @@ impl AgentSession {
             None => broadcast::channel(1).1,
         }
     }
+    /// Subscribe to provider text and reasoning item events produced by SDK runs.
+    ///
+    /// The stream is transient and retains up to 64 updates. It closes with the
+    /// session. Legacy unindexed deltas still arrive on [`Self::subscribe`].
+    /// A cancelled or failed attempt can leave an item without an end event.
+    /// Use the request ID to distinguish attempts and committed records for the
+    /// authoritative assistant response.
+    pub fn subscribe_assistant_content(&self) -> broadcast::Receiver<Arc<AssistantContentEvent>> {
+        match &self.assistant_content {
+            Some(content) => content.subscribe(),
+            None => broadcast::channel(1).1,
+        }
+    }
+
     /// The stable, Pi-visible session ID. Imported journals can retain an
     /// external ID that differs from their native storage UUID.
     pub fn session_id(&self) -> Result<String> {
@@ -2946,13 +3000,13 @@ impl AgentSession {
             limits: self.limits.clone(),
         };
         let result = agent
-            .run_correlated(
+            .run_correlated_with_events(
                 &mut journal,
                 trigger_id,
                 None,
                 &mut input_queue,
                 &active.token,
-                &mut observe,
+                &mut |event| emit_run_event(&events, &self.control, &event),
             )
             .await;
         let final_inputs = active.finish_inputs(&mut journal, &mut input_queue, &mut observe);
@@ -3576,19 +3630,7 @@ impl AgentSession {
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let observe_event = std::sync::Mutex::new(|event: crate::AgentEvent<'_>| {
-            match &event {
-                crate::AgentEvent::Notification(notification) => {
-                    self.control.observe(notification);
-                    emit(&events, notification);
-                }
-                crate::AgentEvent::TextDelta { delta, .. } => {
-                    emit(&events, &Notification::Text(delta))
-                }
-                crate::AgentEvent::ReasoningDelta { delta, .. } => {
-                    emit(&events, &Notification::Reasoning(delta))
-                }
-                _ => {}
-            }
+            emit_run_event(&events, &self.control, &event);
             observer(event);
         });
         let mut observe = |event: Notification<'_>| {
@@ -3900,6 +3942,7 @@ impl AgentSession {
         }
         self.closed = true;
         drop(self.tool_progress.take());
+        drop(self.assistant_content.take());
         self.control.owner.closed.cancel();
         self.control.abort();
         {
@@ -4218,6 +4261,71 @@ impl Drop for ActiveRun {
         *self.state.lock().expect("session control") = None;
     }
 }
+fn send_assistant_content(
+    sender: &broadcast::Sender<Arc<AssistantContentEvent>>,
+    request_id: Uuid,
+    event: &crate::AgentEvent<'_>,
+) {
+    use crate::AgentEvent;
+
+    let (index, update) = match *event {
+        AgentEvent::TextStart { index } => (index, AssistantContentUpdate::TextStart),
+        AgentEvent::TextDelta { index, delta } => (
+            index,
+            AssistantContentUpdate::TextDelta {
+                delta: delta.into(),
+            },
+        ),
+        AgentEvent::TextEnd { index, content } => (
+            index,
+            AssistantContentUpdate::TextEnd {
+                content: content.into(),
+            },
+        ),
+        AgentEvent::ReasoningStart { index } => (
+            index,
+            AssistantContentUpdate::ReasoningStart {
+                redacted: crate::redacted_reasoning_start(),
+            },
+        ),
+        AgentEvent::ReasoningDelta { index, delta } => (
+            index,
+            AssistantContentUpdate::ReasoningDelta {
+                delta: delta.into(),
+            },
+        ),
+        AgentEvent::ReasoningEnd { index, content } => (
+            index,
+            AssistantContentUpdate::ReasoningEnd {
+                content: content.into(),
+            },
+        ),
+        _ => return,
+    };
+    let _ = sender.send(Arc::new(AssistantContentEvent {
+        request_id,
+        index,
+        update,
+    }));
+}
+
+fn emit_run_event(events: &SessionEvents, control: &SessionControl, event: &crate::AgentEvent<'_>) {
+    if let Some((sender, request_id)) = events.assistant_content_target() {
+        send_assistant_content(&sender, request_id, event);
+    }
+    match event {
+        crate::AgentEvent::Notification(notification) => {
+            control.observe(notification);
+            emit(events, notification);
+        }
+        crate::AgentEvent::TextDelta { delta, .. } => emit(events, &Notification::Text(delta)),
+        crate::AgentEvent::ReasoningDelta { delta, .. } => {
+            emit(events, &Notification::Reasoning(delta))
+        }
+        _ => {}
+    }
+}
+
 fn emit(events: &SessionEvents, notification: &Notification<'_>) {
     if let Notification::ToolProgress(crate::LifecycleEvent::ToolExecutionUpdate {
         tool_call_id,
