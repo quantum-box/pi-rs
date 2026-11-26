@@ -2509,7 +2509,7 @@ impl Agent<'_> {
                 }
                 let ReplyAttempt {
                     outcome: result,
-                    partial_record,
+                    partial_request,
                 } = active
                     .reply(session, attempt, true, cancel, observer, Some(followups))
                     .await?;
@@ -2525,7 +2525,6 @@ impl Agent<'_> {
                     )
                     .is_ok_and(|retention| has_summary_prefix(session, retention.boundary))
                 {
-                    omit_retry_partial(session, partial_record, observer)?;
                     continue;
                 }
                 let control = session.retry_control();
@@ -2537,7 +2536,16 @@ impl Agent<'_> {
                 {
                     // Persist the omission before notifying the caller or entering
                     // cancellable backoff. The failed completion remains in history.
-                    omit_retry_partial(session, partial_record, observer)?;
+                    if let Some(request_id) = partial_request {
+                        commit(
+                            session,
+                            Event::SourceEntry {
+                                format: crate::journal::RETRY_SCHEDULED.into(),
+                                entry: serde_json::json!({"requestId": request_id}),
+                            },
+                            observer,
+                        )?;
+                    }
                     retry_attempt += 1;
                     let delay_ms = settings.delay_ms(retry_attempt);
                     let retry_wait = control.begin_wait();
@@ -4037,7 +4045,7 @@ impl Agent<'_> {
         self.settle_usage(request_id, &usage, &metadata).await?;
         Ok(ReplyAttempt {
             outcome: result,
-            partial_record: partial_failure.map(|_| record_id),
+            partial_request: partial_failure.map(|_| request_id),
         })
     }
 
@@ -7365,7 +7373,7 @@ impl PreparedAttempt<'_> {
 
 struct ReplyAttempt {
     outcome: Result<Reply>,
-    partial_record: Option<u64>,
+    partial_request: Option<Uuid>,
 }
 
 struct Reply {
@@ -7777,24 +7785,6 @@ mod metadata_scope_tests {
 
 fn commit(session: &mut Session, event: Event, observer: &mut Observer<'_>) -> Result<()> {
     observer(Notification::Committed(session.append(event)?));
-    Ok(())
-}
-
-fn omit_retry_partial(
-    session: &mut Session,
-    target: Option<u64>,
-    observer: &mut Observer<'_>,
-) -> Result<()> {
-    if let Some(target) = target {
-        commit(
-            session,
-            Event::ContextEdited {
-                target,
-                replacement: None,
-            },
-            observer,
-        )?;
-    }
     Ok(())
 }
 
@@ -9876,8 +9866,10 @@ mod tree_tests {
                 session
                     .records()
                     .iter()
-                    .any(|record| matches!(&record.event,
-                Event::ContextEdited { target, replacement: None } if *target == failed.id))
+                    .any(
+                        |record| crate::superseded_turn_partial(session.records(), record)
+                            == Some(failed.id)
+                    )
             );
             assert_ne!(
                 session.last_assistant_text().as_deref(),
@@ -9918,6 +9910,55 @@ mod tree_tests {
                     .unwrap()
                     .contains("private-fixture-secret")
             );
+            drop(events);
+            if always_fail {
+                // Reopen exactly after the durable failure, before recovery
+                // could persist its marker. The next attempt has no text.
+                let run_id = failed.run_id.unwrap();
+                let prefix =
+                    Session::from_records(session.records()[..failed.id as usize].to_vec())
+                        .unwrap();
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory
+                    .path()
+                    .join("interrupted-before-overflow-marker.jsonl");
+                prefix.export_jsonl(&path).unwrap();
+                let mut reopened = Session::open(&path).unwrap();
+                assert_eq!(
+                    reopened.last_assistant_text().as_deref(),
+                    Some("overflow partial")
+                );
+                assert!(
+                    agent
+                        .run_correlated(
+                            &mut reopened,
+                            run_id,
+                            None,
+                            &mut inputs,
+                            &CancellationToken::new(),
+                            &mut |_| {}
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    reopened.branch().iter().any(|record| matches!(record.event,
+                    Event::Compacted { retain_from: Some(boundary), .. } if boundary <= failed.id))
+                );
+                assert!(
+                    reopened
+                        .branch()
+                        .iter()
+                        .any(
+                            |record| crate::superseded_turn_partial(reopened.records(), record)
+                                == Some(failed.id)
+                        )
+                );
+                assert_ne!(
+                    reopened.last_assistant_text().as_deref(),
+                    Some("overflow partial")
+                );
+            }
         }
     }
 

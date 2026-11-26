@@ -14,7 +14,10 @@ use crate::{
 
 mod assistant_transcript;
 
-pub use assistant_transcript::{AssistantTranscriptEntry, native_assistant_stop_reason};
+pub(crate) use assistant_transcript::RETRY_SCHEDULED;
+pub use assistant_transcript::{
+    AssistantTranscriptEntry, native_assistant_stop_reason, superseded_turn_partial,
+};
 
 pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
 const BRANCH_FALLBACK_JOURNAL_VERSION: u32 = 4;
@@ -1684,10 +1687,9 @@ impl Session {
             .iter()
             .rev()
             .find_map(|record| {
-                (matches!(
-                    record.event,
-                    Event::ContextEdited { .. } | Event::Compacted { .. }
-                ) || system_invalidations.contains(&record.id))
+                (matches!(record.event, Event::Compacted { .. })
+                    || is_model_context_edit(&self.records, &record.event)
+                    || system_invalidations.contains(&record.id))
                 .then_some(record.id)
             })
             .unwrap_or(0);
@@ -1791,10 +1793,9 @@ impl Session {
             .iter()
             .rev()
             .find_map(|record| {
-                matches!(
+                (matches!(
                     record.event,
-                    Event::ContextEdited { .. }
-                        | Event::Compacted { .. }
+                    Event::Compacted { .. }
                         | Event::SystemCheckpoint { .. }
                         | Event::ModelSelected { .. }
                         | Event::BranchModelSelected { .. }
@@ -1802,7 +1803,7 @@ impl Session {
                             fallback_model: Some(_),
                             ..
                         }
-                )
+                ) || is_model_context_edit(&self.records, &record.event))
                 .then_some(record.id)
             })
             .unwrap_or(0);
@@ -2687,13 +2688,13 @@ impl Session {
                     } => Some(current == Some(request_id)),
                     Event::Compacted { .. }
                     | Event::BranchSummary { .. }
-                    | Event::ContextEdited { .. }
                     | Event::BashExecution { .. }
                     | Event::CustomMessage { .. }
                     | Event::CustomMessageDelivered { .. }
                     | Event::User { .. }
                     | Event::UserWithImages { .. }
                     | Event::UserImages { .. } => Some(false),
+                    _ if is_model_context_edit(&self.records, &record.event) => Some(false),
                     _ => None,
                 })
                 == Some(true)
@@ -4857,6 +4858,12 @@ fn context_edits<'a>(path: &[&'a Record]) -> BTreeMap<u64, &'a Option<crate::Con
         .collect()
 }
 
+fn is_model_context_edit(records: &[Record], event: &Event) -> bool {
+    matches!(event, Event::ContextEdited { target, .. }
+        if !matches!(records.get(target.saturating_sub(1) as usize).map(|record| &record.event),
+            Some(Event::ModelFinished { .. })))
+}
+
 fn conversation_entries_since(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
@@ -4929,7 +4936,16 @@ fn conversation_entries_since_inner(
             _ => None,
         })
         .collect();
-    let edits = context_edits(path);
+    let mut edits = context_edits(path);
+    if !edits.is_empty() {
+        // Previous versions wrote retry omissions as edits to display-only
+        // completions. Explicit edits to those partials also stay in display.
+        for record in path {
+            if matches!(record.event, Event::ModelFinished { .. }) {
+                edits.remove(&record.id);
+            }
+        }
+    }
     // Replacement blocks may introduce calls with no corresponding result.
     // Compare those calls with the actual repaired model projection, while
     // keeping an otherwise empty assistant for its thinking and usage.

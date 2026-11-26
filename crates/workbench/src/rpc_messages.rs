@@ -184,12 +184,18 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                     imported_entries
                         .get(&record.id)
                         .and_then(|source| {
-                            imported_message(
+                            let mut imported = imported_message(
                                 source,
                                 &value,
                                 record.timestamp_millis().unwrap_or_default(),
-                                true,
-                            )
+                                edited,
+                            )?;
+                            // An elided reply has no retained calls. Preserve
+                            // untouched text and thinking blocks verbatim.
+                            if !edited && let Some(blocks) = imported["content"].as_array_mut() {
+                                blocks.retain(|block| block["type"] != "toolCall");
+                            }
+                            Some(imported)
                         })
                         .unwrap_or(value)
                 }
@@ -1046,7 +1052,11 @@ mod tests {
     #[test]
     fn imported_empty_stop_keeps_repaired_content_in_rpc() {
         let call = json!({"type":"toolCall","id":"call","name":"fixture","arguments":{}});
-        for content in [Value::Null, json!([call])] {
+        let thinking = json!({"type":"thinking","thinking":"original","thinkingSignature":"fixture-signature"});
+        for (content, expected) in [
+            (Value::Null, json!([])),
+            (json!([thinking, call]), json!([thinking])),
+        ] {
             let mut fixture = tempfile::NamedTempFile::new().unwrap();
             let mut entries = vec![
                 json!({"type":"session","version":3}),
@@ -1078,7 +1088,7 @@ mod tests {
             assert_eq!(count(&session), visible.len());
             assert_eq!(native.len() + 1, visible.len());
             assert_eq!(visible.last().unwrap()["stopReason"], "stop");
-            assert_eq!(visible.last().unwrap()["content"], json!([]));
+            assert_eq!(visible.last().unwrap()["content"], expected);
             assert_eq!(session.last_assistant_text(), None);
             assert!(session.records().iter().any(|record| matches!(
                 &record.event, Event::SourceEntry { entry, .. } if entry == &entries[3]
@@ -1221,6 +1231,30 @@ mod tests {
             Some("partial answer")
         );
         assert_eq!(native.len(), 1);
+        if failure == pi_rs::ModelFailure::Retryable {
+            let mut scheduled_records = records.clone();
+            let target = session.head();
+            scheduled_records.push(Record {
+                id: target + 1,
+                parent: Some(target),
+                version: records.last().unwrap().version,
+                timestamp: None,
+                run_id: None,
+                event: Event::SourceEntry {
+                    format: "pi-rs:retry-scheduled".into(),
+                    entry: json!({"requestId": request_id}),
+                },
+            });
+            let scheduled = Session::from_records(scheduled_records).unwrap();
+            assert_eq!(snapshot(&scheduled).0.len(), 1);
+            let wire = super::super::rpc_entries::Entries::new(&scheduled)
+                .after(None)
+                .unwrap();
+            let entries = wire["entries"].as_array().unwrap();
+            assert_eq!(entries[entries.len() - 2]["message"], visible[1]);
+            assert_eq!(entries.last().unwrap()["type"], "context_edit");
+            assert_eq!(entries.last().unwrap()["targetId"], target.to_string());
+        }
         let mut reopened = Session::from_records(session.records().to_vec()).unwrap();
         assert_eq!(snapshot(&reopened).0, visible);
         let target = reopened.head();

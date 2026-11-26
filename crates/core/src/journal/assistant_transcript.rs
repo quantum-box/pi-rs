@@ -7,6 +7,33 @@ use super::{
 };
 use crate::{ContentBlock, ContextContent};
 
+pub(crate) const RETRY_SCHEDULED: &str = "pi-rs:retry-scheduled";
+
+/// Resolve a retry or overflow marker to the marked turn partial it superseded.
+/// The nearest completion must match on the marker's own branch and run.
+#[doc(hidden)]
+pub fn superseded_turn_partial(records: &[super::Record], marker: &super::Record) -> Option<u64> {
+    let Event::SourceEntry { format, entry } = &marker.event else {
+        return None;
+    };
+    if !matches!(format.as_str(), RETRY_SCHEDULED | "pi-rs:overflow-recovery") {
+        return None;
+    }
+    let request = uuid::Uuid::parse_str(entry["requestId"].as_str()?).ok()?;
+    let mut parent = marker.parent;
+    while let Some(record) = parent.and_then(|id| records.get(id.checked_sub(1)? as usize)) {
+        if record.run_id != marker.run_id {
+            return None;
+        }
+        if let Event::ModelFinished { request_id, .. } = &record.event {
+            return (*request_id == request && turn_partial_failure(records, record).is_some())
+                .then_some(record.id);
+        }
+        parent = record.parent;
+    }
+    None
+}
+
 /// Normalize native stops from the original reply. An edit can change its text
 /// or calls, but cannot change how the turn ended.
 #[doc(hidden)]
@@ -78,6 +105,7 @@ impl Session {
         let edits = context_edits(&branch);
         let mut completions = BTreeMap::new();
         let mut assistant_requests = BTreeSet::new();
+        let mut superseded = BTreeSet::new();
         for record in &branch {
             match &record.event {
                 Event::ModelFinished {
@@ -94,13 +122,16 @@ impl Session {
                 } => {
                     assistant_requests.insert(*id);
                 }
+                Event::SourceEntry { .. } => {
+                    superseded.extend(superseded_turn_partial(self.records(), record));
+                }
                 _ => {}
             }
         }
 
         branch
             .into_iter()
-            .filter(|record| record.id >= retain_from)
+            .filter(|record| record.id >= retain_from && !superseded.contains(&record.id))
             .filter_map(|record| {
                 let replacement = match edits.get(&record.id) {
                     Some(None) => return None,

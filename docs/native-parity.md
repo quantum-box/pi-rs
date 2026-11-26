@@ -7392,11 +7392,17 @@ original stop reason, even if the edit removes all its text or calls. For
 native completions without a recognized length limit or recorded failure, the
 original presence of tool calls distinguishes `toolUse` from `stop`. Pi
 imports keep their original stop reasons. Marked failed and cancelled turn
-partials can provide display text without entering model context. Scheduling
-automatic retry or overflow recovery records an omission for the superseded
-partial before retry or backoff. The raw attempt and its usage remain in the
-journal. The omission also applies after cancelling backoff or reopening the
-session. Older unmarked failures and summary partials remain excluded.
+partials can provide display text without entering model context. A durable
+retry or overflow marker omits the superseded partial on its branch, including
+after cancelling backoff or resuming overflow recovery from a saved failure.
+The raw attempt and its usage remain in the journal. Earlier native journals
+that recorded the omission as a context edit still hide that partial. Edits
+to display-only completions leave measured usage and model projection intact.
+Older readers can open journals containing the retry marker and may display
+the superseded partial.
+Older unmarked failures and summary partials remain excluded. RPC keeps
+unmodified imported blocks, including signed thinking, when restoring an empty
+normal reply after tool-call repair.
 [Pinned Pi assistant text selection](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4522-L4549)
 
 ### SDK skill commands

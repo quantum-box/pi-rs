@@ -10569,7 +10569,10 @@ mod tests {
                         Ok(ModelEvent::Text("previous answer".into())),
                         Ok(ModelEvent::Complete {
                             calls: vec![],
-                            usage: None,
+                            usage: Some(crate::Usage {
+                                input_tokens: 83,
+                                output_tokens: 7,
+                            }),
                         }),
                     ],
                     attempt => vec![
@@ -10612,6 +10615,16 @@ mod tests {
                     max_agent_delay_ms: 60_000,
                 })
                 .unwrap();
+            session
+                .journal()
+                .unwrap()
+                .append(crate::Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
             session.prompt("first question").await.unwrap();
             let mut first_partial = None;
             let mut omission_committed = false;
@@ -10624,10 +10637,11 @@ mod tests {
                             usage: crate::UsageReport::Unconfirmed,
                             ..
                         } if partial == "first partial" => first_partial = Some(record.id),
-                        crate::Event::ContextEdited {
-                            target,
-                            replacement: None,
-                        } if Some(*target) == first_partial => omission_committed = true,
+                        crate::Event::SourceEntry { format, .. }
+                            if format == crate::journal::RETRY_SCHEDULED =>
+                        {
+                            omission_committed = true
+                        }
                         _ => {}
                     },
                     crate::Notification::Retry(crate::RetryEvent::Start { .. }) => {
@@ -10658,6 +10672,14 @@ mod tests {
                 Some(expected)
             );
             let journal = reopened.journal().unwrap();
+            assert_eq!(journal.context_budget_estimate().usage_tokens, 90);
+            assert_eq!(journal.context_usage_estimate().usage_tokens, 90);
+            assert!(
+                !journal
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, crate::Event::ContextEdited { .. }))
+            );
             let partial = &journal.records()[first_partial.unwrap() as usize - 1];
             assert!(matches!(&partial.event,
                 crate::Event::ModelFinished { partial, usage: crate::UsageReport::Unconfirmed, .. }
@@ -10669,6 +10691,43 @@ mod tests {
                     .all(|message| !matches!(message,
                 Message::Assistant { content, .. } if content.contains("partial")))
             );
+            assert!(
+                journal
+                    .current_messages()
+                    .iter()
+                    .any(|message| matches!(message,
+                Message::Assistant { content, .. } if content.is_empty()))
+            );
+            if retry && cancel {
+                let mut records = journal.records().to_vec();
+                let marker = records.iter_mut().find(|record| matches!(&record.event,
+                    crate::Event::SourceEntry { format, .. } if format == crate::journal::RETRY_SCHEDULED)).unwrap();
+                marker.event = crate::Event::ContextEdited {
+                    target: partial.id,
+                    replacement: None,
+                };
+                let legacy = Session::from_records(records).unwrap();
+                assert_eq!(
+                    legacy.last_assistant_text().as_deref(),
+                    Some("previous answer")
+                );
+                assert_eq!(
+                    legacy.context_budget_estimate(),
+                    journal.context_budget_estimate()
+                );
+                assert_eq!(
+                    legacy.context_usage_estimate(),
+                    journal.context_usage_estimate()
+                );
+                assert_eq!(legacy.current_messages(), journal.current_messages());
+
+                let mut before_retry = Session::from_records(journal.records().to_vec()).unwrap();
+                before_retry.checkout(partial.id).unwrap();
+                assert_eq!(
+                    before_retry.last_assistant_text().as_deref(),
+                    Some("first partial")
+                );
+            }
         }
     }
 
