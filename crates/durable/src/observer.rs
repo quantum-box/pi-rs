@@ -125,6 +125,14 @@ impl<'a> Observer<'a> {
         }
     }
 
+    pub(crate) fn record_prefix(&self) -> Vec<u8> {
+        record_prefix_with(self.prefix, self.stream)
+    }
+
+    pub(crate) fn record_key(&self, cursor: Cursor) -> Vec<u8> {
+        record_key_with(self.prefix, self.stream, cursor.0)
+    }
+
     pub(crate) fn tool_attempts(store: &'a Store, conversation: Uuid) -> Self {
         Self {
             store,
@@ -341,9 +349,13 @@ fn head_key_with(prefix: &[u8], id: Uuid) -> Vec<u8> {
     key.push(b'h');
     key
 }
-fn record_key_with(prefix: &[u8], id: Uuid, sequence: u64) -> Vec<u8> {
+fn record_prefix_with(prefix: &[u8], id: Uuid) -> Vec<u8> {
     let mut key = stream_prefix_with(prefix, id);
     key.push(b'r');
+    key
+}
+fn record_key_with(prefix: &[u8], id: Uuid, sequence: u64) -> Vec<u8> {
+    let mut key = record_prefix_with(prefix, id);
     key.extend_from_slice(&sequence.to_be_bytes());
     key
 }
