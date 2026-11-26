@@ -3115,9 +3115,9 @@ setting, and its `PI_TELEMETRY` override in [484da3a86][pi-remove-telemetry].
 Native pi-rs preserves the legacy key when editing shared settings and keeps
 its changelog state local. The key and environment variable have no effect in
 pi-rs. Upstream Pi now applies its client attribution to supported provider
-requests independently of telemetry. Native pi-rs retains its own provider
-identity and does not add upstream Pi attribution. This also keeps the
-identity of a host-embedded Rust SDK independent of a legacy settings file.
+requests independently of telemetry. Native pi-rs uses provider-specific
+and host-configured headers independently of the legacy field. It does not
+inject upstream Pi attribution by default.
 
 [pi-remove-telemetry]: https://github.com/earendil-works/pi/commit/484da3a8696b4726ddfe9677d3ba98bbd64b076c
 The Warnings submenu includes the default-on
