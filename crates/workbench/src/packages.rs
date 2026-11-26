@@ -6,6 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use clap::Subcommand;
+use indexmap::IndexMap;
 use pi_rs::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -47,6 +48,8 @@ pub enum PackageCommand {
 pub struct PackageResources {
     #[serde(default)]
     pub extensions: Vec<PathBuf>,
+    #[serde(skip)]
+    pub extension_packages: Vec<(Vec<PathBuf>, ExtensionPackage)>,
     #[serde(default)]
     pub skills: Vec<PathBuf>,
     #[serde(default)]
@@ -54,6 +57,42 @@ pub struct PackageResources {
     #[serde(default)]
     pub themes: Vec<PathBuf>,
 }
+/// Package provenance for extensions selected by the native package resolver.
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct ExtensionPackage {
+    pub key: String,
+    pub root: PathBuf,
+    pub source: String,
+    pub version: String,
+}
+
+impl ExtensionPackage {
+    pub fn changelog(&self) -> Option<(String, String)> {
+        let root = self.root.canonicalize().ok()?;
+        let (manifest, _) = local_startup_manifest(&root).ok()?;
+        let pi = manifest_pi(&manifest).ok()?;
+        let relative = Path::new(pi["changelogPath"].as_str().unwrap_or("CHANGELOG.md"));
+        if relative.as_os_str().is_empty() || relative.is_absolute() {
+            return None;
+        }
+        let path = root.join(relative).canonicalize().ok()?;
+        let relative = path.strip_prefix(&root).ok()?.to_str()?;
+        if relative.is_empty() {
+            return None;
+        }
+        let bytes = read_optional_manifest(&root, relative).ok()??;
+        let notes = String::from_utf8(bytes).ok()?;
+        let name = manifest["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&self.source);
+        // A display name occupies one line in either rendering mode.
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        Some((name, notes))
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Installed {
     source: String,
@@ -252,7 +291,14 @@ struct ResourceSelections {
     entries: Vec<(PathBuf, bool, String, ResourceLocation)>,
 }
 impl ResourceSelections {
-    fn insert(&mut self, path: &Path, enabled: bool, identity: &str, root: &Path, extension: bool) {
+    fn insert(
+        &mut self,
+        path: &Path,
+        enabled: bool,
+        identity: &str,
+        root: &Path,
+        extension: bool,
+    ) -> bool {
         let relative = match path.strip_prefix(root) {
             Ok(relative) => ResourceLocation::WithinPackage(relative.to_path_buf()),
             Err(_) if extension => ResourceLocation::BuiltExecutable(
@@ -269,7 +315,9 @@ impl ResourceSelections {
         {
             self.entries
                 .push((path.to_path_buf(), enabled, identity.to_owned(), relative));
+            return true;
         }
+        false
     }
     fn enabled(self) -> Vec<PathBuf> {
         self.entries
@@ -286,6 +334,7 @@ fn resolve_package_resources(
 ) -> Result<PackageResources> {
     let installed = index()?;
     let mut extensions = ResourceSelections::default();
+    let mut extension_packages = Vec::new();
     let mut skills = ResourceSelections::default();
     let mut prompts = ResourceSelections::default();
     let mut themes = ResourceSelections::default();
@@ -303,8 +352,7 @@ fn resolve_package_resources(
         let local = !remote(&declaration.source);
         // Single-file native sources retain their existing handling; Pi loads
         // such files directly and does not apply directory package filters.
-        let legacy = local && Path::new(&declaration.source).is_file();
-        if legacy {
+        if local && Path::new(&declaration.source).is_file() {
             let identity = source_identity(&declaration.source);
             extensions.insert(
                 Path::new(&declaration.source),
@@ -315,9 +363,9 @@ fn resolve_package_resources(
             );
             continue;
         }
-        let pi_package =
-            !legacy && local_startup_manifest(&package.root).is_ok_and(|(_, upstream)| upstream);
+        let pi_package = local_startup_manifest(&package.root).is_ok_and(|(_, upstream)| upstream);
         let identity = source_identity(&declaration.source);
+        let mut selected_executables = Vec::new();
         for (name, paths, target) in [
             ("extensions", &package.resources.extensions, &mut extensions),
             ("skills", &package.resources.skills, &mut skills),
@@ -360,7 +408,7 @@ fn resolve_package_resources(
                 Err(error) => return Err(error),
             };
             if let Some(candidates) = diagnostic {
-                match filter.states(&candidates, &package.root, false) {
+                match filter.states(&candidates, &package.root) {
                     Ok(_) => {}
                     Err(_) if local => break,
                     Err(error) => return Err(error),
@@ -369,26 +417,47 @@ fn resolve_package_resources(
             if startup && name != "themes" && paths.is_empty() {
                 continue;
             }
-            let states = match filter.states(paths, &package.root, legacy) {
+            let states = match filter.states(paths, &package.root) {
                 Ok(states) => states,
                 Err(_) if local => break,
                 Err(error) => return Err(error),
             };
-            for (path, state) in paths.iter().zip(states) {
-                if let Some(enabled) = state {
-                    target.insert(
-                        path,
-                        enabled,
-                        &identity,
-                        &package.root,
-                        name == "extensions",
-                    );
+            for (index, enabled) in states {
+                let path = &paths[index];
+                let inserted = target.insert(
+                    path,
+                    enabled,
+                    &identity,
+                    &package.root,
+                    name == "extensions",
+                );
+                if inserted && enabled && name == "extensions" {
+                    selected_executables.push(path.clone());
                 }
             }
+        }
+        if !selected_executables.is_empty()
+            && let Some(version) = package.version
+        {
+            let scope = declaration.scope_order;
+            // Project installations can resolve different versions of the same
+            // source in different workspaces.
+            let project = (scope == 0).then_some(&args.workspace);
+            let package_key = key(&format!("{scope}:{project:?}:{identity}"));
+            extension_packages.push((
+                selected_executables,
+                ExtensionPackage {
+                    key: package_key,
+                    root: package.root,
+                    source: display_source(&declaration.source),
+                    version,
+                },
+            ));
         }
     }
     Ok(PackageResources {
         extensions: extensions.enabled(),
+        extension_packages,
         skills: skills.enabled(),
         prompts: prompts.enabled(),
         themes: themes.enabled(),
@@ -695,7 +764,11 @@ fn local_startup_manifest(root: &Path) -> Result<(Value, bool)> {
             .and_then(|value| value.get("metadata"))
             .and_then(|value| value.get("pi"))
     }) {
-        return Ok((json!({"pi": metadata}), false));
+        let name = cargo_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.get("package"))
+            .and_then(|package| package.get("name"));
+        return Ok((json!({"pi": metadata, "name": name}), false));
     }
     let pi_package = package_manifest.is_some();
     Ok((package_manifest.unwrap_or_else(|| json!({})), pi_package))
@@ -766,15 +839,18 @@ fn parse_pi_package_json(path: &Path, bytes: &[u8]) -> Result<Value> {
         validate_pi(pi)?;
     }
     let explicit = pi.is_some_and(has_resource_fields);
-    let theme_only = if explicit {
+    let mut theme_only = if explicit {
         json!({"extensions": [], "skills": [], "prompts": [],
             "themes": pi.and_then(|pi| pi.get("themes")).cloned().unwrap_or_else(|| json!([]))})
     } else {
         json!({})
     };
+    if let Some(path) = pi.and_then(|pi| pi["changelogPath"].as_str()) {
+        theme_only["changelogPath"] = json!(path);
+    }
     // Treat an explicit Pi resource manifest as authoritative before scanning
     // native executables; only theme entries are supported from this format.
-    Ok(json!({"pi": theme_only, "version": value.get("version")}))
+    Ok(json!({"pi": theme_only, "version": value.get("version"), "name": value.get("name")}))
 }
 
 struct ResourceFilter {
@@ -795,69 +871,25 @@ impl ResourceFilter {
             autoload: value["autoload"] != false,
         })
     }
-    // Local and layered packages retain the previous behavior until their
-    // separately caught errors and evaluation order can be reproduced.
-    fn includes_legacy(&self, path: &Path, root: &Path, inherited: bool) -> bool {
-        if self.autoload {
-            return self
-                .patterns
-                .as_ref()
-                .is_none_or(|patterns| selected(path, root, patterns));
-        }
-        self.patterns
-            .iter()
-            .flatten()
-            .fold(inherited, |enabled, pattern| {
-                let prefix = pattern.chars().next();
-                let target = if matches!(prefix, Some('+' | '-' | '!')) {
-                    &pattern[1..]
-                } else {
-                    pattern.as_str()
-                };
-                if resource_matches(path, root, target, matches!(prefix, Some('+' | '-')), false) {
-                    !matches!(prefix, Some('-' | '!'))
-                } else {
-                    enabled
-                }
-            })
-    }
-
-    // Delta filters write only matched paths. Computing from both initial
-    // states distinguishes an untouched path from an explicit enable/disable.
-    fn states(&self, paths: &[PathBuf], root: &Path, legacy: bool) -> Result<Vec<Option<bool>>> {
-        let run = |initial: bool| -> Result<Vec<bool>> {
-            if legacy {
-                Ok(paths
-                    .iter()
-                    .map(|path| self.includes_legacy(path, root, initial))
-                    .collect())
-            } else {
-                self.apply(paths, root, &vec![initial; paths.len()])
-            }
-        };
-        let disabled = run(false)?;
-        if self.autoload {
-            return Ok(disabled.into_iter().map(Some).collect());
-        }
-        let enabled = run(true)?;
-        Ok(disabled
-            .into_iter()
-            .zip(enabled)
-            .map(|(a, b)| (a == b).then_some(a))
-            .collect())
-    }
 
     #[cfg(test)]
     fn includes(&self, path: &Path, root: &Path, inherited: bool) -> Result<bool> {
-        Ok(self.apply(&[path.to_path_buf()], root, &[inherited])?[0])
+        Ok(self
+            .states(&[path.to_path_buf()], root)?
+            .first()
+            .map_or(inherited, |&(_, enabled)| enabled))
     }
 
-    fn apply(&self, paths: &[PathBuf], root: &Path, inherited: &[bool]) -> Result<Vec<bool>> {
+    fn states(&self, paths: &[PathBuf], root: &Path) -> Result<Vec<(usize, bool)>> {
         let Some(patterns) = &self.patterns else {
             return Ok(if self.autoload {
-                vec![true; paths.len()]
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| (index, true))
+                    .collect()
             } else {
-                inherited.to_vec()
+                Vec::new()
             });
         };
         let matches = |path: &Path, pattern: &str, exact: bool| -> Result<bool> {
@@ -875,7 +907,7 @@ impl ResourceFilter {
             Ok(resource_matches(path, root, pattern, exact, false))
         };
         if !self.autoload {
-            let mut enabled = inherited.to_vec();
+            let mut enabled = IndexMap::new();
             for pattern in patterns {
                 let prefix = pattern.chars().next();
                 let override_pattern = matches!(prefix, Some('+' | '-' | '!'));
@@ -884,16 +916,21 @@ impl ResourceFilter {
                 } else {
                     pattern.as_str()
                 };
-                for (path, enabled) in paths.iter().zip(&mut enabled) {
+                // A later pattern replaces the vote while preserving the first match position.
+                for (index, path) in paths.iter().enumerate() {
                     if matches(path, target, matches!(prefix, Some('+' | '-')))? {
-                        *enabled = !matches!(prefix, Some('-' | '!'));
+                        enabled.insert(index, !matches!(prefix, Some('-' | '!')));
                     }
                 }
             }
-            return Ok(enabled);
+            return Ok(enabled.into_iter().collect());
         }
         if patterns.is_empty() {
-            return Ok(vec![false; paths.len()]);
+            return Ok(paths
+                .iter()
+                .enumerate()
+                .map(|(index, _)| (index, false))
+                .collect());
         }
         let any = |path: &Path, prefix: Option<char>, exact: bool| -> Result<bool> {
             for pattern in patterns {
@@ -929,7 +966,7 @@ impl ResourceFilter {
                 }
             }
         }
-        Ok(enabled)
+        Ok(enabled.into_iter().enumerate().collect())
     }
 }
 
@@ -3090,6 +3127,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resources_for(&args, false).unwrap().prompts.len(), 1);
+        // The first matching delta fixes the position, even if it initially
+        // disables a resource. A later delta can enable it in that same position.
+        let ordered = directory.join("ordered");
+        std::fs::create_dir_all(ordered.join("themes")).unwrap();
+        for name in ["alpha.json", "zeta.json", "untouched.json"] {
+            std::fs::write(ordered.join("themes").join(name), "{}").unwrap();
+        }
+        std::fs::write(
+            ordered.join("package.json"),
+            json!({"pi":{"themes":["themes/alpha.json", "themes/zeta.json", "themes/untouched.json"]}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(".pi/settings.json"),
+            json!({"packages":[{
+                "source":ordered,
+                "autoload":false,
+                "themes":["-themes/zeta.json","themes/alpha.json","+themes/zeta.json"]
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(agent.join("settings.json"), "{}").unwrap();
+        let names: Vec<_> = startup_themes(&args, false)
+            .unwrap()
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["zeta.json", "alpha.json"]);
+
         // A project delta resolves against the first user source even when
         // its own revision differs.
         std::fs::write(
@@ -3877,14 +3945,8 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         ).unwrap();
 
         assert_eq!(
-            filter.states(&candidates, root, false).unwrap(),
-            [
-                Some(true),
-                Some(false),
-                Some(true),
-                Some(false),
-                Some(false)
-            ]
+            filter.states(&candidates, root).unwrap(),
+            [(0, true), (1, false), (2, true), (3, false), (4, false)]
         );
 
         let delta = ResourceFilter::new(
@@ -3893,8 +3955,8 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         )
         .unwrap();
         assert_eq!(
-            delta.states(&candidates, root, false).unwrap(),
-            [Some(true), None, None, Some(true), None]
+            delta.states(&candidates, root).unwrap(),
+            [(0, true), (3, true)]
         );
     }
 
@@ -3921,8 +3983,8 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         ] {
             let filter = ResourceFilter::new(&json!({"prompts": patterns}), "prompts").unwrap();
             assert_eq!(
-                filter.states(&candidates, root, false).unwrap(),
-                expected.map(Some),
+                filter.states(&candidates, root).unwrap(),
+                expected.into_iter().enumerate().collect::<Vec<_>>(),
                 "{patterns:?}"
             );
         }
@@ -3972,7 +4034,7 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
             "prompts",
         )
         .unwrap();
-        let error = filter.apply(&paths, &root, &[false, false]).unwrap_err();
+        let error = filter.states(&paths, &root).unwrap_err();
         assert!(error.to_string().contains("URI malformed"));
     }
 
@@ -4898,6 +4960,67 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         );
     }
     #[test]
+    fn extension_changelog_discovery_honors_package_manifest_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("package");
+        std::fs::create_dir(&root).unwrap();
+        let package = ExtensionPackage {
+            key: "fixture".into(),
+            root: root.clone(),
+            source: "fallback".into(),
+            version: "1.2.0".into(),
+        };
+        assert!(package.changelog().is_none());
+        std::fs::write(root.join("CHANGELOG.md"), "default").unwrap();
+        std::fs::write(root.join("NEWS.md"), "custom").unwrap();
+        assert_eq!(
+            package.changelog(),
+            Some(("fallback".into(), "default".into()))
+        );
+
+        let pi_manifest = root.join("package.json");
+        std::fs::write(
+            &pi_manifest,
+            r#"{"name":"from-package-json","pi":{"changelogPath":"NEWS.md"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            package.changelog(),
+            Some(("from-package-json".into(), "custom".into()))
+        );
+        std::fs::remove_file(pi_manifest).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"from-cargo\"\n[package.metadata.pi]\nchangelogPath = \"NEWS.md\"",
+        )
+        .unwrap();
+        assert_eq!(
+            package.changelog(),
+            Some(("from-cargo".into(), "custom".into()))
+        );
+
+        let native_manifest = root.join("pi-package.json");
+        std::fs::write(directory.path().join("outside.md"), "outside").unwrap();
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        std::fs::write(root.join("invalid.md"), [0xff]).unwrap();
+        for path in ["", "../outside.md", "missing.md", "subdir", "invalid.md"] {
+            std::fs::write(
+                &native_manifest,
+                json!({"pi":{"changelogPath":path}}).to_string(),
+            )
+            .unwrap();
+            assert!(package.changelog().is_none(), "{path}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(directory.path().join("outside.md"), root.join("link.md"))
+                .unwrap();
+            std::fs::write(&native_manifest, r#"{"pi":{"changelogPath":"link.md"}}"#).unwrap();
+            assert!(package.changelog().is_none());
+        }
+    }
+
+    #[test]
     fn explicit_manifest_excludes_undeclared_resource_types() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -5469,8 +5592,8 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         ] {
             let filter = ResourceFilter::new(&json!({"prompts": [pattern]}), "prompts").unwrap();
             assert_eq!(
-                filter.apply(&paths, root, &[false; 3]).unwrap(),
-                expected,
+                filter.states(&paths, root).unwrap(),
+                expected.into_iter().enumerate().collect::<Vec<_>>(),
                 "{pattern}"
             );
         }

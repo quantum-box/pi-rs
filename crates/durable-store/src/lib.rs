@@ -7,6 +7,7 @@
 //! the database before deciding whether to retry a non-idempotent operation.
 
 pub mod controls;
+mod document_lifecycle;
 #[cfg(feature = "experimental-graph-revision")]
 pub mod graph_revision;
 pub mod owner;
@@ -127,6 +128,7 @@ pub enum Error {
     IncompatibleGraphProtocol,
     MigrationOwnerUnavailable(String),
     DocumentFrameTooLarge,
+    InvalidDocumentLifecycle,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -149,6 +151,12 @@ impl fmt::Display for Error {
                 "snapshot is newer than document history or lacks tracking evidence"
             ),
             Self::DocumentFrameTooLarge => write!(f, "document commit exceeds merged watch limits"),
+            Self::InvalidDocumentLifecycle => {
+                write!(
+                    f,
+                    "defined document and its policy must keep a consistent incarnation"
+                )
+            }
         }
     }
 }
@@ -2857,6 +2865,7 @@ impl Store {
                 });
             }
         }
+        document_lifecycle::validate(&tx, mutations)?;
         // Ownership is explicit metadata keyed by the exact document key. No
         // existing scope string is interpreted as a task scope. All validation,
         // candidate resolution, and retirement happen under this write lock.

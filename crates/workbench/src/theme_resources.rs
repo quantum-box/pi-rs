@@ -3,13 +3,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use crossterm::style::Color;
-use pi_rs::{Error, Result};
-use serde_json::Value;
+use pi_rs::{Error, Result, UiThemeInfo};
 
 const MAX_FILES: usize = 64;
 const MAX_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
-const MAX_VARIABLE_DEPTH: usize = 128;
 
 /// Exact absolute files the host authorizes this load to read. Paths cannot
 /// contain parent components. Symlinks are followed;
@@ -119,7 +117,7 @@ impl ThemeReadGrants {
         let mut themes = Vec::with_capacity(self.files.len());
         for path in &self.files {
             validate_path(path, "file")?;
-            let text = crate::prompt_resources::read_optional(path)?.ok_or_else(|| {
+            let text = read_theme_file(path)?.ok_or_else(|| {
                 Error::Config(format!("theme file is missing: {}", path.display()))
             })?;
             total = total
@@ -128,7 +126,6 @@ impl ThemeReadGrants {
             if total > MAX_TOTAL_BYTES {
                 return Err(Error::Config("theme files exceed size limit".into()));
             }
-            validate_variable_depth(&text)?;
             let parsed = crate::theme_parser::parse_theme(&text)?;
             if !names.insert(parsed.name.clone()) {
                 return Err(Error::Config(format!(
@@ -146,45 +143,82 @@ impl ThemeReadGrants {
     }
 }
 
+/// Read one bounded, regular theme file using the native loader policy.
+#[doc(hidden)]
+pub fn read_theme_file(path: &Path) -> Result<Option<String>> {
+    let text = crate::prompt_resources::read_optional_resource(path, "theme file")?;
+    if text
+        .as_deref()
+        .is_some_and(|text| text.starts_with('\u{feff}'))
+    {
+        return Err(Error::Config(
+            "theme file contains more than one UTF-8 BOM".into(),
+        ));
+    }
+    Ok(text)
+}
+
+/// Resolve a presentation catalog from the worker's already resolved theme files.
+#[doc(hidden)]
+pub fn extension_theme_catalog(paths: &[PathBuf]) -> Result<Vec<UiThemeInfo>> {
+    if paths.len() > MAX_DIRECTORY_ENTRIES {
+        return Err(Error::Config("too many resolved theme files".into()));
+    }
+    let mut bytes = 0usize;
+    let mut seen = HashSet::from(["system".to_owned(), "dark".to_owned(), "light".to_owned()]);
+    let mut themes = vec![
+        UiThemeInfo {
+            name: "dark".into(),
+            path: None,
+        },
+        UiThemeInfo {
+            name: "light".into(),
+            path: None,
+        },
+    ];
+    for path in paths {
+        let Ok(Some(text)) = read_theme_file(path) else {
+            continue;
+        };
+        bytes += text.len();
+        if bytes > MAX_TOTAL_BYTES {
+            return Err(Error::Config(
+                "theme catalog exceeds its read size limit".into(),
+            ));
+        }
+        let Ok(theme) = crate::theme_parser::parse_theme(&text) else {
+            continue;
+        };
+        if seen.insert(theme.name.clone()) {
+            themes.push(UiThemeInfo {
+                name: theme.name,
+                path: path.to_str().map(PathBuf::from),
+            });
+        }
+    }
+    let locale = crate::locale::select(|name| std::env::var(name).ok());
+    let collator = crate::locale::collator(&locale).ok();
+    themes.sort_by(|left, right| {
+        collator.as_ref().map_or_else(
+            || left.name.cmp(&right.name),
+            |collator| collator.compare(&left.name, &right.name),
+        )
+    });
+    themes.insert(
+        0,
+        UiThemeInfo {
+            name: "system".into(),
+            path: None,
+        },
+    );
+    Ok(themes)
+}
+
 fn validate_path(path: &Path, kind: &str) -> Result<()> {
     if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
         return Err(Error::Config(format!(
             "theme {kind} path must be absolute without parent components"
         )));
-    }
-    Ok(())
-}
-
-// Bound variable recursion before calling the parser shared with the TUI.
-fn validate_variable_depth(text: &str) -> Result<()> {
-    let value: Value = serde_json::from_str(text)?;
-    let Some(vars) = value.get("vars").and_then(Value::as_object) else {
-        return Ok(());
-    };
-    for key in vars.keys() {
-        let mut next = key.as_str();
-        let mut seen = HashSet::new();
-        loop {
-            if !seen.insert(next) {
-                break;
-            } // The shared parser reports referenced cycles.
-            if seen.len() > MAX_VARIABLE_DEPTH {
-                return Err(Error::Config(
-                    "theme variable chain exceeds depth limit".into(),
-                ));
-            }
-            let Some(value) = vars.get(next).and_then(Value::as_str) else {
-                break;
-            };
-            if value.is_empty()
-                || value.starts_with('#')
-                || value.to_ascii_lowercase().starts_with("okhsl(")
-                || value.to_ascii_lowercase().starts_with("oklch(")
-            {
-                break;
-            }
-            next = value;
-        }
     }
     Ok(())
 }
