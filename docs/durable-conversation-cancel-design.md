@@ -605,10 +605,10 @@ behavior at the fixture's scale. The scan-budget results still support keeping
 both experimental features opt-in.
 
 The typed-document extension of this rehearsal was run against `main`
-`0a34d4e8d` and the migration tooling. The standard source contained 32
+`43765fde7` and the migration tooling. The standard source contained 32
 conversations, 16 parked tasks, and 64 documents, with 720 live rows and a
 1,323,008-byte backup. Backup, migration and reopen, and restore verification
-measured 4 ms, 5 ms, and 19 ms on macOS. Both copies retained the original
+measured 3 ms, 7 ms, and 22 ms on macOS. Both copies retained the original
 document incarnations and branch-local values, and a new historical fork
 received a distinct incarnation. Both copies migrated the document schema
 without changing its incarnation and assigned a new incarnation on retirement
