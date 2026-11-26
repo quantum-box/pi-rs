@@ -9890,10 +9890,12 @@ mod tree_tests {
                 model.calls.load(Ordering::SeqCst),
                 if provide { 2 } else { 3 }
             );
-            let events = seen.lock().unwrap();
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0]["reason"], "overflow");
-            assert_eq!(events[0]["willRetry"], true);
+            {
+                let events = seen.lock().unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0]["reason"], "overflow");
+                assert_eq!(events[0]["willRetry"], true);
+            }
             if !provide {
                 assert!(!session.records().iter().any(|record| matches!(&record.event,
                     Event::ModelFinished { partial, failure: None, reply: None, .. } if partial == "model summary")),
@@ -9910,7 +9912,6 @@ mod tree_tests {
                     .unwrap()
                     .contains("private-fixture-secret")
             );
-            drop(events);
             if always_fail {
                 // Reopen exactly after the durable failure, before recovery
                 // could persist its marker. The next attempt has no text.
