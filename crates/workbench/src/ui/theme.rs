@@ -185,6 +185,7 @@ pub struct Theme {
     pub path: Option<PathBuf>,
     colors: BTreeMap<String, Color>,
     dim: BTreeSet<String>,
+    extension_instance: bool,
 }
 /// Watches the selected custom file while retaining the last valid theme.
 pub struct ThemeWatcher {
@@ -250,19 +251,19 @@ impl Theme {
             "dark" => Self::parse(include_str!("../../assets/themes/dark.json"), None),
             "light" => Self::parse(include_str!("../../assets/themes/light.json"), None),
             _ => {
-                let mut paths = vec![
-                    crate::config::agent_dir()
-                        .join("themes")
-                        .join(format!("{name}.json")),
-                ];
-                if !discover {
-                    paths.clear();
+                let mut paths = Vec::new();
+                if discover {
+                    paths.push(
+                        crate::config::agent_dir()
+                            .join("themes")
+                            .join(format!("{name}.json")),
+                    );
                 }
                 if trusted && discover {
                     paths.push(workspace.join(".pi/themes").join(format!("{name}.json")));
                 }
                 for path in extra {
-                    paths.push(if path.is_dir() {
+                    paths.push(if discover && path.is_dir() {
                         path.join(format!("{name}.json"))
                     } else {
                         path.clone()
@@ -326,7 +327,67 @@ impl Theme {
             path,
             colors: parsed.colors,
             dim: BTreeSet::new(),
+            extension_instance: false,
         })
+    }
+    pub fn from_named_palette(palette: pi_rs::UiThemePalette, path: Option<PathBuf>) -> Self {
+        Self::from_palette(palette, path, false)
+    }
+
+    pub fn from_extension_palette(palette: pi_rs::UiThemePalette) -> Result<Self> {
+        if palette.colors.is_empty()
+            || palette.colors.len() > 256
+            || palette
+                .dim
+                .iter()
+                .any(|role| !palette.colors.contains_key(role))
+        {
+            return Err(Error::Config("extension theme palette is invalid".into()));
+        }
+        Ok(Self::from_palette(palette, None, true))
+    }
+
+    fn from_palette(
+        palette: pi_rs::UiThemePalette,
+        path: Option<PathBuf>,
+        extension_instance: bool,
+    ) -> Self {
+        let colors = palette
+            .colors
+            .into_iter()
+            .map(|(role, color)| {
+                let color = match color {
+                    pi_rs::UiThemeColor::Rgb { r, g, b } => Color::Rgb { r, g, b },
+                    pi_rs::UiThemeColor::Indexed { index } => Color::AnsiValue(index),
+                    pi_rs::UiThemeColor::Reset => Color::Reset,
+                };
+                (role, color)
+            })
+            .collect();
+        Self {
+            name: palette.name,
+            path,
+            colors,
+            dim: palette.dim,
+            extension_instance,
+        }
+    }
+
+    pub fn is_extension_instance(&self) -> bool {
+        self.extension_instance
+    }
+
+    pub fn uses_terminal_colors(&self) -> bool {
+        self.name == "system" && !self.extension_instance
+    }
+
+    pub fn extension_palette(self) -> pi_rs::UiThemePalette {
+        pi_rs_workbench::theme_resources::ui_theme_palette(
+            self.name,
+            self.path,
+            &self.colors,
+            self.dim,
+        )
     }
     pub fn color(&self, role: &str) -> Color {
         self.colors.get(role).copied().unwrap_or(Color::Reset)
@@ -342,6 +403,7 @@ impl Theme {
                 path: None,
                 colors: generated.colors,
                 dim: generated.dim,
+                extension_instance: false,
             };
         }
         let background = unpack_terminal_color(TERMINAL_BACKGROUND.load(Ordering::Relaxed));
@@ -365,6 +427,7 @@ impl Theme {
             path: None,
             colors: generated.colors,
             dim: generated.dim,
+            extension_instance: false,
         }
     }
 

@@ -20,6 +20,7 @@ mod auth_cli;
 mod auth_lock;
 mod auth_login;
 mod backend;
+mod bug_report;
 mod builtin_chat;
 mod cache_stats;
 mod cache_warming;
@@ -51,6 +52,8 @@ mod pi_messages;
 mod process;
 mod providers;
 mod vertex_auth;
+#[cfg(windows)]
+mod windows_file_identity;
 mod xai_auth;
 use providers::Provider;
 mod radius_auth;
@@ -288,6 +291,8 @@ struct Cli {
     /// Theme name, or a light/dark theme pair for automatic appearance.
     #[arg(long, global = true)]
     use_theme: Option<String>,
+    #[arg(skip)]
+    extension_theme: Option<String>,
     /// Additional theme file or directory. Repeatable.
     #[arg(long = "theme", global = true)]
     themes: Vec<PathBuf>,
@@ -350,8 +355,9 @@ struct InitialSelection {
 
 impl Cli {
     fn theme_setting(&self) -> Option<&str> {
-        self.use_theme
+        self.extension_theme
             .as_deref()
+            .or(self.use_theme.as_deref())
             .or_else(|| self.settings.string("theme"))
     }
 

@@ -23,6 +23,8 @@ enum TurnNormalized {
     ArgumentRejected(String),
 }
 
+const TOOL_TIMEOUT_SETTLEMENT_WINDOW: Duration = Duration::from_millis(250);
+
 const MAX_PI_ARGUMENT_ISSUES: usize = 32;
 const MAX_PI_ARGUMENT_PREVIEW_BYTES: usize = 64 * 1024;
 
@@ -2094,6 +2096,17 @@ impl Agent<'_> {
         } else {
             Some(tool_timeout)
         };
+        // Opted-in direct tools still receive the original execution budget.
+        // Give their reply a bounded window for shutdown and formatting.
+        let reply_timeout = if !programmatic && tool.tool.settles_host_timeout() {
+            timeout.map(|budget| {
+                budget
+                    .checked_add(TOOL_TIMEOUT_SETTLEMENT_WINDOW)
+                    .unwrap_or(budget)
+            })
+        } else {
+            timeout
+        };
         let invocation = async {
             if programmatic {
                 tool.tool
@@ -2109,7 +2122,7 @@ impl Agent<'_> {
             biased;
             _ = cancel.cancelled() => Outcome::Unknown("cancelled after dispatch was committed".into()).into(),
             result = async {
-                match timeout {
+                match reply_timeout {
                     Some(timeout) => platform_time::timeout(timeout, invocation).await
                         .unwrap_or_else(|_| Outcome::Unknown("tool timed out".into()).into()),
                     None => invocation.await,
@@ -3124,7 +3137,130 @@ impl Agent<'_> {
 #[cfg(test)]
 mod start_tests {
     use super::*;
+    use crate::Tool;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(20);
+
+    struct DeadlineProbe(bool);
+
+    #[async_trait::async_trait]
+    impl Tool for DeadlineProbe {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "deadline_probe".into(),
+                description: "A tool that never settles".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+
+        fn settles_host_timeout(&self) -> bool {
+            self.0
+        }
+
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            std::future::pending().await
+        }
+
+        async fn invoke_transaction_with_timeout(
+            &self,
+            args: serde_json::Value,
+            context: ToolContext,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn ToolHost>,
+            timeout: Option<Duration>,
+        ) -> ToolReply {
+            assert_eq!(timeout, Some(PROBE_TIMEOUT));
+            self.invoke(args, context).await.into()
+        }
+    }
+
+    struct NoNestedCalls;
+
+    #[async_trait::async_trait]
+    impl ToolHost for NoNestedCalls {
+        fn tools(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+            unreachable!("the deadline probe does not call tools")
+        }
+    }
+
+    async fn invoke_deadline_probe(
+        settles_host_timeout: bool,
+        programmatic: bool,
+        cancel: &CancellationToken,
+    ) -> ToolReply {
+        let tool = Arc::new(DeadlineProbe(settles_host_timeout));
+        let spec = tool.spec();
+        let cancellation = cancel.child_token();
+        let preparation = TurnPreparation::Ready {
+            tool: Arc::new(RegisteredTool {
+                owner: "timeout-test".into(),
+                validator: jsonschema::validator_for(&spec.parameters).unwrap(),
+                spec,
+                tool,
+                constrained_sampling: None,
+            }),
+            args: serde_json::json!({}),
+            guard: cancellation.clone().drop_guard(),
+            context: ToolContext {
+                operation_id: Uuid::new_v4(),
+                cancellation: cancellation.clone(),
+            },
+            state: None,
+        };
+        let reply = Agent::turn_invoke(
+            preparation,
+            cancel,
+            Arc::new(NoNestedCalls),
+            programmatic,
+            false,
+            PROBE_TIMEOUT,
+        )
+        .await;
+        assert!(cancellation.is_cancelled());
+        assert!(reply.state.is_none());
+        reply
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduler_bounds_timeout_settlement_for_opted_in_direct_tools() {
+        for (settles, programmatic, expected) in [
+            (false, false, PROBE_TIMEOUT),
+            (true, true, PROBE_TIMEOUT),
+            (true, false, PROBE_TIMEOUT + TOOL_TIMEOUT_SETTLEMENT_WINDOW),
+        ] {
+            let started = platform_time::Instant::now();
+            let reply =
+                invoke_deadline_probe(settles, programmatic, &CancellationToken::new()).await;
+            assert_eq!(reply.outcome, Outcome::Unknown("tool timed out".into()));
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= expected && elapsed < expected + Duration::from_millis(5),
+                "settles={settles}, programmatic={programmatic}: {elapsed:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_cancellation_preempts_tool_timeout_settlement() {
+        let cancel = CancellationToken::new();
+        let started = platform_time::Instant::now();
+        let after = PROBE_TIMEOUT + Duration::from_millis(25);
+        let (reply, ()) = tokio::join!(invoke_deadline_probe(true, false, &cancel), async {
+            platform_time::sleep(after).await;
+            cancel.cancel();
+        });
+        assert_eq!(
+            reply.outcome,
+            Outcome::Unknown("cancelled after dispatch was committed".into())
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed >= after && elapsed < after + Duration::from_millis(5));
+    }
 
     #[tokio::test]
     async fn first_poll_happens_before_a_foreign_commit() {

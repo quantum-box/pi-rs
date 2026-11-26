@@ -1128,6 +1128,216 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
 struct ModelStub {
     arguments: String,
 }
+
+#[tokio::test]
+async fn checkpointable_tool_starts_and_reattaches_to_a_foreground_subagent() {
+    let directory = tempfile::tempdir().unwrap();
+    exercise_foreground_delegation(directory.path(), false, None).await;
+}
+
+#[tokio::test]
+async fn checkpointable_foreground_subagent_crash_fixture() {
+    if let Some(directory) = std::env::var_os("PI_FOREGROUND_CHILD_RESTART_DIR") {
+        exercise_foreground_delegation(std::path::Path::new(&directory), true, None).await;
+    }
+}
+
+#[tokio::test]
+async fn checkpointable_foreground_subagent_reuses_answer_after_process_loss() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "checkpointable_foreground_subagent_crash_fixture",
+        ])
+        .env("PI_FOREGROUND_CHILD_RESTART_DIR", directory.path())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !directory.path().join("child-answered").exists() {
+        if std::time::Instant::now() >= deadline || process.try_wait().unwrap().is_some() {
+            let _ = process.kill();
+            let _ = process.wait();
+            panic!("foreground tool did not reach its persisted answer");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    process.kill().unwrap();
+    process.wait().unwrap();
+    let root = std::fs::read_to_string(directory.path().join("parent"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    exercise_foreground_delegation(directory.path(), false, Some(root)).await;
+}
+
+async fn exercise_foreground_delegation(
+    directory: &std::path::Path,
+    hold_after_answer: bool,
+    resume: Option<uuid::Uuid>,
+) {
+    use pi_rs_durable::{async_task_tool::ForegroundSubagentRequest, runtime::Status};
+
+    struct Delegate(Option<std::path::PathBuf>);
+    #[async_trait]
+    impl Tool for Delegate {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "root".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl DurableAsyncTool for Delegate {
+        async fn execute_durable(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: DurableToolResume,
+            host: &dyn DurableTaskHost,
+        ) -> Result<DurableToolStep, String> {
+            let request = || ForegroundSubagentRequest {
+                key: "delegate".into(),
+                config: Config {
+                    model: "child".into(),
+                    system_prompt: String::new(),
+                    max_output_tokens: 100,
+                },
+                prompt: "child input".into(),
+                allowed_tools: vec![],
+            };
+            let child = host.start_foreground_subagent(request()).await?;
+            assert_eq!(host.start_foreground_subagent(request()).await?, child);
+            let mut different_request = request();
+            different_request.prompt = "different input".into();
+            assert!(
+                host.start_foreground_subagent(different_request)
+                    .await
+                    .is_err()
+            );
+            let Some(Status::Done { answer }) = host
+                .wait_foreground_subagent(&child, Duration::from_secs(15))
+                .await?
+            else {
+                return Err("foreground subagent did not settle successfully".into());
+            };
+            if let Some(dir) = &self.0 {
+                std::fs::write(dir.join("child-answered"), b"ready").unwrap();
+                std::future::pending::<()>().await;
+            }
+            Ok(DurableToolStep::Complete(Outcome::SucceededWithDetails {
+                output: answer,
+                details: json!({"conversationId": child.child}),
+            }))
+        }
+    }
+
+    struct DelegateModel(std::path::PathBuf);
+    #[async_trait]
+    impl Model for DelegateModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            if request.model == "child" {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.0.join("model-invocations"))
+                    .unwrap()
+                    .write_all(b"x")
+                    .unwrap();
+                assert!(request.messages.iter().any(|message| {
+                    matches!(message, Message::User { content } if content == "child input")
+                }));
+                assert!(request.tools.is_empty());
+                return Ok(stream::iter(vec![
+                    Ok(ModelEvent::Text("child answer".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])
+                .boxed());
+            }
+            ModelStub {
+                arguments: "{}".into(),
+            }
+            .stream(request)
+            .await
+        }
+    }
+
+    let mut registry = Registry::default();
+    let tool = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(Delegate(hold_after_answer.then(|| directory.to_owned()))),
+        "delegate-v1",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let mut scheduler = Scheduler::open_paused(
+        directory.join("db"),
+        Options {
+            model: Arc::new(DelegateModel(directory.to_owned())),
+            tools: vec![tool.register()],
+            restart_limit: 3,
+            max_turns: 2,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+    )
+    .unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let root = if let Some(root) = resume {
+        scheduler.schedule(root);
+        root
+    } else {
+        let root = scheduler
+            .create_conversation(Config {
+                model: "root".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        std::fs::write(directory.join("parent"), root.to_string()).unwrap();
+        scheduler
+            .submit(root, None, "delegate work".into())
+            .unwrap();
+        root
+    };
+    tokio::time::timeout(Duration::from_secs(20), scheduler.wait(root))
+        .await
+        .unwrap()
+        .unwrap();
+    let result = scheduler.conversation(root).unwrap();
+    assert!(result.messages.iter().any(
+        |message| matches!(message, Message::Tool { content, .. } if content == "child answer")
+    ));
+    let child: uuid::Uuid = serde_json::from_value(
+        result.tool_results[0].details.as_ref().unwrap()["conversationId"].clone(),
+    )
+    .unwrap();
+    assert_eq!(scheduler.conversation(child).unwrap().submissions.len(), 1);
+    let page = scheduler
+        .scan_task_owned_subagents(result.tool_results[0].operation_id, None, 16)
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].child, child);
+    assert_eq!(
+        std::fs::read(directory.join("model-invocations")).unwrap(),
+        b"x"
+    );
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
 #[async_trait]
 impl Model for ModelStub {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
