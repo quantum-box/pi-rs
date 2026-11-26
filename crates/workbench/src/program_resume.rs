@@ -19,6 +19,7 @@ pub(super) struct ExplicitLimits {
     max_output_tokens: Option<u32>,
     output_budget: Option<u32>,
     model_timeout_secs: Option<u64>,
+    context_window: Option<u32>,
 }
 
 impl ExplicitLimits {
@@ -36,6 +37,7 @@ impl ExplicitLimits {
             max_output_tokens: explicit(matches, "max_output_tokens"),
             output_budget: explicit(matches, "output_budget"),
             model_timeout_secs: explicit(matches, "model_timeout_secs"),
+            context_window: explicit(matches, "context_window"),
         }
     }
 
@@ -56,6 +58,10 @@ impl ExplicitLimits {
             (
                 "model-timeout-secs",
                 self.model_timeout_secs.map(|value| value.to_string()),
+            ),
+            (
+                "context-window",
+                self.context_window.map(|value| value.to_string()),
             ),
         ] {
             if let Some(value) = value {
@@ -581,6 +587,8 @@ fn report_body(executable: &Path, args: &Cli, confirm_project: bool) -> Option<S
         || args.api_key.is_some()
         || args.endpoint_explicit
         || args.provider_argument.is_some()
+        || args.project.is_some()
+        || !args.extensions.is_empty()
         || !args.extension_flags.is_empty()
         || args.system_prompt.is_some()
         || !args.append_system_prompt.is_empty()
@@ -778,6 +786,8 @@ mod tests {
                 "256",
                 "--output-budget=512",
                 "--model-timeout-secs=20",
+                "--context-window",
+                "4096",
             ]
             .map(std::ffi::OsString::from),
         )
@@ -790,7 +800,8 @@ mod tests {
                 "--max-requests=12",
                 "--max-output-tokens=256",
                 "--output-budget=512",
-                "--model-timeout-secs=20"
+                "--model-timeout-secs=20",
+                "--context-window=4096",
             ]
         );
 
@@ -819,6 +830,36 @@ mod tests {
             args.session = baseline.session.clone();
             args.workspace = root.clone();
             assert!(report_body(&executable, &args, false).is_none(), "{flag}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_resume_suppresses_explicit_projects_and_extensions() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        if !root.ancestors().all(enforces_posix_permissions) {
+            return;
+        }
+        let baseline = fixture_args(&root);
+        let executable = root.join("pi");
+        assert!(report_body(&executable, &baseline, false).is_some());
+        let cases: &[&[&str]] = &[
+            &["--project", "component with rules"],
+            &["--extension", "./local extension"],
+            &["--extension", "builtin:mcp"],
+            &["--no-extensions", "--extension=builtin:mcp"],
+        ];
+        for flags in cases {
+            let mut args = Cli::parse_from(std::iter::once("pi").chain(flags.iter().copied()));
+            args.session = baseline.session.clone();
+            args.workspace = root.clone();
+            assert!(
+                report_body(&executable, &args, false).is_none(),
+                "{flags:?}"
+            );
         }
     }
 
@@ -952,8 +993,10 @@ mod tests {
         args.no_trust = false;
         args.no_mcp = false;
         args.no_extensions = false;
-        args.extensions.push("builtin:mcp".into());
         args.trust = true;
+        let mut explicit_mcp = args.clone();
+        explicit_mcp.no_extensions = true;
+        explicit_mcp.extensions.push("builtin:mcp".into());
 
         let mcp = project.join("mcp.json");
         for (config, approval) in [
@@ -979,6 +1022,12 @@ mod tests {
                 (!approval).then_some(true),
                 "{config}"
             );
+            assert_eq!(
+                explicit_mcp.project_trust().unwrap(),
+                (!approval).then_some(true),
+                "{config}"
+            );
+            assert!(report_body(&root.join("pi"), &explicit_mcp, false).is_none());
             if approval {
                 assert_report_requires_project_confirmation(&args, root.join("pi"));
                 args.terminal_resume_approved = true;

@@ -6263,10 +6263,12 @@ and `--resume` retain their existing workspace behavior.
 
 The command carries restrictive options such as `--no-trust`, `--no-mcp`,
 `--no-extensions`, `--offline`, and explicit tool selections. It also carries
-explicit request, output-token, output-budget, and model-time limits. Pi skips
-reporting for ephemeral sessions, pending trust decisions, and invocations
-whose explicit credentials, connection options, extension flags, system
-prompt overrides, or instructions cannot be carried safely. Automatic restore
+explicit request, output-token, output-budget, model-time, and context-window
+limits. Pi skips reporting for ephemeral sessions and pending trust decisions.
+It also skips reporting when the invocation supplies explicit credentials,
+connection options, a `--project` directory, `--extension` entries, extension
+flags, system prompt overrides, or instructions. An explicit `--extension`
+entry suppresses reporting even with `--no-extensions`. Automatic restore
 accepts an owner-only regular journal under protected directories on an
 allowlisted local filesystem. Linux accepts ext-family, XFS, Btrfs, and tmpfs.
 macOS accepts local APFS, HFS, and tmpfs

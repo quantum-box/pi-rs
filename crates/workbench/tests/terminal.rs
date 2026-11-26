@@ -968,6 +968,7 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
                 "--max-output-tokens=256",
                 "--output-budget=512",
                 "--model-timeout-secs=20",
+                "--context-window=4096",
                 "--terminal-resume",
                 "--workspace",
             ])
@@ -998,6 +999,7 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
             "--max-output-tokens=256",
             "--output-budget=512",
             "--model-timeout-secs=20",
+            "--context-window=4096",
             "--session-dir",
             session_dir.to_str().unwrap(),
         ];
