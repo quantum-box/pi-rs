@@ -2511,6 +2511,17 @@ impl Conversation {
         self.tool_attempt
             .filter(|attempt| attempt.operation_id == operation_id)
     }
+    /// Provider call currently associated with the persisted tool attempt.
+    pub fn active_tool_call(&self) -> Option<&ToolCall> {
+        match &self.phase {
+            Phase::ToolRunning { calls, index, .. }
+            | Phase::ToolFinished { calls, index, .. }
+            | Phase::TaskPending { calls, index, .. }
+            | Phase::Blocked { calls, index, .. }
+            | Phase::Pending { calls, index, .. } => calls.get(*index),
+            _ => None,
+        }
+    }
     /// Identity of the answer settling a submission. Older persisted answers
     /// predate answer IDs and return None.
     pub fn answer_id(&self, submission: Uuid) -> Option<Uuid> {
