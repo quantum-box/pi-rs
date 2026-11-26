@@ -528,15 +528,14 @@ impl Cursor {
                             .get(&record.id)
                             .filter(|&&count| count > 0)
                         && let Some(compaction) = records.get((record.id + count - 1) as usize)
-                        && matches!(
-                            compaction.event,
-                            Event::Compacted {
-                                retain_from: None,
-                                ..
-                            }
-                        )
+                        && let Event::Compacted { retain_from, .. } = &compaction.event
                     {
-                        entry["firstKeptEntryId"] = json!(record.id.to_string());
+                        // The verified boundary is a native record, even when
+                        // the original Pi entry used a positional v1 index.
+                        let first = retain_from
+                            .and_then(|id| self.positions.get(id as usize)?.visible)
+                            .unwrap_or(record.id);
+                        entry["firstKeptEntryId"] = json!(first.to_string());
                     }
                     Some(entry)
                 } else {

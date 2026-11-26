@@ -394,17 +394,6 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
             }
         }
         let converted = converted_entry.as_ref().unwrap_or(&entry);
-        if converted["type"] == "compaction"
-            && (branch.missing_ancestors
-                || converted["firstKeptEntryId"]
-                    .as_str()
-                    .and_then(|target| branches.get(target))
-                    .is_some_and(|target| target.missing_ancestors))
-        {
-            return Err(Error::Session(
-                "cannot import compaction involving an orphaned branch".into(),
-            ));
-        }
         let parent_ancestry = branch.ancestry_index;
         let events = convert_references(
             converted,
@@ -2483,6 +2472,91 @@ mod tests {
     }
 
     #[test]
+    fn orphaned_compaction_rejected_in_import_and_both_replay_paths() {
+        for (boundary, parent) in [
+            ("before", None),
+            ("compact", None),
+            ("compact", Some("info")),
+        ] {
+            let mut entries = vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"session_info","id":"info","parentId":null}),
+                json!({"type":"message","id":"before","parentId":parent,"message":{"role":"user","content":"before"}}),
+                json!({"type":"compaction","id":"compact","parentId":"before","firstKeptEntryId":boundary,"summary":"summary"}),
+            ];
+            let session = import_pi(entries.clone()).unwrap();
+            entries[2]["parentId"] = json!("missing");
+            let error = import_pi(entries).err().unwrap();
+            assert!(error.to_string().contains("orphaned branch"), "{error}");
+
+            let mut records = session.records().to_vec();
+            let before = records
+                .iter_mut()
+                .find_map(|record| match &mut record.event {
+                    Event::SourceEntry { entry, .. } if entry["id"] == "before" => Some(entry),
+                    _ => None,
+                })
+                .unwrap();
+            before["parentId"] = json!("missing");
+            let metadata = session
+                .records()
+                .iter()
+                .filter_map(|record| {
+                    session
+                        .record_metadata(record.id)
+                        .cloned()
+                        .map(|value| (record.id, value))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let orphaned = Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+            let error = orphaned.validated_pi_conversion_counts().unwrap_err();
+            assert!(error.to_string().contains("orphaned branch"), "{error}");
+            let error = pi_rs::pi_import::StreamVerifier::new()
+                .advance(orphaned.records(), &metadata, true)
+                .unwrap_err();
+            assert!(error.to_string().contains("orphaned branch"), "{error}");
+        }
+    }
+
+    #[test]
+    fn fork_removed_labels_do_not_make_compaction_ancestry_orphaned() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"label","id":"root-label","parentId":null,"targetId":"missing","label":"dangling"}),
+            json!({"type":"message","id":"before","parentId":"root-label","message":{"role":"user","content":"retained"}}),
+            json!({"type":"label","id":"bookmark","parentId":"before","targetId":"before","label":"bookmark"}),
+            json!({"type":"compaction","id":"compact","parentId":"bookmark","firstKeptEntryId":"before","summary":"summary"}),
+        ]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork.jsonl");
+        session.fork_to(session.head(), &path).unwrap();
+        let reopened = read(&path).unwrap();
+        // Also verify the older form of the same fork without stored conversion counts.
+        let legacy = Session::from_records(reopened.records().to_vec()).unwrap();
+        for fork in [&reopened, &legacy] {
+            assert_eq!(fork.current_messages(), session.current_messages());
+            let counts = fork.validated_pi_conversion_counts().unwrap();
+            let metadata = fork
+                .records()
+                .iter()
+                .filter_map(|record| {
+                    fork.record_metadata(record.id)
+                        .cloned()
+                        .map(|value| (record.id, value))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut verifier = pi_rs::pi_import::StreamVerifier::new();
+            assert!(
+                verifier
+                    .advance(fork.records(), &metadata, true)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(verifier.counts(), &counts);
+        }
+    }
+
+    #[test]
     fn compaction_ancestor_and_self_boundaries_keep_rpc_identity_after_reopen() {
         for target in ["a", "b", "c"] {
             let session = import_pi(vec![
@@ -3092,8 +3166,30 @@ mod tests {
         assert!(session.records().iter().any(|record| matches!(
             &record.event, Event::SourceEntry { entry, .. } if entry == &compaction
         )));
-        let fork = Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
-        assert_eq!(fork.current_messages(), messages);
+        let directory = tempfile::tempdir().unwrap();
+        let export = directory.path().join("native.jsonl");
+        session.export_jsonl(&export).unwrap();
+        let reopened = read(&export).unwrap();
+        let fork = reopened.fork_session(reopened.head()).unwrap();
+        for snapshot in [&session, &reopened, &fork] {
+            assert_eq!(snapshot.current_messages(), messages);
+            let wire = super::super::rpc_entries::Entries::new(snapshot)
+                .after(None)
+                .unwrap();
+            let entries = wire["entries"].as_array().unwrap();
+            let retained = entries
+                .iter()
+                .find(|entry| entry["message"]["content"] == "retained")
+                .unwrap();
+            let boundary = entries
+                .iter()
+                .find(|entry| entry["type"] == "compaction")
+                .unwrap();
+            assert_eq!(boundary["firstKeptEntryId"], retained["id"]);
+        }
+        assert!(reopened.records().iter().any(|record| matches!(
+            &record.event, Event::SourceEntry { entry, .. } if entry == &compaction
+        )));
     }
 
     #[test]

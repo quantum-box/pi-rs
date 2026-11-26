@@ -2247,10 +2247,11 @@ its original parent ID remains in the retained source entry, while RPC presents
 it as a root. Missing ancestors may contain unrecoverable state or tool calls;
 orphan tool results and compactions involving orphaned branches are still rejected.
 Forward parent references and missing or forward compaction boundary IDs are
-also rejected. Pi v1 keeps its positional boundary migration. When a compaction
-names an earlier boundary on a complete sibling
-branch, Pi restores its system checkpoint, summary and descendants with no
-pre-compaction messages. Native import does the same and retains the original
+also rejected. Pi v1 keeps its positional boundary migration, and RPC exposes
+the verified boundary as a projected entry ID. When a compaction names an
+earlier boundary on a complete sibling branch, Pi restores its system
+checkpoint, summary and descendants with no pre-compaction messages. Native
+import does the same and retains the original
 boundary and usage in a full export. A fork or Pi RPC projection uses the
 compaction's own ID as the boundary, so the result is independent of the
 sibling branch.

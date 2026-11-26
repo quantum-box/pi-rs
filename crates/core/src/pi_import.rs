@@ -212,18 +212,19 @@ pub fn convert_references(
     }
     let discard_earlier = if entry["type"] == "compaction" {
         let target = required(entry, "firstKeptEntryId")?;
+        let target_branch = branches.get(target);
+        if branch.missing_ancestors || target_branch.is_some_and(|target| target.missing_ancestors)
+        {
+            return Err(Error::Session(
+                "cannot import compaction involving an orphaned branch".into(),
+            ));
+        }
         if target == name {
             true
-        } else if let Some(target_branch) = branches.get(target) {
-            let sibling = !is_ancestor(target_branch.ancestry_index, branch.ancestry_index);
-            if sibling && (branch.missing_ancestors || target_branch.missing_ancestors) {
-                return Err(Error::Session(
-                    "cannot import compaction involving an orphaned branch".into(),
-                ));
-            }
+        } else if let Some(target_branch) = target_branch {
             // A sibling boundary is absent from this path. Pi keeps the
             // compaction and its descendants, with no pre-compaction messages.
-            sibling
+            !is_ancestor(target_branch.ancestry_index, branch.ancestry_index)
         } else {
             return Err(Error::Session(format!(
                 "missing or forward imported compaction target {target}"
@@ -233,6 +234,37 @@ pub fn convert_references(
         false
     };
     convert_entry(entry, branch, branches, discard_earlier)
+}
+
+fn has_fork_label_slot_parent(
+    records: &[crate::Record],
+    record: &crate::Record,
+    parent_source: Option<u64>,
+) -> bool {
+    // Forks remove Pi labels but keep their physical slots as empty session
+    // info records. A child can still carry that label's original source ID.
+    // Fresh imports anchor a genuinely orphaned source directly to the Pi
+    // header or its parent-session record.
+    record
+        .parent
+        .and_then(|id| id.checked_sub(1))
+        .and_then(|index| records.get(index as usize))
+        .is_some_and(|parent| {
+            parent.run_id.is_none()
+                && matches!(
+                    parent.event,
+                    Event::SessionInfo {
+                        name: None,
+                        cwd: None
+                    }
+                )
+                // A real unnamed Pi session_info has the same native shape.
+                && !parent_source.is_some_and(|id| {
+                    id + 1 == parent.id
+                        && matches!(&records[(id - 1) as usize].event,
+                            Event::SourceEntry { entry, .. } if entry["type"] == "session_info")
+                })
+        })
 }
 
 fn context_edit_replacement(entry: &Value) -> Result<Option<crate::ContextContent>> {
@@ -632,7 +664,8 @@ impl StreamVerifier {
                 branch.missing_ancestors |= !self.legacy
                     && entry["parentId"]
                         .as_str()
-                        .is_some_and(|parent| !self.source_ids.contains_key(parent));
+                        .is_some_and(|parent| !self.source_ids.contains_key(parent))
+                    && !has_fork_label_slot_parent(records, record, parent_source);
                 branch.head = record.parent.unwrap_or(0);
                 let mut migrated = entry.clone();
                 if self.legacy
@@ -1057,9 +1090,6 @@ pub(crate) fn validate_conversions(
                             "imported Pi source parent does not match its branch".into(),
                         ));
                     }
-                    // An absent parent may be an original orphan or a label
-                    // removed by an existing fork; neither can be distinguished
-                    // using the retained source records alone.
                 }
                 _ => return Err(Error::Session("invalid imported Pi parent ID".into())),
             }
@@ -1110,7 +1140,8 @@ pub(crate) fn validate_conversions(
         branch.missing_ancestors |= !legacy
             && entry["parentId"]
                 .as_str()
-                .is_some_and(|parent| !branches.contains_key(parent));
+                .is_some_and(|parent| !branches.contains_key(parent))
+            && !has_fork_label_slot_parent(records, record, parent_source);
         branch.head = record.parent.unwrap_or(0);
         let mut migrated = entry.clone();
         if legacy
