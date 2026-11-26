@@ -2,6 +2,7 @@
 //! Frames are immutable; expiring a payload leaves an authenticated marker at
 //! its locator and preserves the frame's cursor and original commit sequence.
 pub(crate) mod generation;
+pub(crate) mod inline;
 
 use durable_store::{Check, Entry, Expected, Mutation, Store};
 use serde::{Deserialize, Serialize};
@@ -259,11 +260,12 @@ mod tests {
     use crate::{
         recovery::UncertainPolicy,
         runtime::{
-            Config, Harness, Options, ProgressHistoryChange,
-            prepare_checkpointable_progress_history,
+            Config, Harness, Options, ProgressHistoryChange, ToolAttempt,
+            prepare_checkpointable_progress_history, prepare_progress_history,
         },
         task::{Checkpoint, Task, TaskOwner},
         task_store::{Save, TaskStore},
+        tool_progress,
     };
     use pi_rs_core::{Model, ModelRequest, ModelStream};
     use std::{num::NonZeroUsize, sync::Arc};
@@ -285,6 +287,215 @@ mod tests {
             max_turns: 1,
             uncertain_policy: UncertainPolicy::RequireReconciliation,
         }
+    }
+
+    #[test]
+    fn inline_tool_reports_expire_only_after_their_own_terminal_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("durable.sqlite");
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let conversation = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "keep the conversation".into(),
+                max_output_tokens: 5,
+            })
+            .unwrap();
+        let start = harness.progress_history_from_now(conversation).unwrap();
+        let merged = harness.merged_progress_from_now(conversation).unwrap();
+        let store = harness.owner.store();
+        let ordinary = ToolAttempt {
+            operation_id: Uuid::new_v4(),
+            attempt_id: Uuid::new_v4(),
+        };
+        let mut progress = tool_progress::Snapshot::load(store, ordinary.attempt_id).unwrap();
+        let last = serde_json::json!({"text": "ordinary".repeat(1024)});
+        progress.update(last.clone()).unwrap();
+        let mut snapshot = progress.prepare_checkpoint().unwrap();
+        let frame = prepare_progress_history(
+            store,
+            conversation,
+            vec![ProgressHistoryChange::Tool {
+                attempt: ordinary,
+                state: progress.state().clone(),
+                partial_is_null: false,
+            }],
+        )
+        .unwrap();
+        snapshot.checks.extend(frame.checks);
+        snapshot.mutations.extend(frame.mutations);
+        let observer = Observer::tool_progress(store, ordinary.attempt_id);
+        let attempt_event = observer
+            .prepare_append(&serde_json::json!({
+                "conversation_id":conversation,"attempt":ordinary,
+                "state":progress.state(),"partial_is_null":false
+            }))
+            .unwrap();
+        snapshot.checks.extend(attempt_event.checks);
+        snapshot.mutations.extend(attempt_event.mutations);
+        store.commit(&snapshot.checks, &snapshot.mutations).unwrap();
+
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::Value::Null,
+            },
+            2,
+        )
+        .unwrap()
+        .into_task_tool();
+        let task_id = task.id();
+        let task_attempt = Uuid::new_v4();
+        let tasks = TaskStore::new(store);
+        tasks.save(&[Save::Create(&task)]).unwrap();
+        let ready = tasks.load(task_id).unwrap().unwrap();
+        tasks.update(&ready, |task| task.start()).unwrap();
+        let report = prepare_checkpointable_progress_history(
+            store,
+            conversation,
+            task_id,
+            task_attempt,
+            &DurableToolProgress {
+                text: "checkpointed".repeat(1024),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store.commit(&report.checks, &report.mutations).unwrap();
+        let limit = NonZeroUsize::new(2).unwrap();
+        let original = harness.progress_history(&start, limit).unwrap();
+        let original_attempt = harness
+            .tool_progress_events(ordinary.attempt_id, Cursor(0), limit)
+            .unwrap()
+            .records
+            .remove(0);
+        let mut after = Vec::new();
+        let mut after_attempts = Vec::new();
+        inline::sweep(store, &mut after, inline::Scope::Tools, 10, 20).unwrap();
+        inline::sweep_tool_attempts(store, &mut after_attempts, 10, 20).unwrap();
+        assert_eq!(
+            harness.progress_history(&start, limit).unwrap().records,
+            original.records
+        );
+
+        let progress = tool_progress::Snapshot::load(store, ordinary.attempt_id).unwrap();
+        let mut checkpoint = progress.prepare_complete().unwrap();
+        let terminal_event = observer
+            .prepare_append(&serde_json::json!({
+                "conversation_id":conversation,"attempt":ordinary,
+                "state":tool_progress::State::Completed,"partial_is_null":false,
+                "retained_partial":last
+            }))
+            .unwrap();
+        checkpoint.checks.extend(terminal_event.checks);
+        checkpoint.mutations.extend(terminal_event.mutations);
+        store
+            .commit(&checkpoint.checks, &checkpoint.mutations)
+            .unwrap();
+        inline::sweep(store, &mut after, inline::Scope::Generation, 100, 20).unwrap();
+        assert_eq!(
+            harness.progress_history(&start, limit).unwrap().records,
+            original.records
+        );
+        inline::sweep(store, &mut after, inline::Scope::Tools, 100, 20).unwrap();
+        inline::sweep(store, &mut after, inline::Scope::Tools, 120, 20).unwrap();
+        inline::sweep_tool_attempts(store, &mut after_attempts, 100, 20).unwrap();
+        inline::sweep_tool_attempts(store, &mut after_attempts, 119, 20).unwrap();
+        assert_eq!(
+            harness
+                .tool_progress_events(ordinary.attempt_id, Cursor(0), limit)
+                .unwrap()
+                .records[0],
+            original_attempt
+        );
+        inline::sweep_tool_attempts(store, &mut after_attempts, 120, 20).unwrap();
+        let events = harness
+            .tool_progress_events(ordinary.attempt_id, Cursor(0), limit)
+            .unwrap();
+        assert_eq!(events.records[0].cursor, original_attempt.cursor);
+        assert_eq!(events.records[0].value["expired"], true);
+        assert_eq!(events.records[0].value["state"]["state"], "running");
+        assert_eq!(
+            serde_json::from_value::<tool_progress::State>(
+                events.records[0].value["state"].clone()
+            )
+            .unwrap(),
+            tool_progress::State::Running(None),
+        );
+        assert_eq!(events.records[1].value["retained_partial"], last);
+        assert_eq!(events.records[1].value["state"]["state"], "completed");
+        let live = harness.progress_history(&start, limit).unwrap();
+        assert_eq!(
+            live.records[0].changes,
+            [ProgressHistoryChange::ExpiredTool { attempt: ordinary }]
+        );
+        assert_eq!(live.records[1], original.records[1]);
+        assert_eq!(
+            tool_progress::Snapshot::load(store, ordinary.attempt_id)
+                .unwrap()
+                .retained_partial(),
+            Some(&last)
+        );
+
+        let running = tasks.load(task_id).unwrap().unwrap();
+        tasks
+            .update(&running, |task| {
+                task.succeed(serde_json::json!("retained result"))
+            })
+            .unwrap();
+        let terminal_key = crate::task_store::key(task_id);
+        let terminal_task = store.get(&terminal_key).unwrap().unwrap();
+        inline::sweep(store, &mut after, inline::Scope::Tools, 200, 20).unwrap();
+        let fork = harness.fork(conversation).unwrap();
+        let unified = harness.unified_history_start(conversation, false).unwrap();
+        drop(harness);
+
+        let harness = Harness::open_paused(path, options()).unwrap();
+        let store = harness.owner.store();
+        inline::sweep(store, &mut after, inline::Scope::Tools, 219, 20).unwrap();
+        assert_eq!(
+            harness.progress_history(&start, limit).unwrap().records[1],
+            original.records[1]
+        );
+        inline::sweep(store, &mut after, inline::Scope::Tools, 220, 20).unwrap();
+        let retired = harness.progress_history(&start, limit).unwrap();
+        assert_eq!(retired.next, original.next);
+        for (retired, old) in retired.records.iter().zip(&original.records) {
+            assert_eq!(retired.cursor, old.cursor);
+            assert_eq!(retired.commit_sequence, old.commit_sequence);
+        }
+        assert_eq!(
+            retired.records[1].changes,
+            [ProgressHistoryChange::ExpiredCheckpointableTool {
+                task: task_id,
+                attempt: task_attempt
+            }]
+        );
+        assert_eq!(store.get(&terminal_key).unwrap().unwrap(), terminal_task);
+        let limit = NonZeroUsize::new(16).unwrap();
+        assert!(
+            harness
+                .merged_progress(&merged, limit)
+                .unwrap()
+                .frames
+                .iter()
+                .any(|frame| frame.progress.as_ref() == Some(&retired.records[1]))
+        );
+        assert!(
+            harness
+                .unified_history(&unified, limit)
+                .unwrap()
+                .commits
+                .iter()
+                .flat_map(|commit| &commit.progress)
+                .any(|frame| frame == &retired.records[1])
+        );
+        assert_eq!(
+            harness.conversation(fork).unwrap().config.system_prompt,
+            "keep the conversation"
+        );
     }
 
     #[test]

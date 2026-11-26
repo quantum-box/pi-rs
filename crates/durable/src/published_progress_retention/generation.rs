@@ -1,7 +1,5 @@
 //! Expiry for published running model partials. The terminal checkpoint is
 //! retained as the writer fence and as evidence for expiry.
-pub(crate) mod inline;
-
 use super::{PAGE_ROWS, enable_at, enabled_at, parse_payload_key, payload_key, read_payload};
 use crate::{
     observer::{Append, Cursor, Observer},
@@ -170,7 +168,7 @@ fn expire_one(
     )
 }
 
-fn terminal_for_publication(
+pub(super) fn terminal_for_publication(
     store: &Store,
     request_id: Uuid,
     original_commit: u64,
@@ -194,6 +192,7 @@ fn terminal_for_publication(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::published_progress_retention::inline::{self, Scope};
     use crate::{
         model::GenerationProgress,
         recovery::UncertainPolicy,
@@ -378,7 +377,7 @@ mod tests {
         let mut after_inline = Vec::new();
         let mut after = Vec::new();
         sweep(store, &mut after, 1_000, 20).unwrap();
-        inline::sweep(store, &mut after_inline, 1_000, 20).unwrap();
+        inline::sweep(store, &mut after_inline, Scope::Generation, 1_000, 20).unwrap();
         assert!(
             store
                 .get(&crate::progress_retention::observation_key(&inline_key))
@@ -458,13 +457,13 @@ mod tests {
         let first = &history.records[0];
         let original = store.get(&inline_key).unwrap().unwrap();
         let terminal = history.records[2].clone();
-        inline::sweep(store, &mut after_inline, 3_000, 20).unwrap();
+        inline::sweep(store, &mut after_inline, Scope::Generation, 3_000, 20).unwrap();
         drop(harness);
         let harness = Harness::open_paused(path, options()).unwrap();
         let store = harness.owner.store();
-        inline::sweep(store, &mut after_inline, 3_019, 20).unwrap();
+        inline::sweep(store, &mut after_inline, Scope::Generation, 3_019, 20).unwrap();
         assert_eq!(store.get(&inline_key).unwrap().unwrap(), original);
-        inline::sweep(store, &mut after_inline, 3_020, 20).unwrap();
+        inline::sweep(store, &mut after_inline, Scope::Generation, 3_020, 20).unwrap();
         let replacement = store.get(&inline_key).unwrap().unwrap();
         assert_eq!(replacement.version, original.version);
         assert!(replacement.value.len() < original.value.len());

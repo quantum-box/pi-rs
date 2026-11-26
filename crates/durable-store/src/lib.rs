@@ -32,10 +32,26 @@ type BoundedHistoryRow = (Option<Vec<u8>>, Option<u64>, Option<u64>);
 type BoundedChangeRow = (u64, Option<Vec<u8>>, Option<u64>, Option<u64>);
 type ReadLimit = (std::rc::Rc<()>, Vec<Vec<u8>>, usize);
 
-struct InlineGenerationExpiry<'a> {
+struct InlineProgressExpiry<'a> {
     key: &'a [u8],
     frame: &'a Entry,
+    terminal_key: Vec<u8>,
+    terminal: &'a Entry,
     replacement: Option<Vec<u8>>,
+}
+
+enum InlineProgressClass {
+    Generation,
+    Tool,
+}
+
+fn progress_checkpoint_finished(value: &[u8]) -> Result<bool, Error> {
+    let state: serde_json::Value =
+        serde_json::from_slice(value).map_err(|_| Error::InvalidSnapshot)?;
+    Ok(matches!(
+        state["state"].as_str(),
+        Some("completed" | "aborted")
+    ))
 }
 
 thread_local! {
@@ -195,6 +211,11 @@ mod task_record {
             return None;
         }
         Some(task.state.is_terminal_state())
+    }
+
+    pub(super) fn terminal_task_tool(value: &[u8], id: Uuid) -> bool {
+        serde_json::from_slice::<Task>(value)
+            .is_ok_and(|task| task.id == id && task.task_tool && task.state.is_terminal_state())
     }
 
     #[cfg(feature = "experimental-graph-revision")]
@@ -2510,12 +2531,13 @@ impl Store {
         terminal: &Entry,
         observation_version: u64,
     ) -> Result<(), Error> {
-        self.change_inline_generation_progress(
+        self.change_inline_progress(
             key,
             frame,
             terminal,
             Expected::Version(observation_version),
             None,
+            InlineProgressClass::Generation,
         )
     }
 
@@ -2530,69 +2552,161 @@ impl Store {
         previous_observation: Option<u64>,
         observed_ms: u64,
     ) -> Result<(), Error> {
-        self.change_inline_generation_progress(
+        self.change_inline_progress(
             key,
             frame,
             terminal,
             previous_observation.map_or(Expected::Missing, Expected::Version),
             Some(observed_ms),
+            InlineProgressClass::Generation,
         )
     }
 
-    fn change_inline_generation_progress(
+    /// Expire a previously observed inline running ordinary report or
+    /// checkpointable tool report at its original commit position.
+    pub fn expire_inline_tool_progress(
+        &self,
+        key: &[u8],
+        frame: &Entry,
+        terminal: &Entry,
+        observation_version: u64,
+    ) -> Result<(), Error> {
+        self.change_inline_progress(
+            key,
+            frame,
+            terminal,
+            Expected::Version(observation_version),
+            None,
+            InlineProgressClass::Tool,
+        )
+    }
+
+    /// Observe terminal evidence for an inline tool report, fenced to the
+    /// original bytes even when a concurrent expiry preserves its version.
+    pub fn observe_inline_tool_progress(
+        &self,
+        key: &[u8],
+        frame: &Entry,
+        terminal: &Entry,
+        previous_observation: Option<u64>,
+        observed_ms: u64,
+    ) -> Result<(), Error> {
+        self.change_inline_progress(
+            key,
+            frame,
+            terminal,
+            previous_observation.map_or(Expected::Missing, Expected::Version),
+            Some(observed_ms),
+            InlineProgressClass::Tool,
+        )
+    }
+
+    fn change_inline_progress(
         &self,
         key: &[u8],
         frame: &Entry,
         terminal: &Entry,
         expected_observation: Expected,
         observed_ms: Option<u64>,
+        class: InlineProgressClass,
     ) -> Result<(), Error> {
-        let suffix = key
-            .strip_prefix(b"durable/progress-history/")
+        let attempt_stream = key.strip_prefix(b"durable/tool-progress-events/");
+        let suffix = attempt_stream
+            .or_else(|| key.strip_prefix(b"durable/progress-history/"))
             .filter(|suffix| suffix.len() == 26 && suffix[16..18] == *b"/r")
             .ok_or(Error::InvalidSnapshot)?;
-        let conversation =
-            uuid::Uuid::from_slice(&suffix[..16]).map_err(|_| Error::InvalidSnapshot)?;
-        if conversation.is_nil() || suffix[18..].iter().all(|byte| *byte == 0) {
+        let stream = uuid::Uuid::from_slice(&suffix[..16]).map_err(|_| Error::InvalidSnapshot)?;
+        if stream.is_nil() || suffix[18..].iter().all(|byte| *byte == 0) {
             return Err(Error::InvalidSnapshot);
         }
         let original: serde_json::Value =
             serde_json::from_slice(&frame.value).map_err(|_| Error::InvalidSnapshot)?;
-        let change = original["changes"]
-            .as_array()
-            .filter(|changes| changes.len() == 1)
-            .map(|changes| &changes[0])
-            .filter(|change| {
-                change["kind"] == "generation" && change["state"]["state"] == "running"
-            })
-            .ok_or(Error::InvalidSnapshot)?;
-        if original["version"] != 1
-            || original["conversation"] != conversation.to_string()
-            || !original["generation"].is_null()
-            || !original["checkpointable"].is_null()
-        {
-            return Err(Error::InvalidSnapshot);
-        }
-        let request = change["request_id"]
-            .as_str()
-            .and_then(|id| uuid::Uuid::parse_str(id).ok())
-            .filter(|id| !id.is_nil())
-            .ok_or(Error::InvalidSnapshot)?;
-        let terminal_key = format!("durable/generation-progress/{request}").into_bytes();
-        let terminal_state: serde_json::Value =
-            serde_json::from_slice(&terminal.value).map_err(|_| Error::InvalidSnapshot)?;
-        if self.get_bounded(&terminal_key, 1024 * 1024)?.as_ref() != Some(terminal) {
-            return Err(Error::Conflict { key: terminal_key });
-        }
+        let id = |value: &serde_json::Value| {
+            value
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+                .ok_or(Error::InvalidSnapshot)
+        };
+        let change = if attempt_stream.is_some() {
+            if !matches!(class, InlineProgressClass::Tool)
+                || !original["expired"].is_null()
+                || !original["kind"].is_null()
+                || id(&original["attempt"]["attempt_id"])? != stream
+                || original["state"]["state"] != "running"
+            {
+                return Err(Error::InvalidSnapshot);
+            }
+            &original
+        } else {
+            if original["version"] != 1
+                || original["conversation"] != stream.to_string()
+                || !original["generation"].is_null()
+                || !original["checkpointable"].is_null()
+            {
+                return Err(Error::InvalidSnapshot);
+            }
+            original["changes"]
+                .as_array()
+                .filter(|changes| changes.len() == 1)
+                .map(|changes| &changes[0])
+                .ok_or(Error::InvalidSnapshot)?
+        };
+        let (terminal_key, expiry, settled) = match (class, change["kind"].as_str()) {
+            (InlineProgressClass::Tool, None) if attempt_stream.is_some() => {
+                let operation = id(&change["attempt"]["operation_id"])?;
+                let conversation = id(&change["conversation_id"])?;
+                (
+                    format!("durable/tool-progress/{stream}").into_bytes(),
+                    serde_json::json!({
+                        "conversation_id":conversation,
+                        "attempt":{"attempt_id":stream,"operation_id":operation},
+                        "state":{"state":"running","partial":null},
+                        "partial_is_null":false,
+                        "expired":true
+                    }),
+                    progress_checkpoint_finished(&terminal.value)?,
+                )
+            }
+            (InlineProgressClass::Generation, Some("generation"))
+                if change["state"]["state"] == "running" =>
+            {
+                let request = id(&change["request_id"])?;
+                (
+                    format!("durable/generation-progress/{request}").into_bytes(),
+                    serde_json::json!({"kind":"expired_generation", "request_id":request}),
+                    progress_checkpoint_finished(&terminal.value)?,
+                )
+            }
+            (InlineProgressClass::Tool, Some("tool")) if change["state"]["state"] == "running" => {
+                let attempt = id(&change["attempt"]["attempt_id"])?;
+                let operation = id(&change["attempt"]["operation_id"])?;
+                (
+                    format!("durable/tool-progress/{attempt}").into_bytes(),
+                    serde_json::json!({"kind":"expired_tool","attempt":{
+                        "attempt_id":attempt,"operation_id":operation
+                    }}),
+                    progress_checkpoint_finished(&terminal.value)?,
+                )
+            }
+            (InlineProgressClass::Tool, Some("checkpointable_tool")) => {
+                let task = id(&change["task"])?;
+                let attempt = id(&change["attempt"])?;
+                (
+                    [b"durable/task/".as_slice(), task.as_bytes()].concat(),
+                    serde_json::json!({"kind":"expired_checkpointable_tool","task":task,"attempt":attempt}),
+                    task_record::terminal_task_tool(&terminal.value, task),
+                )
+            }
+            _ => return Err(Error::InvalidSnapshot),
+        };
         let original_commit = self
             .commit_for_version(key, frame.version)?
             .ok_or(Error::InvalidSnapshot)?;
-        if !matches!(
-            terminal_state["state"].as_str(),
-            Some("completed" | "aborted")
-        ) || self
-            .commit_for_version(&terminal_key, terminal.version)?
-            .is_none_or(|commit| commit <= original_commit)
+        if !settled
+            || self
+                .commit_for_version(&terminal_key, terminal.version)?
+                .is_none_or(|commit| commit <= original_commit)
         {
             return Err(Error::InvalidSnapshot);
         }
@@ -2603,7 +2717,7 @@ impl Store {
                 expected: Expected::Version(frame.version),
             },
             Check {
-                key: terminal_key,
+                key: terminal_key.clone(),
                 expected: Expected::Version(terminal.version),
             },
             Check {
@@ -2620,12 +2734,12 @@ impl Store {
             .map_err(|_| Error::InvalidSnapshot)?;
             (Mutation::Put { key: marker, value }, None)
         } else {
-            let expiration = serde_json::to_vec(&serde_json::json!({
-                "version": 4,
-                "conversation": conversation,
-                "changes": [{"kind":"expired_generation", "request_id": request}]
-            }))
-            .map_err(|_| Error::InvalidSnapshot)?;
+            let expiration = if attempt_stream.is_some() {
+                expiry
+            } else {
+                serde_json::json!({"version":4,"conversation":stream,"changes":[expiry]})
+            };
+            let expiration = serde_json::to_vec(&expiration).map_err(|_| Error::InvalidSnapshot)?;
             (Mutation::Delete { key: marker }, Some(expiration))
         };
         self.commit_inner(
@@ -2633,9 +2747,11 @@ impl Store {
             &[mutation],
             &[],
             None,
-            Some(InlineGenerationExpiry {
+            Some(InlineProgressExpiry {
                 key,
                 frame,
+                terminal_key,
+                terminal,
                 replacement,
             }),
         )
@@ -2687,7 +2803,7 @@ impl Store {
         mutations: &[Mutation],
         acquisitions: &[TaskDocumentAcquisition],
         prefix_fence: Option<(&[&[u8]], u64)>,
-        inline_generation_expiry: Option<InlineGenerationExpiry<'_>>,
+        inline_progress_expiry: Option<InlineProgressExpiry<'_>>,
     ) -> Result<(), Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         #[cfg(feature = "experimental-graph-revision")]
@@ -3211,11 +3327,15 @@ impl Store {
                 }
             }
         }
-        if let Some(expiry) = inline_generation_expiry {
+        if let Some(expiry) = inline_progress_expiry {
             let current: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM durable_store_entries
-                 WHERE key=?1 AND version=?2 AND value=?3)",
-                params![expiry.key, expiry.frame.version, expiry.frame.value],
+                 WHERE key=?1 AND version=?2 AND value=?3)
+                 AND EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?4 AND version=?5 AND value=?6)",
+                params![
+                    expiry.key, expiry.frame.version, expiry.frame.value,
+                    expiry.terminal_key, expiry.terminal.version, expiry.terminal.value,
+                ],
                 |row| row.get(0),
             )?;
             if !current {

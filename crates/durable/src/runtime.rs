@@ -3258,6 +3258,8 @@ pub enum ProgressHistoryChange {
         state: crate::tool_progress::State,
         partial_is_null: bool,
     },
+    /// An ordinary tool report whose inline payload was retired.
+    ExpiredTool { attempt: ToolAttempt },
     /// A committed checkpointable tool report. A park or wake may end the
     /// live attempt without producing another report.
     CheckpointableTool {
@@ -3340,17 +3342,17 @@ impl ProgressHistoryRecord {
             .ok_or_else(|| Error::Invalid("invalid generation progress history record".into()))
     }
 
-    pub(crate) fn inline_running_request(&self, conversation: Uuid) -> Option<Uuid> {
+    pub(crate) fn inline_progress_change(
+        &self,
+        conversation: Uuid,
+    ) -> Option<&ProgressHistoryChange> {
         if self.version == 1
             && self.conversation == conversation
             && self.checkpointable.is_none()
             && self.generation.is_none()
-            && let [ProgressHistoryChange::Generation { request_id, state }] =
-                self.changes.as_slice()
-            && !request_id.is_nil()
-            && matches!(state.as_ref(), crate::progress::State::Running(_))
+            && let [change] = self.changes.as_slice()
         {
-            return Some(*request_id);
+            return Some(change);
         }
         None
     }
@@ -3423,7 +3425,16 @@ fn decode_progress_history_frame(
         }
         4 if event.checkpointable.is_none()
             && event.generation.is_none()
-            && matches!(event.changes.as_slice(), [ProgressHistoryChange::ExpiredGeneration { request_id }] if !request_id.is_nil()) =>
+            && match event.changes.as_slice() {
+                [ProgressHistoryChange::ExpiredGeneration { request_id }] => !request_id.is_nil(),
+                [ProgressHistoryChange::ExpiredTool { attempt }] => {
+                    !attempt.operation_id.is_nil() && !attempt.attempt_id.is_nil()
+                }
+                [ProgressHistoryChange::ExpiredCheckpointableTool { task, attempt }] => {
+                    !task.is_nil() && !attempt.is_nil()
+                }
+                _ => false,
+            } =>
         {
             event.changes
         }
@@ -14631,7 +14642,9 @@ impl Harness {
     }
 
     /// Poll committed replacement and terminal events for one attempt. Cursors
-    /// are exclusive and scoped to this attempt and database.
+    /// are exclusive and scoped to this attempt and database. The inline
+    /// retention opt-in exposes retired running reports with `expired: true`
+    /// and no partial at their original cursor.
     pub fn tool_progress_events(
         &self,
         attempt_id: Uuid,
@@ -23356,6 +23369,7 @@ pub struct Scheduler {
     published_progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     published_generation_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     inline_generation_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
+    inline_tool_progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
     worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
     summary_tasks: HashMap<Uuid, SummaryTask>,
@@ -24184,6 +24198,7 @@ impl Scheduler {
             published_progress_retention: None,
             published_generation_retention: None,
             inline_generation_retention: None,
+            inline_tool_progress_retention: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -25914,26 +25929,66 @@ impl Scheduler {
         retain_for: Duration,
         interval: Duration,
     ) -> Result<(), Error> {
+        self.start_inline_progress_retention(
+            crate::published_progress_retention::inline::Scope::Generation,
+            retain_for,
+            interval,
+        )
+    }
+
+    /// Retire inline ordinary and checkpointable tool reports after observing
+    /// their terminal evidence. The collector preserves the terminal records
+    /// and leaves each original progress cursor at the same commit.
+    pub fn start_inline_tool_progress_retention(
+        &mut self,
+        retain_for: Duration,
+        interval: Duration,
+    ) -> Result<(), Error> {
+        self.start_inline_progress_retention(
+            crate::published_progress_retention::inline::Scope::Tools,
+            retain_for,
+            interval,
+        )
+    }
+
+    fn start_inline_progress_retention(
+        &mut self,
+        scope: crate::published_progress_retention::inline::Scope,
+        retain_for: Duration,
+        interval: Duration,
+    ) -> Result<(), Error> {
+        use crate::published_progress_retention::inline::{self, Scope};
+
         let retain_ms = u64::try_from(retain_for.as_millis())
             .ok()
             .filter(|time| *time > 0)
-            .ok_or_else(|| Error::Invalid("invalid inline generation retention".into()))?;
-        if interval.is_zero() || self.inline_generation_retention.is_some() {
+            .ok_or_else(|| Error::Invalid("invalid inline progress retention".into()))?;
+        let worker = match scope {
+            Scope::Generation => &mut self.inline_generation_retention,
+            Scope::Tools => &mut self.inline_tool_progress_retention,
+        };
+        if interval.is_zero() || worker.is_some() {
             return Err(Error::Invalid(
-                "inline generation retention needs a nonzero interval and one worker".into(),
+                "inline progress retention needs a nonzero interval and one worker per scope"
+                    .into(),
             ));
         }
         let reader = self.harness.worker();
         let cancel = self.reporter_cancel.clone();
-        self.inline_generation_retention = Some(tokio::spawn(async move {
+        *worker = Some(tokio::spawn(async move {
             let mut after = Vec::new();
+            let mut after_attempts = Vec::new();
             while !cancel.is_cancelled() {
-                crate::published_progress_retention::generation::inline::sweep(
-                    reader.owner.store(),
-                    &mut after,
-                    unix_ms(),
-                    retain_ms,
-                )?;
+                let now = unix_ms();
+                inline::sweep(reader.owner.store(), &mut after, scope, now, retain_ms)?;
+                if matches!(scope, Scope::Tools) {
+                    inline::sweep_tool_attempts(
+                        reader.owner.store(),
+                        &mut after_attempts,
+                        now,
+                        retain_ms,
+                    )?;
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(interval) => (),
@@ -26235,6 +26290,7 @@ impl Scheduler {
             self.published_progress_retention.take(),
             self.published_generation_retention.take(),
             self.inline_generation_retention.take(),
+            self.inline_tool_progress_retention.take(),
         ]
         .into_iter()
         .flatten()
