@@ -11415,13 +11415,14 @@ impl Harness {
         let source = self
             .session_observation_transcript(origin, observation.0)?
             .ok_or(InvalidSnapshot)?;
-        if position
-            .as_ref()
-            .is_some_and(|(cursor, _)| *cursor != source)
-        {
-            return Err(Error::Invalid(
-                "checkout requires the final context of a commit".into(),
-            ));
+        if let Some((cursor, retain)) = position.as_ref().filter(|(cursor, _)| *cursor != source) {
+            return self.load_failure_reset_checkout(
+                state,
+                entry.id(),
+                cursor,
+                observation.0,
+                *retain,
+            );
         }
         let store = self.owner.store();
         let snapshot = store.get(&anchor[1].key)?.ok_or(InvalidSnapshot)?;
@@ -11491,6 +11492,61 @@ impl Harness {
         state.session_checkout = Some(SessionCheckout::Entry {
             id: entry.id(),
             source,
+            prefix_histories,
+        });
+        Ok(checks)
+    }
+
+    fn load_failure_reset_checkout(
+        &self,
+        state: &mut Conversation,
+        entry: Uuid,
+        source: &crate::transcript::Cursor,
+        observation: u64,
+        retain: Option<usize>,
+    ) -> Result<Vec<Check>, Error> {
+        use crate::fork::Error::InvalidSnapshot;
+
+        let origin = source.transcript_id();
+        let (mut cut, _, checks) = self.prove_failure_reset_cut(origin, source, observation)?;
+        let occurrences = self.resolved_occurrences(origin, source.clone())?;
+        if occurrences
+            .iter()
+            .map(|(message, _)| message)
+            .ne(cut.messages.iter())
+        {
+            return Err(InvalidSnapshot.into());
+        }
+        let retain = retain.unwrap_or(occurrences.len());
+        let prefix = occurrences
+            .get(..retain)
+            .filter(|prefix| !prefix.is_empty())
+            .ok_or(InvalidSnapshot)?;
+        let prefix_histories = prefix
+            .iter()
+            .map(|(_, history)| history.clone())
+            .collect::<Vec<_>>();
+        if prefix_histories.iter().any(Option::is_none)
+            || prefix_histories
+                .last()
+                .and_then(Option::as_ref)
+                .map(|history| history.id)
+                != Some(entry)
+        {
+            return Err(InvalidSnapshot.into());
+        }
+        let prefix_histories = (retain < cut.messages.len()).then_some(prefix_histories);
+        cut.messages.truncate(retain);
+        cut.content_blocks.retain(|index, _| *index < retain);
+        crate::fork::validate_context(&cut.messages)?;
+        state.messages = cut.messages;
+        state.content_blocks = cut.content_blocks;
+        state.session_info = cut.session_info;
+        state.tool_results = cut.tool_results;
+        state.occurrence_epoch_proven = cut.occurrence_epoch_proven;
+        state.session_checkout = Some(SessionCheckout::Entry {
+            id: entry,
+            source: source.clone(),
             prefix_histories,
         });
         Ok(checks)

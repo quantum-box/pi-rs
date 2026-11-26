@@ -2158,6 +2158,56 @@ fn atomic_failure_fork_preserves_writes_at_each_reset() {
         cursor = page.older;
     }
     assert_eq!(custom, vec![first_write]);
+    drop(h);
+
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.session_transaction(fork, |tx| {
+        tx.edit_defined_document(&document, "", |value| {
+            value.insert("generation".into(), serde_json::json!(2));
+            Ok(())
+        })
+    })
+    .unwrap();
+    let draft = h
+        .navigate_session_entry(fork, occurrences[1])
+        .unwrap()
+        .unwrap();
+    assert_eq!(draft.history.id, occurrences[1]);
+    assert_eq!(
+        draft.blocks.unwrap(),
+        [serde_json::json!({"type":"text","text":"later in first reset"})]
+    );
+    assert!(matches!(
+        h.checkout_session_entry(id, occurrences[0]),
+        Err(Error::Fork(crate::fork::Error::Unsettled))
+    ));
+    drop(h);
+
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let state = h.conversation(fork).unwrap();
+    assert_eq!(state.messages.len(), 2);
+    assert_eq!(state.content_blocks[&1].message_id, occurrences[0]);
+    let tree = h
+        .session_tree(&h.session_entries_start(fork).unwrap())
+        .unwrap();
+    assert_eq!(tree.leaf_id, Some(occurrences[0]));
+    assert!(
+        tree.entries
+            .iter()
+            .any(|entry| entry.entry.id() == occurrences[1])
+    );
+    assert_eq!(
+        h.session_transaction(fork, |tx| tx.defined_document(&document, ""))
+            .unwrap()
+            .unwrap()
+            .value["generation"],
+        2
+    );
+    h.checkout_session_entry(fork, occurrences[1]).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().content_blocks[&2].message_id,
+        occurrences[1]
+    );
 }
 
 #[test]
