@@ -2472,6 +2472,16 @@ pub(crate) struct AdmissionPublication<'a> {
     state: std::sync::MutexGuard<'a, InvocationState>,
 }
 impl AdmissionPublication<'_> {
+    fn owns_callback(&self, task: &Task, token: Uuid) -> bool {
+        let state = &self.state;
+        !state.poisoned
+            && !state.handler_failed
+            && state.attempts.contains(&task.id())
+            && state.leases.get(&task.id()) == Some(&(token, task.attempt_id()))
+            && !state.failed_handlers.contains(&task.id())
+            && !state.published.iter().any(|(id, _)| *id == task.id())
+    }
+
     pub(crate) fn permits_admission(
         &self,
         owner: &OwnedStore,
@@ -4327,6 +4337,46 @@ impl DetachedInvocation {
 }
 
 impl AdmissionHandle<'_> {
+    pub(crate) fn checkpointable_subagent_status(
+        &self,
+        child: &crate::owned_subagent::Admission,
+    ) -> Result<crate::runtime::Status, crate::runtime::Error> {
+        self.validator
+            .ok_or(crate::runtime::Error::NotFound)?
+            .checkpointable_subagent_status(&self.running.task, child)
+    }
+
+    pub(crate) fn admit_checkpointable_subagent(
+        &self,
+        request: crate::async_task_tool::ForegroundSubagentRequest,
+        cancellation: &pi_rs_core::CancellationToken,
+    ) -> Result<crate::owned_subagent::Admission, crate::runtime::Error> {
+        use crate::runtime::Error as RuntimeError;
+        let unavailable =
+            || RuntimeError::Invalid("foreground checkpointable attempt unavailable".into());
+        let harness = self.validator.ok_or_else(unavailable)?;
+        if self.abort || self.lease.retired || !self.running.task.replay_safe() {
+            return Err(unavailable());
+        }
+        harness.worker().admit_checkpointable_subagent(
+            &self.running.task,
+            request,
+            &|harness, task, publication| {
+                if task != &self.running.task
+                    || cancellation.is_cancelled()
+                    || self
+                        .lease
+                        .scheduler_poison
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || !publication.owns_callback(task, self.lease.token)
+                {
+                    return Err(unavailable());
+                }
+                let definitions = self.definitions.read().map_err(|_| RuntimeError::Failed)?;
+                harness.checkpointable_conversation_checks(task, &definitions.registry)
+            },
+        )
+    }
     pub(crate) fn graph_start_boundary(&self) -> Result<u64, String> {
         #[cfg(feature = "experimental-graph-scope")]
         return self
