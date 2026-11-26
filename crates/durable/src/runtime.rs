@@ -1617,7 +1617,7 @@ fn record_tool_result(
         call_id: call.id.clone(),
         tool: call.name.clone(),
         content_block_id: None,
-        is_error: matches!(outcome, Outcome::Failed(_) | Outcome::Skipped(_)),
+        is_error: outcome.is_error(),
         redacted: false,
         metadata_truncated,
         schema_validated: false,
