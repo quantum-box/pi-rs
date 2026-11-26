@@ -15,7 +15,7 @@ test-hooks = []
 coding-tools = ["dep:pi-rs-workbench"]
 builtin-images = ["dep:image"]
 openai-responses = ["dep:async-stream", "dep:eventsource-stream", "dep:reqwest"]
-text-cli = ["builtin-images", "openai-responses", "dep:clap", "dep:pi-rs-workbench", "tokio/signal"]
+text-cli = ["builtin-images", "openai-responses", "dep:chrono", "dep:clap", "dep:pi-rs-workbench", "serde_json/raw_value", "tokio/signal"]
 
 [[bin]]
 name = "pi-rs-durable"
@@ -28,6 +28,7 @@ eventsource-stream = { version = "0.2", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "stream", "rustls-tls"] }
 durable-task-schema = { path = "../durable-task-schema" }
 base64 = "0.22"
+chrono = { version = "0.4", optional = true, default-features = false, features = ["std"] }
 clap = { version = "4", optional = true, features = ["derive"] }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 serde = { version = "1", features = ["derive"] }

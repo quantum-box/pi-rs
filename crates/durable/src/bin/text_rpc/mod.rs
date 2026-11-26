@@ -1,4 +1,6 @@
 //! Companion implementation of the line-delimited Pi RPC protocol.
+mod session_history;
+
 use std::collections::HashSet;
 use std::io::{self, BufRead, Read};
 use std::sync::Arc;
@@ -296,6 +298,25 @@ async fn respond(
         Err(error) => return reply(&Value::Null, Err(error)).map(|_| false),
     };
     let command = request["type"].as_str().unwrap_or_default();
+    if command == "get_tree" {
+        let result = session_history::snapshot(scheduler, id).and_then(|tree| tree.nested());
+        return match result {
+            Ok(data) => {
+                #[derive(serde::Serialize)]
+                struct TreeResponse<'a> {
+                    #[serde(flatten)]
+                    response: Value,
+                    data: &'a serde_json::value::RawValue,
+                }
+                emit(&TreeResponse {
+                    response: response_envelope(&request, true),
+                    data: &data,
+                })
+            }
+            Err(error) => reply(&request, Err(error)),
+        }
+        .map(|_| false);
+    }
     let mut admitted = false;
     let result = match command {
         "prompt" | "steer" | "follow_up" => {
@@ -391,6 +412,9 @@ async fn respond(
             }
             Some(data)
         }).map_err(|error| error.to_string()),
+        "get_entries" => session_history::snapshot(scheduler, id)
+            .and_then(|tree| tree.entries_after(request.get("since")))
+            .map(Some),
         _ => Err("unsupported durable RPC command".into()),
     };
     reply(&request, result)?;
@@ -506,14 +530,19 @@ fn set_queue_mode(
     Ok(None)
 }
 
-fn reply(request: &Value, result: Result<Option<Value>, String>) -> io::Result<()> {
-    let mut reply = json!({"type":"response","success":result.is_ok()});
+fn response_envelope(request: &Value, success: bool) -> Value {
+    let mut reply = json!({"type":"response","success":success});
     if let Some(command) = request.get("type") {
         reply["command"] = command.clone();
     }
     if let Some(id) = request.get("id") {
         reply["id"] = id.clone();
     }
+    reply
+}
+
+fn reply(request: &Value, result: Result<Option<Value>, String>) -> io::Result<()> {
+    let mut reply = response_envelope(request, result.is_ok());
     match result {
         Ok(Some(data)) => reply["data"] = data,
         Err(error) => reply["error"] = json!(error),
