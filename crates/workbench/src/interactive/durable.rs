@@ -13,6 +13,9 @@ use uuid::Uuid;
 use super::*;
 use crate::ui::input::{InputEvent, Reader};
 
+// The companion counts the whole UTF-8 RPC line, including its newline.
+const MAX_RPC_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
 struct Companion {
     child: Child,
     input: Option<ChildStdin>,
@@ -68,11 +71,15 @@ impl Companion {
     }
 
     fn send(&mut self, request: Value) -> Result<()> {
+        self.send_json(&serde_json::to_vec(&request)?)
+    }
+
+    fn send_json(&mut self, request: &[u8]) -> Result<()> {
         let input = self
             .input
             .as_mut()
             .ok_or_else(|| Error::Config("Durable companion input is closed".into()))?;
-        serde_json::to_writer(&mut *input, &request)?;
+        input.write_all(request)?;
         writeln!(input)?;
         input.flush()?;
         Ok(())
@@ -128,13 +135,17 @@ impl Conversation {
                         if let Some(model) = event["data"]["model"]["id"].as_str() {
                             args.model = model.to_owned();
                         }
-                        if let Some(session) = event["data"]["sessionId"].as_str() {
+                        if let Some(session) = event["data"]["sessionId"].as_str()
+                            && view.session_name.as_deref() != Some(session)
+                        {
                             view.session_name = Some(session.to_owned());
+                            append_session_reference(view);
                         }
                     }
                     Some("get_messages") => {
                         if let Some(messages) = event["data"]["messages"].as_array() {
                             view.lines.clear();
+                            append_session_reference(view);
                             for message in messages {
                                 append_message(view, message);
                             }
@@ -174,19 +185,23 @@ impl Conversation {
         }
     }
 
-    fn submit(&mut self, worker: &mut Companion, view: &mut View, follow_up: bool) -> Result<()> {
+    fn submit(
+        &mut self,
+        view: &mut View,
+        follow_up: bool,
+        send: impl FnOnce(&[u8]) -> Result<()>,
+    ) -> Result<()> {
         if view.clipboard.is_some() {
             return Ok(());
         }
-        let text = view.editor.take();
+        let text = &view.editor.text;
         if text.trim().is_empty() && view.draft_images.is_empty() {
             return Ok(());
         }
-        let input = view.draft_message(&text);
         let busy = self.busy();
         let id = Uuid::new_v4();
-        let images: Vec<_> = input
-            .images
+        let images: Vec<_> = view
+            .draft_images
             .iter()
             .map(|image| json!({"type":"image", "mimeType":image.mime_type, "data":image.data}))
             .collect();
@@ -194,14 +209,24 @@ impl Conversation {
         if busy {
             request["streamingBehavior"] = json!(if follow_up { "followUp" } else { "steer" });
         }
-        if let Err(error) = worker.send(request) {
-            view.editor.replace(text);
-            return Err(error);
+        let encoded = serde_json::to_vec(&request)?;
+        if encoded.len() >= MAX_RPC_REQUEST_BYTES {
+            view.append("Durable request exceeds 4 MiB. Shorten the draft or remove an image.");
+            return Ok(());
         }
+        send(&encoded)?;
+        let input = view.draft_message(text);
+        view.editor.take();
         view.history_index = None;
         view.draft_images.clear();
         self.submissions.insert(id, input);
         Ok(())
+    }
+}
+
+fn append_session_reference(view: &mut View) {
+    if let Some(session) = &view.session_name {
+        view.append(&format!("Durable session ID {session}"));
     }
 }
 
@@ -420,9 +445,9 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                     "tui.input.submit" if view.editor.continued_line() => {}
                     "tui.input.submit" | "app.message.followUp" => {
                         conversation.submit(
-                            &mut worker,
                             &mut view,
                             action == "app.message.followUp",
+                            |request| worker.send_json(request),
                         )?;
                     }
                     _ => {
@@ -491,6 +516,104 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_prompt_preserves_the_entire_draft_and_never_writes_to_rpc() {
+        let mut view = View::default();
+        let mut conversation = Conversation::default();
+        // JSON escaping doubles these bytes even though the editor text fits.
+        let text = "\\".repeat(MAX_RPC_REQUEST_BYTES / 2);
+        let image = pi_rs::ImageContent {
+            data: "YQ==".into(),
+            mime_type: "image/png".into(),
+        };
+        view.editor.replace(text.clone());
+        view.editor.cursor = 2;
+        view.draft_images.push(image.clone());
+        conversation
+            .submit(&mut view, false, |_| panic!("oversized prompt was sent"))
+            .unwrap();
+        assert_eq!(view.editor.text, text);
+        assert_eq!(view.editor.cursor, 2);
+        assert_eq!(view.draft_images, [image]);
+        assert!(conversation.submissions.is_empty());
+        assert!(matches!(&view.lines[..], [Entry::Notice(text)] if text.contains("4 MiB")));
+
+        view.editor.replace("shortened".into());
+        conversation
+            .submit(&mut view, false, |request| {
+                let request: Value = serde_json::from_slice(request)?;
+                assert_eq!(request["message"], "shortened");
+                assert_eq!(request["images"][0]["data"], "YQ==");
+                Ok(())
+            })
+            .unwrap();
+        assert!(view.editor.text.is_empty());
+        assert!(view.draft_images.is_empty());
+        assert_eq!(conversation.submissions.len(), 1);
+    }
+
+    #[test]
+    fn prompt_limit_counts_the_wire_newline() {
+        let mut view = View::default();
+        let prefix_bytes = serde_json::to_vec(
+            &json!({"type":"prompt", "id":Uuid::nil(), "message":"", "images":[]}),
+        )
+        .unwrap()
+        .len();
+        let mut conversation = Conversation::default();
+        view.editor
+            .replace("a".repeat(MAX_RPC_REQUEST_BYTES - prefix_bytes));
+        conversation
+            .submit(&mut view, false, |_| panic!("oversized prompt was sent"))
+            .unwrap();
+        assert!(conversation.submissions.is_empty());
+
+        view.editor
+            .replace("a".repeat(MAX_RPC_REQUEST_BYTES - prefix_bytes - 1));
+        conversation
+            .submit(&mut view, false, |request| {
+                assert_eq!(request.len() + 1, MAX_RPC_REQUEST_BYTES);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(conversation.submissions.len(), 1);
+    }
+
+    #[test]
+    fn durable_session_id_survives_history_loading_with_the_header_hidden() {
+        let session = Uuid::new_v4().to_string();
+        let settings_dir = tempfile::tempdir().unwrap();
+        let path = settings_dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"quietStartup":true}"#).unwrap();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.tui_mode = Some(TuiMode::Regular);
+        args.settings =
+            crate::config::Settings::load_from_paths(settings_dir.path(), false, &path).unwrap();
+        assert!(!show_startup_header(&args));
+
+        let mut conversation = Conversation::default();
+        let mut view = View::default();
+        let state = json!({
+            "type":"response","command":"get_state","success":true,
+            "data":{"sessionId":session}
+        });
+        conversation.event(&mut view, &mut args, state.clone());
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({
+                "type":"response","command":"get_messages","success":true,"data":{"messages":[
+                    {"role":"user","content":[{"type":"text","text":"saved"}]}
+                ]}
+            }),
+        );
+        conversation.event(&mut view, &mut args, state);
+        assert!(matches!(
+            &view.lines[..],
+            [Entry::Notice(text), Entry::User(_)] if text == &format!("Durable session ID {session}")
+        ));
+    }
 
     #[test]
     fn durable_tool_cards_use_the_native_result_renderer_without_duplicates() {
