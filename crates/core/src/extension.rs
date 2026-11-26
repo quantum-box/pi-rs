@@ -35,6 +35,7 @@ type BranchModels = BTreeMap<
     (Arc<dyn crate::Model>, Option<crate::Limits>),
 >;
 
+type CycledModels = BTreeMap<(Uuid, crate::journal::CycledModelSelection), Arc<dyn crate::Model>>;
 type ReservedBranchModel = (Uuid, String, String);
 struct BranchModelReservation {
     reserved: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
@@ -2154,6 +2155,7 @@ pub struct Registry {
     omit_mcp_declarations: bool,
     pub(crate) publish_tool_attempts: bool,
     branch_models: Arc<RwLock<BranchModels>>,
+    cycled_models: Arc<RwLock<CycledModels>>,
     branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
 }
 
@@ -2501,6 +2503,50 @@ impl Registry {
         }
         Ok((result, revoked))
     }
+    pub(crate) fn cycled_model(
+        &self,
+        session: Uuid,
+        selection: &crate::journal::CycledModelSelection,
+    ) -> Option<Arc<dyn crate::Model>> {
+        self.cycled_models
+            .read()
+            .expect("cycled models")
+            .get(&(session, selection.clone()))
+            .cloned()
+    }
+
+    pub(crate) fn commit_cycled_model<T>(
+        &self,
+        session: Uuid,
+        selection: &crate::journal::CycledModelSelection,
+        client: Arc<dyn crate::Model>,
+        require_existing: bool,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        let key = (session, selection.clone());
+        self.commit_reserved_session_models(
+            session,
+            || {
+                let models = self.cycled_models.read().expect("cycled models");
+                match models.get(&key) {
+                    Some(existing) if Arc::ptr_eq(existing, &client) => Ok(()),
+                    None if !require_existing => Ok(()),
+                    _ => Err(Error::Config(
+                        "cycled model client changed while resolving".into(),
+                    )),
+                }
+            },
+            commit,
+            || {
+                self.cycled_models
+                    .write()
+                    .expect("cycled models")
+                    .entry(key.clone())
+                    .or_insert_with(|| client.clone());
+            },
+        )
+    }
+
     /// Reserve the entire session while startup commits and installs its
     /// complete staged model set. A concurrent revocation wins as a unit.
     pub(crate) fn commit_session_model_bindings<T>(
@@ -2515,33 +2561,60 @@ impl Registry {
         }) {
             return Err(Error::Config("provider or model name is empty".into()));
         }
-        let key = (session_id, String::new(), String::new());
+        self.commit_reserved_session_models(
+            session_id,
+            || {
+                if let Some((provider, name, client)) = guarded
+                    && self
+                        .branch_models
+                        .read()
+                        .expect("branch models")
+                        .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
+                        .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, client))
+                {
+                    return Err(Error::Config(format!(
+                        "model client changed while resolving {provider}/{name}"
+                    )));
+                }
+                Ok(())
+            },
+            commit,
+            || {
+                let mut models = self.branch_models.write().expect("branch models");
+                for (provider, name, client) in bindings {
+                    let guarded_binding = guarded
+                        .is_some_and(|(p, n, _)| provider.as_deref() == Some(p) && name == n);
+                    let key = (Some(session_id), provider, name);
+                    if guarded_binding {
+                        models.entry(key).or_insert((client, None));
+                    } else {
+                        models.insert(key, (client, None));
+                    }
+                }
+            },
+        )
+    }
+
+    fn commit_reserved_session_models<T>(
+        &self,
+        session: Uuid,
+        validate: impl FnOnce() -> Result<()>,
+        commit: impl FnOnce() -> Result<T>,
+        install: impl FnOnce(),
+    ) -> Result<(T, bool)> {
+        let key = (session, String::new(), String::new());
         {
             let mut reservations = self
                 .branch_reservations
                 .write()
                 .expect("branch reservations");
-            if reservations
-                .keys()
-                .any(|(owner, _, _)| *owner == session_id)
-            {
+            if reservations.keys().any(|(owner, _, _)| *owner == session) {
                 return Err(Error::Config("session models are being resolved".into()));
             }
-            if let Some((provider, name, client)) = guarded
-                && self
-                    .branch_models
-                    .read()
-                    .expect("branch models")
-                    .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
-                    .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, client))
-            {
-                return Err(Error::Config(format!(
-                    "model client changed while resolving {provider}/{name}"
-                )));
-            }
+            validate()?;
             reservations.insert(key.clone(), false);
         }
-        let _reservation = BranchModelReservation {
+        let reservation = BranchModelReservation {
             reserved: self.branch_reservations.clone(),
             key,
         };
@@ -2550,22 +2623,13 @@ impl Registry {
             .branch_reservations
             .read()
             .expect("branch reservations");
-        let revoked = reservations.get(&_reservation.key) == Some(&true);
+        let revoked = reservations.get(&reservation.key) == Some(&true);
         if !revoked {
-            let mut models = self.branch_models.write().expect("branch models");
-            for (provider, name, client) in bindings {
-                let guarded_binding =
-                    guarded.is_some_and(|(p, n, _)| provider.as_deref() == Some(p) && name == n);
-                let key = (Some(session_id), provider, name);
-                if guarded_binding {
-                    models.entry(key).or_insert((client, None));
-                } else {
-                    models.insert(key, (client, None));
-                }
-            }
+            install();
         }
         Ok((result, revoked))
     }
+
     /// Register a session-specific provider client and its effective run limits.
     pub fn register_session_provider_model_with_limits(
         &self,
@@ -2641,6 +2705,25 @@ impl Registry {
             models.insert((Some(destination), provider, name), model);
         }
     }
+    pub(crate) fn copy_cycled_models(&self, source: Uuid, destination: Uuid) {
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        if reservations.get(&(source, String::new(), String::new())) == Some(&true)
+            || reservations.contains_key(&(destination, String::new(), String::new()))
+        {
+            return;
+        }
+        let mut models = self.cycled_models.write().expect("cycled models");
+        let copies: Vec<_> = models
+            .iter()
+            .filter(|((owner, _), _)| *owner == source)
+            .map(|((_, selection), model)| ((destination, selection.clone()), model.clone()))
+            .collect();
+        models.extend(copies);
+    }
+
     /// Remove recovery clients for a session before rebuilding its host configuration.
     pub fn remove_session_branch_models(&self, session_id: Uuid) {
         let mut reservations = self
@@ -2652,6 +2735,10 @@ impl Registry {
                 *revoked = true;
             }
         }
+        self.cycled_models
+            .write()
+            .expect("cycled models")
+            .retain(|(owner, _), _| *owner != session_id);
         self.branch_models
             .write()
             .expect("branch models")
@@ -3266,6 +3353,7 @@ impl Registry {
             mcp_servers: Arc::new(self.mcp_servers.copy_registrations()),
             omit_mcp_declarations: self.omit_mcp_declarations,
             publish_tool_attempts: self.publish_tool_attempts,
+            cycled_models: self.cycled_models.clone(),
             branch_models: self.branch_models.clone(),
             branch_reservations: self.branch_reservations.clone(),
         })

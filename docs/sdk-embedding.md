@@ -60,6 +60,19 @@ cloned catalogs and existing sessions retain their original bindings. Hosts
 needing automatic fallback can provide their own `HistoricalModelResolver`.
 This provider-neutral API does not depend on Tauri or a desktop runtime.
 
+## Native quickstart
+
+The [Ollama SDK example](../crates/ollama/examples/sdk_chat.rs) creates an
+in-memory session, sends a prompt to the local server, and closes the session:
+
+```sh
+ollama pull qwen2.5:7b
+cargo run --locked -p pi-rs-ollama --example sdk_chat
+```
+
+Set `PI_RS_EXAMPLE_MODEL` to use another installed model. For a browser-only
+app, a native server can own the session and expose an application-specific API.
+
 ## Model cycling
 
 Call `AgentSession::cycle_model` with the current ordered snapshot of models
@@ -81,8 +94,14 @@ provider capabilities. A host can use
 `ModelCatalog::get` for a prebuilt client. Hosts that use the native workbench
 factory can prepare clients using `ModelClientFactory` before passing the
 snapshot. The SDK performs no discovery or credential lookup during selection.
-Historical client lookup still uses provider and model identity. If an adapter
-needs to restore the historical thinking level, the host owns that configuration.
+Each cycled journal selection retains its own client binding, including across
+in-process forks and checkouts. Native journal records carry a binding marker,
+so cycling requires a session store with atomic record metadata. When reopening
+a native journal, use `SessionBuilder::cycled_model_resolver` to resolve the
+exact provider, model, and recorded thinking level. The host applies its normal
+credential and capability policy. If it cannot supply that exact client, the
+SDK leaves the selection unresolved and cannot dispatch requests with it.
+Explicit SDK model setters keep their existing identity-based behavior.
 
 The SDK records the chosen model and effective thinking level together in the
 session journal, then delivers selection hooks with source `cycle`. A host owns
@@ -90,19 +109,6 @@ the scope and any application-wide defaults, including whether to persist the
 new model to settings. See the
 [pinned upstream cycling implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2701-L2774)
 for the reference ordering and scope behavior.
-
-## Native quickstart
-
-The [Ollama SDK example](../crates/ollama/examples/sdk_chat.rs) creates an
-in-memory session, sends a prompt to the local server, and closes the session:
-
-```sh
-ollama pull qwen2.5:7b
-cargo run --locked -p pi-rs-ollama --example sdk_chat
-```
-
-Set `PI_RS_EXAMPLE_MODEL` to use another installed model. For a browser-only
-app, a native server can own the session and expose an application-specific API.
 
 ## Native state and Tauri
 

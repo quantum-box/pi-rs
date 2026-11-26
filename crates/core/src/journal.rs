@@ -441,6 +441,15 @@ impl AbandonedBranch {
     }
 }
 
+// A provider/model pair can be selected repeatedly with different clients.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CycledModelSelection {
+    pub id: Uuid,
+    pub provider: String,
+    pub model: String,
+    pub thinking: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1944,17 +1953,98 @@ impl Session {
             .map(|(_, model, thinking)| (model, thinking))
     }
 
+    fn model_selection_record_at(&self, target: u64) -> Option<&Record> {
+        std::iter::successors(
+            self.records.get(target.checked_sub(1)? as usize),
+            |record| self.records.get(record.parent?.checked_sub(1)? as usize),
+        )
+        .find(|record| {
+            matches!(
+                record.event,
+                Event::ModelSelected { .. }
+                    | Event::BranchModelSelected { .. }
+                    | Event::BranchSummary {
+                        fallback_model: Some(_),
+                        ..
+                    }
+            )
+        })
+    }
+
+    pub(crate) fn cycled_model_at(&self, target: u64) -> Option<CycledModelSelection> {
+        let record = self.model_selection_record_at(target)?;
+        let marker = self.record_metadata(record.id)?.get("sdkCycleBinding")?;
+        let (provider, model, thinking) = match &record.event {
+            Event::ModelSelected {
+                provider: Some(provider),
+                model,
+                thinking: Some(thinking),
+            } => (provider, model, thinking.as_str()),
+            Event::BranchModelSelected {
+                provider, model, ..
+            } => (
+                provider,
+                model,
+                self.record_metadata(record.id)?
+                    .get("sdkCycleThinking")?
+                    .as_str()?,
+            ),
+            Event::BranchSummary {
+                fallback_model: Some(selection),
+                ..
+            } => (
+                &selection.provider,
+                &selection.model,
+                self.record_metadata(record.id)?
+                    .get("sdkCycleThinking")?
+                    .as_str()?,
+            ),
+            _ => return None,
+        };
+        Some(CycledModelSelection {
+            id: marker
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .unwrap_or_else(Uuid::nil),
+            provider: provider.clone(),
+            model: model.clone(),
+            thinking: thinking.to_owned(),
+        })
+    }
+
+    pub(crate) fn select_cycled_model(&mut self, selection: &CycledModelSelection) -> Result<()> {
+        self.append_cycled_model_transition(
+            Event::ModelSelected {
+                provider: Some(selection.provider.clone()),
+                model: selection.model.clone(),
+                thinking: Some(selection.thinking.clone()),
+            },
+            selection,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn append_cycled_model_transition(
+        &mut self,
+        event: Event,
+        selection: &CycledModelSelection,
+    ) -> Result<&Record> {
+        self.append_inner_with_metadata(
+            event,
+            false,
+            Some(serde_json::json!({"sdkCycleBinding": selection.id, "sdkCycleThinking": selection.thinking})),
+            false,
+        )
+    }
+
     /// The provider belongs to the same selection record as the model. Older
     /// records and request-only histories have no reliable provider identity.
     pub(crate) fn model_identity_at(
         &self,
         target: u64,
     ) -> Option<(Option<String>, String, Option<String>)> {
-        let branch = self.path(target);
-        branch
-            .iter()
-            .rev()
-            .find_map(|record| match &record.event {
+        self.model_selection_record_at(target)
+            .and_then(|record| match &record.event {
                 Event::ModelSelected {
                     model,
                     thinking,
@@ -1962,22 +2052,35 @@ impl Session {
                 } => Some((provider.clone(), model.clone(), thinking.clone())),
                 Event::BranchModelSelected {
                     provider, model, ..
-                } => Some((Some(provider.clone()), model.clone(), None)),
+                } => Some((
+                    Some(provider.clone()),
+                    model.clone(),
+                    self.record_metadata(record.id)
+                        .and_then(|marker| marker.get("sdkCycleThinking"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                )),
                 Event::BranchSummary {
                     fallback_model: Some(selection),
                     ..
                 } => Some((
                     Some(selection.provider.clone()),
                     selection.model.clone(),
-                    None,
+                    self.record_metadata(record.id)
+                        .and_then(|marker| marker.get("sdkCycleThinking"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
                 )),
                 _ => None,
             })
             .or_else(|| {
-                branch.iter().rev().find_map(|record| match &record.event {
-                    Event::ModelRequested { model, .. } => Some((None, model.clone(), None)),
-                    _ => None,
-                })
+                self.path(target)
+                    .into_iter()
+                    .rev()
+                    .find_map(|record| match &record.event {
+                        Event::ModelRequested { model, .. } => Some((None, model.clone(), None)),
+                        _ => None,
+                    })
             })
     }
 
@@ -2038,7 +2141,6 @@ impl Session {
         &mut self,
         provider: &str,
         model: &str,
-        thinking: Option<&str>,
     ) -> Result<()> {
         if provider.trim().is_empty() || model.trim().is_empty() {
             return Err(Error::Config("provider or model name is empty".into()));
@@ -2046,7 +2148,7 @@ impl Session {
         self.append_inner(
             Event::ModelSelected {
                 model: model.into(),
-                thinking: thinking.map(str::to_owned),
+                thinking: None,
                 provider: Some(provider.into()),
             },
             false,

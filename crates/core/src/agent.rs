@@ -450,7 +450,26 @@ pub(crate) struct TreeModelResolution {
     pub fallback: bool,
     pub require_existing: bool,
     pub legacy: bool,
+    pub cycle: Option<crate::journal::CycledModelSelection>,
     pub revoked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn tree_handoff_model(
+    registry: &Registry,
+    session: &Session,
+    name: &str,
+) -> Option<(Arc<dyn Model>, Option<Limits>)> {
+    if let Some(selection) = session.cycled_model_at(session.head()) {
+        return registry
+            .cycled_model(session.session_id(), &selection)
+            .map(|model| (model, None));
+    }
+    match session.model_provider() {
+        Some(provider) => registry.provider_branch_config(session.session_id(), provider, name),
+        None => registry
+            .branch_model(session.session_id(), name)
+            .map(|model| (model, None)),
+    }
 }
 
 impl Agent<'_> {
@@ -715,6 +734,7 @@ impl Agent<'_> {
             return Err(Error::Cancelled);
         }
         let selected_provider = session.model_provider().map(str::to_owned);
+        let selected_cycle = session.cycled_model_at(session.head());
         let handoff = if input.is_none() {
             match session.begin_tree_trigger_handoff(run_id) {
                 Ok(handoff) => handoff,
@@ -762,29 +782,14 @@ impl Agent<'_> {
         let branch_model = handoff
             .as_ref()
             .and_then(|_| session.model_selection().map(|selection| selection.0));
-        let provider_changed =
-            handoff.is_some() && session.model_provider() != selected_provider.as_deref();
+        let provider_changed = handoff.is_some()
+            && (session.model_provider() != selected_provider.as_deref()
+                || session.cycled_model_at(session.head()) != selected_cycle);
         let model = match branch_model
             .as_deref()
             .filter(|name| *name != self.model_name || provider_changed)
         {
-            Some(name) => match session
-                .model_provider()
-                .and_then(|provider| {
-                    self.registry
-                        .provider_branch_config(session.session_id(), provider, name)
-                })
-                .or_else(|| {
-                    session
-                        .model_provider()
-                        .is_none()
-                        .then(|| {
-                            self.registry
-                                .branch_model(session.session_id(), name)
-                                .map(|model| (model, None))
-                        })
-                        .flatten()
-                }) {
+            Some(name) => match tree_handoff_model(self.registry, session, name) {
                 Some(model) => Some(model),
                 None => {
                     let error = if let Some((return_to, _)) = handoff {
@@ -850,6 +855,7 @@ impl Agent<'_> {
                 break;
             };
             let selected_provider = session.model_provider().map(str::to_owned);
+            let selected_cycle = session.cycled_model_at(session.head());
             let handoff = match session.begin_tree_trigger_handoff(trigger_id) {
                 Ok(Some((return_to, records))) => {
                     for record in &records {
@@ -875,29 +881,14 @@ impl Agent<'_> {
             observer(Notification::RunStarted { run_id: trigger_id });
             let branch_model =
                 handoff.and_then(|_| session.model_selection().map(|selection| selection.0));
-            let provider_changed =
-                handoff.is_some() && session.model_provider() != selected_provider.as_deref();
+            let provider_changed = handoff.is_some()
+                && (session.model_provider() != selected_provider.as_deref()
+                    || session.cycled_model_at(session.head()) != selected_cycle);
             let model = match branch_model
                 .as_deref()
                 .filter(|name| *name != self.model_name || provider_changed)
             {
-                Some(name) => match session
-                    .model_provider()
-                    .and_then(|provider| {
-                        self.registry
-                            .provider_branch_config(session.session_id(), provider, name)
-                    })
-                    .or_else(|| {
-                        session
-                            .model_provider()
-                            .is_none()
-                            .then(|| {
-                                self.registry
-                                    .branch_model(session.session_id(), name)
-                                    .map(|model| (model, None))
-                            })
-                            .flatten()
-                    }) {
+                Some(name) => match tree_handoff_model(self.registry, session, name) {
                     Some(model) => Some(model),
                     None => {
                         session.set_run_id(None);
@@ -5177,8 +5168,21 @@ impl Agent<'_> {
         }
         if let Some(resolved) = resolution {
             let session_id = session.session_id();
-            let commit = || session.append(transition).cloned();
-            let (record, revoked) = if resolved.legacy {
+            let commit = || match &resolved.cycle {
+                Some(selection) if resolved.fallback => session
+                    .append_cycled_model_transition(transition, selection)
+                    .cloned(),
+                _ => session.append(transition).cloned(),
+            };
+            let (record, revoked) = if let Some(selection) = &resolved.cycle {
+                self.registry.commit_cycled_model(
+                    session_id,
+                    selection,
+                    resolved.client,
+                    resolved.require_existing,
+                    commit,
+                )?
+            } else if resolved.legacy {
                 self.registry.commit_existing_legacy_model(
                     session_id,
                     &resolved.model,
