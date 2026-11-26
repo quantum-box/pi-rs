@@ -2753,7 +2753,12 @@ theme's syntax roles, and unknown languages use its plain code-block color.
 Paragraphs are separated from following code blocks as well. TypeScript and
 TSX fences use Syntect's JavaScript grammar as a fallback, so shared syntax is
 highlighted but TypeScript-specific tokens can differ from Pi's highlighter.
-Empty fenced blocks retain one indented content row.
+Empty fenced blocks retain one content row.
+`markdown.codeBlockIndent` sets the terminal prefix on transcript message code rows,
+including code nested in a quote or list. The default is two spaces and an
+empty string removes the prefix. Fences retain their own layout and theme role.
+Native wrapping repeats the prefix on continuation rows and clips it on narrow
+terminals to leave space for code.
 Tilde-fenced code keeps its source indentation after container markers are
 removed, matching Pi. Backtick fences strip their opening indentation.
 Wrapped list content keeps its indentation. Quotes render borders and quote
