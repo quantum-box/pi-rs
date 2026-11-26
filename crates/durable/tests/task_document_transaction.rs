@@ -136,6 +136,157 @@ fn initialize(path: &std::path::Path) {
     tx.commit(&db).unwrap();
 }
 #[test]
+fn defined_task_document_migrates_retires_and_recreates_across_reopen() {
+    use pi_rs_durable::document::{Error, TaskDocument};
+    use std::num::NonZeroU32;
+
+    #[derive(Clone, serde::Deserialize, serde::Serialize)]
+    struct First {
+        count: u32,
+    }
+    #[derive(Clone, serde::Deserialize, serde::Serialize)]
+    struct Second {
+        text: String,
+    }
+    fn initial() -> TaskDocument<First> {
+        TaskDocument {
+            kind: "status".into(),
+            version: NonZeroU32::MIN,
+            initial: First { count: 1 },
+        }
+    }
+    fn upgraded() -> TaskDocument<Second> {
+        TaskDocument {
+            kind: "status".into(),
+            version: NonZeroU32::new(2).unwrap(),
+            initial: Second {
+                text: "fresh".into(),
+            },
+        }
+    }
+
+    struct DocumentTask;
+    impl Handler for DocumentTask {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            task: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            let first = initial();
+            let second = upgraded();
+            let phase = &task.checkpoint().phase;
+            let previous_id = task.checkpoint().data.clone();
+            let next = match phase.as_str() {
+                "start" => {
+                    assert!(docs.defined_document(&first, "progress").unwrap().is_none());
+                    docs.edit_defined_document(&first, "progress", |draft| {
+                        draft.count += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                    let created = docs.defined_document(&first, "progress").unwrap().unwrap();
+                    Checkpoint {
+                        phase: "migrate".into(),
+                        data: json!(created.incarnation),
+                    }
+                }
+                "migrate" => {
+                    docs.migrate_defined_document(&first, &second, "progress", |old| {
+                        Ok(Second {
+                            text: old.count.to_string(),
+                        })
+                    })
+                    .unwrap();
+                    let migrated = docs.defined_document(&second, "progress").unwrap().unwrap();
+                    assert_eq!(json!(migrated.incarnation), previous_id);
+                    assert_eq!(migrated.value.text, "2");
+                    assert!(matches!(
+                        docs.defined_document(&first, "progress"),
+                        Err(Error::InvalidDocumentDefinition)
+                    ));
+                    Checkpoint {
+                        phase: "retire".into(),
+                        data: previous_id,
+                    }
+                }
+                "retire" => {
+                    assert!(docs.retire_defined_document(&second, "progress").unwrap());
+                    assert!(
+                        docs.defined_document(&second, "progress")
+                            .unwrap()
+                            .is_none()
+                    );
+                    Checkpoint {
+                        phase: "recreate".into(),
+                        data: previous_id,
+                    }
+                }
+                "recreate" => {
+                    docs.edit_defined_document(&second, "progress", |_| Ok(()))
+                        .unwrap();
+                    let recreated = docs.defined_document(&second, "progress").unwrap().unwrap();
+                    assert_ne!(json!(recreated.incarnation), previous_id);
+                    assert_eq!(recreated.value.text, "fresh");
+                    cp("finish")
+                }
+                "finish" => {
+                    docs.edit_defined_document(&second, "progress", |draft| {
+                        draft.text = "not published".into();
+                        Ok(())
+                    })
+                    .unwrap();
+                    return Ok(Step::Succeed(json!(null)));
+                }
+                phase => panic!("unexpected phase {phase}"),
+            };
+            Ok(Step::Continue(next))
+        }
+    }
+    fn document_registry() -> Registry {
+        let mut registry = Registry::default();
+        assert!(registry.register("parent", true, DocumentTask));
+        registry
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    initialize_conversation(&path);
+    let task = parent();
+    let mut scheduler = Scheduler::open(&path, document_registry()).unwrap();
+    scheduler.submit(&task).unwrap();
+    assert!(scheduler.tick(0).unwrap());
+    drop(scheduler);
+
+    let store = Store::open(&path).unwrap();
+    let docs = Documents::new(&store);
+    let address = initial().address(task.id(), "progress");
+    let (baseline, mut watch) = docs.watch_task_document(&address).unwrap();
+    assert_eq!(baseline.document.unwrap().value["count"], 2);
+
+    let mut scheduler = Scheduler::open(&path, document_registry()).unwrap();
+    for _ in 0..4 {
+        assert!(scheduler.tick(0).unwrap());
+    }
+    assert!(matches!(
+        scheduler.get(task.id()).unwrap().unwrap().state(),
+        TaskState::Succeeded(_)
+    ));
+
+    let frames = watch.poll(8).unwrap();
+    assert_eq!(frames.len(), 4);
+    assert_eq!(frames[0].document.as_ref().unwrap().value["text"], "2");
+    assert!(frames[1].retired);
+    assert_eq!(frames[2].document.as_ref().unwrap().value["text"], "fresh");
+    assert!(frames[3].retired);
+    assert!(frames[3].ops.is_empty());
+    assert!(watch.ended());
+    assert!(docs.get(&address).unwrap().is_none());
+}
+
+#[test]
 fn checkpoint_documents_and_child_survive_reopen_together() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
