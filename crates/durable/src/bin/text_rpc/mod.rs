@@ -216,12 +216,7 @@ pub(super) async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = prepare_input_adapter(scheduler, id, model.has_image_adapter)?;
     let mut provider_model = model.provider_model(&state.config.model)?.to_owned();
-    let mut seen: HashSet<Uuid> = state
-        .submissions
-        .iter()
-        .filter(|input| !matches!(input.status, Status::Queued | Status::Running))
-        .map(|input| input.id)
-        .collect();
+    let mut seen = settled_submissions(&state);
     let mut watching = state
         .submissions
         .iter()
@@ -245,12 +240,12 @@ pub(super) async fn run(
             }
             received = input.recv(), if input_open => {
                 match received {
-                    Some(Ok(request)) if request["type"] == "fork_at_entry" => {
-                        let result = fork_at_entry(scheduler, model, id, watching, &request)
+                    Some(Ok(request)) if matches!(request["type"].as_str(), Some("fork_at_entry" | "checkout_entry")) => {
+                        let result = switch_session_entry(scheduler, model, id, watching, &request)
                             .map(|(child, state, child_model)| {
                                 id = child;
                                 provider_model = child_model;
-                                seen.clear();
+                                seen = settled_submissions(&state);
                                 tools = model.has_coding_tools.then(|| ToolEvents::new(&state));
                                 Some(json!({
                                     "sessionId": id,
@@ -274,7 +269,16 @@ pub(super) async fn run(
     Ok(())
 }
 
-fn fork_at_entry(
+fn settled_submissions(state: &Conversation) -> HashSet<Uuid> {
+    state
+        .submissions
+        .iter()
+        .filter(|input| !matches!(input.status, Status::Queued | Status::Running))
+        .map(|input| input.id)
+        .collect()
+}
+
+fn switch_session_entry(
     scheduler: &mut Scheduler,
     model: &RoutedModel,
     source: Uuid,
@@ -285,15 +289,22 @@ fn fork_at_entry(
         .conversation(source)
         .map_err(|error| error.to_string())?;
     if watching || current.input_run_active() {
-        return Err("Wait for the current turn before forking".into());
+        return Err("Wait for the current turn before changing the session position".into());
     }
     let entry = request["entryId"]
         .as_str()
         .and_then(|id| Uuid::parse_str(id).ok())
-        .ok_or("Invalid entry ID for forking")?;
-    let child = scheduler
-        .fork_by_entry_id(source, entry)
-        .map_err(|error| error.to_string())?;
+        .ok_or("Invalid session entry ID")?;
+    let child = if request["type"] == "checkout_entry" {
+        scheduler
+            .checkout_session_entry(source, entry)
+            .map_err(|error| error.to_string())?;
+        source
+    } else {
+        scheduler
+            .fork_by_entry_id(source, entry)
+            .map_err(|error| error.to_string())?
+    };
     let state = scheduler
         .conversation(child)
         .map_err(|error| error.to_string())?;

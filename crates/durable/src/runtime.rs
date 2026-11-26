@@ -1374,6 +1374,8 @@ pub struct Conversation {
     has_session_labels: bool,
     #[serde(skip)]
     forked_session_labels: Vec<SessionLabelEntry>,
+    #[serde(skip)]
+    session_checkout: Option<(Uuid, crate::transcript::Cursor)>,
     #[serde(default)]
     pub queue_modes: QueueModes,
     #[serde(default)]
@@ -2899,6 +2901,7 @@ pub struct SessionTree {
 
 enum SessionTreeEvent {
     ContextStart,
+    Checkout(Uuid),
     Entry(SessionEntry),
 }
 
@@ -7634,6 +7637,7 @@ impl Harness {
                     other => Error::Signal(other),
                 })?;
         let mut state = state.clone();
+        let checkout = state.session_checkout.take();
         validate_pending_reset_blocks(&state)?;
         let key = Self::key(state.id);
         let base = self
@@ -7794,7 +7798,7 @@ impl Harness {
                     .all(|(i, b)| state.content_blocks.get(i) == Some(b))
                 && previous.context_generation == state.context_generation
                 && state.resets == previous.resets;
-            if !unchanged && !reset_proven && !block_compaction {
+            if !unchanged && !reset_proven && !block_compaction && checkout.is_none() {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
             }
         }
@@ -7851,7 +7855,9 @@ impl Harness {
                 "independent compaction proof changed".into(),
             ));
         }
-        let change = if let Some((system_end, first_kept)) = compacted {
+        let change = if checkout.is_some() {
+            None
+        } else if let Some((system_end, first_kept)) = compacted {
             let previous = old.unwrap();
             let (source, created) =
                 self.resolved_occurrences_with_ids(state.id, previous.transcript.clone().unwrap())?;
@@ -8022,7 +8028,7 @@ impl Harness {
         let new_blocks: Vec<_> = state
             .content_blocks
             .range(if reset_proven { 0 } else { old_len }..)
-            .filter(|_| !block_compaction)
+            .filter(|_| !block_compaction && checkout.is_none())
             .map(|(&index, binding)| (index, binding.clone()))
             .collect();
         if !new_blocks.is_empty() {
@@ -8320,6 +8326,14 @@ impl Harness {
             atomic_evidence = Some((revision, checks, mutations));
             state.transcript = Some(anchor_cursor);
             Some(batch)
+        } else if let Some((_, source)) = &checkout {
+            let previous = old
+                .and_then(|prior| prior.transcript.as_ref())
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let (batch, cursor) = crate::transcript::Transcript::new(self.owner.store(), state.id)
+                .prepare_checkout(previous, source)?;
+            state.transcript = Some(cursor);
+            Some(batch)
         } else if expected == Expected::Missing
             && let Some(len) = state.block_fork_cut
         {
@@ -8419,7 +8433,9 @@ impl Harness {
             event["_reset_baseline_sha256"] =
                 serde_json::Value::String(reset_baseline_digest(baseline)?);
         }
-        if let Some(info) = state.session_info.as_ref()
+        if let Some((entry, _)) = checkout {
+            event["session_checkout"] = serde_json::to_value(entry)?;
+        } else if let Some(info) = state.session_info.as_ref()
             && old.is_some_and(|old| old.session_info.as_ref() != Some(info))
         {
             event["session_info"] = serde_json::to_value(info)?;
@@ -9105,6 +9121,7 @@ impl Harness {
             last_session_label: None,
             has_session_labels: false,
             forked_session_labels: Vec::new(),
+            session_checkout: None,
             queue_modes: QueueModes::default(),
             after_failed_run: AfterFailedRun::default(),
             extensions: vec![],
@@ -9680,6 +9697,7 @@ impl Harness {
             last_session_label: None,
             has_session_labels,
             forked_session_labels,
+            session_checkout: None,
             config: point.config,
             queue_modes: point
                 .documents
@@ -10810,11 +10828,23 @@ impl Harness {
             leaf_id: None,
         };
         let mut latest_labels = HashMap::new();
+        let mut visited = HashSet::new();
         for event in events.into_iter().rev() {
-            let SessionTreeEvent::Entry(entry) = event else {
-                tree.leaf_id = None;
-                continue;
+            let entry = match event {
+                SessionTreeEvent::Entry(entry) => entry,
+                SessionTreeEvent::ContextStart => {
+                    tree.leaf_id = None;
+                    continue;
+                }
+                SessionTreeEvent::Checkout(entry) => {
+                    if !visited.contains(&entry) {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    tree.leaf_id = Some(entry);
+                    continue;
+                }
             };
+            visited.insert(entry.id());
             if let SessionEntry::Label { entry, .. } = &entry {
                 latest_labels.insert(entry.target_id, entry.clone());
             }
@@ -10831,6 +10861,139 @@ impl Harness {
                 .filter(|label| label.label.is_some());
         }
         Ok(tree)
+    }
+
+    /// Move a settled session to the inclusive context of a recorded entry.
+    /// The previous branch remains in the session tree and can be revisited.
+    pub fn checkout_session_entry(&mut self, id: Uuid, entry_id: Uuid) -> Result<(), Error> {
+        use crate::fork::Error::{InvalidCursor, InvalidSnapshot, Unsettled};
+
+        let (mut state, version) = self.load(id)?;
+        if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+            || state.input_run_active()
+            || state.abort_requested
+            || !state.pending_resets.is_empty()
+            || state.pending_independent_summary.is_some()
+            || state.active_manual_compaction.is_some()
+            || state
+                .manual_compactions
+                .iter()
+                .any(|operation| operation.status == ManualCompactionStatus::Running)
+            || state
+                .submissions
+                .iter()
+                .any(|input| matches!(input.status, Status::Queued | Status::Running))
+            || state
+                .application_writes
+                .iter()
+                .any(|write| !write.placed && !write.withdrawn)
+        {
+            return Err(Unsettled.into());
+        }
+        let tree = self.session_tree(&self.session_entries_start(id)?)?;
+        if tree.leaf_id == Some(entry_id) {
+            return Ok(());
+        }
+        let entry = tree
+            .entries
+            .into_iter()
+            .find(|node| node.entry.id() == entry_id)
+            .ok_or(InvalidCursor)?
+            .entry;
+        let (origin, observation, position) = match &entry {
+            SessionEntry::Message(message)
+                if message.history.commit_boundary || message.compaction.is_some() =>
+            {
+                (
+                    message.history.origin,
+                    crate::observer::Cursor(message.history.commit),
+                    Some(
+                        self.original_occurrence_position(&message.history, &message.message)?
+                            .cursor,
+                    ),
+                )
+            }
+            SessionEntry::SessionInfo {
+                origin,
+                observation,
+                ..
+            }
+            | SessionEntry::Label {
+                origin,
+                observation,
+                ..
+            } => (*origin, *observation, None),
+            _ => {
+                return Err(Error::Invalid(
+                    "checkout requires a complete session entry boundary".into(),
+                ));
+            }
+        };
+        let anchor = self.fork_anchor_checks(origin, observation.0)?;
+        let source = self
+            .session_observation_transcript(origin, observation.0)?
+            .ok_or(InvalidSnapshot)?;
+        if position.is_some_and(|position| position != source) {
+            return Err(Error::Invalid(
+                "checkout requires the final context of a commit".into(),
+            ));
+        }
+        let store = self.owner.store();
+        let snapshot = store.get(&anchor[1].key)?.ok_or(InvalidSnapshot)?;
+        let snapshot: serde_json::Value = serde_json::from_slice(&snapshot.value)?;
+        if snapshot.get("_transcript") != Some(&serde_json::to_value(&source)?) {
+            return Err(InvalidSnapshot.into());
+        }
+        let mut checks =
+            crate::transcript::Transcript::new(store, origin).fork_source_checks(&source)?;
+        checks.extend(anchor);
+        let (messages, blocks) = self.read_transcript_blocks(origin, source.clone())?;
+        if self
+            .resolved_occurrences(origin, source.clone())?
+            .iter()
+            .map(|(message, _)| message)
+            .ne(messages.iter())
+        {
+            return Err(InvalidSnapshot.into());
+        }
+        crate::fork::validate_context(&messages)?;
+        state.messages = messages;
+        state.content_blocks = blocks;
+        state.session_info = serde_json::from_value(
+            snapshot
+                .pointer("/documents/pi-rs~1runtime~1session-info")
+                .cloned()
+                .unwrap_or_default(),
+        )?;
+        state.tool_results = snapshot
+            .pointer("/documents/pi-rs~1runtime~1tool-results")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        state.phase = Phase::Idle;
+        state.run_failure = None;
+        state.occurrence_epoch_proven = snapshot
+            .pointer("/documents/pi-rs~1runtime~1occurrence-epoch-proven")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        state.context_generation = Some(Uuid::new_v4());
+        state.session_checkout = Some((entry_id, source));
+        let evidence = crate::task_store::OwnedBatch {
+            checks,
+            mutations: Vec::new(),
+        };
+        let merge = self.merge_admissions;
+        self.merge_admissions = false;
+        let result = self.save_composed_locked(
+            &state,
+            Expected::Version(version),
+            None,
+            &[],
+            &[],
+            Some(&evidence),
+        );
+        self.merge_admissions = merge;
+        result
     }
 
     /// Resolve the active bookmarks in this captured session history.
@@ -11264,6 +11427,12 @@ impl Harness {
         let message_cutoff = cutoff.is_some_and(|id| messages.iter().any(|entry| entry.id() == id));
         let mut messages = messages.into_iter();
         let mut events = Vec::new();
+        if let Some(checkout) = record.value.get("session_checkout") {
+            self.authenticate_fork_anchor(source, observation)?;
+            events.push(SessionTreeEvent::Checkout(serde_json::from_value(
+                checkout.clone(),
+            )?));
+        }
         let mut replacement_index = 0;
         for (starts_context, len) in layout {
             if starts_context {
@@ -11529,6 +11698,9 @@ impl Harness {
                     continue;
                 }
                 last_reference = Some(reference.clone());
+                if record.value.get("session_checkout").is_some() {
+                    continue;
+                }
                 let batch = transcript.read_with_blocks(&reference, std::num::NonZeroUsize::MIN)?;
                 let Some(batch) = batch.records.first() else {
                     continue;
@@ -13459,6 +13631,10 @@ impl Harness {
     // A matching observer payload alone is not evidence of a runtime commit:
     // both reserved records must be the versions written by the same commit.
     fn authenticate_fork_anchor(&self, origin: Uuid, commit: u64) -> Result<(), Error> {
+        self.fork_anchor_checks(origin, commit).map(|_| ())
+    }
+
+    fn fork_anchor_checks(&self, origin: Uuid, commit: u64) -> Result<[Check; 2], Error> {
         if commit == 0 {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
@@ -13487,7 +13663,16 @@ impl Harness {
         if !store.runtime_snapshot_exact_at(root.as_bytes(), prefix.as_bytes(), &fork, sequence)? {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
-        Ok(())
+        Ok([
+            Check {
+                key: observation,
+                expected: Expected::Version(event.version),
+            },
+            Check {
+                key: fork,
+                expected: Expected::Version(snapshot.version),
+            },
+        ])
     }
 
     fn verify_occurrence_origin(
@@ -25389,6 +25574,9 @@ impl Scheduler {
     pub fn session_tree(&self, capture: &SessionEntryCursor) -> Result<SessionTree, Error> {
         self.harness.session_tree(capture)
     }
+    pub fn checkout_session_entry(&mut self, id: Uuid, entry_id: Uuid) -> Result<(), Error> {
+        self.harness.checkout_session_entry(id, entry_id)
+    }
 
     pub fn session_entries(
         &self,
@@ -36383,6 +36571,7 @@ mod scheduler_tests {
             last_session_label: None,
             has_session_labels: false,
             forked_session_labels: Vec::new(),
+            session_checkout: None,
             queue_modes: QueueModes::default(),
             after_failed_run: AfterFailedRun::default(),
             extensions: vec![],

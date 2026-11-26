@@ -997,6 +997,132 @@ fn session_tree_keeps_writes_from_coalesced_text_resets() {
 }
 
 #[test]
+fn session_checkout_retains_both_paths_and_reopens_at_the_selected_leaf() {
+    use std::num::NonZeroUsize;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let append = |h: &mut Harness, content: &str| {
+        let (mut state, version) = h.load(id).unwrap();
+        state.messages.push(Message::User {
+            content: content.into(),
+        });
+        h.save(&state, Expected::Version(version)).unwrap();
+        h.session_tree(&h.session_entries_start(id).unwrap())
+            .unwrap()
+            .leaf_id
+            .unwrap()
+    };
+    let shared = append(&mut h, "shared");
+    let original = append(&mut h, "original");
+    let before_checkout = h.session_entries_start(id).unwrap();
+    h.checkout_session_entry(id, shared).unwrap();
+    assert_eq!(
+        h.session_tree(&h.session_entries_start(id).unwrap())
+            .unwrap()
+            .leaf_id,
+        Some(shared)
+    );
+    assert_eq!(h.conversation(id).unwrap().messages.len(), 1);
+    let alternate = append(&mut h, "alternate");
+    h.checkout_session_entry(id, original).unwrap();
+    drop(h);
+
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let current = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap();
+    assert_eq!(current.leaf_id, Some(original));
+    assert_eq!(
+        current
+            .entries
+            .iter()
+            .map(|node| (node.entry.id(), node.parent_id))
+            .collect::<Vec<_>>(),
+        [
+            (shared, None),
+            (original, Some(shared)),
+            (alternate, Some(shared))
+        ]
+    );
+    assert_eq!(h.session_tree(&before_checkout).unwrap().entries.len(), 2);
+    assert!(
+        matches!(h.conversation(id).unwrap().messages.last(), Some(Message::User { content }) if content == "original")
+    );
+    let fork = h.fork_by_entry_id(id, alternate).unwrap();
+    assert!(
+        matches!(h.conversation(fork).unwrap().messages.last(), Some(Message::User { content }) if content == "alternate")
+    );
+    h.checkout_session_entry(fork, shared).unwrap();
+    assert_eq!(h.conversation(fork).unwrap().messages.len(), 1);
+    h.checkout_session_entry(id, alternate).unwrap();
+    assert_eq!(
+        h.session_entries(
+            &h.session_entries_start(id).unwrap(),
+            NonZeroUsize::new(9).unwrap()
+        )
+        .unwrap()
+        .entries
+        .len(),
+        3
+    );
+    assert!(
+        matches!(h.conversation(id).unwrap().messages.last(), Some(Message::User { content }) if content == "alternate")
+    );
+}
+
+#[test]
+fn session_checkout_keeps_ordered_content_blocks_and_rejects_pending_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let blocks = vec![
+        serde_json::json!({"type":"text","text":"older content"}),
+        serde_json::json!({"type":"text","text":"with two blocks"}),
+    ];
+    let (_, original) = h
+        .reset_with_blocks(id, Some("older".into()), vec![blocks.clone()])
+        .unwrap();
+    h.reset(id, Some("next context".into())).unwrap();
+    let later = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap()
+        .leaf_id
+        .unwrap();
+    h.checkout_session_entry(id, original[0]).unwrap();
+    drop(h);
+
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let state = h.conversation(id).unwrap();
+    let block = state.content_blocks.values().next().unwrap();
+    assert_eq!(block.message_id, original[0]);
+    assert_eq!(block.blocks, blocks);
+    h.checkout_session_entry(id, later).unwrap();
+    let pending = h.submit(id, None, "queued".into()).unwrap();
+    assert!(matches!(
+        h.checkout_session_entry(id, original[0]),
+        Err(Error::Fork(crate::fork::Error::Unsettled))
+    ));
+    let state = h.conversation(id).unwrap();
+    assert!(state.submissions.iter().any(|input| input.id == pending));
+}
+
+#[test]
 fn interrupted_recovery_retries_racing_stream_append() {
     for initial in [None, Some("first")] {
         let dir = tempfile::tempdir().unwrap();
