@@ -2297,6 +2297,21 @@ async fn execute(
             "a managed session must be opened by its host".into(),
         ));
     }
+    if let Some(pending) = session.pending_before_agent_start_run() {
+        if skip_initial_prompt {
+            command = Command::Resume;
+            skip_initial_prompt = false;
+        } else if matches!(&command, Command::Run { .. } | Command::Extension { .. }) {
+            return Err(Error::Session(
+                "resume the pending run preflight before submitting a prompt".into(),
+            ));
+        }
+        if matches!(&command, Command::Resume) && args.run_id.is_some_and(|id| id != pending) {
+            return Err(Error::Session(
+                "resume must use the pending run preflight's run ID".into(),
+            ));
+        }
+    }
     if matches!(&command, Command::Run { .. }) && session.pending_extension_boundary_run().is_some()
     {
         return Err(Error::Session(
@@ -2706,7 +2721,12 @@ async fn execute(
             }
         }
         let run_id = if index == 0 {
-            args.run_id.or_else(|| input.is_none().then(|| session.pending_extension_boundary_run()).flatten())
+            args.run_id.or_else(|| {
+                input.is_none().then(|| {
+                    session.pending_extension_boundary_run()
+                        .or_else(|| session.pending_before_agent_start_run())
+                }).flatten()
+            })
         } else {
             None
         }.unwrap_or_else(Uuid::new_v4);
@@ -2919,7 +2939,9 @@ async fn run_pending_custom_trigger(
     runtime: &runtime::Runtime,
     session: &mut Session,
 ) -> Result<()> {
-    if session.pending_extension_boundary_run().is_some() {
+    if session.pending_extension_boundary_run().is_some()
+        || session.pending_before_agent_start_run().is_some()
+    {
         return Ok(());
     }
     let Some(run_id) = session.pending_custom_trigger() else {

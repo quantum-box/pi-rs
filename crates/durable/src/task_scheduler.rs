@@ -2368,6 +2368,9 @@ struct InvocationState {
     // A task ID alone can be reused by a later reservation. Bind each live
     // executor to the durable attempt that was reserved for it.
     leases: HashMap<Uuid, (Uuid, Option<Uuid>)>,
+    // Only these explicitly admitted children can execute under a live
+    // replay-unsafe parent. Reopening never restores this authorization.
+    immediate_children: HashMap<Uuid, HashSet<Uuid>>,
     poisoned: bool,
     handler_failed: bool,
     failed_handlers: HashSet<Uuid>,
@@ -2376,26 +2379,42 @@ struct InvocationState {
 
 // A stored Running state alone can be an interrupted invocation after reopen.
 // Only the scheduler that owns its still-unpublished lease may dispatch below it.
-fn live_task_tool_parent(task: &Task, invocations: &Mutex<InvocationState>) -> bool {
-    if !task.is_task_tool() || task.state() != &TaskState::Running {
-        return false;
+fn live_task_tool_parent(task: &Task, child: &Task, invocations: &Mutex<InvocationState>) -> bool {
+    invocations
+        .lock()
+        .is_ok_and(|state| state.permits_running_parent(task, child))
+}
+
+impl InvocationState {
+    fn admitted_immediate_child(&self, task: &Task, child: &Task) -> bool {
+        child.owner() == &TaskOwner::Task(task.id())
+            && self
+                .immediate_children
+                .get(&task.id())
+                .is_some_and(|children| children.contains(&child.id()))
     }
-    // A checkpointable unsafe parent's live invocation is not an admission
-    // boundary: its children can dispatch only after it durably parks.
-    if !task.replay_safe()
-        && task
-            .kind()
-            .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1."))
-    {
-        return false;
+
+    fn permits_running_parent(&self, task: &Task, child: &Task) -> bool {
+        if !task.is_task_tool() || task.state() != &TaskState::Running {
+            return false;
+        }
+        if !task.replay_safe()
+            && task
+                .kind()
+                .is_some_and(|kind| kind.starts_with("pi-rs.unsafe-park-async.v1."))
+            && !self.admitted_immediate_child(task, child)
+        {
+            return false;
+        }
+        !self.poisoned
+            && self.attempts.contains(&task.id())
+            && self
+                .leases
+                .get(&task.id())
+                .is_some_and(|(_, attempt)| *attempt == task.attempt_id())
+            && !self.failed_handlers.contains(&task.id())
+            && !self.published.iter().any(|(id, _)| *id == task.id())
     }
-    let Ok(state) = invocations.lock() else {
-        return false;
-    };
-    !state.poisoned
-        && state.attempts.contains(&task.id())
-        && !state.failed_handlers.contains(&task.id())
-        && !state.published.iter().any(|(id, _)| *id == task.id())
 }
 
 fn unsafe_checkpointable_ready(task: &Task) -> bool {
@@ -2537,6 +2556,7 @@ impl Drop for InvocationLease {
         {
             state.leases.remove(&self.id);
             state.attempts.remove(&self.id);
+            state.immediate_children.remove(&self.id);
             state.published.retain(|(id, _)| *id != self.id);
         }
         if !self.retired {
@@ -2769,7 +2789,10 @@ impl PendingMaintenance {
                     ) {
                         Ok(affected) => Ok(affected),
                         Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
-                        Err(crate::runtime::Error::Invalid(reason)) => {
+                        Err(
+                            crate::runtime::Error::Invalid(reason)
+                            | crate::runtime::Error::CheckpointableSelectionChanged(reason),
+                        ) => {
                             // Invalid wake or binding cannot authorize the callback.
                             // Hold failure locally so ordinary graph maintenance
                             // drains owned work without stopping unrelated roots.
@@ -8168,6 +8191,7 @@ impl AdmissionHandle<'_> {
         let tasks = TaskStore::new(owner.store());
         let mut history = None;
         let mut ancestor = current.task.clone();
+        let mut descendant = None;
         let mut seen = std::collections::HashSet::new();
         loop {
             if !seen.insert(ancestor.id())
@@ -8183,6 +8207,10 @@ impl AdmissionHandle<'_> {
             if !(ancestor.id() == current.task.id()
                 || ancestor.replay_safe()
                 || matches!(ancestor.state(), TaskState::Waiting(_))
+                || descendant.as_ref().is_some_and(|child| {
+                    state.admitted_immediate_child(&ancestor, child)
+                        && state.permits_running_parent(&ancestor, child)
+                })
                 || ancestor.retains_task_children_on_success()
                     && matches!(ancestor.state(), TaskState::Completing(_)))
             {
@@ -8190,11 +8218,12 @@ impl AdmissionHandle<'_> {
             }
             match ancestor.owner() {
                 TaskOwner::Task(id) => {
-                    ancestor = tasks
+                    let parent = tasks
                         .load(*id)
                         .map_err(|e| e.to_string())?
                         .ok_or("missing owner")?
-                        .task
+                        .task;
+                    descendant = Some(std::mem::replace(&mut ancestor, parent));
                 }
                 TaskOwner::Conversation(id) => {
                     if let Some(harness) = self.validator {
@@ -8574,7 +8603,7 @@ impl AdmissionHandle<'_> {
         {
             return Err(Error::Ownership);
         }
-        let publication = AdmissionPublication { state };
+        let mut publication = AdmissionPublication { state };
         let tasks = TaskStore::new(owner.store());
         let parent = tasks.load(self.lease.id)?.ok_or(Error::Ownership)?;
         if parent.task != self.running.task
@@ -8612,14 +8641,12 @@ impl AdmissionHandle<'_> {
             ChildAdmission::Checkpointable => {
                 let registry = &definitions.registry;
                 let parent_kind = parent.task.kind().ok_or(Error::Registration)?;
-                if !parent.task.replay_safe() {
-                    return Err(Error::Registration);
-                }
                 if let Some(harness) = self.validator {
                     let checkpointable = registry
                         .matches_conversation_checkpointable(&tool_identity, &tool.handler());
-                    let generic_safe =
-                        tool_identity.replay_safe && !tool_identity.is_checkpointable();
+                    let generic_safe = parent.task.replay_safe()
+                        && tool_identity.replay_safe
+                        && !tool_identity.is_checkpointable();
                     if !(checkpointable || generic_safe)
                         || !registry.is_conversation_checkpointable_task(&parent.task)
                         || registry.checkpointable_selection_for_kind(parent_kind)
@@ -8631,7 +8658,6 @@ impl AdmissionHandle<'_> {
                         .checkpointable_conversation_checks(&parent.task, registry)
                         .map_err(|error| Error::Handler(error.to_string()))?;
                 } else if !self.standalone
-                    || !tool_identity.replay_safe
                     || ![parent_kind, tool_identity.kind.as_str()]
                         .into_iter()
                         .all(|kind| {
@@ -8728,6 +8754,14 @@ impl AdmissionHandle<'_> {
                 .scheduler_poison
                 .store(true, std::sync::atomic::Ordering::Release);
             return Err(error.into());
+        }
+        if matches!(mode, ChildAdmission::Checkpointable) && !parent.task.replay_safe() {
+            publication
+                .state
+                .immediate_children
+                .entry(parent.task.id())
+                .or_default()
+                .insert(prepared.child);
         }
         self.activity.notify();
         Ok(prepared.child)
@@ -9140,6 +9174,7 @@ impl DetachedInvocation {
             }
             live.leases.remove(&self.lease.id);
             live.attempts.remove(&self.lease.id);
+            live.immediate_children.remove(&self.lease.id);
             live.published.retain(|(id, _)| *id != self.lease.id);
             self.lease.retired = true;
         }
@@ -9978,7 +10013,7 @@ fn unbound_cancel_owned_tasks(
     for root in roots {
         if graph.uncertain_task(*root) {
             for record in records {
-                if !task_ancestors_available(store, &record.task, records, |p| p.id() == *root) {
+                if !task_ancestors_available(store, &record.task, records, |p, _| p.id() == *root) {
                     result.insert(record.task.id());
                 }
             }
@@ -9994,7 +10029,7 @@ fn task_ancestors_available(
     store: &durable_store::Store,
     task: &Task,
     tasks: &[task_store::StoredTask],
-    blocked: impl FnMut(&Task) -> bool,
+    blocked: impl FnMut(&Task, &Task) -> bool,
 ) -> bool {
     task_ancestors_available_mode(store, task, tasks, false, blocked)
 }
@@ -10003,7 +10038,7 @@ fn task_ancestors_available_mode(
     task: &Task,
     tasks: &[task_store::StoredTask],
     allow_aborted_conversation: bool,
-    mut blocked: impl FnMut(&Task) -> bool,
+    mut blocked: impl FnMut(&Task, &Task) -> bool,
 ) -> bool {
     let edges = crate::ownership_edge::EdgeStore::new(store);
     let mut current = task;
@@ -10071,7 +10106,7 @@ fn task_ancestors_available_mode(
         let successful_anchor = past_conversation
             && matches!(parent.task.state(), TaskState::Succeeded(_))
             && !parent.task.abort_requested();
-        if !successful_anchor && blocked(&parent.task) {
+        if !successful_anchor && blocked(&parent.task, current) {
             return false;
         }
         current = &parent.task;
@@ -10108,12 +10143,13 @@ impl WakeDefinitions {
         tasks: &[task_store::StoredTask],
         live: &Mutex<InvocationState>,
     ) -> bool {
-        task_ancestors_available(store, task, tasks, |parent| {
+        task_ancestors_available(store, task, tasks, |parent, child| {
             parent.abort_requested()
                 || parent.is_terminal()
                 || unsafe_checkpointable_ready(parent)
                 || matches!(parent.state(), TaskState::CompletingFailed(_))
-                || (parent.state() == &TaskState::Running && !live_task_tool_parent(parent, live))
+                || (parent.state() == &TaskState::Running
+                    && !live_task_tool_parent(parent, child, live))
                 || self.blocked_reason(parent).is_some()
         })
     }
@@ -12601,6 +12637,7 @@ impl Scheduler {
         let edges = crate::ownership_edge::EdgeStore::new(owner.store());
         let mut current = task.clone();
         let mut first = true;
+        let mut descendant = None;
         let mut through_conversation = false;
         let mut seen_tasks = HashSet::new();
         let mut seen_conversations = HashSet::new();
@@ -12617,7 +12654,9 @@ impl Scheduler {
                     || current.is_terminal()
                     || matches!(current.state(), TaskState::CompletingFailed(_))
                     || (current.state() == &TaskState::Running
-                        && !live_task_tool_parent(&current, &self.live_invocations))
+                        && !descendant.as_ref().is_some_and(|child| {
+                            live_task_tool_parent(&current, child, &self.live_invocations)
+                        }))
                     || self.blocked_reason(&current).is_some())
             {
                 return Ok(false);
@@ -12632,7 +12671,7 @@ impl Scheduler {
                     let Some(parent) = store.load(*id)? else {
                         return Ok(false);
                     };
-                    current = parent.task;
+                    descendant = Some(std::mem::replace(&mut current, parent.task));
                 }
                 TaskOwner::Conversation(id) => {
                     if background {
@@ -12676,7 +12715,7 @@ impl Scheduler {
                             if edge.edge.task_owner != *parent.task.owner() {
                                 return Err(Error::Ownership);
                             }
-                            current = parent.task;
+                            descendant = Some(std::mem::replace(&mut current, parent.task));
                             through_conversation = true;
                         }
                     }
@@ -14293,7 +14332,7 @@ impl Scheduler {
                                     owner.store(),
                                     &item.task,
                                     &records,
-                                    |parent| parent.id() == *root,
+                                    |parent, _| parent.id() == *root,
                                 )
                             })))
                     .then_some(item.task.id())
@@ -17282,7 +17321,7 @@ impl Scheduler {
                 && !task.is_background()
                 && tasks.iter().any(|entry| {
                     entry.task.id() == *parent
-                        && live_task_tool_parent(&entry.task, &live_invocations)
+                        && live_task_tool_parent(&entry.task, task, &live_invocations)
                 })
         };
         // A pending result or maintenance may coexist only with an abort
@@ -18325,6 +18364,8 @@ impl Scheduler {
         // Both use the captured version, so aborts and competing graph writers
         // fence the whole transaction, without a self-conflict.
         let mut graph = self.ts().prepare_save(&batch)?;
+        #[cfg(feature = "test-hooks")]
+        hook_fence_test_hook::run(running.task.id(), "checkpointable-settlement");
         let selection_gate = if self
             .registered(&running.task)?
             .conversation_checkpointable
@@ -18347,9 +18388,26 @@ impl Scheduler {
                 .conversation_checkpointable
                 .is_some()
         {
-            let checks = harness
+            let checks = match harness
                 .checkpointable_conversation_checks(&running.task, &self.registry)
-                .map_err(|_| Error::Ownership)?;
+            {
+                Ok(checks) => checks,
+                Err(crate::runtime::Error::CheckpointableSelectionChanged(_)) => {
+                    // A host can replace a selection after a hook returns.
+                    // Discard this attempt's staged effects and settle the
+                    // task through the checked owned-failure path.
+                    drop(_selection);
+                    return self.finish_running_conflict(
+                        &running,
+                        "checkpointable extension selection changed before task settlement".into(),
+                        &owner,
+                        _gate,
+                        nonblocking_abort,
+                        deferred,
+                    );
+                }
+                Err(_) => return Err(Error::Ownership),
+            };
             for check in checks {
                 if let Some(existing) = graph
                     .checks
@@ -18790,13 +18848,13 @@ impl Scheduler {
     /// A child must not execute while an interrupted or incompatible ancestor is
     /// still awaiting recovery; such an ancestor can later cancel the subtree.
     fn ancestors_available(&self, task: &Task, tasks: &[task_store::StoredTask]) -> bool {
-        task_ancestors_available(self.owner().store(), task, tasks, |parent| {
+        task_ancestors_available(self.owner().store(), task, tasks, |parent, child| {
             parent.abort_requested()
                 || parent.is_terminal()
                 || unsafe_checkpointable_ready(parent)
                 || matches!(parent.state(), TaskState::CompletingFailed(_))
                 || (parent.state() == &TaskState::Running
-                    && !live_task_tool_parent(parent, &self.live_invocations))
+                    && !live_task_tool_parent(parent, child, &self.live_invocations))
                 || self.blocked_reason(parent).is_some()
         })
     }
@@ -19305,7 +19363,7 @@ pub(crate) fn pending_abort_root_for_running(
         && let Some(task) = ts.load(running)?
         && !task.task.holds_interrupted_cleanup()
         && complete_foreground_chain(ts, &task.task)?
-        && task_ancestors_available(ts.store(), &task.task, &ts.list()?, |ancestor| {
+        && task_ancestors_available(ts.store(), &task.task, &ts.list()?, |ancestor, _| {
             ancestor.state() == &TaskState::Running
         })
     {
@@ -19457,7 +19515,7 @@ fn pending_abort_root_mode(
                     &running_task.task,
                     &records,
                     allow_aborted_conversation,
-                    |parent| parent.id() == root,
+                    |parent, _| parent.id() == root,
                 )
             {
                 return Err(Error::Busy);
