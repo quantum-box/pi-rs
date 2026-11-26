@@ -627,7 +627,10 @@ mod tests {
         // The background exchange holds the credential lock through persistence.
         let guard = super::super::auth_lock::acquire_async(&path).await.unwrap();
         let persisted = super::super::config::read_auth_object_locked(&guard).unwrap();
-        assert_eq!(parse_credential(&persisted).unwrap().unwrap().refresh, "rotated");
+        assert_eq!(
+            parse_credential(&persisted).unwrap().unwrap().refresh,
+            "rotated"
+        );
     }
     #[tokio::test]
     async fn noncooperating_api_key_change_is_not_overwritten() {
