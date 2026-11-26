@@ -934,6 +934,7 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
             .watch_view(id, NonZeroUsize::MIN, Duration::from_millis(5))
             .unwrap();
         let progress_cursor = scheduler.progress_history_from_now(id).unwrap();
+        let unified_cursor = scheduler.unified_history_from_now(id).unwrap();
         scheduler.submit(id, None, "work".into()).unwrap();
         let first = wait_for_stream_text(&mut watch, |p| p.text == "first").await;
         let store = durable_store::Store::open(&path).unwrap();
@@ -1113,6 +1114,31 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
             assert_eq!(recorded.last().unwrap().2.text, "second attempt");
         }
         assert_eq!(scheduler.conversation(id).unwrap().messages, published);
+        let history = scheduler
+            .watch_unified_history(
+                &unified_cursor,
+                NonZeroUsize::new(255).unwrap(),
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap();
+        assert!(history.commits.iter().any(|commit| {
+            commit.snapshots.is_empty() && commit.applications.is_none()
+                && commit.progress.iter().any(|frame| {
+                    assert_eq!(frame.commit_sequence, commit.sequence);
+                    frame.changes.iter().any(|change| matches!(
+                        change,
+                        pi_rs_durable::runtime::ProgressHistoryChange::CheckpointableTool { task: reported, progress, .. }
+                            if *reported == task && progress.text == "first"
+                    ))
+                })
+        }));
+        assert!(
+            history
+                .commits
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
         watch.close();
         driver.shutdown().unwrap();
         scheduler.shutdown().await.unwrap();

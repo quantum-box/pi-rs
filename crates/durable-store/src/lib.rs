@@ -7,6 +7,7 @@
 //! the database before deciding whether to retry a non-idempotent operation.
 
 pub mod controls;
+mod document_lifecycle;
 #[cfg(feature = "experimental-graph-revision")]
 pub mod graph_revision;
 pub mod owner;
@@ -28,6 +29,8 @@ pub type KeyedEntry = (Vec<u8>, Entry);
 pub type MetadataPage = (Option<Entry>, Vec<KeyedEntry>);
 pub type DocumentChange = (Vec<u8>, Option<Entry>);
 pub type DocumentCommit = (u64, Vec<DocumentChange>);
+pub type ScopedDocumentCommit = (u64, u64, Vec<DocumentChange>);
+pub const MAX_SCOPED_DOCUMENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
 type BoundedHistoryRow = (Option<Vec<u8>>, Option<u64>, Option<u64>);
 type BoundedChangeRow = (u64, Option<Vec<u8>>, Option<u64>, Option<u64>);
 type ReadLimit = (std::rc::Rc<()>, Vec<Vec<u8>>, usize);
@@ -125,6 +128,7 @@ pub enum Error {
     IncompatibleGraphProtocol,
     MigrationOwnerUnavailable(String),
     DocumentFrameTooLarge,
+    InvalidDocumentLifecycle,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -147,6 +151,12 @@ impl fmt::Display for Error {
                 "snapshot is newer than document history or lacks tracking evidence"
             ),
             Self::DocumentFrameTooLarge => write!(f, "document commit exceeds merged watch limits"),
+            Self::InvalidDocumentLifecycle => {
+                write!(
+                    f,
+                    "defined document and its policy must keep a consistent incarnation"
+                )
+            }
         }
     }
 }
@@ -1633,7 +1643,7 @@ impl Store {
         &self,
         prefix: &[u8],
         after: u64,
-    ) -> Result<Option<(u64, u64, Vec<DocumentChange>)>, Error> {
+    ) -> Result<Option<ScopedDocumentCommit>, Error> {
         if !prefix.starts_with(b"durable/document/") || after > i64::MAX as u64 {
             return Err(Error::InvalidSnapshot);
         }
@@ -1658,8 +1668,94 @@ impl Store {
             )
             .optional()?
             .ok_or(Error::InvalidSnapshot)?;
-        let mut stmt = conn.prepare("SELECT key,value,version,length(key),coalesce(length(value),0) FROM durable_document_history WHERE revision=?1 AND substr(key,1,?2)=?3 ORDER BY key LIMIT 257")?;
-        let mut rows = stmt.query(params![revision, prefix.len() as i64, prefix])?;
+        let changes = Self::scoped_document_changes(&conn, prefix, revision, sequence)?;
+        Ok(Some((revision, sequence, changes)))
+    }
+
+    /// Locate scoped document revisions in a captured store commit range.
+    /// The sequence boundary excludes legacy revisions without commit tracking.
+    pub fn scoped_document_commit_positions(
+        &self,
+        prefix: &[u8],
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64)>, Error> {
+        if !prefix.starts_with(b"durable/document/")
+            || limit == 0
+            || limit > 256
+            || after > through
+            || through > i64::MAX as u64
+        {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let current: u64 = conn.query_row(
+            "SELECT sequence FROM durable_commit_meta WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if through > current {
+            return Err(Error::InvalidSnapshot);
+        }
+        let end = prefix_end(prefix).ok_or(Error::InvalidSnapshot)?;
+        let mut stmt = conn.prepare(
+            "SELECT s.sequence, s.revision FROM durable_document_commit_sequences s
+             WHERE s.sequence > ?1 AND s.sequence <= ?2
+             AND EXISTS (
+                 SELECT 1 FROM durable_document_history h
+                 WHERE h.revision = s.revision AND h.key >= ?3 AND h.key < ?4
+             ) ORDER BY s.sequence LIMIT ?5",
+        )?;
+        let mut rows = stmt.query(params![after, through, prefix, end, limit as i64])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            result.push((row.get(0)?, row.get(1)?));
+        }
+        Ok(result)
+    }
+
+    /// Read one complete immutable scoped revision selected for a history page.
+    pub fn scoped_document_changes_at_commit(
+        &self,
+        prefix: &[u8],
+        revision: u64,
+        sequence: u64,
+    ) -> Result<Vec<DocumentChange>, Error> {
+        if !prefix.starts_with(b"durable/document/") || revision > i64::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let recorded = conn
+            .query_row(
+                "SELECT sequence FROM durable_document_commit_sequences WHERE revision=?1",
+                [revision],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?;
+        if recorded != Some(sequence) {
+            return Err(Error::InvalidSnapshot);
+        }
+        let changes = Self::scoped_document_changes(&conn, prefix, revision, sequence)?;
+        if changes.is_empty() {
+            return Err(Error::InvalidSnapshot);
+        }
+        Ok(changes)
+    }
+
+    fn scoped_document_changes(
+        conn: &Connection,
+        prefix: &[u8],
+        revision: u64,
+        sequence: u64,
+    ) -> Result<Vec<DocumentChange>, Error> {
+        let end = prefix_end(prefix).ok_or(Error::InvalidSnapshot)?;
+        let mut stmt = conn.prepare(
+            "SELECT key, value, version, length(key), coalesce(length(value), 0)
+             FROM durable_document_history
+             WHERE revision = ?1 AND key >= ?2 AND key < ?3 ORDER BY key LIMIT 257",
+        )?;
+        let mut rows = stmt.query(params![revision, prefix, end])?;
         let mut changes = Vec::new();
         let mut bytes = 0usize;
         while let Some(row) = rows.next()? {
@@ -1672,7 +1768,7 @@ impl Store {
                 .checked_add(key_bytes)
                 .and_then(|n| n.checked_add(value_bytes))
                 .ok_or(Error::DocumentFrameTooLarge)?;
-            if bytes > 8 * 1024 * 1024 {
+            if bytes > MAX_SCOPED_DOCUMENT_FRAME_BYTES {
                 return Err(Error::DocumentFrameTooLarge);
             }
             let entry = match (
@@ -1698,7 +1794,7 @@ impl Store {
             }
             changes.push((key, entry));
         }
-        Ok(Some((revision, sequence, changes)))
+        Ok(changes)
     }
 
     /// Commit containing this put, including puts later overwritten or deleted.
@@ -1730,6 +1826,26 @@ impl Store {
         through: u64,
         limit: usize,
     ) -> Result<Vec<(u64, Vec<KeyedEntry>)>, Error> {
+        self.conversation_commits_including_progress(
+            observer_prefix,
+            None,
+            application_key,
+            after,
+            through,
+            limit,
+        )
+    }
+
+    /// Read observer, progress and application records in database commit order.
+    pub fn conversation_commits_including_progress(
+        &self,
+        observer_prefix: &[u8],
+        progress_prefix: Option<&[u8]>,
+        application_key: &[u8],
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<KeyedEntry>)>, Error> {
         if limit == 0 || limit > 256 || after > through || through > i64::MAX as u64 {
             return Err(Error::InvalidSnapshot);
         }
@@ -1746,7 +1862,7 @@ impl Store {
         let sql = "WITH records AS (
             SELECT c.sequence,e.key,e.value,e.version FROM durable_store_entries e
             JOIN durable_commit_versions c ON c.key=e.key AND c.version=e.version
-            WHERE substr(e.key,1,?1)=?2
+            WHERE substr(e.key,1,?1)=?2 OR (?7 IS NOT NULL AND substr(e.key,1,?8)=?7)
             UNION ALL
             SELECT c.sequence,h.key,h.value,h.version FROM durable_document_history h
             JOIN durable_commit_versions c ON c.key=h.key AND c.version=h.version
@@ -1760,7 +1876,9 @@ impl Store {
             application_key,
             after,
             through,
-            limit as i64
+            limit as i64,
+            progress_prefix,
+            progress_prefix.map(|prefix| prefix.len() as i64)
         ])?;
         let mut result: Vec<(u64, Vec<KeyedEntry>)> = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2747,6 +2865,7 @@ impl Store {
                 });
             }
         }
+        document_lifecycle::validate(&tx, mutations)?;
         // Ownership is explicit metadata keyed by the exact document key. No
         // existing scope string is interpreted as a task scope. All validation,
         // candidate resolution, and retirement happen under this write lock.
