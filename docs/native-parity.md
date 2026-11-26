@@ -2059,7 +2059,9 @@ ID. Terminal HTTP errors include bounded diagnostics from the decision error
 envelope with echoed request credentials redacted. Cancellation covers credential
 loading and the HTTP operation. A provider-level `api: "pi-decision"` configures
 the decision profile without changing the provider's bundled chat or operation
-routes. The legacy `pi-classifier` API and automatic Radius discovery keep their
+routes. Chat models in that profile use their own explicit chat API and `baseUrl`.
+The decision profile's credentials and headers stay on the operation routes.
+The legacy `pi-classifier` API and automatic Radius discovery keep their
 `/classify` route. Pi Decision uses the existing endpoint-bound credentials
 and headers, HTTP limits, and classifier retry policy. A built-in provider name
 supplies neither an implicit decision URL nor ambient credentials for it.

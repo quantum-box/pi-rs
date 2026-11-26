@@ -122,6 +122,22 @@ pub(super) fn usage(cost: &Cost, usage: &Value) -> Option<Value> {
     }))
 }
 
+fn normalize_diagnostic(value: &str) -> String {
+    let value: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_control()
+                || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub(super) async fn http_error(
     mut response: reqwest::Response,
     request_headers: &reqwest::header::HeaderMap,
@@ -150,9 +166,10 @@ pub(super) async fn http_error(
     };
     let diagnostic = &body["error"];
     let clean = |field: &str, limit| {
-        let value = diagnostic[field].as_str()?;
+        let value = normalize_diagnostic(diagnostic[field].as_str()?);
         // The server may echo any of the configured credentials, including
-        // values carried under custom header names. Omit sensitive fields.
+        // values carried under custom header names. Compare before truncation
+        // so even a credential crossing the display limit is omitted in full.
         if request_headers
             .values()
             .filter(|header| header.is_sensitive())
@@ -160,7 +177,8 @@ pub(super) async fn http_error(
                 let Ok(secret) = std::str::from_utf8(header.as_bytes()) else {
                     return false;
                 };
-                (!secret.is_empty() && value.contains(secret))
+                let secret = normalize_diagnostic(secret);
+                (!secret.is_empty() && value.contains(&secret))
                     || secret.split_once(' ').is_some_and(|(scheme, token)| {
                         scheme.eq_ignore_ascii_case("bearer")
                             && !token.is_empty()
@@ -170,15 +188,8 @@ pub(super) async fn http_error(
         {
             return Some("[redacted]".to_owned());
         }
-        let value: String = value.chars().take(limit).map(|ch| {
-            if ch.is_control() || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
-                ' '
-            } else {
-                ch
-            }
-        }).collect();
-        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!value.is_empty()).then_some(value)
+        let value: String = value.chars().take(limit).collect();
+        (!value.is_empty()).then(|| value.trim_end().to_owned())
     };
     match (clean("code", 64), clean("message", 512)) {
         (Some(code), Some(message)) => Error::Model(format!(
@@ -310,7 +321,7 @@ mod tests {
         let mut args = Cli::parse_from(["pi"]);
         args.model_profiles = Profiles::parse(&json!({"providers":{"decision-fixture":{
             "baseUrl":base,"api":"pi-decision","apiKey":"fixture-decision-key",
-            "headers":{"x-private-fixture":"fixture-private-header"},"models":[{
+            "headers":{"x-private-fixture":"  fixture-private-header\t value  "},"models":[{
                 "type":"classifier","id":"judge","input":["text","image"]
             }]
         }}}))
@@ -320,12 +331,16 @@ mod tests {
 
     #[test]
     fn provider_level_decision_configuration_isolated_from_bundled_routes() {
-        let profiles = Profiles::parse(&json!({"providers":{"openai":{
+        let mut config = json!({"providers":{"openai":{
             "api":"pi-decision","baseUrl":"https://decision.invalid/v1",
             "apiKey":"fixture-decision-key","headers":{"x-private-fixture":"private"},
-            "models":[{"type":"classifier","id":"judge"}]
-        }}}))
-        .unwrap();
+            "authHeader":true,
+            "models":[{"type":"classifier","id":"judge"},{
+                "id":"chat-fixture","api":"openai-responses","baseUrl":"https://chat.invalid/v1",
+                "headers":{"x-chat-fixture":"chat-only"}
+            }]
+        }}});
+        let profiles = Profiles::parse(&config).unwrap();
         let chat = profiles.provider("openai").unwrap();
         assert_eq!(profiles.endpoint(&chat), chat.default_endpoint());
         assert!(
@@ -333,6 +348,22 @@ mod tests {
                 .credential(&chat, profiles.endpoint(&chat))
                 .is_none()
         );
+        assert!(
+            profiles
+                .model_ids(&chat)
+                .iter()
+                .any(|id| id == "chat-fixture")
+        );
+        let chat_endpoint = profiles.model_endpoint(&chat, "chat-fixture").unwrap();
+        assert_eq!(chat_endpoint, "https://chat.invalid/v1/responses");
+        assert!(profiles.credential(&chat, chat_endpoint).is_none());
+        let headers = profiles
+            .header_settings(&chat, chat_endpoint, Some("chat-fixture"))
+            .static_headers(&chat, None)
+            .unwrap();
+        assert_eq!(headers["x-chat-fixture"], "chat-only");
+        assert!(!headers.contains_key("x-private-fixture"));
+        assert!(!headers.contains_key("authorization"));
 
         let catalogue = &profiles.operations().0;
         let decision = catalogue
@@ -346,6 +377,7 @@ mod tests {
         );
         assert_eq!(decision.api_key.as_deref(), Some("fixture-decision-key"));
         assert_eq!(decision.model.headers["x-private-fixture"], "private");
+        assert!(!decision.model.headers.contains_key("x-chat-fixture"));
         let builtin = catalogue
             .iter()
             .find(|entry| entry.provider == "openai" && matches!(entry.api, Api::OpenAiDecisions))
@@ -356,6 +388,38 @@ mod tests {
         );
         assert!(builtin.api_key.is_none());
         assert!(!builtin.model.headers.contains_key("x-private-fixture"));
+
+        config["providers"]["openai"]["models"][1]["baseUrl"] = Value::Null;
+        assert!(
+            matches!(Profiles::parse(&config), Err(Error::Config(message))
+            if message.contains("openai/chat-fixture requires its own baseUrl"))
+        );
+    }
+
+    #[test]
+    fn mixed_custom_provider_keeps_model_scoped_chat_and_decision_routes() {
+        let profiles = Profiles::parse(&json!({"providers":{"mixed-fixture":{
+            "api":"pi-decision","apiKey":"fixture-decision-key",
+            "models":[
+                {"type":"classifier","id":"judge","baseUrl":"https://decision.invalid/v1"},
+                {"type":"chat","id":"chat","api":"openai-completions","baseUrl":"https://chat.invalid/v1"}
+            ]
+        }}})).unwrap();
+        let chat = profiles.provider("mixed-fixture").unwrap();
+        let endpoint = profiles.model_endpoint(&chat, "chat").unwrap();
+        assert_eq!(endpoint, "https://chat.invalid/v1/chat/completions");
+        assert!(profiles.credential(&chat, endpoint).is_none());
+        let decision = profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "mixed-fixture")
+            .unwrap();
+        assert_eq!(
+            decision.endpoint.as_str(),
+            "https://decision.invalid/v1/decision"
+        );
+        assert_eq!(decision.api_key.as_deref(), Some("fixture-decision-key"));
     }
 
     async fn invoke(operation: &Operations, args: Value, cancellation: CancellationToken) -> Value {
@@ -559,7 +623,8 @@ mod tests {
                     "details":{"value":"fixture-decision-key"}
                 }}).to_string()),
                 ("401 Unauthorized", json!({"error":{
-                    "code":"denied", "message":"echo: fixture-decision-key fixture-private-header"
+                    "code":"echo: fixture-private-header\n value",
+                    "message":"echo: fixture-decision-key"
                 }}).to_string()),
                 ("400 Bad Request", json!({"error":{"message":"x".repeat(17 * 1024)}}).to_string()),
             ] {
@@ -567,7 +632,7 @@ mod tests {
                 let (route, headers, _) = request(&mut socket).await;
                 assert_eq!(route, "POST /v1/decision HTTP/1.1\r\n");
                 assert_eq!(headers["authorization"], "Bearer fixture-decision-key");
-                assert_eq!(headers["x-private-fixture"], "fixture-private-header");
+                assert_eq!(headers["x-private-fixture"], "fixture-private-header\t value");
                 let response = format!(
                     "HTTP/1.1 {status}\r\nRetry-After-Ms: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -597,7 +662,10 @@ mod tests {
             assert!(!invalid.contains(omitted));
         }
         let denied = terminal_error().await;
-        assert!(denied.contains("HTTP 401 (denied): [redacted]"), "{denied}");
+        assert!(
+            denied.contains("HTTP 401 ([redacted]): [redacted]"),
+            "{denied}"
+        );
         assert!(!denied.contains("fixture-decision-key"));
         assert!(!denied.contains("fixture-private-header"));
         let oversized = terminal_error().await;

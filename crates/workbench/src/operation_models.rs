@@ -482,7 +482,13 @@ impl Catalogue {
             {
                 // Keep the decision configuration off the remaining bundled
                 // operations, even when the provider name is built in.
-                decision_profiles.push((name.clone(), Value::Object(configured.clone())));
+                let mut decision = configured.clone();
+                if let Some(models) = decision.get_mut("models").and_then(Value::as_array_mut) {
+                    models.retain(|model| {
+                        matches!(model["type"].as_str(), Some("classifier" | "image"))
+                    });
+                }
+                decision_profiles.push((name.clone(), Value::Object(decision)));
             } else {
                 models.extend(
                     configured

@@ -847,7 +847,8 @@ impl Profiles {
             if let Some(profile) = profiles.entries.get_mut("radius")
                 && data["providers"].as_object().is_some_and(|providers| {
                     providers.iter().any(|(name, entry)| {
-                        name.eq_ignore_ascii_case("radius") && entry["baseUrl"].is_null()
+                        name.eq_ignore_ascii_case("radius")
+                            && (entry["baseUrl"].is_null() || entry["api"] == "pi-decision")
                     })
                 })
             {
@@ -938,9 +939,35 @@ impl Profiles {
         let configured_providers = providers;
         let operations = super::operation_models::Catalogue::parse(configured_providers)?;
         let mut providers = configured_providers.clone();
-        // A provider-level decision route belongs to the operation catalogue.
-        // Its endpoint, headers and key must not replace the built-in chat route.
-        providers.retain(|_, entry| entry["api"] != "pi-decision");
+        for (name, entry) in configured_providers
+            .iter()
+            .filter(|(_, entry)| entry["api"] == "pi-decision")
+        {
+            // Retain explicitly routed chat definitions without inheriting the
+            // operation default, its credentials, or its base URL.
+            let models: Vec<_> = entry["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|model| {
+                    model["type"].as_str().is_none_or(|kind| kind == "chat")
+                        && model["api"].as_str().and_then(Adapter::named).is_some()
+                })
+                .collect();
+            for model in &models {
+                if model["baseUrl"].as_str().is_none() {
+                    let id = model["id"].as_str().unwrap_or_default();
+                    return Err(Error::Config(format!(
+                        "chat model {name}/{id} requires its own baseUrl in a pi-decision profile"
+                    )));
+                }
+            }
+            if models.is_empty() {
+                providers.remove(name);
+            } else {
+                providers.insert(name.clone(), serde_json::json!({"models": models}));
+            }
+        }
         configure_cloudflare_workers(&mut providers, account)?;
         if let Some(route) = &cloudflare_gateway_route {
             let name = providers
@@ -993,7 +1020,11 @@ impl Profiles {
                 {
                     return Err(Error::Config("invalid custom model provider name".into()));
                 }
-                if entry["baseUrl"].as_str().is_none() {
+                if entry["baseUrl"].as_str().is_none()
+                    && !configured_providers
+                        .get(name)
+                        .is_some_and(|configured| configured["api"] == "pi-decision")
+                {
                     return Err(Error::Config(format!(
                         "custom model provider {name} requires baseUrl"
                     )));
@@ -1140,6 +1171,7 @@ impl Profiles {
                         provider.id(),
                         "cloudflare-workers-ai" | "cloudflare-ai-gateway"
                     ) && configured["api"] != "cloudflare-workers-ai-system-one"
+                        && configured["api"] != "pi-decision"
                 })
                 .and_then(|configured| configured["baseUrl"].as_str())
                 .map(str::to_owned);
