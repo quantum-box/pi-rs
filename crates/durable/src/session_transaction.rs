@@ -3,7 +3,10 @@
 //! Changes are provisional until the enclosing `Harness::session_transaction`
 //! commits. The callback is never replayed after a conflict.
 use crate::{
-    document::{Address, Documents, Error, ForkPolicy},
+    document::{
+        Address, ConversationDocument, DefinedDocumentValue, Documents, Error, ForkPolicy,
+        StoredDocumentPolicy,
+    },
     runtime::{ApplicationWrite, Conversation, Submission},
     task_store::OwnedBatch,
 };
@@ -66,12 +69,18 @@ pub struct SessionTransaction<'a> {
     writes: HashMap<Address, Option<Map<String, Value>>>,
     drafts: HashSet<Address>,
     policy_reads: HashSet<Address>,
-    policies: HashMap<Address, ForkPolicy>,
+    policies: HashMap<Address, StoredDocumentPolicy>,
     task_reads: HashMap<Uuid, (Expected, Option<crate::task_store::StoredTask>)>,
     tasks: Vec<crate::task::Task>,
     signals: crate::document::HostTransaction<'a>,
     clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
     children: Vec<SessionChild>,
+}
+
+struct CheckedDocument {
+    address: Address,
+    policy: StoredDocumentPolicy,
+    document: Option<Map<String, Value>>,
 }
 
 impl<'a> SessionTransaction<'a> {
@@ -323,9 +332,180 @@ impl<'a> SessionTransaction<'a> {
         Ok(())
     }
 
+    /// Read a document by its definition in this conversation.
+    pub fn defined_document<T>(
+        &mut self,
+        definition: &ConversationDocument<T>,
+        key: &str,
+    ) -> Result<Option<DefinedDocumentValue<T>>, Error>
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize,
+    {
+        let CheckedDocument {
+            policy, document, ..
+        } = self.checked_document_definition(definition, key)?;
+        let Some(value) = document else {
+            return Ok(None);
+        };
+        let value = Value::Object(value);
+        let typed: T = serde::Deserialize::deserialize(&value)?;
+        if serde_json::to_value(&typed)? != value {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        let incarnation = policy
+            .definition
+            .and_then(|binding| binding.incarnation)
+            .ok_or(Error::InvalidDocumentDefinition)?;
+        Ok(Some(DefinedDocumentValue {
+            incarnation,
+            value: typed,
+        }))
+    }
+
+    /// Create, recreate or edit a document together with its schema and fork
+    /// policy. A retired address receives a fresh identity on the next edit.
+    pub fn edit_defined_document<T, R>(
+        &mut self,
+        definition: &ConversationDocument<T>,
+        key: &str,
+        edit: impl FnOnce(&mut T) -> Result<R, Error>,
+    ) -> Result<R, Error>
+    where
+        T: Clone + serde::de::DeserializeOwned + serde::Serialize,
+    {
+        let CheckedDocument {
+            address,
+            mut policy,
+            document,
+        } = self.checked_document_definition(definition, key)?;
+        let result = self.edit_document(&address, || definition.initial.clone(), edit)?;
+        if document.is_none() {
+            policy
+                .definition
+                .as_mut()
+                .expect("validated definition")
+                .incarnation = Some(Uuid::new_v4());
+            self.policies.insert(address, policy);
+        }
+        Ok(result)
+    }
+
+    /// Retire this conversation's current incarnation, retaining its definition
+    /// for future edits and historical forks.
+    pub fn retire_defined_document<T: serde::Serialize>(
+        &mut self,
+        definition: &ConversationDocument<T>,
+        key: &str,
+    ) -> Result<bool, Error> {
+        let CheckedDocument {
+            address,
+            mut policy,
+            document,
+        } = self.checked_document_definition(definition, key)?;
+        if document.is_none() {
+            return Ok(false);
+        }
+        self.delete_document(&address)?;
+        policy
+            .definition
+            .as_mut()
+            .expect("validated definition")
+            .incarnation = None;
+        self.policies.insert(address, policy);
+        Ok(true)
+    }
+
+    /// Upgrade a bound definition in the same transaction as its value. A
+    /// live value retains its incarnation. A retired address stays retired.
+    pub fn migrate_defined_document<From, To>(
+        &mut self,
+        old: &ConversationDocument<From>,
+        new: &ConversationDocument<To>,
+        key: &str,
+        migrate: impl FnOnce(From) -> Result<To, Error>,
+    ) -> Result<(), Error>
+    where
+        From: serde::de::DeserializeOwned + serde::Serialize,
+        To: serde::Serialize,
+    {
+        if old.kind != new.kind || old.version >= new.version {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        let CheckedDocument {
+            address,
+            policy: current,
+            document,
+        } = self.checked_document_definition(old, key)?;
+        if self.stored_document_policy(&address)?.definition.is_none() {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        let mut replacement = new.binding()?;
+        replacement
+            .definition
+            .as_mut()
+            .expect("constructed definition")
+            .incarnation = current.definition.and_then(|binding| binding.incarnation);
+        if let Some(value) = document {
+            let value = Value::Object(value);
+            let typed: From = serde::Deserialize::deserialize(&value)?;
+            if serde_json::to_value(&typed)? != value {
+                return Err(Error::InvalidDocumentDefinition);
+            }
+            let Value::Object(value) = serde_json::to_value(migrate(typed)?)? else {
+                return Err(Error::InvalidDocumentDefinition);
+            };
+            self.put_document(&address, value)?;
+        }
+        self.policies.insert(address, replacement);
+        Ok(())
+    }
+
+    fn checked_document_definition<T: serde::Serialize>(
+        &mut self,
+        definition: &ConversationDocument<T>,
+        key: &str,
+    ) -> Result<CheckedDocument, Error> {
+        let address = Address {
+            scope: self.state.id.to_string(),
+            name: definition.kind.clone(),
+            key: key.to_owned(),
+        };
+        let expected = definition.binding()?;
+        let stored = self.stored_document_policy(&address)?;
+        let document = self.document(&address)?;
+        let Some(binding) = &stored.definition else {
+            if document.is_some() {
+                return Err(Error::InvalidDocumentDefinition);
+            }
+            return Ok(CheckedDocument {
+                address,
+                policy: expected,
+                document: None,
+            });
+        };
+        let expected_binding = expected.definition.expect("constructed definition");
+        if binding.schema != expected_binding.schema
+            || binding.initial_digest != expected_binding.initial_digest
+            || stored.policy != expected.policy
+            || document.is_some() != binding.incarnation.is_some()
+            || binding.incarnation.is_some_and(|id| id.is_nil())
+        {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        Ok(CheckedDocument {
+            address,
+            policy: stored,
+            document,
+        })
+    }
+
     /// Read the fork policy at the transaction's snapshot or its staged replacement.
     /// An address without an explicit policy uses `ForkPolicy::Copy`.
     pub fn document_fork_policy(&mut self, address: &Address) -> Result<ForkPolicy, Error> {
+        Ok(self.stored_document_policy(address)?.policy)
+    }
+
+    fn stored_document_policy(&mut self, address: &Address) -> Result<StoredDocumentPolicy, Error> {
         if let Some(policy) = self.policies.get(address) {
             return Ok(policy.clone());
         }
@@ -334,7 +514,10 @@ impl<'a> SessionTransaction<'a> {
             .document_at(&address.policy_key()?, self.revision)?
         {
             Some(entry) => serde_json::from_slice(&entry.value)?,
-            None => ForkPolicy::Copy,
+            None => StoredDocumentPolicy {
+                policy: ForkPolicy::Copy,
+                definition: None,
+            },
         };
         self.policy_reads.insert(address.clone());
         Ok(policy)
@@ -347,8 +530,12 @@ impl<'a> SessionTransaction<'a> {
         address: &Address,
         policy: ForkPolicy,
     ) -> Result<(), Error> {
-        self.document_fork_policy(address)?;
-        self.policies.insert(address.clone(), policy);
+        let mut stored = self.stored_document_policy(address)?;
+        if stored.definition.is_some() && stored.policy != policy {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        stored.policy = policy;
+        self.policies.insert(address.clone(), stored);
         Ok(())
     }
 
@@ -685,6 +872,27 @@ impl<'a> SessionTransaction<'a> {
         self.writes.retain(|address, candidate| {
             !self.drafts.contains(address) || self.reads.get(address) != Some(candidate)
         });
+        for (address, value) in &self.writes {
+            let stored;
+            let policy = if let Some(policy) = self.policies.get(address) {
+                policy
+            } else if let Some(entry) = self
+                .store
+                .document_at(&address.policy_key()?, self.revision)?
+            {
+                stored = serde_json::from_slice::<StoredDocumentPolicy>(&entry.value)?;
+                &stored
+            } else {
+                self.policy_reads.insert(address.clone());
+                continue;
+            };
+            if let Some(binding) = &policy.definition
+                && value.is_some() != binding.incarnation.is_some()
+            {
+                return Err(Error::InvalidDocumentDefinition);
+            }
+            self.policy_reads.insert(address.clone());
+        }
         if let Some(profile) = self.image_profile_guard {
             let adapter = self
                 .adapter
