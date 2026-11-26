@@ -3146,7 +3146,7 @@ impl View {
     }
 
     fn restore(&mut self, args: &Cli) -> Result<()> {
-        let session = Session::open(&args.session)?;
+        let session = args.open_session()?;
         self.restore_session(args, &session)
     }
     fn restore_session(&mut self, args: &Cli, session: &Session) -> Result<()> {
@@ -4939,7 +4939,7 @@ fn slash(
             }
         }
         "/name" => {
-            let mut session = Session::open(&args.session)?;
+            let mut session = args.open_session()?;
             if !rest.is_empty() {
                 let name = pi_rs::sanitize_session_name(rest);
                 if session.name().unwrap_or_default() != name {
@@ -4960,12 +4960,12 @@ fn slash(
             } else {
                 Some(pi_rs::ContextContent::Text(content.into()))
             };
-            Session::open(&args.session)?.edit_context(target, replacement)?;
+            args.open_session()?.edit_context(target, replacement)?;
             view.append("Updated future model context");
         }
         "/label" => {
             let (id, label) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-            let mut session = Session::open(&args.session)?;
+            let mut session = args.open_session()?;
             let target = id
                 .parse()
                 .map_err(|_| Error::Config("use /label <record-id> [label]".into()))?;
@@ -4973,7 +4973,7 @@ fn slash(
             view.append("Label saved");
         }
         "/fork" if rest.is_empty() => {
-            let session = Session::open(&args.session)?;
+            let session = args.open_session()?;
             let items: Vec<_> = session
                 .branch()
                 .iter()
@@ -4999,7 +4999,7 @@ fn slash(
             }
         }
         "/clone" | "/fork" => {
-            let session = Session::open(&args.session)?;
+            let session = args.open_session()?;
             let (entry_id, position, target, input) = if name == "/fork" {
                 let target = rest
                     .parse::<u64>()
@@ -5046,7 +5046,7 @@ fn slash(
             )?;
             drop(session);
             args.session = destination;
-            args.restore_session_model(&Session::open(&args.session)?)?;
+            args.restore_session_model(&args.open_session()?)?;
             view.restore(args)?;
             view.clear_extension_chrome();
             args.session_transition = Some(pi_rs::SessionStartReason::Fork);
@@ -5066,7 +5066,7 @@ fn slash(
                     args.workspace.join(path)
                 }
             };
-            let session = Session::open(&args.session)?;
+            let session = args.open_session()?;
             sessions::export(&session, &destination)?;
             view.append(&format!("Exported {}", destination.display()));
         }
@@ -5082,7 +5082,7 @@ fn slash(
             switch_session(args, view, destination)?;
         }
         "/copy" => {
-            sessions::copy_last(&Session::open(&args.session)?)?;
+            sessions::copy_last(&args.open_session()?)?;
             view.append("Copied last response");
         }
         "/share" => {
@@ -5601,7 +5601,7 @@ fn slash(
             } else {
                 "todo-list"
             };
-            let session = Session::open(&args.session)?;
+            let session = args.open_session()?;
             let states = session.extension_states();
             view.append(
                 &states
@@ -5648,7 +5648,7 @@ fn slash(
             let id = rest
                 .parse()
                 .map_err(|_| Error::Config("use /checkout <record-id>".into()))?;
-            let mut session = Session::open(&args.session)?;
+            let mut session = args.open_session()?;
             session.checkout(id)?;
             args.restore_session_model(&session)?;
             drop(session);
@@ -5955,8 +5955,13 @@ pub(super) async fn run(
         std::fs::create_dir_all(parent)?;
     }
     let reported_settings = args.settings.diagnostics().to_vec();
-    let terminal_resume = args.terminal_resume;
     args = prepare_initial_session_async(args).await?;
+    if args.trusted && super::program_resume::needs_fresh_approval(&args) {
+        args.trusted = false;
+        args.trust_pending = true;
+        args.settings = super::config::Settings::load(&args.workspace, false)?;
+        args.refresh_workspace_selection();
+    }
     for warning in args.settings.diagnostics() {
         if !reported_settings.contains(warning) {
             eprintln!("{warning}");
@@ -5990,11 +5995,7 @@ pub(super) async fn run(
     };
     let changelog_path = super::config::agent_dir().join("pi-rs-changelog.json");
     let mut extension_changelog_session = {
-        let session = if terminal_resume {
-            super::program_resume::open_bound_session(&args)?
-        } else {
-            Session::open(&args.session)?
-        };
+        let session = args.open_session()?;
         view.restore_session(&args, &session)?;
         let empty = session.current_messages().is_empty();
         if empty
@@ -6213,7 +6214,7 @@ pub(super) async fn run(
         }
         if !is_busy(&worker)
             && let Some(pending) = &view.pending_thinking
-            && persist_pending_thinking(pending).is_ok()
+            && persist_pending_thinking(pending, &args).is_ok()
         {
             if pending.session == args.session && pending.previous_level != pending.level {
                 args.selection_events
@@ -7449,7 +7450,7 @@ pub(super) async fn run(
                                     "type":"set_session_label","target":id,"label":label,"id":request,
                                 })).map(|()| picker.track_tree_label(request, id))
                             } else {
-                                Session::open(&args.session).and_then(|mut session| {
+                                args.open_session().and_then(|mut session| {
                                     session.set_label(id, label)?;
                                     picker.refresh_tree(
                                         session_tree::picker(&session, TreeFilter::Default),
@@ -8268,7 +8269,7 @@ pub(super) async fn run(
         drop(worker.take());
     }
     if let Some(pending) = view.pending_thinking.take() {
-        persist_pending_thinking(&pending)?;
+        persist_pending_thinking(&pending, &args)?;
         if pending.session == args.session && pending.previous_level != pending.level {
             args.selection_events
                 .push(pi_rs::LifecycleEvent::ThinkingLevelSelect {
@@ -8340,12 +8341,13 @@ fn is_busy(worker: &Option<Worker>) -> bool {
         .is_some_and(|worker| worker.busy || worker.bashing)
 }
 
-fn persist_pending_thinking(pending: &PendingThinking) -> Result<()> {
-    Session::open(&pending.session)?.select_thinking_level(
-        pending.provider.as_deref(),
-        &pending.model,
-        &pending.level,
-    )
+fn persist_pending_thinking(pending: &PendingThinking, args: &Cli) -> Result<()> {
+    let mut session = if args.resume_existing_session.as_ref() == Some(&pending.session) {
+        Session::open_existing(&pending.session)?
+    } else {
+        Session::open(&pending.session)?
+    };
+    session.select_thinking_level(pending.provider.as_deref(), &pending.model, &pending.level)
 }
 
 fn start_prompt(
@@ -9346,15 +9348,15 @@ fn confirm_tree(view: &mut View, id: u64) {
 }
 
 fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
-    let input = Session::open(&args.session)?
-        .records()
-        .get(id.saturating_sub(1) as usize)
-        .and_then(|record| match &record.event {
-            pi_rs::Event::User { content, .. } | pi_rs::Event::UserWithImages { content, .. } => {
-                Some(content.clone())
-            }
-            _ => None,
-        });
+    let input =
+        args.open_session()?
+            .records()
+            .get(id.saturating_sub(1) as usize)
+            .and_then(|record| match &record.event {
+                pi_rs::Event::User { content, .. }
+                | pi_rs::Event::UserWithImages { content, .. } => Some(content.clone()),
+                _ => None,
+            });
     restore_workspace(args)?;
     let images = std::mem::take(&mut view.draft_images);
     let restored = view.restore(args);
@@ -10374,6 +10376,7 @@ fn select(
         Selection::Trust(decision) => {
             crate::config::save_trust(&args.workspace, decision)?;
             args.trusted = decision;
+            args.terminal_resume_approved = decision && args.resume_requires_existing();
             args.trust_pending = false;
             args.settings = args.settings.reload_latest(&args.workspace, decision)?;
             for warning in args.settings.diagnostics() {
@@ -10512,7 +10515,7 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
 
 async fn prepare_initial_session_async(mut args: Cli) -> Result<Cli> {
     if std::mem::take(&mut args.terminal_resume) {
-        let mut session = super::program_resume::open_bound_session(&args)?;
+        let mut session = args.open_session()?;
         initialize_open_session(&mut args, &mut session)?;
         return Ok(args);
     }
@@ -10564,7 +10567,7 @@ fn prepare_initial_session(args: &mut Cli) -> Result<()> {
 }
 
 fn initialize_session(args: &mut Cli) -> Result<()> {
-    let mut session = Session::open(&args.session)?;
+    let mut session = args.open_session()?;
     initialize_open_session(args, &mut session)
 }
 
@@ -10586,8 +10589,10 @@ fn initialize_open_session(args: &mut Cli, session: &mut Session) -> Result<()> 
     Ok(())
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
-    let session = Session::open(&args.session)?;
-    if let Some(cwd) = session.working_directory() {
+    let session = args.open_session()?;
+    if !args.resume_requires_existing()
+        && let Some(cwd) = session.working_directory()
+    {
         let path = PathBuf::from(cwd);
         if !path.is_dir() {
             return Err(Error::Config(
@@ -10596,16 +10601,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
         }
         args.workspace = path;
     }
-    let decision = crate::config::project_trust(
-        &args.workspace,
-        if args.no_trust {
-            Some(false)
-        } else if args.trust || args.project.is_some() {
-            Some(true)
-        } else {
-            None
-        },
-    )?;
+    let decision = args.project_trust()?;
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
     args.settings = args.settings.reload_latest(&args.workspace, args.trusted)?;

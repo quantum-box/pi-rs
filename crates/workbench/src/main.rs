@@ -164,6 +164,16 @@ struct Cli {
     /// Internal OSC restore with an explicit journal and workspace binding.
     #[arg(long, hide = true, requires_all = ["session", "workspace"])]
     terminal_resume: bool,
+    #[arg(long, hide = true, requires = "terminal_resume")]
+    terminal_resume_confirm_project: bool,
+    #[arg(long, hide = true, requires_all = ["terminal_managed_worker", "session", "workspace"])]
+    terminal_resume_worker: bool,
+    #[arg(long, hide = true, requires = "terminal_resume_worker")]
+    terminal_resume_approved: bool,
+    #[arg(skip)]
+    resume_existing_session: Option<PathBuf>,
+    #[arg(skip)]
+    resume_limits: program_resume::ExplicitLimits,
     /// Open or create a named session in this workspace's session directory.
     #[arg(long, conflicts_with_all = ["session", "continue_session", "resume_session", "no_session"], value_parser = sessions::validate_id)]
     session_id: Option<String>,
@@ -353,6 +363,40 @@ struct InitialSelection {
 }
 
 impl Cli {
+    fn resume_requires_existing(&self) -> bool {
+        self.resume_existing_session.as_ref() == Some(&self.session)
+    }
+
+    fn project_trust(&self) -> Result<Option<bool>> {
+        let decision = config::project_trust(
+            &self.workspace,
+            if self.no_trust {
+                Some(false)
+            } else if self.trust || self.project.is_some() {
+                Some(true)
+            } else {
+                None
+            },
+        )?;
+        if decision == Some(true) && program_resume::needs_fresh_approval(self) {
+            if self.terminal_resume_worker {
+                return Err(Error::Config(
+                    "terminal resume requires fresh project approval".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        Ok(decision)
+    }
+
+    fn open_session(&self) -> Result<Session> {
+        if self.resume_requires_existing() {
+            program_resume::open_bound_session(self)
+        } else {
+            Session::open(&self.session)
+        }
+    }
+
     fn theme_setting(&self) -> Option<&str> {
         self.use_theme
             .as_deref()
@@ -706,7 +750,7 @@ impl Cli {
         source: pi_rs::ModelSelectSource,
     ) -> Result<()> {
         let selected = self.prepare_model_change(provider, model, thinking, source)?;
-        selected.record_model_selection(&mut Session::open(&selected.session)?)?;
+        selected.record_model_selection(&mut selected.open_session()?)?;
         *self = selected;
         Ok(())
     }
@@ -1559,8 +1603,11 @@ async fn run_cli(resume_token: Option<String>) -> i32 {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        args.resume_limits = program_resume::ExplicitLimits::from_matches(&matches);
         if args.terminal_resume {
             program_resume::bind_startup(&mut args)?;
+        } else if args.terminal_resume_worker {
+            program_resume::bind_worker(&mut args)?;
         }
         if let Some(plan) = export_plan {
             if plan.input.as_os_str().is_empty() {
@@ -1633,16 +1680,7 @@ async fn run_cli(resume_token: Option<String>) -> i32 {
                 _ = &mut signal_rx => Err(Error::Cancelled),
             };
         }
-        let decision = config::project_trust(
-            &args.workspace,
-            if args.no_trust {
-                Some(false)
-            } else if args.trust || args.project.is_some() {
-                Some(true)
-            } else {
-                None
-            },
-        )?;
+        let decision = args.project_trust()?;
         args.trusted = decision.unwrap_or(false);
         args.trust_pending = decision.is_none();
         args.settings = if matches!(args.command, Some(Command::Serve))
@@ -2303,7 +2341,7 @@ async fn execute(
     let mut session = if matches!(&command, Command::Share) {
         Session::open_for_share(&args.session)?
     } else {
-        Session::open(&args.session)?
+        args.open_session()?
     };
     if session.host_binding().is_some() {
         return Err(Error::Session(

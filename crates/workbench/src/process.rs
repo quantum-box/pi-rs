@@ -214,6 +214,11 @@ impl Worker {
         transition: Option<(SessionStartReason, Option<std::path::PathBuf>)>,
         fallback: Option<&super::config::Settings>,
     ) -> Result<Self> {
+        if args.trusted && super::program_resume::needs_fresh_approval(args) {
+            return Err(Error::Config(
+                "terminal resume requires fresh project approval".into(),
+            ));
+        }
         let history = args.settings.worker_fallback(&args.workspace, args.trusted);
         let settings = args.settings.reload_with_fallback(
             &args.workspace,
@@ -242,6 +247,12 @@ impl Worker {
                         Ok(())
                     });
                 }
+            }
+        }
+        if args.resume_requires_existing() {
+            command.arg("--terminal-resume-worker");
+            if args.terminal_resume_approved {
+                command.arg("--terminal-resume-approved");
             }
         }
         command.env(REFRESH_BARRIER_ENV, refresh_barrier.path());
@@ -930,8 +941,13 @@ fn configuration(args: &Cli) -> Value {
         .map(|path| path.as_os_str().as_encoded_bytes())
         .collect::<Vec<_>>();
     let theme_inputs = json!({"disabled":args.no_themes,"paths":theme_paths});
+    let workspace_scope = (
+        &args.workspace,
+        args.resume_requires_existing(),
+        args.resume_requires_existing() && args.terminal_resume_approved,
+    );
     json!({
-        "workspace":args.workspace,
+        "workspace":workspace_scope,
         "provider":args.provider.id(),"endpoint":args.model_endpoint_for(&args.provider, Some(&args.model)),"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
         "extension_flags":extension_flags,
         "model_profiles":args.model_profiles.revision(),"model_keys":args.model_keys.revision(),

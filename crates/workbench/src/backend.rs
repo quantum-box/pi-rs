@@ -756,12 +756,16 @@ fn refresh_snapshot(snapshot: &Mutex<SessionSnapshot>, session: &Session) {
     emit_refreshed_entries(entries);
 }
 
-fn open_initial_snapshot(path: &std::path::Path, emit_entries: bool) -> Result<SessionSnapshot> {
-    let session = match Session::snapshot(path) {
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            Session::open(path)?
+fn open_initial_snapshot(args: &Cli, emit_entries: bool) -> Result<SessionSnapshot> {
+    let session = if args.resume_requires_existing() {
+        super::program_resume::snapshot_bound_session(args)?
+    } else {
+        match Session::snapshot(&args.session) {
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                args.open_session()?
+            }
+            result => result?,
         }
-        result => result?,
     };
     if emit_entries {
         session.validated_pi_conversion_counts()?;
@@ -985,7 +989,7 @@ async fn run_worker(
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
     let snapshot = Arc::new(Mutex::new(open_initial_snapshot(
-        &args.session,
+        &args,
         args.mode == Some(super::OutputMode::Rpc),
     )?));
     let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
@@ -1046,7 +1050,7 @@ async fn run_worker(
     .await;
     let mut session = Session::snapshot(&args.session)?;
     if session.host_binding().is_none() {
-        session = Session::open(&args.session)?;
+        session = args.open_session()?;
     }
     let discovered = runtime
         .discover_resources(
@@ -1121,7 +1125,7 @@ async fn run_worker(
                     Some(input) => {
                         cache.clear(&args.session, "conversation context changed");
                         let mut replies = Vec::new();
-                        let result = Session::open(&args.session).and_then(|mut session| {
+                        let result = args.open_session().and_then(|mut session| {
                             if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
                             refresh_snapshot(&snapshot, &session);
                             let mut observer = |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
@@ -1204,7 +1208,7 @@ async fn run_worker(
             let result = tokio::select! {
                 result = async {
                     if runtime.registry.has_session_transition_hooks() {
-                        match Session::open(&args.session) {
+                        match args.open_session() {
                             Ok(mut session) if session.host_binding().is_none() => {
                                 let result = runtime
                                     .registry
@@ -1322,7 +1326,7 @@ async fn run_worker(
             args.session = session;
             runtime.configure_model_options(&args, reported_thinking)?;
             model_reports_thinking = reported_thinking;
-            refresh_snapshot(&snapshot, &Session::open(&args.session)?);
+            refresh_snapshot(&snapshot, &args.open_session()?);
             if switched {
                 ui.refresh_themes(&base_theme_paths);
                 notify_session_lifecycle(
@@ -1336,7 +1340,7 @@ async fn run_worker(
                 .await;
                 let mut session = Session::snapshot(&args.session)?;
                 if session.host_binding().is_none() {
-                    session = Session::open(&args.session)?;
+                    session = args.open_session()?;
                 }
                 let discovered = runtime
                     .discover_resources(
@@ -1453,7 +1457,7 @@ async fn run_worker(
                     } => result?,
                 }
             }
-            let session = run_session.insert(Session::open(&args.session)?);
+            let session = run_session.insert(args.open_session()?);
             session.set_auto_compaction_control(runtime.auto_compaction.clone());
             session.set_retry_control(runtime.retry.clone());
             if let Some(control) = &live_model {
@@ -1922,7 +1926,10 @@ async fn run_worker(
                 })
             };
             match run_session.as_mut().map_or_else(
-                || Session::open(&args.session).and_then(|mut session| persist(&mut session)),
+                || {
+                    args.open_session()
+                        .and_then(|mut session| persist(&mut session))
+                },
                 persist,
             ) {
                 Ok(()) => Some((live.args, adapter, reported_thinking)),
@@ -1959,7 +1966,7 @@ async fn run_worker(
         for execution in completed_shells {
             let recorded = match run_session.as_mut() {
                 Some(session) => record_shell(session, &execution, &args, &snapshot),
-                None => Session::open(&args.session).and_then(|mut session| {
+                None => args.open_session().and_then(|mut session| {
                     record_shell(&mut session, &execution, &args, &snapshot)
                 }),
             };
@@ -1975,7 +1982,8 @@ async fn run_worker(
         drop(run_session);
         if started && resume_queued && (result.is_ok() || matches!(&result, Err(Error::Cancelled)))
         {
-            continue_queue = Session::open(&args.session)
+            continue_queue = args
+                .open_session()
                 .is_ok_and(|session| !session.queued_inputs().is_empty());
         }
         if let Some(id) = prompt_response {
@@ -2068,7 +2076,8 @@ fn save_shell(
     active: &Mutex<ControlState>,
 ) {
     if let Ok(execution) = &shell.result
-        && let Err(error) = Session::open(&args.session)
+        && let Err(error) = args
+            .open_session()
             .and_then(|mut session| record_shell(&mut session, execution, args, snapshot))
     {
         shell.result = Err(error);
@@ -2120,7 +2129,7 @@ fn apply_idle_queue(
     snapshot: &Mutex<SessionSnapshot>,
     input: AgentInput,
 ) -> Result<()> {
-    let mut session = Session::open(&args.session)?;
+    let mut session = args.open_session()?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "managed session queue controls require its host".into(),
@@ -3372,9 +3381,30 @@ mod share_context_tests {
     fn initial_snapshot_releases_new_journal_lock_for_worker() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("new-session.jsonl");
-        let snapshot = open_initial_snapshot(&path, true).unwrap();
+        let mut args = <Cli as clap::Parser>::parse_from(["pi"]);
+        args.session = path.clone();
+        let snapshot = open_initial_snapshot(&args, true).unwrap();
         let worker_session = Session::open(&path).unwrap();
         assert_eq!(snapshot.records[0].id, worker_session.records()[0].id);
+    }
+
+    #[test]
+    fn program_resume_worker_cannot_recreate_its_deleted_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let mut args = <Cli as clap::Parser>::parse_from(["pi"]);
+        args.session = root.path().join("restored.jsonl");
+        args.resume_existing_session = Some(args.session.clone());
+        drop(Session::open(&args.session).unwrap());
+        std::fs::remove_file(&args.session).unwrap();
+
+        assert!(open_initial_snapshot(&args, false).is_err());
+        assert!(args.open_session().is_err());
+        assert!(!args.session.exists());
+
+        // An explicit new session can still create its own journal.
+        args.session = root.path().join("ordinary.jsonl");
+        open_initial_snapshot(&args, false).unwrap();
+        assert!(args.session.is_file());
     }
 
     #[test]

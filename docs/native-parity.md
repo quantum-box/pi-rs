@@ -6135,13 +6135,23 @@ A journal with a different saved workspace is rejected. Ordinary `--session`
 and `--resume` retain their existing workspace behavior.
 
 The command carries restrictive options such as `--no-trust`, `--no-mcp`,
-`--no-extensions`, `--offline`, and explicit tool selections. Pi skips
+`--no-extensions`, `--offline`, and explicit tool selections. It also carries
+explicit request, output-token, output-budget, and model-time limits. Pi skips
 reporting for ephemeral sessions, pending trust decisions, and invocations
 whose explicit credentials, connection options, or extension flags cannot
-be carried safely. Automatic restore currently requires Unix permissions,
-including an owner-only regular journal and directories protected against
-replacement by other users. On macOS, extended ACL grants also make a
-path ineligible.
+be carried safely. Automatic restore accepts an owner-only regular journal
+under protected directories on an allowlisted local filesystem. Linux accepts
+ext-family, XFS, Btrfs, and tmpfs. macOS accepts local APFS, HFS, and tmpfs
+with ownership enforced and without extended ACL grants. The checks reject
+unknown filesystem semantics, network filesystems, and mounts that ignore
+ownership. Workers keep the existing-only journal policy for the restored
+session, including later reopens. An explicit new session can create a journal.
+
+If a trusted workspace was unprotected when Pi reported it, or cannot be
+verified as protected at restore time, the normal project trust prompt
+requires fresh approval before loading trusted project configuration. A
+previously denied workspace remains untrusted. These safeguards are native
+restrictions on unattended restore.
 
 Session switches replace the report. Returning from suspend refreshes it
 immediately, including during package reload. A missing journal or a normal

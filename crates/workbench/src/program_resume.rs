@@ -13,6 +13,58 @@ pub(super) const TOKEN_ENV: &str = "OSC7577_TOKEN";
 const MAX_FRAME_BYTES: usize = 2048;
 const MAX_ARGV_ELEMENTS: usize = 64;
 
+#[derive(Clone, Default)]
+pub(super) struct ExplicitLimits {
+    max_requests: Option<usize>,
+    max_output_tokens: Option<u32>,
+    output_budget: Option<u32>,
+    model_timeout_secs: Option<u64>,
+}
+
+impl ExplicitLimits {
+    pub fn from_matches(matches: &clap::ArgMatches) -> Self {
+        fn explicit<T: Clone + Send + Sync + 'static>(
+            matches: &clap::ArgMatches,
+            name: &str,
+        ) -> Option<T> {
+            (matches.value_source(name) == Some(clap::parser::ValueSource::CommandLine))
+                .then(|| matches.get_one::<T>(name).cloned())
+                .flatten()
+        }
+        Self {
+            max_requests: explicit(matches, "max_requests"),
+            max_output_tokens: explicit(matches, "max_output_tokens"),
+            output_budget: explicit(matches, "output_budget"),
+            model_timeout_secs: explicit(matches, "model_timeout_secs"),
+        }
+    }
+
+    fn append_args(&self, argv: &mut Vec<String>) {
+        for (flag, value) in [
+            (
+                "max-requests",
+                self.max_requests.map(|value| value.to_string()),
+            ),
+            (
+                "max-output-tokens",
+                self.max_output_tokens.map(|value| value.to_string()),
+            ),
+            (
+                "output-budget",
+                self.output_budget.map(|value| value.to_string()),
+            ),
+            (
+                "model-timeout-secs",
+                self.model_timeout_secs.map(|value| value.to_string()),
+            ),
+        ] {
+            if let Some(value) = value {
+                argv.push(format!("--{flag}={value}"));
+            }
+        }
+    }
+}
+
 /// Validate the explicit workspace before looking at journal metadata or trust.
 pub(super) fn bind_startup(args: &mut Cli) -> Result<()> {
     if args.command.is_some()
@@ -32,10 +84,37 @@ pub(super) fn bind_startup(args: &mut Cli) -> Result<()> {
     args.workspace = canonical_workspace(&args.workspace)
         .filter(|workspace| *workspace == args.workspace)
         .ok_or_else(|| Error::Config("terminal resume requires a canonical workspace".into()))?;
-    require_journal_path(&args.session)?;
-    check_workspace(&Session::snapshot(&args.session)?, &args.workspace)?;
+    snapshot_bound_session(args)?;
+    args.resume_existing_session = Some(args.session.clone());
     args.command = Some(Command::Interactive);
     Ok(())
+}
+
+pub(super) fn bind_worker(args: &mut Cli) -> Result<()> {
+    if !matches!(args.command, Some(Command::Serve))
+        || !args.terminal_managed_worker
+        || !args.stdin_control
+    {
+        return Err(Error::Config(
+            "terminal resume worker requires a managed serve command".into(),
+        ));
+    }
+    snapshot_bound_session(args)?;
+    args.resume_existing_session = Some(args.session.clone());
+    Ok(())
+}
+
+pub(super) fn needs_fresh_approval(args: &Cli) -> bool {
+    args.resume_requires_existing()
+        && !args.terminal_resume_approved
+        && (args.terminal_resume_confirm_project || !protected_workspace(&args.workspace))
+}
+
+pub(super) fn snapshot_bound_session(args: &Cli) -> Result<Session> {
+    require_journal_path(&args.session)?;
+    let session = Session::snapshot(&args.session)?;
+    check_workspace(&session, &args.workspace)?;
+    Ok(session)
 }
 
 pub(super) fn open_bound_session(args: &Cli) -> Result<Session> {
@@ -81,8 +160,7 @@ fn canonical_workspace(path: &Path) -> Option<PathBuf> {
 fn protected_journal_path(path: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
 
-    // Resolve directory aliases before publishing a path. The journal entry
-    // itself must be a regular file, rather than an alias for another file.
+    // Publish the canonical parent and keep the final entry itself intact.
     let path = std::path::absolute(path).ok()?;
     let parent = path.parent()?.canonicalize().ok()?;
     let path = parent.join(path.file_name()?);
@@ -93,27 +171,103 @@ fn protected_journal_path(path: &Path) -> Option<PathBuf> {
         || metadata.uid() != uid
         || metadata.mode() & 0o077 != 0
         || metadata.nlink() != 1
+        || !enforces_posix_permissions(&path)
         || !has_no_granting_acl(&path)
+        || !protected_directories(&parent, uid, true)
     {
         return None;
-    }
-    for directory in parent.ancestors() {
-        let metadata = std::fs::symlink_metadata(directory).ok()?;
-        if !metadata.is_dir()
-            || (metadata.uid() != 0 && metadata.uid() != uid)
-            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
-            || !has_no_granting_acl(directory)
-        {
-            return None;
-        }
     }
     Some(path)
 }
 
+#[cfg(unix)]
+fn protected_workspace(path: &Path) -> bool {
+    // SAFETY: geteuid has no arguments or memory-safety preconditions.
+    let uid = unsafe { libc::geteuid() };
+    canonical_workspace(path).as_deref() == Some(path) && protected_directories(path, uid, false)
+}
+
+#[cfg(unix)]
+fn protected_directories(path: &Path, uid: u32, allow_sticky_leaf: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    path.ancestors().enumerate().all(|(depth, directory)| {
+        std::fs::symlink_metadata(directory).is_ok_and(|metadata| {
+            let mode = metadata.mode();
+            // A sticky ancestor protects the next owned entry. An untrusted
+            // writer could add project configuration directly in the workspace.
+            let sticky_allowed = (depth > 0 || allow_sticky_leaf) && mode & 0o1000 != 0;
+            metadata.is_dir()
+                && (metadata.uid() == 0 || metadata.uid() == uid)
+                && (mode & 0o022 == 0 || sticky_allowed)
+                && enforces_posix_permissions(directory)
+                && has_no_granting_acl(directory)
+        })
+    })
+}
+
 #[cfg(not(unix))]
 fn protected_journal_path(_: &Path) -> Option<PathBuf> {
-    // Automatic restore requires a verified owner-only file and protected ancestry.
     None
+}
+
+#[cfg(not(unix))]
+fn protected_workspace(_: &Path) -> bool {
+    false
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn enforces_posix_permissions(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the path is NUL-terminated and statfs initializes the output on success.
+    unsafe {
+        libc::statfs(path.as_ptr(), stat.as_mut_ptr()) == 0
+            && permissions_mount(&stat.assume_init())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn permissions_mount(stat: &libc::statfs) -> bool {
+    let filesystem: Vec<_> = stat.f_fstypename.iter().map(|&byte| byte as u8).collect();
+    macos_permissions_mount(stat.f_flags, &filesystem)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_permissions_mount(flags: u32, filesystem: &[u8]) -> bool {
+    // Darwin aliases MNT_UNKNOWNPERMISSIONS to MNT_IGNORE_OWNERSHIP.
+    flags & libc::MNT_LOCAL as u32 != 0
+        && flags & libc::MNT_IGNORE_OWNERSHIP as u32 == 0
+        && matches!(
+            filesystem.split(|&byte| byte == 0).next(),
+            Some(b"apfs" | b"hfs" | b"tmpfs")
+        )
+}
+
+#[cfg(target_os = "linux")]
+fn permissions_mount(stat: &libc::statfs) -> bool {
+    linux_permissions_mount(stat.f_type as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_permissions_mount(kind: u32) -> bool {
+    // Only local filesystems with known kernel-enforced owner and mode semantics.
+    [
+        libc::EXT4_SUPER_MAGIC as u32,
+        libc::XFS_SUPER_MAGIC as u32,
+        libc::BTRFS_SUPER_MAGIC as u32,
+        libc::TMPFS_MAGIC as u32,
+    ]
+    .contains(&kind)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn enforces_posix_permissions(_: &Path) -> bool {
+    false
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -255,6 +409,9 @@ fn report_body(executable: &Path, args: &Cli) -> Option<String> {
         "--workspace".into(),
         workspace.to_str()?.into(),
     ];
+    if args.trusted && !protected_workspace(&workspace) {
+        argv.push("--terminal-resume-confirm-project".into());
+    }
     for (restricted, flag) in [
         (args.no_trust || !args.trusted, "--no-trust"),
         (args.no_mcp, "--no-mcp"),
@@ -284,6 +441,7 @@ fn report_body(executable: &Path, args: &Cli) -> Option<String> {
             .iter()
             .map(|id| format!("--disable-extension={id}")),
     );
+    args.resume_limits.append_args(&mut argv);
     if let Some(seconds) = args.tool_timeout_secs {
         argv.push(format!("--tool-timeout-secs={seconds}"));
     }
@@ -368,6 +526,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let mut args = fixture_args(&root);
+        if !root.ancestors().all(enforces_posix_permissions) {
+            return;
+        }
         let executable = root.join("pi");
         let body = report_body(&executable, &args).unwrap();
         let argv = body
@@ -401,12 +562,105 @@ mod tests {
         assert!(report_body(&executable, &args).is_none());
     }
 
+    #[test]
+    fn program_resume_preserves_only_explicit_limits() {
+        let (matches, _) = super::super::cli_compat::parse(
+            [
+                "pi",
+                "--max-requests=12",
+                "--max-output-tokens",
+                "256",
+                "--output-budget=512",
+                "--model-timeout-secs=20",
+            ]
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        let mut argv = Vec::new();
+        ExplicitLimits::from_matches(&matches).append_args(&mut argv);
+        assert_eq!(
+            argv,
+            [
+                "--max-requests=12",
+                "--max-output-tokens=256",
+                "--output-budget=512",
+                "--model-timeout-secs=20"
+            ]
+        );
+
+        let (defaults, _) =
+            super::super::cli_compat::parse([std::ffi::OsString::from("pi")]).unwrap();
+        argv.clear();
+        ExplicitLimits::from_matches(&defaults).append_args(&mut argv);
+        assert!(argv.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn program_resume_rejects_unenforced_and_unknown_macos_mounts() {
+        let local = libc::MNT_LOCAL as u32;
+        let ignore_ownership = libc::MNT_IGNORE_OWNERSHIP as u32;
+        assert!(macos_permissions_mount(local, b"apfs\0"));
+        assert!(!macos_permissions_mount(
+            local | ignore_ownership,
+            b"apfs\0"
+        ));
+        assert!(!macos_permissions_mount(0, b"apfs\0"));
+        assert!(!macos_permissions_mount(local, b"msdos\0"));
+        assert!(!macos_permissions_mount(local, b"unknown\0"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn program_resume_rejects_network_overlay_and_unknown_linux_mounts() {
+        assert!(linux_permissions_mount(libc::EXT4_SUPER_MAGIC as u32));
+        assert!(!linux_permissions_mount(libc::NFS_SUPER_MAGIC as u32));
+        assert!(!linux_permissions_mount(libc::OVERLAYFS_SUPER_MAGIC as u32));
+        assert!(!linux_permissions_mount(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_resume_requires_fresh_approval_for_a_mutable_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut args = fixture_args(&root);
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        args.workspace = workspace.clone();
+        args.resume_existing_session = Some(args.session.clone());
+        args.trusted = true;
+        args.no_trust = false;
+        args.trust = true;
+
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(!protected_workspace(&workspace));
+        assert_eq!(args.project_trust().unwrap(), None);
+        if protected_journal_path(&args.session).is_some() {
+            let body = report_body(&root.join("pi"), &args).unwrap();
+            assert!(body.contains(&STANDARD.encode("--terminal-resume-confirm-project")));
+            std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(args.project_trust().unwrap(), Some(true));
+            args.terminal_resume_confirm_project = true;
+            assert_eq!(args.project_trust().unwrap(), None);
+        }
+
+        args.terminal_resume_approved = true;
+        assert_eq!(args.project_trust().unwrap(), Some(true));
+        args.no_trust = true;
+        assert_eq!(args.project_trust().unwrap(), Some(false));
+    }
+
     #[cfg(unix)]
     #[test]
     fn program_resume_rejects_a_different_workspace_and_missing_journal() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let mut args = fixture_args(&root);
+        if !root.ancestors().all(enforces_posix_permissions) {
+            return;
+        }
         let other = root.join("other workspace");
         std::fs::create_dir(&other).unwrap();
         Session::open(&args.session)
@@ -439,6 +693,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let mut args = fixture_args(&root);
+        if !root.ancestors().all(enforces_posix_permissions) {
+            return;
+        }
         let executable = root.join("pi");
         std::fs::set_permissions(&args.session, std::fs::Permissions::from_mode(0o620)).unwrap();
         assert!(report_body(&executable, &args).is_none());
@@ -466,6 +723,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let args = fixture_args(&root);
+        if !root.ancestors().all(enforces_posix_permissions) {
+            return;
+        }
         let mut reporter = Reporter {
             token: "fixture-token".into(),
             executable: root.join("pi"),
