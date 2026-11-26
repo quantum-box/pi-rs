@@ -64,6 +64,12 @@ pub struct Address {
     pub key: String,
 }
 impl Address {
+    pub(crate) fn conversation_scope_prefix(conversation: uuid::Uuid) -> Vec<u8> {
+        let mut prefix = PREFIX.to_vec();
+        prefix.extend_from_slice(format!("[\"{conversation}\",").as_bytes());
+        prefix
+    }
+
     pub(crate) fn storage_key(&self) -> Result<Vec<u8>, Error> {
         let mut result = PREFIX.to_vec();
         result.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
@@ -359,6 +365,25 @@ pub struct ConversationDocument<T> {
     pub fork: DefinedDocumentFork,
 }
 
+/// A typed task document family. Each address belongs to a specific task and
+/// retires with that task, including on cancellation or failure.
+pub struct TaskDocument<T> {
+    pub kind: String,
+    pub version: std::num::NonZeroU32,
+    pub initial: T,
+}
+
+impl<T> TaskDocument<T> {
+    /// Address to use with `Documents::watch_task_document`.
+    pub fn address(&self, task: uuid::Uuid, key: &str) -> Address {
+        Address {
+            scope: format!("pi.task/{task}"),
+            name: self.kind.clone(),
+            key: key.to_owned(),
+        }
+    }
+}
+
 /// A live typed document. Recreating a retired address creates a new identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DefinedDocumentValue<T> {
@@ -381,18 +406,35 @@ pub(crate) struct StoredDocumentDefinition {
     pub incarnation: Option<uuid::Uuid>,
 }
 
+fn defined_document_binding<T: serde::Serialize>(
+    kind: &str,
+    version: std::num::NonZeroU32,
+    initial: &T,
+) -> Result<(StoredDocumentDefinition, Map<String, Value>), Error> {
+    use sha2::{Digest, Sha256};
+    if kind.trim().is_empty() || kind.starts_with("pi.") {
+        return Err(Error::InvalidDocumentDefinition);
+    }
+    let mut initial = serde_json::to_value(initial)?;
+    initial.sort_all_objects();
+    let Value::Object(initial) = initial else {
+        return Err(Error::InvalidDocumentDefinition);
+    };
+    let initial_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&initial)?));
+    Ok((
+        StoredDocumentDefinition {
+            schema: version,
+            initial_digest,
+            incarnation: None,
+        },
+        initial,
+    ))
+}
+
 impl<T: serde::Serialize> ConversationDocument<T> {
     pub(crate) fn binding(&self) -> Result<StoredDocumentPolicy, Error> {
-        use sha2::{Digest, Sha256};
-        if self.kind.trim().is_empty() || self.kind.starts_with("pi.") {
-            return Err(Error::InvalidDocumentDefinition);
-        }
-        let mut initial = serde_json::to_value(&self.initial)?;
-        initial.sort_all_objects();
-        let Value::Object(initial) = initial else {
-            return Err(Error::InvalidDocumentDefinition);
-        };
-        let initial_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&initial)?));
+        let (definition, initial) =
+            defined_document_binding(&self.kind, self.version, &self.initial)?;
         let policy = match self.fork {
             DefinedDocumentFork::Initial => ForkPolicy::Initial { value: initial },
             DefinedDocumentFork::Current => ForkPolicy::Current,
@@ -400,11 +442,7 @@ impl<T: serde::Serialize> ConversationDocument<T> {
         };
         Ok(StoredDocumentPolicy {
             policy,
-            definition: Some(StoredDocumentDefinition {
-                schema: self.version,
-                initial_digest,
-                incarnation: None,
-            }),
+            definition: Some(definition),
         })
     }
 }
@@ -545,42 +583,14 @@ impl DocumentWatch<'_> {
         };
         for (revision, entry) in changes {
             let document = Documents::decode(entry)?;
-            let recorded = match (&address, &previous, &document) {
-                (Some(address), Some(old), Some(new)) => {
-                    match self.store.document_commit_sequence(revision)? {
-                        Some(sequence)
-                            if self.store.commit_for_version(&self.key, new.version)?
-                                == Some(sequence) =>
-                        {
-                            committed_operations(self.store, address, old, new, sequence)?
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
-            let actual = recorded.is_some();
-            let ops = if let Some(ops) = recorded {
-                ops
-            } else {
-                match (&previous, &document) {
-                    (Some(old), Some(new)) => crate::chord_ops::diff(
-                        &Value::Object(old.value.clone()),
-                        &Value::Object(new.value.clone()),
-                    ),
-                    (None, Some(new)) => {
-                        crate::chord_ops::replacement(&Value::Object(new.value.clone()))
-                    }
-                    (_, None) => Vec::new(),
-                }
-            };
-            frames.push(DocumentOperationFrame {
+            frames.push(document_operation_frame(
+                self.store,
+                &self.key,
+                address.as_ref(),
                 revision,
-                retired: document.is_none(),
-                document: document.clone(),
-                ops,
-                actual,
-            });
+                previous.as_ref(),
+                document.clone(),
+            )?);
             previous = document;
         }
         if let Some(last) = frames.last() {
@@ -607,6 +617,75 @@ impl DocumentWatch<'_> {
         }
         Ok(result)
     }
+}
+
+fn document_operation_frame(
+    store: &Store,
+    key: &[u8],
+    address: Option<&Address>,
+    revision: u64,
+    previous: Option<&Document>,
+    document: Option<Document>,
+) -> Result<DocumentOperationFrame, Error> {
+    let recorded = match (address, previous, &document) {
+        (Some(address), Some(old), Some(new)) => match store.document_commit_sequence(revision)? {
+            Some(sequence) if store.commit_for_version(key, new.version)? == Some(sequence) => {
+                committed_operations(store, address, old, new, sequence)?
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let actual = recorded.is_some();
+    let ops = recorded.unwrap_or_else(|| match (previous, &document) {
+        (Some(old), Some(new)) => crate::chord_ops::diff(
+            &Value::Object(old.value.clone()),
+            &Value::Object(new.value.clone()),
+        ),
+        (None, Some(new)) => crate::chord_ops::replacement(&Value::Object(new.value.clone())),
+        (_, None) => Vec::new(),
+    });
+    Ok(DocumentOperationFrame {
+        revision,
+        retired: document.is_none(),
+        document,
+        ops,
+        actual,
+    })
+}
+
+pub(crate) fn scoped_document_operations(
+    store: &Store,
+    conversation: uuid::Uuid,
+    revision: u64,
+    changes: Vec<durable_store::DocumentChange>,
+) -> Result<Vec<(Address, DocumentOperationFrame)>, Error> {
+    let scope = conversation.to_string();
+    let before = revision.checked_sub(1).ok_or(Error::InvalidDocument)?;
+    changes
+        .into_iter()
+        .map(|(key, entry)| {
+            let address = Address::from_storage_key(&key)?;
+            if address.scope != scope {
+                return Err(Error::InvalidDocument);
+            }
+            let previous = Documents::decode(store.document_at_bounded(
+                &key,
+                before,
+                durable_store::MAX_SCOPED_DOCUMENT_FRAME_BYTES,
+            )?)?;
+            let document = Documents::decode(entry)?;
+            let operations = document_operation_frame(
+                store,
+                &key,
+                Some(&address),
+                revision,
+                previous.as_ref(),
+                document,
+            )?;
+            Ok((address, operations))
+        })
+        .collect()
 }
 
 /// Pull watch for an explicitly acquired task document. It ends after the
@@ -2238,6 +2317,12 @@ pub(crate) enum TaskSubmissionDraft {
     },
 }
 
+#[derive(Clone)]
+struct TaskDocumentBinding {
+    definition: Option<StoredDocumentDefinition>,
+    dirty: bool,
+}
+
 /// Checked document operations at one invocation-wide immutable revision.
 /// Staged values are visible to later reads. A staged new document has version
 /// zero; existing staged documents retain their original version until commit.
@@ -2248,6 +2333,7 @@ pub struct TaskDocuments<'a> {
     reads: HashMap<Address, Option<Document>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
     acquired: HashSet<Address>,
+    definitions: HashMap<Address, TaskDocumentBinding>,
     task: crate::task::Task,
     entries: Option<PendingEntries>,
     entry_initial_len: usize,
@@ -2281,6 +2367,7 @@ pub struct DetachedTaskDocuments {
     reads: HashMap<Address, Option<Document>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
     acquired: HashSet<Address>,
+    definitions: HashMap<Address, TaskDocumentBinding>,
     entries: Option<PendingEntries>,
     entry_initial_len: usize,
     runtime_cut: Option<usize>,
@@ -2435,6 +2522,7 @@ impl DetachedTaskDocuments {
             reads,
             writes,
             acquired,
+            definitions,
             entries,
             entry_initial_len,
             runtime_cut,
@@ -2457,6 +2545,7 @@ impl DetachedTaskDocuments {
             reads,
             writes,
             acquired,
+            definitions,
             task: reservation.task.clone(),
             entries,
             entry_initial_len,
@@ -2819,6 +2908,7 @@ impl<'a> TaskDocuments<'a> {
             task: self.task,
             revision: self.revision,
             acquired: HashSet::new(),
+            definitions: HashMap::new(),
             entries: None,
             entry_initial_len: 0,
             runtime_cut: None,
@@ -2859,6 +2949,7 @@ impl<'a> TaskDocuments<'a> {
             reads,
             writes,
             acquired,
+            definitions,
             task: _,
             entries,
             entry_initial_len,
@@ -2882,6 +2973,7 @@ impl<'a> TaskDocuments<'a> {
             reads,
             writes,
             acquired,
+            definitions,
             entries,
             entry_initial_len,
             runtime_cut,
@@ -2908,6 +3000,7 @@ impl<'a> TaskDocuments<'a> {
             input_validator: None,
             task: task.clone(),
             acquired: HashSet::new(),
+            definitions: HashMap::new(),
             entries: None,
             entry_initial_len: 0,
             runtime_cut: None,
@@ -3685,6 +3778,180 @@ impl<'a> TaskDocuments<'a> {
         Ok(child.task.is_terminal())
     }
 
+    /// Read a live typed task document without creating or acquiring it.
+    pub fn defined_document<T>(
+        &mut self,
+        definition: &TaskDocument<T>,
+        key: &str,
+    ) -> Result<Option<DefinedDocumentValue<T>>, Error>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let address = definition.address(self.task.id(), key);
+        self.checked_defined_document(definition, &address)
+    }
+
+    /// Create, recreate, or edit a typed task document with the task checkpoint.
+    pub fn edit_defined_document<T, R>(
+        &mut self,
+        definition: &TaskDocument<T>,
+        key: &str,
+        edit: impl FnOnce(&mut T) -> Result<R, Error>,
+    ) -> Result<R, Error>
+    where
+        T: Clone + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let address = definition.address(self.task.id(), key);
+        let current = self.checked_defined_document(definition, &address)?;
+        let mut draft = current
+            .as_ref()
+            .map_or_else(|| definition.initial.clone(), |doc| doc.value.clone());
+        let result = edit(&mut draft)?;
+        let Value::Object(draft) = serde_json::to_value(&draft)? else {
+            return Err(Error::InvalidDocumentDefinition);
+        };
+        if current.is_none() {
+            let (mut binding, _) = defined_document_binding(
+                &definition.kind,
+                definition.version,
+                &definition.initial,
+            )?;
+            binding.incarnation = Some(uuid::Uuid::new_v4());
+            self.acquire_owned(&address)?;
+            self.stage_task_definition(&address, binding);
+        }
+        if self.get(&address)?.is_none_or(|old| old.value != draft) {
+            self.put(&address, draft)?;
+        }
+        Ok(result)
+    }
+
+    /// Retire the current incarnation. The next edit starts with the initial value.
+    pub fn retire_defined_document<T>(
+        &mut self,
+        definition: &TaskDocument<T>,
+        key: &str,
+    ) -> Result<bool, Error>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let address = definition.address(self.task.id(), key);
+        if self
+            .checked_defined_document(definition, &address)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let (binding, _) =
+            defined_document_binding(&definition.kind, definition.version, &definition.initial)?;
+        self.delete(&address)?;
+        self.stage_task_definition(&address, binding);
+        Ok(true)
+    }
+
+    /// Upgrade a bound task document in the same transaction as its value.
+    /// Migration keeps a live incarnation and leaves retired addresses absent.
+    pub fn migrate_defined_document<From, To>(
+        &mut self,
+        old: &TaskDocument<From>,
+        new: &TaskDocument<To>,
+        key: &str,
+        migrate: impl FnOnce(From) -> Result<To, Error>,
+    ) -> Result<(), Error>
+    where
+        From: serde::Serialize + serde::de::DeserializeOwned,
+        To: serde::Serialize,
+    {
+        if old.kind != new.kind || old.version >= new.version {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        let address = old.address(self.task.id(), key);
+        let current = self.checked_defined_document(old, &address)?;
+        if self.definitions[&address].definition.is_none() {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        let (mut binding, _) = defined_document_binding(&new.kind, new.version, &new.initial)?;
+        if let Some(current) = current {
+            let Value::Object(value) = serde_json::to_value(migrate(current.value)?)? else {
+                return Err(Error::InvalidDocumentDefinition);
+            };
+            self.put(&address, value)?;
+            binding.incarnation = Some(current.incarnation);
+        }
+        self.stage_task_definition(&address, binding);
+        Ok(())
+    }
+
+    fn stage_task_definition(&mut self, address: &Address, definition: StoredDocumentDefinition) {
+        self.definitions.insert(
+            address.clone(),
+            TaskDocumentBinding {
+                definition: Some(definition),
+                dirty: true,
+            },
+        );
+    }
+
+    fn checked_defined_document<T>(
+        &mut self,
+        definition: &TaskDocument<T>,
+        address: &Address,
+    ) -> Result<Option<DefinedDocumentValue<T>>, Error>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let (expected, _) =
+            defined_document_binding(&definition.kind, definition.version, &definition.initial)?;
+        if !self.definitions.contains_key(address) {
+            let binding = self
+                .store
+                .document_at(&address.policy_key()?, self.revision)?
+                .map(|entry| -> Result<_, Error> {
+                    let policy: StoredDocumentPolicy = serde_json::from_slice(&entry.value)?;
+                    if policy.policy != ForkPolicy::Copy {
+                        return Err(Error::InvalidDocumentDefinition);
+                    }
+                    policy.definition.ok_or(Error::InvalidDocumentDefinition)
+                })
+                .transpose()?;
+            self.definitions.insert(
+                address.clone(),
+                TaskDocumentBinding {
+                    definition: binding,
+                    dirty: false,
+                },
+            );
+        }
+        let document = self.get(address)?;
+        let owner = self.store.task_document_owner(&address.storage_key()?)?;
+        let Some(binding) = &self.definitions[address].definition else {
+            if document.is_some() || owner.is_some() {
+                return Err(Error::InvalidDocumentDefinition);
+            }
+            return Ok(None);
+        };
+        if !(owner == Some(self.task.id()) || (owner.is_none() && self.acquired.contains(address)))
+            || binding.schema != expected.schema
+            || binding.initial_digest != expected.initial_digest
+            || document.is_some() != binding.incarnation.is_some()
+            || binding.incarnation.is_some_and(|id| id.is_nil())
+        {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        let Some((document, incarnation)) = document.zip(binding.incarnation) else {
+            return Ok(None);
+        };
+        let value = Value::Object(document.value);
+        let typed: T = serde::Deserialize::deserialize(&value)?;
+        if serde_json::to_value(&typed)? != value {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        Ok(Some(DefinedDocumentValue {
+            incarnation,
+            value: typed,
+        }))
+    }
+
     /// Read a task-owned document, acquiring an absent address for this task.
     /// Existing owned addresses may be reacquired by the same task; an
     /// unowned existing document is never implicitly taken over.
@@ -3949,6 +4216,23 @@ impl<'a> TaskDocuments<'a> {
                         value: serde_json::to_vec(value)?,
                     },
                     None => Mutation::Delete { key },
+                });
+            }
+        }
+        for (address, binding) in self.definitions {
+            let key = address.policy_key()?;
+            batch.checks.push(Check {
+                key: key.clone(),
+                expected: Expected::DocumentUnchangedSince(self.revision),
+            });
+            if binding.dirty {
+                let policy = StoredDocumentPolicy {
+                    policy: ForkPolicy::Copy,
+                    definition: binding.definition,
+                };
+                batch.mutations.push(Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&policy)?,
                 });
             }
         }
@@ -5501,6 +5785,7 @@ mod detached_task_documents_tests {
             reads: docs.reads.clone(),
             writes: docs.writes.clone(),
             acquired: docs.acquired.clone(),
+            definitions: docs.definitions.clone(),
             task: docs.task.clone(),
             entries: docs.entries.clone(),
             entry_initial_len: docs.entry_initial_len,
