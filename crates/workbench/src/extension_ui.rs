@@ -1,4 +1,5 @@
 //! Correlated extension interactions between the worker and its frontend.
+use futures_util::FutureExt;
 use pi_rs::{
     CancellationToken, ExtensionResult, ExtensionUi, HeaderRenderContext, HeaderRenderer,
     RenderedExtensionRows, UiRequest, UiResponse, UiThemePalette, UiThemeSelection,
@@ -8,6 +9,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -126,14 +128,15 @@ impl Broker {
         Some(async move {
             let _slot = slot;
             let rows = {
-                let render = async {
+                let render = AssertUnwindSafe(async {
                     if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
                         return Ok(None);
                     }
                     renderer
                         .render_with_cancellation(&context, &cancellation)
                         .await
-                };
+                })
+                .catch_unwind();
                 tokio::pin!(render);
                 let result = tokio::select! {
                     biased;
@@ -141,17 +144,23 @@ impl Broker {
                     _ = tokio::time::sleep_until(deadline) => None,
                     rows = &mut render => Some(rows),
                 };
-                if let Some(rows) = result {
-                    rows.ok().flatten().filter(|rows| {
+                match result {
+                    Some(Ok(Ok(rows))) => rows.filter(|rows| {
                         !cancellation.is_cancelled()
                             && tokio::time::Instant::now() < deadline
                             && rows.within_header_limits()
-                    })
-                } else {
-                    cancellation.cancel();
-                    // Keep the slot until any background work has been reaped.
-                    let _ = render.await;
-                    None
+                    }),
+                    Some(Err(_)) => {
+                        cancellation.cancel();
+                        None
+                    }
+                    Some(Ok(Err(_))) => None,
+                    None => {
+                        cancellation.cancel();
+                        // Keep the slot until any background work has been reaped.
+                        let _ = render.await;
+                        None
+                    }
                 }
             };
             drop(renderer);
@@ -649,6 +658,98 @@ else:
         let (_, renderer) = header();
         ui.clear_header_renderer().await;
         assert!(renderer.upgrade().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_header_panic_completes_with_fallback_and_allows_replacement() {
+        struct PanickingRenderer {
+            entered: Option<Arc<tokio::sync::Notify>>,
+            request_token: Arc<Mutex<Option<CancellationToken>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl HeaderRenderer for PanickingRenderer {
+            async fn render(
+                &self,
+                _: &HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                panic!("in-process header renderer failed");
+            }
+
+            async fn render_with_cancellation(
+                &self,
+                context: &HeaderRenderContext,
+                cancellation: &CancellationToken,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                *self.request_token.lock().unwrap() = Some(cancellation.clone());
+                if let Some(entered) = &self.entered {
+                    entered.notify_one();
+                    cancellation.cancelled().await;
+                }
+                self.render(context).await
+            }
+        }
+
+        struct GoodRenderer;
+
+        #[async_trait::async_trait]
+        impl HeaderRenderer for GoodRenderer {
+            async fn render(
+                &self,
+                context: &HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                Ok(Some(RenderedExtensionRows {
+                    lines: vec![vec![pi_rs::UiComponentSpan {
+                        text: format!("replacement at {}", context.width),
+                        ..Default::default()
+                    }]],
+                    ..Default::default()
+                }))
+            }
+        }
+
+        let ui = Broker::new(true);
+        let context = HeaderRenderContext {
+            width: 72,
+            theme: crate::ui::theme::Theme::system().extension_render_theme(),
+        };
+        let mount = |renderer: Arc<dyn HeaderRenderer>| {
+            ui.set_header_renderer("test", Some(renderer), &CancellationToken::new())
+                .unwrap();
+            ui.header.lock().unwrap().as_ref().unwrap().id
+        };
+
+        for entered in [None, Some(Arc::new(tokio::sync::Notify::new()))] {
+            let request_token = Arc::new(Mutex::new(None));
+            let id = mount(Arc::new(PanickingRenderer {
+                entered: entered.clone(),
+                request_token: request_token.clone(),
+            }));
+            // As in the worker, a successful join lets the caller report completion.
+            let running = tokio::spawn(ui.admit_header_render(id, context.clone()).unwrap());
+            let replacement = if let Some(entered) = entered {
+                entered.notified().await;
+                Some(mount(Arc::new(GoodRenderer)))
+            } else {
+                None
+            };
+            assert!(running.await.unwrap().is_none());
+            assert!(
+                request_token
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .is_cancelled()
+            );
+            let replacement = replacement.unwrap_or_else(|| mount(Arc::new(GoodRenderer)));
+            let rows = ui
+                .admit_header_render(replacement, context.clone())
+                .unwrap()
+                .await
+                .unwrap();
+            assert_eq!(rows.lines[0][0].text, "replacement at 72");
+        }
     }
 
     #[tokio::test(start_paused = true)]
