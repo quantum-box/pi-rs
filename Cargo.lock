@@ -2906,6 +2906,7 @@ dependencies = [
  "pi-rs-tool-arguments",
  "regex",
  "ryu-js",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.10.9",

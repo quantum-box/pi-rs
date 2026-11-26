@@ -94,12 +94,15 @@ async fn file_backed_sdk_and_shared_export_protect_the_source() {
             .contains("disk transcript")
     );
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let alias = directory.path().join("alias.html");
         std::fs::hard_link(&source, &alias).unwrap();
         let error = session_html::export(&shared, &alias, Some(&source)).unwrap_err();
         assert!(error.to_string().contains("over the source session file"));
+        let error = session_html::export_agent_session(&sdk, &alias).unwrap_err();
+        assert!(error.to_string().contains("over the source session file"));
+        assert_eq!(std::fs::read(&alias).unwrap(), original);
     }
     assert_eq!(std::fs::read(&source).unwrap(), original);
 
@@ -113,4 +116,71 @@ async fn file_backed_sdk_and_shared_export_protect_the_source() {
         matches!(error, pi_rs::Error::Io(error) if error.kind() == std::io::ErrorKind::AlreadyExists)
     );
     assert_eq!(std::fs::read(&source).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sdk_export_protects_the_open_journal_after_its_old_name_is_reused() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("session.jsonl");
+    let moved = directory.path().join("moved.jsonl");
+    let mut sdk = SessionBuilder::new(Arc::new(FixtureModel), "fixture")
+        .open(&source)
+        .unwrap();
+    std::fs::rename(&source, &moved).unwrap();
+    std::fs::write(&source, "unrelated file").unwrap();
+    sdk.set_name("Moved session").unwrap();
+    let original = std::fs::read(&moved).unwrap();
+
+    let error = session_html::export_agent_session(&sdk, &moved).unwrap_err();
+    assert!(error.to_string().contains("over the source session file"));
+    assert_eq!(std::fs::read(&moved).unwrap(), original);
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "unrelated file");
+
+    let output = directory.path().join("existing.html");
+    std::fs::write(&output, "old export").unwrap();
+    session_html::export_agent_session(&sdk, &output).unwrap();
+    assert!(
+        std::fs::read_to_string(&output)
+            .unwrap()
+            .contains("Moved session")
+    );
+    assert_eq!(std::fs::read(&moved).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn export_leaves_output_untouched_if_opening_parent_for_sync_fails() {
+    use std::fs::{self, File, Permissions};
+    use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("session.jsonl");
+    let journal = Session::open(&source).unwrap();
+    let parent = directory.path().join("write-only");
+    fs::create_dir(&parent).unwrap();
+    let output = parent.join("existing.html");
+    fs::write(&output, "old export").unwrap();
+    fs::set_permissions(&parent, Permissions::from_mode(0o300)).unwrap();
+
+    // Privileged test processes can open a directory regardless of its mode.
+    let open = File::open(&parent);
+    let results = open.is_err().then(|| {
+        let new_output = parent.join("new.html");
+        let create = session_html::export(&journal, &new_output, None);
+        let replace = session_html::export(&journal, &output, Some(&source));
+        (create, replace, new_output)
+    });
+    fs::set_permissions(&parent, Permissions::from_mode(0o700)).unwrap();
+    if let Some((create, replace, new_output)) = results {
+        assert_eq!(open.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        for result in [create, replace] {
+            assert!(
+                matches!(result, Err(pi_rs::Error::Io(error)) if error.kind() == ErrorKind::PermissionDenied)
+            );
+        }
+        assert!(!new_output.exists());
+        assert_eq!(fs::read_to_string(&output).unwrap(), "old export");
+    }
 }

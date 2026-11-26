@@ -7,16 +7,27 @@ use pi_rs::{AgentSession, Error, Event, Result, Session};
 
 /// Export the selected branch of an owned SDK session to an explicit path.
 ///
-/// This uses the SDK-managed journal path to protect the source. Without a
-/// managed path, including for in-memory sessions, it creates a new file
-/// without replacing an existing one. The destination's parent must exist.
+/// Replacing a destination requires a managed journal and confirmation that
+/// the destination is distinct from the open journal file. Otherwise the
+/// export may only create a new file. The destination's parent must exist.
 /// A busy journal returns the same error as [`AgentSession::journal`].
+/// A directory sync error can be returned after successful publication.
 pub fn export_agent_session(session: &AgentSession, destination: &Path) -> Result<()> {
-    let document = {
+    let (document, replace) = {
         let journal = session.journal()?;
-        render(&journal)
+        let document = render(&journal);
+        let replace = if session.session_file().is_some() {
+            match journal.backing_file_matches(destination) {
+                Ok(Some(true)) => return Err(source_destination_error()),
+                Ok(Some(false)) => true,
+                Ok(None) | Err(_) => false,
+            }
+        } else {
+            false
+        };
+        (document, replace)
     };
-    publish(&document, destination, session.session_file())
+    publish(&document, destination, replace)
 }
 
 /// Export the selected branch of a journal to an explicit path.
@@ -25,40 +36,45 @@ pub fn export_agent_session(session: &AgentSession, destination: &Path) -> Resul
 /// With a source path, an existing destination can be replaced unless it refers
 /// to the source file. Without one, publication never replaces an existing file.
 /// The destination's parent must exist.
+/// A directory sync error can be returned after successful publication.
 pub fn export(session: &Session, destination: &Path, source: Option<&Path>) -> Result<()> {
-    publish(&render(session), destination, source)
-}
-
-fn publish(document: &str, destination: &Path, source: Option<&Path>) -> Result<()> {
     if let Some(source) = source {
         match destination.canonicalize() {
             Ok(destination) => {
                 let source = source.canonicalize()?;
                 if same_export_file(&source, &destination)? {
-                    return Err(Error::Config(
-                        "Cannot export HTML over the source session file".into(),
-                    ));
+                    return Err(source_destination_error());
                 }
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
     }
+    publish(&render(session), destination, source.is_some())
+}
+
+fn source_destination_error() -> Error {
+    Error::Config("Cannot export HTML over the source session file".into())
+}
+
+fn publish(document: &str, destination: &Path, replace: bool) -> Result<()> {
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    #[cfg(unix)]
+    let parent_dir = std::fs::File::open(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(document.as_bytes())?;
     temporary.as_file().sync_all()?;
-    let published = if source.is_some() {
+    let published = if replace {
         temporary.persist(destination)
     } else {
         temporary.persist_noclobber(destination)
     };
     published.map_err(|error| Error::Io(error.error))?;
     #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
+    parent_dir.sync_all()?;
     Ok(())
 }
 
