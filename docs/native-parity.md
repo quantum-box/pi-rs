@@ -517,13 +517,31 @@ tool turns. Loopback CLI coverage does not replace live Xiaomi acceptance.
 
 ### Ant Ling API key checkpoint
 
-The pinned Ant Ling catalog defaults to `Ling-3.1-flash` and uses
-`ANT_LING_API_KEY` at the official chat endpoint. The endpoint accepts
-`thinking.type` set to `enabled` or `disabled`. The built-in profile exposes
-`high` and `off`, and custom profiles with the legacy `ant-ling`
-`thinkingFormat` use the same toggle. Live acceptance with an Ant Ling account
-remains open. The pinned Cloudflare defaults are `@cf/zai-org/glm-5.3` for
-Workers AI and `workers-ai/@cf/zai-org/glm-5.3` for AI Gateway.
+The [bundled Ant Ling entries](../crates/workbench/assets/builtin-chat-models.json#L464)
+were generated from the five Ling 3.x models in the `bailing` provider snapshot
+of the [models.dev API](https://models.dev/api.json). The
+[Pi generator at `db79712854`](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/catalog/providers/ant-ling.ts)
+reads that provider and maps reasoning to a binary toggle. The
+[published catalog revision pinned by that commit](https://pi.dev/api/models/revisions/sha256-57ce6dc1e9af675259fcdf681bc08deedb0a5f8daf9b16d2eaf596849b864b65?types=chat,image,classifier)
+still contains `Ling-2.6-1T`, `Ling-2.6-flash`, and `Ring-2.6-1T` with the old
+`ant-ling` format. In that published snapshot only Ring reports reasoning,
+with `high` and `xhigh` levels.
+
+The [Pi startup resolver](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/model-resolver.ts)
+prefers `Ling-3.1-flash` for Ant Ling and falls back through authenticated
+models when a saved default is missing. pi-rs applies that fallback to those
+three former bundled IDs when absent from the effective catalog, without
+rewriting settings. Explicit model selections and custom model entries take
+precedence. The resolver also prefers `@cf/zai-org/glm-5.3` for Workers AI and
+`workers-ai/@cf/zai-org/glm-5.3` for AI Gateway.
+
+The official chat endpoint uses `ANT_LING_API_KEY` and accepts `thinking.type`
+set to `enabled` or `disabled`. Following
+[Pi's startup clamp](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/sdk.ts#L269-L277),
+an omitted thinking level starts at `medium` and clamps to `high` for the bundled
+models. The alternative level is `off`, and legacy custom
+`thinkingFormat: ant-ling` uses the same wire toggle. Live acceptance with an Ant
+Ling account remains open.
 
 ### OpenCode Zen and Go
 

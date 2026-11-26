@@ -97,6 +97,16 @@ pub(super) fn default_for_provider<'a>(
         .or_else(|| models.first())
 }
 
+pub(super) fn is_unconfigured_retired_ant_ling_model(
+    profiles: &super::model_profiles::Profiles,
+    provider: &Provider,
+    id: &str,
+) -> bool {
+    provider.id() == "ant-ling"
+        && matches!(id, "Ling-2.6-flash" | "Ling-2.6-1T" | "Ring-2.6-1T")
+        && profiles.model(provider, id).is_none()
+}
+
 /// Choose from known catalog entries without resolving credential commands
 /// or refreshing OAuth on startup. Native Ollama remains the local fallback.
 pub(super) async fn automatic_startup_model(args: &Cli) -> Option<ScopedChoice> {
