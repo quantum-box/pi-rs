@@ -485,13 +485,14 @@ fn terminal_project_trust_dispatch_reuses_the_sandboxed_registration() {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    for (vote, explicit, saved, fallback, trusted) in [
-        ("yes", None, false, false, true),
-        ("no", None, false, false, false),
-        ("undecided", None, false, true, false),
-        ("error", None, false, true, false),
-        ("yes", Some("--no-trust"), false, false, false),
-        ("yes", None, true, false, false),
+    for (vote, explicit, saved, fallback, trusted, malformed_native) in [
+        ("yes", None, false, false, true, false),
+        ("no", None, false, false, false, false),
+        ("undecided", None, false, true, false, false),
+        ("error", None, false, true, false, false),
+        ("yes", Some("--no-trust"), false, false, false, false),
+        ("yes", None, true, false, false, false),
+        ("yes", None, false, true, false, true),
     ] {
         let root = tempfile::tempdir().unwrap();
         let agent = root.path().join("agent");
@@ -507,6 +508,10 @@ fn terminal_project_trust_dispatch_reuses_the_sandboxed_registration() {
         std::fs::write(local.join("input"), "workspace file\n").unwrap();
         let canonical = workspace.canonicalize().unwrap();
         let trust_path = agent.join("trust.json");
+        let native_trust = agent.join("native-project-trust.json");
+        if malformed_native {
+            std::fs::write(&native_trust, b"{").unwrap();
+        }
         if saved {
             std::fs::write(
                 &trust_path,
@@ -522,7 +527,8 @@ fn terminal_project_trust_dispatch_reuses_the_sandboxed_registration() {
         if vote == "error" {
             vote_response["project_trust_error"] = json!("fixture runtime error");
         } else {
-            vote_response["project_trust"] = json!({"trusted":vote, "remember":vote == "no"});
+            vote_response["project_trust"] =
+                json!({"trusted":vote, "remember":vote == "no" || malformed_native});
         }
         let envelope = |value| json!({"version":1, "response":{"Ok":value}});
         let bytes = format!(
@@ -667,6 +673,8 @@ esac
             if fallback {
                 text.contains("Load project configuration?")
                     && (vote != "error" || text.contains("fixture runtime error"))
+                    && (!malformed_native
+                        || text.contains("Cannot remember native project trust vote:"))
             } else {
                 assert!(
                     !text.contains("Load project configuration?"),
@@ -677,6 +685,7 @@ esac
         });
         if fallback {
             assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+            assert!(!trust_path.exists());
             master.write_all(b"\x1b[B\r").unwrap();
             output_until(&mut master, |text| {
                 text.contains("Project configuration skipped")
@@ -710,9 +719,8 @@ esac
         );
         assert_eq!(agent.join("packages/index.json").exists(), trusted);
         if vote == "no" && !saved && !fallback {
-            let native_trust = agent.join("native-project-trust.json");
             let decisions: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(native_trust).unwrap()).unwrap();
+                serde_json::from_slice(&std::fs::read(&native_trust).unwrap()).unwrap();
             let decision = &decisions[canonical.to_string_lossy().as_ref()];
             assert_eq!(decision["trusted"], false);
             assert_eq!(decision["workspace"]["path"].as_str(), canonical.to_str());
@@ -723,6 +731,9 @@ esac
             assert_eq!(decisions[canonical.to_string_lossy().as_ref()], false);
         } else {
             assert!(!trust_path.exists());
+        }
+        if malformed_native {
+            assert_eq!(std::fs::read(&native_trust).unwrap(), b"{");
         }
         if trusted {
             let rpc_log = root.path().join("rpc-launches");
@@ -792,7 +803,7 @@ fn terminal_project_trust_routes_around_a_malformed_native_store() {
                     &mut slave_fd,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size,
+                    std::ptr::addr_of_mut!(size),
                 )
             },
             0

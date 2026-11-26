@@ -986,12 +986,27 @@ where
         }
         match vote {
             Ok(Some(vote)) => {
-                return if vote.remember {
-                    record_canonical_trust(agent, &workspace, vote.trusted, true, identity, &check)
-                        .map(Some)
-                } else {
+                if !vote.remember {
                     check()?;
-                    Ok(Some(vote.trusted))
+                    return Ok(Some(vote.trusted));
+                }
+                return match record_canonical_trust(
+                    agent,
+                    &workspace,
+                    vote.trusted,
+                    true,
+                    identity,
+                    &check,
+                ) {
+                    Ok(decision) => Ok(Some(decision)),
+                    Err(TrustWriteError::MalformedNativeStore(error)) => {
+                        check()?;
+                        warn(format!(
+                            "Cannot remember native project trust vote: {error}"
+                        ));
+                        Ok(None)
+                    }
+                    Err(TrustWriteError::Other(error)) => Err(error),
                 };
             }
             Ok(None) => {}
@@ -1120,11 +1135,34 @@ pub(super) fn save_trust_guarded(
         &check,
     )
     .map(drop)
+    .map_err(Error::from)
 }
 
 #[cfg(test)]
 fn save_canonical_trust(agent: &Path, workspace: &Path, decision: bool) -> Result<()> {
-    record_canonical_trust(agent, workspace, decision, false, None, &|| Ok(())).map(drop)
+    record_canonical_trust(agent, workspace, decision, false, None, &|| Ok(()))
+        .map(drop)
+        .map_err(Error::from)
+}
+
+#[derive(Debug)]
+enum TrustWriteError {
+    MalformedNativeStore(Error),
+    Other(Error),
+}
+
+impl From<Error> for TrustWriteError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<TrustWriteError> for Error {
+    fn from(error: TrustWriteError) -> Self {
+        match error {
+            TrustWriteError::MalformedNativeStore(error) | TrustWriteError::Other(error) => error,
+        }
+    }
 }
 
 fn record_canonical_trust(
@@ -1134,16 +1172,17 @@ fn record_canonical_trust(
     preserve_saved: bool,
     identity: Option<&super::project_trust::WorkspaceIdentity>,
     check: &impl Fn() -> Result<()>,
-) -> Result<bool> {
+) -> std::result::Result<bool, TrustWriteError> {
     check()?;
     let path = agent.join("trust.json");
-    std::fs::create_dir_all(agent)?;
+    std::fs::create_dir_all(agent).map_err(Error::from)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path.with_extension("lock"))?;
+        .open(path.with_extension("lock"))
+        .map_err(Error::from)?;
     loop {
         check()?;
         match lock.try_lock() {
@@ -1151,7 +1190,7 @@ fn record_canonical_trust(
             Err(std::fs::TryLockError::WouldBlock) => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(Error::from(error).into()),
         }
     }
     check()?;
@@ -1173,7 +1212,10 @@ fn record_canonical_trust(
         return Ok(saved);
     }
     // The read fallback must never turn a malformed store into a writable one.
-    let mut native_votes = native_votes?;
+    let mut native_votes = native_votes.map_err(|error| match error {
+        Error::Config(_) if identity.is_some() => TrustWriteError::MalformedNativeStore(error),
+        error => TrustWriteError::Other(error),
+    })?;
     let key = workspace.to_string_lossy().into_owned();
     if let Some(identity) = identity {
         identity.verify(workspace)?;
@@ -1182,7 +1224,8 @@ fn record_canonical_trust(
             serde_json::to_value(SavedVote {
                 trusted: decision,
                 workspace: identity.clone(),
-            })?,
+            })
+            .map_err(Error::from)?,
         );
         write_json_guarded(&native_path, &native_votes, check)?;
     } else {
@@ -1962,7 +2005,7 @@ mod tests {
                     Some(&identity),
                     &|| Ok(()),
                 ),
-                Err(super::Error::Config(_))
+                Err(super::TrustWriteError::MalformedNativeStore(_))
             ));
         }
         assert!(!legacy_path.exists());
@@ -2031,6 +2074,40 @@ mod tests {
                 .unwrap(),
             Some(false)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_trust_preflight_propagates_native_write_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let agent = agent.canonicalize().unwrap();
+        let identity = crate::project_trust::WorkspaceIdentity::capture(&workspace).unwrap();
+        let native_path = agent.join(super::NATIVE_TRUST_FILE);
+        std::fs::write(&native_path, b"{}").unwrap();
+        super::fail_json_write_for_test(&native_path, false, "rename");
+
+        let result = super::resolve_project_trust_guarded(
+            &workspace,
+            None,
+            &agent,
+            Some(&identity),
+            |_| {
+                [Ok(Some(super::ProjectTrustVote {
+                    trusted: true,
+                    remember: true,
+                }))]
+            },
+            |_| panic!("a native write I/O failure must propagate"),
+            || Ok(()),
+        );
+        assert!(matches!(result, Err(super::Error::Io(error))
+            if error.to_string() == "injected JSON write failure"));
+        assert_eq!(std::fs::read(&native_path).unwrap(), b"{}");
+        assert!(!agent.join("trust.json").exists());
     }
 
     #[test]

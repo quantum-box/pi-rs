@@ -1243,15 +1243,17 @@ Cargo preparation and uncached remote installs wait for project trust, since
 their dependency graphs and ambient configuration are outside that path check.
 Explicit CLI extension and package requests retain their separate authorization.
 
-An error or an undecided vote falls through to the next voter. If all abstain
+Voter errors and undecided votes fall through to the next voter. If all abstain
 or fail, the existing trust selector appears. The first yes or no wins, and
 only a decisive vote with `remember: true` is saved. Native remembered votes
 are stored with the directory identity in `native-project-trust.json`. The
 shared `trust.json` keeps its path-based boolean format and takes precedence on
 an identical path. A malformed native vote file contributes no votes. Legacy
 ancestor decisions and the normal host default or selector still apply. A
-malformed legacy file remains an error. Remembering a new native vote requires
-a valid native store, while manual choices are saved separately in `trust.json`.
+malformed legacy file remains an error. If an admitted extension asks to
+remember its vote and the native store is malformed, the host reports the
+problem and shows the manual selector without applying the vote. Manual choices
+are saved separately in `trust.json`.
 A stale native vote is ignored after directory replacement. A host decision
 recorded during preflight takes precedence. The terminal uses the canonical
 workspace and carries its identity into settings, package and resource
