@@ -84,6 +84,7 @@ unicode-width = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "process", "signal", "sync", "time", "fs", "io-util", "io-std", "net"] }
 uuid = { version = "1", features = ["serde"] }
 filetime = "0.2.29"
+zip = { version = "9.8.2", default-features = false }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["socks"] }

@@ -871,10 +871,39 @@ pub(crate) fn durable_progress_key(task: uuid::Uuid, attempt: uuid::Uuid) -> Vec
 
 pub(crate) use replay_safe::live_checkpointable_progress;
 
+/// Start one foreground conversation owned by the current checkpointable task.
+pub struct ForegroundSubagentRequest {
+    /// Stable key within the owning task.
+    pub key: String,
+    pub config: crate::runtime::Config,
+    pub prompt: String,
+    /// The starting session's exact tool allowlist.
+    pub allowed_tools: Vec<String>,
+}
+
 /// Task-owned nested admission and result access. Implementations must fence
 /// every operation against the current parent reservation and abort state.
 #[async_trait::async_trait]
 pub trait DurableTaskHost: Send + Sync {
+    /// Atomically admit and wake a task-owned foreground conversation. A
+    /// replay-safe conversation tool can reattach using the same request key.
+    async fn start_foreground_subagent(
+        &self,
+        _request: ForegroundSubagentRequest,
+    ) -> Result<crate::owned_subagent::Admission, String> {
+        Err("foreground subagent admission is unavailable".into())
+    }
+
+    /// Wait for the owned submission's settled answer. A timeout leaves the
+    /// child attached to the current task; parent abort still drains it.
+    async fn wait_foreground_subagent(
+        &self,
+        _child: &crate::owned_subagent::Admission,
+        _timeout: std::time::Duration,
+    ) -> Result<Option<crate::runtime::Status>, String> {
+        Err("foreground subagent waits are unavailable".into())
+    }
+
     /// Child tools registered for this invocation.
     fn child_tools(&self) -> Vec<ToolSpec> {
         Vec::new()

@@ -523,8 +523,32 @@ and the checks. A second connection attempted an unrelated write every 2 ms.
 | 4,096 | 40 / 40 | 35.06 ms | 45.30 ms |
 | 8,192 | 0 / 40 (scan budget) | 19.70 ms | 25.86 ms |
 
-These measurements cover the SQLite transaction on a synthetic workload.
-Keep both features opt-in. Before changing that default, verify the migration
-and rollback on representative stores and agree on a write-latency and
-reconciliation budget. Production workloads with large scopes also need a
-plan for scans that exceed the limit.
+Keep both features opt-in. The scan limit already prevents every check in the
+8,192-root synthetic case, and the v4 writer fence requires a backup to return
+to a standard build. Promotion requires a representative store with no
+scan-budget failures within the supported workload, an agreed write-latency
+and reconciliation budget, and a successful restore drill.
+
+### Migration and restore drill
+
+1. Stop the scheduler and let all workers release the database. On Unix, run
+   the migration only once the selected binary can acquire the owner lock.
+2. Create a consistent SQLite backup at a new path with the SQLite backup API
+   or `VACUUM INTO`. Check the copy with `PRAGMA integrity_check`. Keep the
+   backup and the pre-migration binary together.
+3. Open a separate copy with both experimental features enabled. Verify it
+   reopens, retains task and document records, and accepts new work. Confirm
+   that the tested old writer cannot change this migrated copy.
+4. Restore the pre-migration backup to another path and open it with the old
+   binary. Confirm that it contains the backup cut and excludes post-cut
+   writes. Preserve the migrated copy and its SQLite sidecars while checking
+   whether those later writes need reconciliation. Switch to the restored
+   path only after that decision.
+
+The SQLite regression drill populates a v3 WAL database with 64 independent
+groups, each containing a conversation record, a parent and child task, and a
+document. It creates a consistent backup, migrates to v4, writes new data,
+and checks that the old writer is fenced. The restored v3 copy contains all
+256 original rows and can write again. The fixture models graph shape and
+backup ordering. Production-scale migration and recovery timing still need
+measurements on a representative copy.

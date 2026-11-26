@@ -7,6 +7,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 pub(super) const REFRESH_BARRIER_ENV: &str = "PI_RS_WORKER_REFRESH_BARRIER";
 pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
@@ -174,6 +175,7 @@ pub(super) struct Worker {
     pending_events: Vec<Value>,
     pub(super) header_renderer: Option<uuid::Uuid>,
     pub(super) pending_header_render: Option<uuid::Uuid>,
+    pub(super) pending_theme_requests: std::collections::BTreeSet<Uuid>,
     extension_sources: std::collections::BTreeMap<String, Value>,
     pub(super) message_renderer_types: std::collections::BTreeSet<String>,
     pub(super) entry_renderer_types: std::collections::BTreeSet<String>,
@@ -468,6 +470,7 @@ impl Worker {
             pending_events: startup_warnings,
             header_renderer: None,
             pending_header_render: None,
+            pending_theme_requests: Default::default(),
             extension_sources: Default::default(),
             message_renderer_types: Default::default(),
             markdown_transformers: false,
@@ -758,36 +761,54 @@ impl Worker {
         }
         Ok(())
     }
-    pub(super) fn notify_selection(
-        slot: &mut Option<Self>,
-        args: &Cli,
-        event: &pi_rs::LifecycleEvent,
-    ) -> Result<()> {
-        Self::notify_selection_cancellable(None, slot, args, event)
-    }
-
     pub(super) fn notify_selection_cancellable(
         cancelled: Option<&std::sync::atomic::AtomicBool>,
         slot: &mut Option<Self>,
         args: &Cli,
         event: &pi_rs::LifecycleEvent,
     ) -> Result<()> {
+        if let Some((active, id)) = Self::begin_selection(slot, args, event)? {
+            active.wait_selection(id, cancelled, |_, _| Ok(false))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn begin_selection<'a>(
+        slot: &'a mut Option<Self>,
+        args: &Cli,
+        event: &pi_rs::LifecycleEvent,
+    ) -> Result<Option<(&'a mut Self, Uuid)>> {
         let Some(active) = Self::extension_worker(slot, args)? else {
-            return Ok(());
+            return Ok(None);
         };
         if active.session != args.session {
-            return Ok(());
+            return Ok(None);
         }
-        let id = json!(uuid::Uuid::new_v4());
+        let id = Uuid::new_v4();
         active.send(
             json!({"type":"selection_changed", "id":id, "session":args.session, "event":event}),
         )?;
+        Ok(Some((active, id)))
+    }
+
+    pub(super) fn wait_selection(
+        &mut self,
+        id: Uuid,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        mut handle: impl FnMut(&mut Self, &Value) -> Result<bool>,
+    ) -> Result<()> {
+        let id = json!(id);
         let deadline = Instant::now() + Duration::from_secs(15);
+        for event in std::mem::take(&mut self.pending_events) {
+            if !handle(self, &event)? {
+                self.pending_events.push(event);
+            }
+        }
         loop {
             if TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
                 || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
             {
-                active.interrupt_shutdown();
+                self.interrupt_shutdown();
                 return Err(Error::Cancelled);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -801,7 +822,7 @@ impl Worker {
             } else {
                 remaining
             };
-            let received = match active.events.recv_timeout(wait) {
+            let received = match self.events.recv_timeout(wait) {
                 Ok(value) => value,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(error) => {
@@ -813,7 +834,9 @@ impl Worker {
             if received["type"] == "selection_notified" && received["id"] == id {
                 return Ok(());
             }
-            active.pending_events.push(received);
+            if !handle(self, &received)? {
+                self.pending_events.push(received);
+            }
         }
     }
     pub(super) fn transition(
@@ -1099,6 +1122,7 @@ mod tests {
             pending_events: Vec::new(),
             header_renderer: None,
             pending_header_render: None,
+            pending_theme_requests: Default::default(),
             extension_sources: Default::default(),
             message_renderer_types: Default::default(),
             markdown_transformers: false,

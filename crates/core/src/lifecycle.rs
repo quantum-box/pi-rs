@@ -454,7 +454,15 @@ impl ToolHost for LifecycleUiHost {
             }
             _ => {}
         }
-        if request.needs_response() && !matches!(request, crate::UiRequest::GetAllThemes) {
+        if request.needs_response()
+            && !matches!(
+                request,
+                crate::UiRequest::GetAllThemes
+                    | crate::UiRequest::GetTheme { .. }
+                    | crate::UiRequest::GetActiveTheme
+                    | crate::UiRequest::SetTheme { .. }
+            )
+        {
             return Err("lifecycle presentation does not support prompts".into());
         }
         tokio::select! {
