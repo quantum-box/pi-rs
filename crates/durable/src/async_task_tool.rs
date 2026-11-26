@@ -1036,6 +1036,7 @@ enum ToolHostRequest {
         tokio::sync::oneshot::Sender<pi_rs_core::ExtensionResult<()>>,
     ),
     Call {
+        index: usize,
         name: String,
         arguments: serde_json::Value,
         cancellation: pi_rs_core::CancellationToken,
@@ -1048,6 +1049,7 @@ enum ToolHostRequest {
 struct CheckpointableToolHost {
     requests: tokio::sync::mpsc::Sender<ToolHostRequest>,
     tools: Vec<ToolSpec>,
+    next_call: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -1102,9 +1104,20 @@ impl pi_rs_core::ToolHost for CheckpointableToolHost {
         if !self.tools.iter().any(|tool| tool.name == name) {
             return Outcome::Skipped("nested tool is not registered for this invocation".into());
         }
+        // A call consumes its replay position even if it is cancelled before
+        // it reaches the channel. Later calls must reconnect to the same keys.
+        let Ok(index) =
+            self.next_call
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |index| {
+                    index.checked_add(1)
+                })
+        else {
+            return Outcome::Failed("nested tool call sequence exhausted".into());
+        };
         let (reply, result) = tokio::sync::oneshot::channel();
         let dispatch_claim = Arc::new(AtomicBool::new(false));
         let request = ToolHostRequest::Call {
+            index,
             name: name.into(),
             arguments,
             cancellation: cancellation.clone(),
@@ -1177,11 +1190,14 @@ impl DurableAsyncTool for CheckpointableTool {
             arguments,
             context,
             None,
-            Arc::new(CheckpointableToolHost { requests, tools }),
+            Arc::new(CheckpointableToolHost {
+                requests,
+                tools,
+                next_call: std::sync::atomic::AtomicUsize::new(0),
+            }),
         );
         tokio::pin!(invocation);
         let mut calls = FuturesUnordered::new();
-        let mut call_index = 0usize;
         let mut requests_open = true;
         let outcome = loop {
             tokio::select! {
@@ -1192,15 +1208,12 @@ impl DurableAsyncTool for CheckpointableTool {
                     Some(ToolHostRequest::Progress(partial, reply)) => {
                         let _ = reply.send(host.report_progress(partial).await);
                     }
-                    Some(ToolHostRequest::Call { name, arguments, cancellation, dispatch_claim, reply }) => {
+                    Some(ToolHostRequest::Call { index, name, arguments, cancellation, dispatch_claim, reply }) => {
                         let Some(timeout) = self.child_timeout else {
                             let _ = reply.send(Outcome::Skipped("nested tool calls are unavailable".into()));
                             continue;
                         };
-                        let key = format!("ordinary-tool-call-{call_index}");
-                        call_index += 1;
-                        // Admit in receive order so the implicit key matches the
-                        // ordinary caller's sequence on replay.
+                        let key = format!("ordinary-tool-call-{index}");
                         if reply.is_closed() || cancellation.is_cancelled()
                             || dispatch_claim.swap(true, std::sync::atomic::Ordering::AcqRel) {
                             let _ = reply.send(Outcome::Skipped("cancelled before nested dispatch".into()));
@@ -2713,6 +2726,7 @@ mod tests {
                 description: String::new(),
                 parameters: json!({}),
             }],
+            next_call: AtomicUsize::new(0),
         };
         let (progress_reply, _ack) = tokio::sync::oneshot::channel();
         assert!(
@@ -2738,12 +2752,22 @@ mod tests {
         ));
         assert!(incoming.try_recv().is_err());
 
-        for admitted in [false, true] {
+        let already_cancelled = pi_rs_core::CancellationToken::new();
+        already_cancelled.cancel();
+        assert!(matches!(
+            host.call_with_cancellation("child", json!({}), already_cancelled)
+                .await,
+            Outcome::Skipped(_)
+        ));
+        assert!(incoming.try_recv().is_err());
+
+        for (index, admitted) in [(2, false), (3, true)] {
             let token = pi_rs_core::CancellationToken::new();
             let pending = host.call_with_cancellation("child", json!({}), token.clone());
             tokio::pin!(pending);
             assert!(matches!(futures_util::poll!(&mut pending), Poll::Pending));
             let Ok(ToolHostRequest::Call {
+                index: assigned,
                 dispatch_claim,
                 reply,
                 ..
@@ -2751,6 +2775,7 @@ mod tests {
             else {
                 panic!("nested call was not enqueued");
             };
+            assert_eq!(assigned, index);
             if admitted {
                 assert!(!dispatch_claim.swap(true, Ordering::AcqRel));
             }
