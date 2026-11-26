@@ -96,6 +96,17 @@ impl ReasoningLevel {
             ))),
         }
     }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
     fn budget(self) -> u32 {
         match self {
             Self::Off => 0,
@@ -240,6 +251,14 @@ pub(crate) fn cache_point(
     Ok(Some(point.build().map_err(|e| {
         Error::Config(format!("invalid Bedrock cache point: {e}"))
     })?))
+}
+
+pub(crate) fn is_claude(model: &str, name: Option<&str>) -> bool {
+    has_any(&candidates(model, name), &["claude"])
+}
+
+pub(crate) fn uses_flat_mapped_effort(model: &str, name: Option<&str>) -> bool {
+    !has_any(&candidates(model, name), &["claude", "gpt-"])
 }
 
 pub(crate) fn reasoning_fields(

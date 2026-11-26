@@ -3364,7 +3364,10 @@ impl Agent<'_> {
         transformed: bool,
         configuration: Option<&str>,
     ) -> u64 {
-        let Some(anchor) = estimate.last_usage_record.filter(|_| !transformed) else {
+        let Some(anchor) = estimate
+            .last_usage_record
+            .filter(|_| !transformed && self.model.can_reuse_measured_context(request))
+        else {
             return self.model.estimate_request_tokens(request);
         };
         let branch = session.branch();
@@ -8329,6 +8332,77 @@ fn request_configuration_hash(model: &dyn Model, request: &ModelRequest) -> Opti
 #[cfg(test)]
 mod retention_estimate_tests {
     use super::*;
+
+    #[test]
+    fn omitted_replay_bypasses_matching_measured_context() {
+        struct MeasuredModel(bool);
+
+        #[async_trait::async_trait]
+        impl Model for MeasuredModel {
+            fn can_reuse_measured_context(&self, _: &ModelRequest) -> bool {
+                self.0
+            }
+
+            async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+                unreachable!()
+            }
+        }
+
+        let (mut session, _) = session_with_reasoning("earlier reasoning");
+        let request_id = Uuid::new_v4();
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 2,
+                tools: 0,
+                max_output_tokens: 9000,
+                request_id: Some(request_id),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: Some(false),
+                context_configuration_sha256: Some("same configuration".into()),
+                tool_decision: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "visible".into(),
+                invocations: vec![],
+                request_id: Some(request_id),
+                usage: Some(Usage {
+                    input_tokens: 1000,
+                    output_tokens: 8000,
+                }),
+            })
+            .unwrap();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: session.current_messages(),
+            tools: vec![],
+            max_output_tokens: 1024,
+        };
+        let registry = Registry::default();
+        for reuse in [true, false] {
+            let model = MeasuredModel(reuse);
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            let actual = agent.request_budget_tokens(
+                &session,
+                &request,
+                session.context_budget_estimate(),
+                false,
+                Some("same configuration"),
+            );
+            let projected = model.estimate_request_tokens(&request);
+            assert!(projected < 9000);
+            assert_eq!(actual, if reuse { 9000 } else { projected });
+        }
+    }
 
     fn session_with_reasoning(reasoning: &str) -> (Session, u64) {
         let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();

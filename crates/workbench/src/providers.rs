@@ -950,7 +950,10 @@ impl Client {
             Self::Google(client) => (self.clone(), client.context_headers()),
             Self::OpenAi(client) => (self.clone(), client.context_headers()),
             Self::PiMessages(client) => (self.clone(), client.context_headers()),
-            Self::Bedrock(_) => (self.clone(), HeaderMap::new()),
+            Self::Bedrock(client) => (
+                Self::Bedrock(client.clone().bind_reasoning_model(model)),
+                HeaderMap::new(),
+            ),
         };
         client = match client {
             Self::PiMessages(client) => Self::PiMessages(client.prepare_context(model).await?),
@@ -1910,24 +1913,13 @@ impl Client {
             }
             Self::Bedrock(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
-                let thinking = thinking.or_else(|| {
-                    metadata
-                        .as_ref()
-                        .filter(|model| {
-                            model.reasoning == Some(true)
-                                && !pi_rs::bedrock::requires_thinking(
-                                    &args.model,
-                                    model.name.as_deref(),
-                                )
-                        })
-                        .map(|_| "off")
-                });
-                let mapped = thinking.and_then(|level| {
-                    metadata
-                        .as_ref()
-                        .and_then(|model| model.mapped_effort(level))
-                });
-                let level = if mapped == Some(None) { None } else { thinking };
+                let requested = args
+                    .thinking
+                    .as_deref()
+                    .map(pi_rs::bedrock::ReasoningLevel::parse)
+                    .transpose()?;
+                let profiles = args.model_profiles.clone();
+                let provider = args.provider.clone();
                 let long_cache_override = args
                     .model_profiles
                     .bedrock_long_cache_override(&args.provider, metadata.as_ref());
@@ -1938,17 +1930,48 @@ impl Client {
                     )
                     .with_cache_retention(cache_retention(true))
                     .with_long_cache_support(long_cache_override)
-                    .with_reasoning_replay_support(
-                        args.model_profiles
-                            .bedrock_reasoning_replay_override(&args.provider, metadata.as_ref()),
-                    )
+                    .with_reasoning_resolver(move |model| {
+                        let metadata = profiles.model(&provider, model);
+                        let reasoning_metadata = metadata
+                            .as_ref()
+                            .filter(|metadata| metadata.reasoning != Some(false));
+                        let level = if metadata.is_some() && reasoning_metadata.is_none() {
+                            None
+                        } else {
+                            requested.or_else(|| {
+                                reasoning_metadata
+                                    .filter(|metadata| {
+                                        metadata.reasoning == Some(true)
+                                            && !pi_rs::bedrock::requires_thinking(
+                                                model,
+                                                metadata.name.as_deref(),
+                                            )
+                                    })
+                                    .map(|_| pi_rs::bedrock::ReasoningLevel::Off)
+                            })
+                        };
+                        let mapped = reasoning_metadata.and_then(|metadata| {
+                            level.and_then(|level| metadata.mapped_effort(level.as_str()))
+                        });
+                        pi_rs::bedrock::ModelReasoning {
+                            model_name: metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.name.clone()),
+                            level: if mapped == Some(None) { None } else { level },
+                            mapped_effort: mapped.flatten().map(str::to_owned),
+                            off_effort: reasoning_metadata
+                                .and_then(|metadata| metadata.mapped_effort("off").flatten())
+                                .map(str::to_owned),
+                            supports_replay: profiles
+                                .bedrock_reasoning_replay_override(&provider, metadata.as_ref()),
+                        }
+                    })
                     .with_strict_tool_support(
                         args.model_profiles
                             .chat_compatibility(&args.provider, metadata.as_ref())
                             .supports_strict_mode()
                             .unwrap_or(false),
-                    )
-                    .with_reasoning(level, mapped.flatten())?;
+                    );
                 if let Some(budgets) = args.settings.value().get("thinkingBudgets") {
                     client = client.with_thinking_budget_settings(budgets.clone());
                 }
@@ -2147,6 +2170,16 @@ impl Model for Client {
             Self::OpenAi(c) => c.context_identity(),
             Self::Bedrock(c) => c.context_identity(),
             Self::Deferred(client) => client.context_identity(),
+        }
+    }
+
+    fn can_reuse_measured_context(&self, request: &ModelRequest) -> bool {
+        match self {
+            Self::Bedrock(client) => client.can_reuse_measured_context(request),
+            Self::Deferred(client) => client
+                .estimation_client()
+                .is_none_or(|client| client.can_reuse_measured_context(request)),
+            _ => true,
         }
     }
 
@@ -6391,6 +6424,48 @@ mod bedrock_tests {
                         .unwrap();
                 }
             }
+            let kimi = "global.moonshotai.kimi-k3.1";
+            let glm = "global.zai.glm-5.3";
+            for (selected, final_model, thinking, summary) in [
+                (kimi, glm, "off", false),
+                (glm, kimi, "off", false),
+                (kimi, kimi, "xhigh", true),
+                ("amazon.nova-lite-v1:0", glm, "high", false),
+            ] {
+                args.model = selected.into();
+                args.thinking = Some(thinking.into());
+                let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let (client, _) = client
+                    .prepare_for_context(final_model)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut req = request(final_model);
+                req.messages.push(pi_rs::Message::Assistant {
+                    content: "visible".into(),
+                    calls: Vec::new(),
+                    replay: Some(Box::new(pi_rs::ProviderReplay {
+                        identity: pi_rs::ResolvedModelIdentity {
+                            provider: "amazon-bedrock".into(),
+                            model: final_model.into(),
+                        },
+                        blocks: vec![
+                            json!({"type":"reasoning","text":"earlier reasoning"}),
+                            json!({"type":"text","text":"visible"}),
+                        ],
+                    })),
+                });
+                req.messages.push(pi_rs::Message::User {
+                    content: "follow up".into(),
+                });
+                assert_eq!(client.can_reuse_measured_context(&req), final_model == glm);
+                let _stream = client
+                    .stream_with_headers(req, &HeaderMap::new(), summary, None)
+                    .await
+                    .unwrap();
+            }
             let workspace = tempfile::tempdir().unwrap();
             std::fs::create_dir(workspace.path().join(".pi")).unwrap();
             std::fs::write(
@@ -6452,7 +6527,7 @@ mod bedrock_tests {
             .unwrap();
         let server = async {
             let mut requests = Vec::new();
-            for _ in 0..19 {
+            for _ in 0..23 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut buf = [0; 8192];
@@ -6573,8 +6648,27 @@ mod bedrock_tests {
             );
             assert_eq!(requests[summary]["inferenceConfig"]["maxTokens"], 512);
         }
+        for (request, effort, replay) in [
+            (&requests[18], None, true),
+            (&requests[19], Some("none"), false),
+            (&requests[20], Some("none"), false),
+            (&requests[21], Some("high"), true),
+        ] {
+            assert_eq!(
+                request["additionalModelRequestFields"]["reasoning_effort"].as_str(),
+                effort
+            );
+            let blocks = request["messages"][1]["content"].as_array().unwrap();
+            assert!(blocks.iter().any(|block| block["text"] == "visible"));
+            assert_eq!(
+                blocks
+                    .iter()
+                    .any(|block| block.get("reasoningContent").is_some()),
+                replay
+            );
+        }
         assert_eq!(
-            requests[18]["additionalModelRequestFields"]["thinking"]["budget_tokens"],
+            requests[22]["additionalModelRequestFields"]["thinking"]["budget_tokens"],
             3456
         );
     }

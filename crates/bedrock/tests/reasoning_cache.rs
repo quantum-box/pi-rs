@@ -657,21 +657,50 @@ async fn mapped_bedrock_effort_and_reasoning_replay_follow_the_selected_model() 
         let mut request = request(model, 1024);
         request.messages.push(Message::Assistant {
             content: "visible answer".into(),
-            calls: vec![],
+            calls: vec![pi_rs_core::ToolCall {
+                id: "call.with/slash".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            }],
             replay: Some(Box::new(ProviderReplay {
                 identity: ResolvedModelIdentity {
                     provider: "amazon-bedrock".into(),
                     model: model.into(),
                 },
                 blocks: vec![
-                    json!({"type":"reasoning","text":"prior reasoning"}),
+                    json!({"type":"reasoning","text":"prior reasoning ".repeat(200)}),
                     json!({"type":"text","text":"visible answer"}),
+                    json!({"type":"tool_use","id":"call.with/slash","name":"lookup","input":{}}),
                 ],
             })),
+        });
+        request.messages.push(Message::Tool {
+            call_id: "call.with/slash".into(),
+            content: "tool result".into(),
+            is_error: false,
+            is_structured: Some(false),
         });
         request.messages.push(Message::User {
             content: "follow-up".into(),
         });
+        let estimator = Bedrock::from_env().with_reasoning_replay_support(override_replay);
+        let mut without_reasoning = request.clone();
+        let Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = &mut without_reasoning.messages[2]
+        else {
+            unreachable!()
+        };
+        replay.blocks.remove(0);
+        let estimate = estimator.estimate_request_tokens(&request);
+        let visible_estimate = estimator.estimate_request_tokens(&without_reasoning);
+        if expect_replay {
+            assert!(estimate > visible_estimate, "{model}");
+        } else {
+            assert_eq!(estimate, visible_estimate, "{model}");
+            assert!(!estimator.can_reuse_measured_context(&request), "{model}");
+        }
         let (body, _) = capture(
             "us-east-1",
             |client| {
@@ -691,6 +720,14 @@ async fn mapped_bedrock_effort_and_reasoning_replay_follow_the_selected_model() 
         );
         let blocks = body["messages"][1]["content"].as_array().unwrap();
         assert!(blocks.iter().any(|block| block["text"] == "visible answer"));
+        let tool_id = blocks
+            .iter()
+            .find_map(|block| block["toolUse"]["toolUseId"].as_str())
+            .unwrap();
+        assert_eq!(
+            body["messages"][2]["content"][0]["toolResult"]["toolUseId"],
+            tool_id
+        );
         assert_eq!(
             blocks
                 .iter()

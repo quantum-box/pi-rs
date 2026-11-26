@@ -22,7 +22,9 @@ use pi_rs_core::{
     ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Select how ConverseStream uses the tools in a request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +38,25 @@ pub enum ToolChoice {
     /// Require the named tool, for models that support named selection.
     Tool { name: String },
 }
+
+/// Reasoning options resolved from the catalog for one Bedrock model.
+#[derive(Clone, Debug, Default)]
+pub struct ModelReasoning {
+    pub model_name: Option<String>,
+    pub level: Option<ReasoningLevel>,
+    pub mapped_effort: Option<String>,
+    pub off_effort: Option<String>,
+    pub supports_replay: Option<bool>,
+}
+
+impl ModelReasoning {
+    fn replay_enabled(&self, model: &str) -> bool {
+        self.supports_replay
+            .unwrap_or_else(|| !model.contains("moonshotai.kimi-k3"))
+    }
+}
+
+type ReasoningResolver = dyn Fn(&str) -> ModelReasoning + Send + Sync;
 
 /// A client configured with the AWS SDK's region and refreshing credential provider chain.
 #[derive(Clone)]
@@ -54,9 +75,8 @@ pub struct Bedrock {
     direct_http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     credentials_http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
-    reasoning: Option<ReasoningLevel>,
-    mapped_effort: Option<String>,
-    reasoning_replay_support: Option<bool>,
+    reasoning: ModelReasoning,
+    reasoning_resolver: Option<Arc<ReasoningResolver>>,
     thinking_budgets: ThinkingBudgets,
     configured_thinking_budgets: Option<Value>,
     thinking_display: ThinkingDisplay,
@@ -88,9 +108,8 @@ impl Bedrock {
             direct_http_client: None,
             http_client: None,
             credentials_http_client: None,
-            reasoning: None,
-            mapped_effort: None,
-            reasoning_replay_support: None,
+            reasoning: ModelReasoning::default(),
+            reasoning_resolver: None,
             thinking_budgets: ThinkingBudgets::default(),
             configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
@@ -206,9 +225,8 @@ impl Bedrock {
             direct_http_client: None,
             http_client: None,
             credentials_http_client: None,
-            reasoning: None,
-            mapped_effort: None,
-            reasoning_replay_support: None,
+            reasoning: ModelReasoning::default(),
+            reasoning_resolver: None,
             thinking_budgets: ThinkingBudgets::default(),
             configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
@@ -376,11 +394,20 @@ impl Bedrock {
         self.prepared_identity = None;
         self
     }
+    fn model_name_for<'a>(&'a self, model: &str, reasoning: &'a ModelReasoning) -> Option<&'a str> {
+        reasoning.model_name.as_deref().or_else(|| {
+            self.model_name
+                .as_ref()
+                .filter(|(id, _)| id == model)
+                .map(|(_, name)| name.as_str())
+        })
+    }
+
     fn is_claude(&self, model: &str) -> bool {
-        model.to_ascii_lowercase().contains("claude")
-            || self.model_name.as_ref().is_some_and(|(id, name)| {
-                id == model && name.to_ascii_lowercase().contains("claude")
-            })
+        options::is_claude(
+            model,
+            self.model_name_for(model, &self.model_reasoning(model)),
+        )
     }
     /// Freeze an inspectable SDK configuration and its effective authentication for one request.
     pub async fn prepare_bedrock(&self) -> Result<Option<Self>> {
@@ -490,9 +517,9 @@ impl Bedrock {
         };
         let identity = pi_rs_core::protected_model_fingerprint(&(
             if self.direct_http_client.is_some() {
-                "bedrock-converse-direct-v1"
+                "bedrock-converse-direct-v2"
             } else {
-                "bedrock-converse-v1"
+                "bedrock-converse-v2"
             },
             &region,
             &endpoint,
@@ -501,8 +528,13 @@ impl Bedrock {
             auth_identity,
             &self.model_name,
             &self.headers,
-            format!("{:?}", self.reasoning),
-            &self.mapped_effort,
+            (
+                &self.reasoning.model_name,
+                format!("{:?}", self.reasoning.level),
+                &self.reasoning.mapped_effort,
+                &self.reasoning.off_effort,
+                self.reasoning.supports_replay,
+            ),
             (
                 format!("{:?}", self.thinking_budgets),
                 &self.configured_thinking_budgets,
@@ -518,17 +550,6 @@ impl Bedrock {
             self.force_cache,
             self.summary,
         ));
-        let identity = if let Some(supported) = self.reasoning_replay_support {
-            identity.and_then(|id| {
-                pi_rs_core::protected_model_fingerprint(&(
-                    id,
-                    "bedrock-reasoning-replay",
-                    supported,
-                ))
-            })
-        } else {
-            identity
-        };
         let identity = if let Some(choice) = &self.tool_choice {
             identity.and_then(|identity| {
                 pi_rs_core::protected_model_fingerprint(&(
@@ -581,7 +602,7 @@ impl Bedrock {
         prepared.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client)));
         prepared.bearer = bearer;
         prepared.known_config = None;
-        prepared.prepared_identity = identity;
+        prepared.prepared_identity = identity.filter(|_| self.reasoning_resolver.is_none());
         Ok(Some((prepared, secrets)))
     }
 
@@ -591,21 +612,49 @@ impl Bedrock {
         level: Option<&str>,
         mapped_effort: Option<&str>,
     ) -> Result<Self> {
-        self.reasoning = level.map(ReasoningLevel::parse).transpose()?;
-        self.mapped_effort = mapped_effort.map(str::to_owned);
+        self.reasoning.level = level.map(ReasoningLevel::parse).transpose()?;
+        self.reasoning.mapped_effort = mapped_effort.map(str::to_owned);
+        self.reasoning.off_effort = mapped_effort
+            .filter(|_| self.reasoning.level == Some(ReasoningLevel::Off))
+            .map(str::to_owned);
         self.prepared_identity = None;
         Ok(self)
     }
     /// Override whether this route accepts reasoning from earlier assistant messages.
     pub fn with_reasoning_replay_support(mut self, supported: Option<bool>) -> Self {
-        self.reasoning_replay_support = supported;
+        self.reasoning.supports_replay = supported;
         self.prepared_identity = None;
         self
     }
 
+    /// Resolve host catalog options against each request's final model ID.
+    pub fn with_reasoning_resolver(
+        mut self,
+        resolve: impl Fn(&str) -> ModelReasoning + Send + Sync + 'static,
+    ) -> Self {
+        self.reasoning_resolver = Some(Arc::new(resolve));
+        self.prepared_identity = None;
+        self
+    }
+
+    /// Bind catalog options before preparing a request's context identity.
+    pub fn bind_reasoning_model(mut self, model: &str) -> Self {
+        if let Some(resolve) = self.reasoning_resolver.take() {
+            self.reasoning = resolve(model);
+            self.prepared_identity = None;
+        }
+        self
+    }
+
+    fn model_reasoning(&self, model: &str) -> Cow<'_, ModelReasoning> {
+        self.reasoning_resolver.as_ref().map_or_else(
+            || Cow::Borrowed(&self.reasoning),
+            |resolve| Cow::Owned(resolve(model)),
+        )
+    }
+
     fn supports_reasoning_replay(&self, model: &str) -> bool {
-        self.reasoning_replay_support
-            .unwrap_or_else(|| !model.contains("moonshotai.kimi-k3"))
+        self.model_reasoning(model).replay_enabled(model)
     }
 
     /// Override per-level budgets for non-adaptive Claude thinking.
@@ -726,8 +775,6 @@ impl Bedrock {
     /// Prepare a one-off summary without cache checkpoints or optional thinking.
     pub fn for_summary(mut self) -> Self {
         self.cache_retention = CacheRetention::None;
-        self.reasoning = Some(ReasoningLevel::Off);
-        self.mapped_effort = None;
         self.summary = true;
         self.prepared_identity = None;
         self
@@ -1240,18 +1287,29 @@ impl Model for Bedrock {
     // Only a prepared, inspectable SDK configuration has a stable identity.
     async fn prepare_context<'a>(
         &'a self,
-        _: &ModelRequest,
+        request: &ModelRequest,
     ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        let client = self.clone().bind_reasoning_model(&request.model);
         let prepared = if pi_rs_core::provider_header_session_id().is_some() {
-            Some(self.prepare_header_context(&http::HeaderMap::new()).await?)
+            Some(
+                client
+                    .prepare_header_context(&http::HeaderMap::new())
+                    .await?,
+            )
         } else {
-            self.prepare_bedrock().await?
+            client.prepare_bedrock().await?
         };
         Ok(prepared.map(|model| std::sync::Arc::new(model) as std::sync::Arc<dyn Model + 'a>))
     }
 
     fn context_identity(&self) -> Option<String> {
         self.prepared_identity.clone()
+    }
+
+    fn can_reuse_measured_context(&self, request: &ModelRequest) -> bool {
+        // Converse reports aggregate output usage, which can include reasoning
+        // that will be absent from the next request.
+        self.supports_reasoning_replay(&request.model)
     }
 
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
@@ -1442,12 +1500,10 @@ impl Bedrock {
             return Err(Error::Config("Bedrock requires a positive max output token limit and does not support managed prompt ARNs".into()));
         }
         let tool_free = !self.has_tools(&request);
-        let is_claude = self.is_claude(&request.model);
-        let model_name = self
-            .model_name
-            .as_ref()
-            .filter(|(id, _)| id == &request.model)
-            .map(|(_, name)| name.as_str());
+        let reasoning_options = self.model_reasoning(&request.model);
+        let include_reasoning = reasoning_options.replay_enabled(&request.model);
+        let model_name = self.model_name_for(&request.model, &reasoning_options);
+        let is_claude = options::is_claude(&request.model, model_name);
         let checkpoint = if options::supports_cache(&request.model, model_name, self.force_cache) {
             let retention = if self.cache_retention == CacheRetention::Long
                 && !self
@@ -1509,7 +1565,7 @@ impl Bedrock {
                                 r,
                                 &request.model,
                                 is_claude,
-                                self.supports_reasoning_replay(&request.model),
+                                include_reasoning,
                                 &content,
                                 &calls,
                                 &mut ids,
@@ -1710,19 +1766,30 @@ impl Bedrock {
         if client.config().region().is_none() {
             return Err(Error::Config("Bedrock requires an AWS region; set AWS_REGION or configure a region in the selected AWS profile".into()));
         }
-        let reasoning = if self.summary
-            && options::requires_thinking(&request.model, model_name)
-            && !(tool_free && options::sonnet_55(&request.model, model_name))
-        {
-            Some(ReasoningLevel::Low)
+        let (reasoning, mapped_effort) = if self.summary {
+            if options::requires_thinking(&request.model, model_name)
+                && !(tool_free && options::sonnet_55(&request.model, model_name))
+            {
+                (Some(ReasoningLevel::Low), None)
+            } else {
+                let off_effort = if options::uses_flat_mapped_effort(&request.model, model_name) {
+                    reasoning_options.off_effort.as_deref()
+                } else {
+                    None
+                };
+                (Some(ReasoningLevel::Off), off_effort)
+            }
         } else {
-            self.reasoning
+            (
+                reasoning_options.level,
+                reasoning_options.mapped_effort.as_deref(),
+            )
         };
         let fields = options::reasoning_fields(
             &request.model,
             model_name,
             reasoning,
-            self.mapped_effort.as_deref(),
+            mapped_effort,
             request.max_output_tokens,
             options::ReasoningContext {
                 region: client.config().region().map(|region| region.as_ref()),
@@ -2447,6 +2514,66 @@ mod tests {
         .with_bearer_token("token-a".into())
         .unwrap();
         assert!(opaque.prepare_bedrock().await.unwrap().is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn implicit_kimi_replay_uses_a_new_prepared_identity() {
+        let region = "us-east-1";
+        let endpoint = "http://127.0.0.1:1";
+        let model = "global.moonshotai.kimi-k3";
+        let config = aws_types::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_types::region::Region::new(region))
+            .endpoint_url(endpoint)
+            .build();
+        let legacy = pi_rs_core::protected_model_fingerprint(&(
+            "bedrock-converse-v1",
+            region,
+            Some(endpoint),
+            config.use_fips(),
+            config.use_dual_stack(),
+            ("bearer", "fixture", "", None::<String>, None::<String>),
+            Some((model, "Kimi K3")),
+            BTreeMap::<String, Vec<String>>::new(),
+            "None",
+            None::<String>,
+            (
+                format!("{:?}", ThinkingBudgets::default()),
+                None::<Value>,
+                "Summarized",
+                true,
+            ),
+            "short",
+            None::<bool>,
+            false,
+            false,
+        ))
+        .unwrap();
+        let client = Bedrock::from_sdk_config(config)
+            .with_bearer_token("fixture".into())
+            .unwrap()
+            .with_model_name(model, Some("Kimi K3"))
+            .with_cache_retention(CacheRetention::Short)
+            .with_force_cache(false);
+        let request = ModelRequest {
+            model: model.into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_output_tokens: 128,
+        };
+
+        let prepared = client.prepare_context(&request).await.unwrap().unwrap();
+        assert_ne!(prepared.context_identity().unwrap(), legacy);
+        assert!(!prepared.can_reuse_measured_context(&request));
+        let override_client = client.clone().with_reasoning_replay_support(Some(true));
+        let with_replay = override_client
+            .prepare_context(&request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(with_replay.can_reuse_measured_context(&request));
+        assert_ne!(prepared.context_identity(), with_replay.context_identity());
     }
 
     #[cfg(any(unix, windows))]
