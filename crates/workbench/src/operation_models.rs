@@ -18,6 +18,8 @@ use super::{
 };
 
 mod decisions;
+#[cfg(test)]
+mod image_acceptance;
 mod llama_cpp;
 mod llama_discovery;
 mod pi_classifier;

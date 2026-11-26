@@ -2187,7 +2187,10 @@ single 250 ms maximum budget and stops those callbacks when the tool returns.
 Ordinary tools still drain accepted updates. Queued Codemode events reach
 presentation consumers, and caller abort preserves the latest omission count
 even if the script cannot publish its final snapshot. The snapshot covers
-`tools.*` calls. `models.*` calls remain outside it.
+`tools.*` and `models.generateImages`. Image rows show the provider and model
+ID and the mapped success, error, or cancellation status. Completed calls
+include their elapsed time. Classifier and catalogue calls still use their
+existing reporting.
 [Pinned Codemode nested tool lifecycle](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/extensions/codemode/execute.ts#L514-L550)
 
 `PI_CODEMODE_MAX_WORKERS` is re-read when
@@ -6026,7 +6029,13 @@ Non-data URLs and structurally incomplete data URLs are ignored. Unlike Pi,
 pi-rs validates generated image MIME types and base64 before exposing them and
 retains its response-size limit. Provider-level operation headers are bound to
 the provider endpoint, including for classifiers; model headers apply to their
-own endpoint. No live OpenRouter account was used.
+own endpoint. Codemode sends image generation once, including when OpenRouter
+returns HTTP 429 with retry headers. A script deadline or caller cancellation
+closes the in-flight response. Loopback checks cover those paths, the 7 MiB
+provider response cap, and a zero-token text preview that retains the image and
+spills the generated text to a file. No live OpenRouter account was used.
+[Pinned OpenRouter image request](https://github.com/earendil-works/pi/blob/8d9408574325a12e2e34898bb8fa22784120e479/packages/ai/src/api/openrouter-images.ts#L68-L85)
+[Pinned Codemode image calls](https://github.com/earendil-works/pi/blob/8d9408574325a12e2e34898bb8fa22784120e479/packages/coding-agent/src/extensions/codemode/execute.ts#L792-L810)
 
 ### Chat model connection and compatibility
 
