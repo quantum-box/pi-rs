@@ -574,15 +574,25 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
                 let tools = request["tools"].as_array().unwrap();
                 assert_eq!(tools.len(), 4);
                 assert!(tools.iter().any(|tool| tool["name"] == "read"));
-                let call = json!({
-                    "type":"function_call", "call_id":"fixture-call", "name":"read",
-                    "arguments":json!({"path":"fixture.txt"}).to_string()
-                });
-                vec![
-                    json!({"type":"response.output_item.added","output_index":0,"item":call}),
-                    json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":call["arguments"]}),
-                    json!({"type":"response.completed","response":{"status":"completed","output":[call],"usage":{"input_tokens":1,"output_tokens":1}}}),
+                let calls = [
+                    ("fixture-call", "fixture.txt"),
+                    ("missing-call", "missing.txt"),
                 ]
+                .map(|(call_id, path)| {
+                    json!({
+                        "type":"function_call", "call_id":call_id, "name":"read",
+                        "arguments":json!({"path":path}).to_string()
+                    })
+                });
+                let mut events = Vec::new();
+                for (index, call) in calls.iter().enumerate() {
+                    events.extend([
+                        json!({"type":"response.output_item.added","output_index":index,"item":call}),
+                        json!({"type":"response.function_call_arguments.delta","output_index":index,"delta":call["arguments"]}),
+                    ]);
+                }
+                events.push(json!({"type":"response.completed","response":{"status":"completed","output":calls,"usage":{"input_tokens":1,"output_tokens":1}}}));
+                events
             } else {
                 assert!(request["input"].as_array().unwrap().iter().any(|item| {
                     item["type"] == "function_call_output"
@@ -636,11 +646,15 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
     let id = events[0]["data"]["sessionId"].as_str().unwrap();
     let start = events
         .iter()
-        .position(|event| event["type"] == "tool_execution_start")
+        .position(|event| {
+            event["type"] == "tool_execution_start" && event["toolCallId"] == "fixture-call"
+        })
         .unwrap_or_else(|| panic!("missing tool event: {events:#?}"));
     let end = events
         .iter()
-        .position(|event| event["type"] == "tool_execution_end")
+        .position(|event| {
+            event["type"] == "tool_execution_end" && event["toolCallId"] == "fixture-call"
+        })
         .unwrap_or_else(|| panic!("missing tool event: {events:#?}"));
     assert!(start < end);
     assert_eq!(events[start]["toolName"], "read");
@@ -649,6 +663,39 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
         events[end]["result"]["content"]
             .to_string()
             .contains("durable-file-content")
+    );
+    let failed = events
+        .iter()
+        .position(|event| {
+            event["type"] == "tool_execution_end" && event["toolCallId"] == "missing-call"
+        })
+        .expect("missing file should produce a tool result");
+    assert_eq!(events[failed]["isError"], true);
+    let failed_outcome: pi_rs_core::Outcome =
+        serde_json::from_value(events[failed]["durableOutcome"].clone()).unwrap();
+    assert!(failed_outcome.is_error());
+    let tool_turns: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event["type"] == "turn_end" && event["message"]["stopReason"] == "toolUse"
+        })
+        .collect();
+    let [(turn_index, turn)] = tool_turns.as_slice() else {
+        panic!("expected exactly one completed tool-use turn: {tool_turns:#?}");
+    };
+    assert!(*turn_index > end.max(failed));
+    let results = turn["toolResults"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(
+        results
+            .iter()
+            .any(|result| result["toolCallId"] == "fixture-call" && result["isError"] == false)
+    );
+    assert!(
+        results
+            .iter()
+            .any(|result| result["toolCallId"] == "missing-call" && result["isError"] == true)
     );
     assert_eq!(events.last().unwrap()["type"], "agent_end");
     assert_eq!(events.last().unwrap()["success"], true);
@@ -669,6 +716,17 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
                         .to_string()
                         .contains("durable-file-content")
             })
+    );
+    let failed_result = reopened[0]["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["toolCallId"] == "missing-call")
+        .expect("the failed result should also reopen");
+    assert_eq!(failed_result["isError"], true);
+    assert_eq!(
+        failed_result["durableOutcome"],
+        events[failed]["durableOutcome"]
     );
     let wrong_workspace = rpc(other.path(), &["--conversation", id], &[]);
     assert!(!wrong_workspace.status.success());

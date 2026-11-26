@@ -505,8 +505,9 @@ mod tests {
                 arguments: r#"{"path":"file"}"#.into(),
             },
         };
-        let outcome = pi_rs::Outcome::SucceededWithDetails {
-            output: "edited".into(),
+        let outcome = pi_rs::Outcome::StructuredWithDetails {
+            data: json!({"content":[{"type":"text","text":"edited"}], "isError":false}),
+            attachments: Vec::new(),
             details: json!({"diff":"- old\n+ new"}),
         };
         conversation.event(
