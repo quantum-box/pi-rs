@@ -48,8 +48,7 @@ impl Turn {
 
     fn emit_user(&mut self, input: &Submission) -> io::Result<()> {
         let user = submission_message(input);
-        emit(&json!({"type":"message_start","message":user}))?;
-        emit(&json!({"type":"message_end","message":user}))?;
+        emit_committed_message(&user)?;
         self.users.push(user);
         Ok(())
     }
@@ -732,6 +731,11 @@ fn message_update(message: Value, mut event: Value) -> io::Result<()> {
     }))
 }
 
+fn emit_committed_message(message: &Value) -> io::Result<()> {
+    emit(&json!({"type":"message_start","message":message}))?;
+    emit(&json!({"type":"message_end","message":message}))
+}
+
 fn emit_turn_end(message: &Value, results: &[Value]) -> io::Result<()> {
     emit(&json!({"type":"turn_end", "message":message, "toolResults":results}))
 }
@@ -847,6 +851,7 @@ impl ToolEvents {
                     "durableInvocation":message["durableInvocation"],
                     "durableOutcome":message["durableOutcome"]
                 }))?;
+                emit_committed_message(message)?;
                 turn.users.push(message.clone());
                 if let Some(pending) = &mut self.pending_turn {
                     pending.results.push(message.clone());
