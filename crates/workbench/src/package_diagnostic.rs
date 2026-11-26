@@ -422,11 +422,11 @@ pub(super) fn candidates(root: &Path, kind: Kind) -> Result<Option<Vec<PathBuf>>
             patterns: Some(overrides),
             autoload: true,
         };
-        let enabled = filter.apply(&paths, root, &vec![false; paths.len()])?;
-        paths = paths
+        paths = filter
+            .states(&paths, root)?
             .into_iter()
-            .zip(enabled)
-            .filter_map(|(path, enabled)| enabled.then_some(path))
+            .filter(|&(_, enabled)| enabled)
+            .map(|(index, _)| paths[index].clone())
             .collect();
     }
     let mut seen = HashSet::new();
