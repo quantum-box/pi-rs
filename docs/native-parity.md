@@ -1893,9 +1893,9 @@ and checks executable extensions against the native protocol. Native settings
 edits preserve `npmCommand` as an unknown key, and package operations ignore
 it in user and project settings. A configured `npm:` source in an active
 settings scope makes native `list`, `update`, and package discovery report an
-unsupported-source error. SDK resource snapshots read local files and
-directories granted by the host.
-The host acquires any package resources before granting those paths.
+unsupported-source error. SDK resource snapshots accept grants for
+individual files and resource-specific directories. The host acquires
+packages and selects which resource paths to grant.
 [Pinned Pi settings schema](https://github.com/earendil-works/pi/blob/524f015b3c951abc4b853ffe4ebd879a9aedd43f/packages/coding-agent/src/core/settings-schema.ts#L301-L305)
 
 Local package theme manifests are read again when resources are resolved, so
