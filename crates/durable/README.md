@@ -489,6 +489,12 @@ so do omitted recorded calls in a replayed scope, unlike upstream. Calls are
 serialized, bounded in depth, and cannot update extension state. A safe replay
 still requires destination-level idempotency for external effects.
 
+Ordinary nested calls support `ToolHost::call_with_cancellation`. Cancelling a
+new call during preparation records a skipped result at its original position.
+Replay reuses that result and the positions of later siblings. Cancellation
+after dispatch retains an uncertain result or an already-published pending
+reference for reconciliation. The token applies to the call and its descendants.
+
 `StandaloneNoHooksHost` constructs a standalone scheduler with an explicit
 host assertion that no hook policy applies. It cannot prove policy outside this
 runtime; do not use it when hooks are required. It cannot attach to a conversation
