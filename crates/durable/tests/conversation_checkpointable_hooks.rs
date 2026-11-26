@@ -104,6 +104,14 @@ impl Hook for OneHook {
         if ctx.memo.get_or_insert("before", json!("stable")).await? != "stable" {
             return Err("memo changed".into());
         }
+        if call.name == "leaf"
+            && let Some(("leaf-before", gate)) = &self.gate
+        {
+            gate.store(1, Ordering::SeqCst);
+            while gate.load(Ordering::SeqCst) != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         if call.name == "root"
             && let Some(("before", gate)) = &self.gate
         {
@@ -350,6 +358,12 @@ async fn selected_hook_cancel_registration_rejects_changed_selection() {
     exercise_selected_hook_cancel_registration("selection").await;
 }
 
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn selection_replaced_between_checkpointable_hook_return_and_settlement() {
+    exercise_selected_hook_cancel_registration("selection-at-settlement").await;
+}
+
 async fn exercise_selected_hook_cancel_registration(change: &str) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
@@ -359,6 +373,7 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
     let cancellations = Arc::new(AtomicUsize::new(0));
     let hook_identity = Arc::new(std::sync::Mutex::new(None));
     let enabled = change == "enabled" || change.starts_with("invalid-");
+    let leaf_gate = Arc::new(AtomicUsize::new(0));
     let hook: Arc<dyn Hook> = if enabled {
         Arc::new(CancelHooks {
             before: before.clone(),
@@ -375,7 +390,7 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
         Arc::new(OneHook {
             before: before.clone(),
             after: after.clone(),
-            gate: None,
+            gate: (change == "selection-at-settlement").then(|| ("leaf-before", leaf_gate.clone())),
         })
     };
     let mut extensions = pi_rs_durable::extension::Registry::default();
@@ -443,7 +458,6 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
     let mut scheduler = Scheduler::open_with_extensions(&path, options, extensions).unwrap();
-    let driver = scheduler.start_tasks(registry).unwrap();
     let conversation = scheduler
         .create_conversation(Config {
             model: "test".into(),
@@ -452,9 +466,71 @@ async fn exercise_selected_hook_cancel_registration(change: &str) {
         })
         .unwrap();
     scheduler.select_extensions(conversation, names).unwrap();
-    scheduler.submit(conversation, None, "work".into()).unwrap();
     let store = durable_store::Store::open(&path).unwrap();
     let tasks = pi_rs_durable::task_store::TaskStore::new(&store);
+    let driver = scheduler.start_tasks(registry).unwrap();
+    scheduler.submit(conversation, None, "work".into()).unwrap();
+
+    #[cfg(feature = "test-hooks")]
+    if change == "selection-at-settlement" {
+        use pi_rs_durable::{
+            task::{TaskOwner, TaskState},
+            task_scheduler::hook_fence_test_hook,
+        };
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while leaf_gate.load(Ordering::SeqCst) != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leaf did not enter the before hook");
+        let leaf = tasks
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|entry| matches!(entry.task.owner(), TaskOwner::Task(_)))
+            .unwrap()
+            .task
+            .id();
+        let (settling, wait_for_settlement) = std::sync::mpsc::channel();
+        let (release, wait_for_replacement) = std::sync::mpsc::channel();
+        hook_fence_test_hook::install(leaf, "checkpointable-settlement", move || {
+            settling.send(()).unwrap();
+            wait_for_replacement
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        });
+        leaf_gate.store(2, Ordering::SeqCst);
+        wait_for_settlement
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        scheduler
+            .install_extension(Extension {
+                name: "policy".into(),
+                hooks: vec![Arc::new(BlockHook)],
+                ..Default::default()
+            })
+            .unwrap();
+        release.send(()).unwrap();
+        let state = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let task = driver.get(leaf).unwrap().unwrap();
+                if task.is_terminal() {
+                    break task.state().clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leaf did not settle after hook selection changed");
+        assert!(matches!(
+            state,
+            TaskState::Failed(reason) if reason.contains("extension selection changed"),
+        ));
+        assert_eq!(cancellations.load(Ordering::SeqCst), 0);
+        return;
+    }
     let root_id = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Some(record) = tasks.list().unwrap().into_iter().find(|record| {

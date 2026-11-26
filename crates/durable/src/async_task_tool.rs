@@ -875,6 +875,11 @@ pub(crate) use replay_safe::live_checkpointable_progress;
 /// every operation against the current parent reservation and abort state.
 #[async_trait::async_trait]
 pub trait DurableTaskHost: Send + Sync {
+    /// Child tools registered for this invocation.
+    fn child_tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
     /// Save a replacement for this execution attempt. The snapshot is limited
     /// to 32 KiB encoded and 30 diagnostics. An eligible cancellation can use
     /// the last committed park when a resumed attempt has not reported.
@@ -903,8 +908,12 @@ pub trait DurableTaskHost: Send + Sync {
     ) -> Result<AsyncTaskCall, String>;
 
     /// Commit a keyed child immediately so it can run while its parent is
-    /// active. The parent must be replay-safe. An explicitly registered unsafe
-    /// conversation child keeps its normal receipt and reconciliation policy.
+    /// active. A registered conversation parent may admit a registered
+    /// checkpointable child regardless of either tool's replay policy.
+    /// A replay-unsafe parent authorizes execution only during this live
+    /// attempt, and an interrupted child retains its receipt policy.
+    /// Standalone admission requires both tools to be registered as standalone
+    /// checkpointable tools.
     /// The ordinary `start_child` stages admission for the parent transition.
     async fn start_child_now(
         &self,
@@ -968,26 +977,60 @@ pub trait DurableAsyncTool: Tool {
 /// a host that can persist textual partial results and their details. Use a
 /// native `DurableAsyncTool` for durable nested calls or parks.
 pub fn checkpointable_leaf(tool: Arc<dyn Tool>) -> Arc<dyn DurableAsyncTool> {
-    Arc::new(CheckpointableLeaf(tool))
+    Arc::new(CheckpointableTool {
+        tool,
+        child_timeout: None,
+    })
 }
 
-struct CheckpointableLeaf(Arc<dyn Tool>);
+/// Wrap an ordinary tool with access to explicitly registered durable children.
+/// Nested calls reattach by call order after replay. Register the wrapper with
+/// a replay policy appropriate for the tool and its surrounding effects.
+pub fn checkpointable_tool(
+    tool: Arc<dyn Tool>,
+    child_timeout: std::time::Duration,
+) -> Arc<dyn DurableAsyncTool> {
+    Arc::new(CheckpointableTool {
+        tool,
+        child_timeout: Some(child_timeout),
+    })
+}
 
-type LeafProgressUpdate = (
-    DurableToolProgress,
-    tokio::sync::oneshot::Sender<pi_rs_core::ExtensionResult<()>>,
-);
+struct CheckpointableTool {
+    tool: Arc<dyn Tool>,
+    child_timeout: Option<std::time::Duration>,
+}
 
-struct LeafProgressHost(tokio::sync::mpsc::Sender<LeafProgressUpdate>);
+enum ToolHostRequest {
+    Progress(
+        DurableToolProgress,
+        tokio::sync::oneshot::Sender<pi_rs_core::ExtensionResult<()>>,
+    ),
+    Call {
+        index: usize,
+        name: String,
+        arguments: serde_json::Value,
+        cancellation: pi_rs_core::CancellationToken,
+        // Admission and cancellation compete for this one-shot claim.
+        dispatch_claim: Arc<std::sync::atomic::AtomicBool>,
+        reply: tokio::sync::oneshot::Sender<Outcome>,
+    },
+}
+
+struct CheckpointableToolHost {
+    requests: tokio::sync::mpsc::Sender<ToolHostRequest>,
+    tools: Vec<ToolSpec>,
+    next_call: std::sync::atomic::AtomicUsize,
+}
 
 #[async_trait::async_trait]
-impl pi_rs_core::ToolHost for LeafProgressHost {
+impl pi_rs_core::ToolHost for CheckpointableToolHost {
     fn tools(&self) -> Vec<ToolSpec> {
-        Vec::new()
+        self.tools.clone()
     }
 
     fn supports_progress(&self) -> bool {
-        !self.0.is_closed()
+        !self.requests.is_closed()
     }
 
     async fn report_progress(
@@ -1009,29 +1052,85 @@ impl pi_rs_core::ToolHost for LeafProgressHost {
             ..Default::default()
         };
         let (reply, result) = tokio::sync::oneshot::channel();
-        self.0
-            .send((progress, reply))
+        self.requests
+            .send(ToolHostRequest::Progress(progress, reply))
             .await
             .map_err(|_| "durable tool invocation ended")?;
         result.await.map_err(|_| "durable tool invocation ended")?
     }
 
-    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
-        Outcome::Skipped("nested calls are unavailable for a durable leaf".into())
+    async fn call(&self, name: &str, arguments: serde_json::Value) -> Outcome {
+        self.call_with_cancellation(name, arguments, pi_rs_core::CancellationToken::new())
+            .await
+    }
+
+    async fn call_with_cancellation(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        cancellation: pi_rs_core::CancellationToken,
+    ) -> Outcome {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        if !self.tools.iter().any(|tool| tool.name == name) {
+            return Outcome::Skipped("nested tool is not registered for this invocation".into());
+        }
+        // A call consumes its replay position even if it is cancelled before
+        // it reaches the channel. Later calls must reconnect to the same keys.
+        let Ok(index) =
+            self.next_call
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |index| {
+                    index.checked_add(1)
+                })
+        else {
+            return Outcome::Failed("nested tool call sequence exhausted".into());
+        };
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let dispatch_claim = Arc::new(AtomicBool::new(false));
+        let request = ToolHostRequest::Call {
+            index,
+            name: name.into(),
+            arguments,
+            cancellation: cancellation.clone(),
+            dispatch_claim: dispatch_claim.clone(),
+            reply,
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Outcome::Skipped("cancelled before nested dispatch".into()),
+            queued = self.requests.send(request) => {
+                if queued.is_err() {
+                    return Outcome::Skipped("durable tool invocation ended".into());
+                }
+            }
+        }
+        tokio::select! {
+            biased;
+            result = result => result.unwrap_or_else(|_| {
+                Outcome::Unknown("durable tool invocation ended during nested call".into())
+            }),
+            _ = cancellation.cancelled() => {
+                if dispatch_claim.swap(true, Ordering::AcqRel) {
+                    Outcome::Unknown("nested call was cancelled during or after admission".into())
+                } else {
+                    Outcome::Skipped("cancelled before nested dispatch".into())
+                }
+            }
+        }
     }
 }
 
 #[async_trait::async_trait]
-impl Tool for CheckpointableLeaf {
+impl Tool for CheckpointableTool {
     fn spec(&self) -> ToolSpec {
-        self.0.spec()
+        self.tool.spec()
     }
 
     async fn prepare_arguments(
         &self,
         arguments: serde_json::Value,
     ) -> pi_rs_core::ExtensionResult<serde_json::Value> {
-        self.0.prepare_arguments(arguments).await
+        self.tool.prepare_arguments(arguments).await
     }
 
     async fn invoke(
@@ -1039,12 +1138,12 @@ impl Tool for CheckpointableLeaf {
         arguments: serde_json::Value,
         context: pi_rs_core::ToolContext,
     ) -> Outcome {
-        self.0.invoke(arguments, context).await
+        self.tool.invoke(arguments, context).await
     }
 }
 
 #[async_trait::async_trait]
-impl DurableAsyncTool for CheckpointableLeaf {
+impl DurableAsyncTool for CheckpointableTool {
     async fn execute_durable(
         &self,
         arguments: serde_json::Value,
@@ -1052,27 +1151,86 @@ impl DurableAsyncTool for CheckpointableLeaf {
         _resume: DurableToolResume,
         host: &dyn DurableTaskHost,
     ) -> Result<DurableToolStep, String> {
-        let (updates, mut progress) = tokio::sync::mpsc::channel(1);
-        let invocation = self.0.invoke_with_host(
+        use futures_util::{StreamExt, stream::FuturesUnordered};
+
+        let (requests, mut incoming) = tokio::sync::mpsc::channel(1);
+        let tools = self
+            .child_timeout
+            .map_or_else(Vec::new, |_| host.child_tools());
+        let invocation = self.tool.invoke_with_host(
             arguments,
             context,
             None,
-            Arc::new(LeafProgressHost(updates)),
+            Arc::new(CheckpointableToolHost {
+                requests,
+                tools,
+                next_call: std::sync::atomic::AtomicUsize::new(0),
+            }),
         );
         tokio::pin!(invocation);
+        let mut calls = FuturesUnordered::new();
+        let mut requests_open = true;
         let outcome = loop {
             tokio::select! {
                 biased;
                 outcome = &mut invocation => break outcome,
-                update = progress.recv() => match update {
-                    Some((partial, reply)) => {
+                _ = calls.next(), if !calls.is_empty() => {}
+                request = incoming.recv(), if requests_open && calls.len() < 16 => match request {
+                    Some(ToolHostRequest::Progress(partial, reply)) => {
                         let _ = reply.send(host.report_progress(partial).await);
                     }
-                    None => break invocation.await,
+                    Some(ToolHostRequest::Call { index, name, arguments, cancellation, dispatch_claim, reply }) => {
+                        let Some(timeout) = self.child_timeout else {
+                            let _ = reply.send(Outcome::Skipped("nested tool calls are unavailable".into()));
+                            continue;
+                        };
+                        let key = format!("ordinary-tool-call-{index}");
+                        if reply.is_closed() || cancellation.is_cancelled()
+                            || dispatch_claim.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            let _ = reply.send(Outcome::Skipped("cancelled before nested dispatch".into()));
+                            continue;
+                        }
+                        match host.start_child_now(&key, &name, arguments).await {
+                            Ok(call) => calls.push(async move {
+                                let outcome = tokio::select! {
+                                    biased;
+                                    _ = cancellation.cancelled() => Outcome::Unknown("nested call was cancelled after admission".into()),
+                                    result = host.wait_child_result(&call, timeout) => ordinary_child_outcome(result),
+                                };
+                                let _ = reply.send(outcome);
+                            }),
+                            Err(reason) => {
+                                let _ = reply.send(Outcome::Failed(reason));
+                            }
+                        }
+                    }
+                    None => requests_open = false,
                 },
             }
         };
         Ok(DurableToolStep::Complete(outcome))
+    }
+}
+
+fn ordinary_child_outcome(result: Result<Option<AsyncTaskResult>, String>) -> Outcome {
+    match result {
+        Ok(Some(AsyncTaskResult::Outcome(outcome))) => outcome,
+        Ok(Some(AsyncTaskResult::Failed(reason))) => Outcome::Failed(reason),
+        Ok(Some(AsyncTaskResult::Cancelled)) => {
+            Outcome::Skipped("nested tool was cancelled".into())
+        }
+        Ok(Some(AsyncTaskResult::Rich(result))) => Outcome::Structured {
+            data: serde_json::json!(result),
+            attachments: Vec::new(),
+        },
+        Ok(Some(AsyncTaskResult::Uncertain(outcome))) => Outcome::Unknown(outcome.tool_content()),
+        Ok(Some(AsyncTaskResult::AfterIncomplete(_))) => {
+            Outcome::Unknown("nested after hook requires reconciliation".into())
+        }
+        Ok(Some(AsyncTaskResult::Unsupported { reason, .. })) | Err(reason) => {
+            Outcome::Unknown(reason)
+        }
+        Ok(None) => Outcome::Unknown("nested tool did not settle before its deadline".into()),
     }
 }
 
@@ -2525,6 +2683,89 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn ordinary_nested_call_cancellation_distinguishes_queue_and_dispatch() {
+        use pi_rs_core::ToolHost;
+        use std::task::Poll;
+
+        let (requests, mut incoming) = tokio::sync::mpsc::channel(1);
+        let host = CheckpointableToolHost {
+            requests,
+            tools: vec![ToolSpec {
+                name: "child".into(),
+                description: String::new(),
+                parameters: json!({}),
+            }],
+            next_call: AtomicUsize::new(0),
+        };
+        let (progress_reply, _ack) = tokio::sync::oneshot::channel();
+        assert!(
+            host.requests
+                .try_send(ToolHostRequest::Progress(
+                    DurableToolProgress::default(),
+                    progress_reply,
+                ))
+                .is_ok()
+        );
+        let token = pi_rs_core::CancellationToken::new();
+        let blocked = host.call_with_cancellation("child", json!({}), token.clone());
+        tokio::pin!(blocked);
+        assert!(matches!(futures_util::poll!(&mut blocked), Poll::Pending));
+        token.cancel();
+        assert!(matches!(
+            futures_util::poll!(&mut blocked),
+            Poll::Ready(Outcome::Skipped(_))
+        ));
+        assert!(matches!(
+            incoming.try_recv(),
+            Ok(ToolHostRequest::Progress(..))
+        ));
+        assert!(incoming.try_recv().is_err());
+
+        let already_cancelled = pi_rs_core::CancellationToken::new();
+        already_cancelled.cancel();
+        assert!(matches!(
+            host.call_with_cancellation("child", json!({}), already_cancelled)
+                .await,
+            Outcome::Skipped(_)
+        ));
+        assert!(incoming.try_recv().is_err());
+
+        for (index, admitted) in [(2, false), (3, true)] {
+            let token = pi_rs_core::CancellationToken::new();
+            let pending = host.call_with_cancellation("child", json!({}), token.clone());
+            tokio::pin!(pending);
+            assert!(matches!(futures_util::poll!(&mut pending), Poll::Pending));
+            let Ok(ToolHostRequest::Call {
+                index: assigned,
+                dispatch_claim,
+                reply,
+                ..
+            }) = incoming.try_recv()
+            else {
+                panic!("nested call was not enqueued");
+            };
+            assert_eq!(assigned, index);
+            if admitted {
+                assert!(!dispatch_claim.swap(true, Ordering::AcqRel));
+            }
+            token.cancel();
+            if admitted {
+                assert!(matches!(
+                    futures_util::poll!(&mut pending),
+                    Poll::Ready(Outcome::Unknown(_))
+                ));
+            } else {
+                assert!(matches!(
+                    futures_util::poll!(&mut pending),
+                    Poll::Ready(Outcome::Skipped(_))
+                ));
+            }
+            assert!(dispatch_claim.load(Ordering::Acquire));
+            assert!(reply.is_closed());
+        }
+    }
 
     struct TestTool {
         calls: Arc<AtomicUsize>,

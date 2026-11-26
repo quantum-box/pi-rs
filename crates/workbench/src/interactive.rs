@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::NoticeKind;
 use crate::ui::{
+    color::ColorMode,
     editor::Editor,
     images::{self, Cleanup, InlineImage, Renderer},
     keys::Keys,
@@ -668,6 +669,7 @@ impl<W: Write> Drop for FrameWriter<W> {
 
 #[derive(PartialEq)]
 struct RegularLayout {
+    color_mode: ColorMode,
     width: usize,
     height: usize,
     cell: (f64, f64),
@@ -4133,9 +4135,10 @@ render_call_id: None,
 
     fn draw(&mut self, args: &Cli, theme: &Theme, busy: bool, keys: &Keys) -> Result<()> {
         let _strike_budget = crate::ui::strike::frame_budget();
+        let color_mode = ColorMode::resolve(args.settings.terminal_true_color());
         self.expand_key = keys.first_binding("app.tools.expand");
         if args.tui_mode == Some(TuiMode::Regular) {
-            return self.draw_regular(args, theme, busy, keys);
+            return self.draw_regular(args, theme, busy, keys, color_mode);
         }
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
@@ -4336,11 +4339,11 @@ render_call_id: None,
         self.graphics.clear_fullscreen_frame(&mut out)?;
         for (row, line) in header.iter().enumerate() {
             queue!(out, MoveTo(0, row as u16))?;
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
         }
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + header_rows) as u16))?;
-            line.draw(&mut out, if modal { width } else { body_width })?;
+            line.draw(&mut out, if modal { width } else { body_width }, color_mode)?;
             let covered = search_overlay.as_ref().is_some_and(|(rows, columns, ..)| {
                 line.image
                     .as_ref()
@@ -4376,7 +4379,7 @@ render_call_id: None,
                     ("│", "scrollbarTrack")
                 };
                 queue!(out, MoveTo((width - 1) as u16, (row + header_rows) as u16))?;
-                Line::themed(glyph, theme, role).draw(&mut out, 1)?;
+                Line::themed(glyph, theme, role).draw(&mut out, 1, color_mode)?;
             }
         }
         let border_row = height - prompt_height - 2 - footer.len() - below.len();
@@ -4390,35 +4393,35 @@ render_call_id: None,
             theme,
             "border",
         )
-        .draw(&mut out, width)?;
+        .draw(&mut out, width, color_mode)?;
         for (row, line) in prompt.iter().enumerate() {
             queue!(out, MoveTo(0, (border_row + 1 + row) as u16))?;
             let mut line = Line::themed(line, theme, "text");
             if row == cursor_row && !hardware_cursor && !modal && self.search.is_none() {
                 line.mark_cursor(column);
             }
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
         }
         for (row, line) in below.iter().enumerate() {
             queue!(
                 out,
                 MoveTo(0, (border_row + 1 + prompt_height + row) as u16)
             )?;
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
         }
         let footer_row = height - footer.len();
         queue!(out, MoveTo(0, (footer_row - 1) as u16))?;
-        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width)?;
+        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width, color_mode)?;
         for (row, line) in footer.iter().enumerate() {
             queue!(out, MoveTo(0, (footer_row + row) as u16))?;
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
         }
         if let Some((rows, columns, overlay, cursor_row, cursor_column)) = search_overlay {
             let left = columns.start;
             let top = header_rows + rows.start;
             for (row, line) in overlay.iter().enumerate() {
                 queue!(out, MoveTo(left as u16, (top + row) as u16))?;
-                line.draw(&mut out, columns.len())?;
+                line.draw(&mut out, columns.len(), color_mode)?;
             }
             if cursor_row < body_height {
                 queue!(
@@ -4569,6 +4572,7 @@ render_call_id: None,
         lines.push(Line::themed(&self.model_display(args), theme, "dim"));
         let session = Session::snapshot(&args.session)?;
         let (messages, _) = super::rpc_messages::snapshot(&session);
+        let color_mode = ColorMode::resolve(args.settings.terminal_true_color());
         let mut output = format!(
             "Debug output at {}\nTerminal: {}x{}\nTotal lines: {}\n\n=== All rendered lines with visible widths ===\n",
             chrono::Utc::now().to_rfc3339(),
@@ -4578,7 +4582,7 @@ render_call_id: None,
         );
         for (index, line) in lines.iter().enumerate() {
             let mut rendered = Vec::new();
-            line.draw(&mut rendered, width)?;
+            line.draw(&mut rendered, width, color_mode)?;
             let rendered = String::from_utf8_lossy(&rendered);
             output.push_str(&format!(
                 "[{index}] (w={width}) {}\n",
@@ -4619,6 +4623,7 @@ render_call_id: None,
     }
 
     fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
+        let color_mode = ColorMode::resolve(args.settings.terminal_true_color());
         self.graphics.reset();
         let output = TranscriptOptions {
             hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
@@ -4629,7 +4634,7 @@ render_call_id: None,
         queue!(out, MoveToColumn(0), Print("\r\n"))?;
         for entry in &self.lines {
             for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking, output) {
-                line.draw(&mut out, width)?;
+                line.draw(&mut out, width, color_mode)?;
                 self.graphics
                     .paint(&line, &mut out, usize::MAX, usize::MAX)?;
                 queue!(out, Print("\r\n"))?;
@@ -4639,13 +4644,21 @@ render_call_id: None,
         Ok(())
     }
 
-    fn draw_regular(&mut self, args: &Cli, theme: &Theme, busy: bool, keys: &Keys) -> Result<()> {
+    fn draw_regular(
+        &mut self,
+        args: &Cli,
+        theme: &Theme,
+        busy: bool,
+        keys: &Keys,
+        color_mode: ColorMode,
+    ) -> Result<()> {
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
         let hardware_cursor = args.settings.show_hardware_cursor();
         let base_output = self.base_transcript_options(args, false);
         let layout = RegularLayout {
+            color_mode,
             width,
             height,
             cell: images::cell_dimensions(),
@@ -4791,7 +4804,7 @@ render_call_id: None,
             queue!(out, Print("\r\n"))?;
             if self.regular.committed == 0 || redraw {
                 for line in self.header_lines(args, theme, width, 16, false) {
-                    line.draw(&mut out, width)?;
+                    line.draw(&mut out, width, color_mode)?;
                     queue!(out, Print("\r\n"))?;
                 }
             }
@@ -4802,7 +4815,7 @@ render_call_id: None,
                 .iter()
                 .flat_map(render_entry)
             {
-                line.draw(&mut out, width)?;
+                line.draw(&mut out, width, color_mode)?;
                 self.graphics
                     .paint(&line, &mut out, usize::MAX, usize::MAX)?;
                 queue!(out, Print("\r\n"))?;
@@ -4811,7 +4824,7 @@ render_call_id: None,
         }
         if committing {
             for line in pending() {
-                line.draw(&mut out, width)?;
+                line.draw(&mut out, width, color_mode)?;
                 self.graphics
                     .paint(&line, &mut out, usize::MAX, usize::MAX)?;
                 queue!(out, Print("\r\n"))?;
@@ -4826,7 +4839,7 @@ render_call_id: None,
             self.regular.max_rows.max(total_rows)
         };
         for (row, line) in active.iter().enumerate() {
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
             self.graphics.paint_active(
                 line,
                 &mut out,
@@ -4845,7 +4858,7 @@ render_call_id: None,
             theme,
             "border",
         )
-        .draw(&mut out, width)?;
+        .draw(&mut out, width, color_mode)?;
         queue!(out, Print("\r\n"))?;
         for (row, line) in prompt.iter().enumerate() {
             let mut line = Line::themed(line, theme, "text");
@@ -4853,17 +4866,17 @@ render_call_id: None,
             {
                 line.mark_cursor(column);
             }
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
             queue!(out, Print("\r\n"))?;
         }
         for line in &below {
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
             queue!(out, Print("\r\n"))?;
         }
-        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width)?;
+        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width, color_mode)?;
         for line in &footer {
             queue!(out, Print("\r\n"))?;
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
         }
         self.regular.cursor_row = active.len() + 1 + cursor;
         self.regular.region_height = region_height;
@@ -5928,6 +5941,7 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     loop {
         if dirty {
             let (width, height) = terminal::size().unwrap_or((80, 24));
+            let color_mode = ColorMode::resolve(args.settings.terminal_true_color());
             execute!(screen.output, MoveTo(0, 0), Clear(ClearType::All))?;
             if let Some(picker) = &view.picker {
                 for (row, line) in picker
@@ -5939,7 +5953,7 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
                         break;
                     }
                     queue!(screen.output, MoveTo(0, row as u16))?;
-                    line.draw(&mut screen.output, width as usize)?;
+                    line.draw(&mut screen.output, width as usize, color_mode)?;
                 }
             }
             screen.output.flush()?;
@@ -16287,6 +16301,27 @@ exit {exit}
             "prepared-cargo-theme"
         );
         assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn resolved_theme_selection_and_extension_catalog_skip_the_same_oversized_duplicate() {
+        use super::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let large = directory.path().join("large.json");
+        let valid = directory.path().join("valid.json");
+        let mut theme: Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        theme["name"] = json!("custom");
+        std::fs::write(&large, format!("{}{}", " ".repeat(256 * 1024), theme)).unwrap();
+        std::fs::write(&valid, theme.to_string()).unwrap();
+
+        let paths = [large, valid.clone()];
+        let selected = load_resolved_theme("custom", &paths, directory.path(), false).unwrap();
+        let catalog = pi_rs_workbench::theme_resources::extension_theme_catalog(&paths).unwrap();
+        let listed = catalog.iter().find(|theme| theme.name == "custom").unwrap();
+        assert_eq!(selected.path, Some(valid));
+        assert_eq!(listed.path, selected.path);
     }
 
     #[test]
