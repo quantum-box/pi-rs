@@ -12,11 +12,11 @@ use uuid::Uuid;
 use crate::{prefix_end, read_limit, Entry, Error, Store};
 
 const PREFIX: &[u8] = b"durable/transcript/entry/";
-const MAGIC: &[u8] = b"\x89PI-TRANSCRIPT\0\x01";
-const HEADER: usize = MAGIC.len() + 4 + 32;
+pub(crate) const MAGIC: &[u8] = b"\x89PI-TRANSCRIPT\0\x01";
+pub(crate) const HEADER: usize = MAGIC.len() + 4 + 32;
 const MIN_BYTES: usize = 1024;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
-const MAX_LIMIT: usize = 64;
+pub(crate) const MAX_LIMIT: usize = 64;
 
 /// A finite database-local pass. The boundary excludes writes after capture.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +60,7 @@ fn packed_bytes(value: &[u8]) -> Result<Option<Vec<u8>>, Error> {
     Ok((packed.len() + 32 <= value.len()).then_some(packed))
 }
 
-fn unpack(value: Vec<u8>, max_bytes: Option<usize>) -> Result<Vec<u8>, Error> {
+pub(crate) fn unpack(value: Vec<u8>, max_bytes: Option<usize>) -> Result<Vec<u8>, Error> {
     if !value.starts_with(MAGIC) {
         return Ok(value);
     }
@@ -128,19 +128,7 @@ impl Store {
             return Err(Error::InvalidSnapshot);
         }
         let after = cursor.after.map_or_else(|| PREFIX.to_vec(), key_for);
-        let end = prefix_end(PREFIX).ok_or(Error::InvalidSnapshot)?;
-        let page = {
-            let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
-            let mut stmt = conn.prepare(
-                "SELECT key, version FROM durable_store_entries
-                 WHERE key>?1 AND key<?2
-                 ORDER BY key LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(params![after, end, limit], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
+        let page = self.packing_candidates(PREFIX, &after, limit)?;
         let next = page
             .last()
             .filter(|_| page.len() == limit)
@@ -158,36 +146,7 @@ impl Store {
             if *version > cursor.through_version {
                 continue;
             }
-            let raw: Option<Vec<u8>> = {
-                let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
-                conn.query_row(
-                    "SELECT value FROM durable_store_entries
-                     WHERE key=?1 AND version=?2 AND length(value) BETWEEN ?3 AND ?4
-                       AND substr(value, 1, ?5)<>?6",
-                    params![key, version, MIN_BYTES, MAX_BYTES, MAGIC.len(), MAGIC],
-                    |row| row.get(0),
-                )
-                .optional()?
-            };
-            let Some(raw) = raw else { continue };
-            let Some(representation) = packed_bytes(&raw)? else {
-                continue;
-            };
-            if unpack(representation.clone(), Some(raw.len()))? != raw {
-                return Err(Error::InvalidSnapshot);
-            }
-            // The CAS includes raw bytes because another packer may have used
-            // this same logical version. No logical read has been changed.
-            let saved = raw.len() - representation.len();
-            let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
-            #[cfg(feature = "experimental-graph-revision")]
-            let _protocol = self.graph_protocol_write_scope();
-            if conn.execute(
-                "UPDATE durable_store_entries SET value=?1
-                 WHERE key=?2 AND version=?3 AND value=?4",
-                params![representation, key, version, raw],
-            )? == 1
-            {
+            if let Some(saved) = self.pack_stored_entry(key, *version)? {
                 packed += 1;
                 reclaimed_bytes += saved;
             }
@@ -198,6 +157,60 @@ impl Store {
             reclaimed_bytes,
             next,
         })
+    }
+
+    pub(crate) fn packing_candidates(
+        &self,
+        prefix: &[u8],
+        after: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, u64)>, Error> {
+        let end = prefix_end(prefix).ok_or(Error::InvalidSnapshot)?;
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT key, version FROM durable_store_entries
+             WHERE key>?1 AND key<?2 ORDER BY key LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![after, end, limit], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn pack_stored_entry(
+        &self,
+        key: &[u8],
+        version: u64,
+    ) -> Result<Option<usize>, Error> {
+        let raw: Option<Vec<u8>> = {
+            let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+            conn.query_row(
+                "SELECT value FROM durable_store_entries
+                 WHERE key=?1 AND version=?2 AND length(value) BETWEEN ?3 AND ?4
+                   AND substr(value, 1, ?5)<>?6",
+                params![key, version, MIN_BYTES, MAX_BYTES, MAGIC.len(), MAGIC],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
+        let Some(raw) = raw else { return Ok(None) };
+        let Some(representation) = packed_bytes(&raw)? else {
+            return Ok(None);
+        };
+        if unpack(representation.clone(), Some(raw.len()))? != raw {
+            return Err(Error::InvalidSnapshot);
+        }
+        // Another worker can pack this same logical version after our read.
+        let saved = raw.len() - representation.len();
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        #[cfg(feature = "experimental-graph-revision")]
+        let _protocol = self.graph_protocol_write_scope();
+        let updated = conn.execute(
+            "UPDATE durable_store_entries SET value=?1
+             WHERE key=?2 AND version=?3 AND value=?4",
+            params![representation, key, version, raw],
+        )?;
+        Ok((updated == 1).then_some(saved))
     }
 }
 

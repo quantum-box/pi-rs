@@ -3101,6 +3101,185 @@ fn packing_keeps_a_runtime_message_cut_forkable_across_reset_and_reopen() {
 }
 
 #[test]
+fn aged_fork_snapshot_packing_preserves_saved_forks_and_history_across_reopen() {
+    use std::num::NonZeroUsize;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fork-history.sqlite");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let system_prompt = "retained system context ".repeat(512);
+    let id = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: system_prompt.clone(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = harness.load(id).unwrap();
+    let message = Message::User {
+        content: "archived prompt".into(),
+    };
+    state.messages.push(message.clone());
+    harness.save(&state, Expected::Version(version)).unwrap();
+
+    let store = harness.owner.store();
+    let observation = crate::observer::Observer::new(store, id).head().unwrap();
+    let prefix = format!("runtime/fork/{id}/");
+    let key = format!("{prefix}{:020}", observation.0).into_bytes();
+    let original = store.get(&key).unwrap().unwrap();
+    let revision = store.document_cut(&key).unwrap().unwrap();
+    let sequence = store
+        .commit_for_version(&key, original.version)
+        .unwrap()
+        .unwrap();
+    let first_fork = harness.fork_at(id, observation).unwrap();
+    assert!(
+        harness
+            .owner
+            .store()
+            .fork_snapshot_packing_due(100, 20)
+            .unwrap()
+            .is_none()
+    );
+    harness.reset(id, Some("new context".into())).unwrap();
+    let newer = crate::observer::Observer::new(harness.owner.store(), id)
+        .head()
+        .unwrap();
+    let newer_key = format!("{prefix}{:020}", newer.0).into_bytes();
+    drop(harness);
+
+    let harness = Harness::open_paused(&path, options()).unwrap();
+    let store = harness.owner.store();
+    assert!(store.fork_snapshot_packing_due(119, 20).unwrap().is_none());
+    let mut cursor = store.fork_snapshot_packing_due(120, 20).unwrap().unwrap();
+    let mut reclaimed = 0;
+    loop {
+        let page = harness
+            .pack_fork_snapshot_history(&cursor, NonZeroUsize::MIN)
+            .unwrap();
+        assert!(page.examined <= 1);
+        reclaimed += page.reclaimed_bytes;
+        let Some(next) = page.next else { break };
+        cursor = next;
+    }
+    assert!(reclaimed > 8_000);
+    assert_eq!(store.get(&key).unwrap().unwrap(), original);
+    assert_eq!(store.document_cut(&key).unwrap(), Some(revision));
+    assert_eq!(
+        store.commit_for_version(&key, original.version).unwrap(),
+        Some(sequence)
+    );
+    assert!(matches!(
+        store.get_bounded(&key, original.value.len() - 1),
+        Err(durable_store::Error::DocumentFrameTooLarge)
+    ));
+    assert!(
+        store
+            .list(prefix.as_bytes())
+            .unwrap()
+            .contains(&(key.clone(), original.clone()))
+    );
+    assert!(
+        store
+            .list_prefixes(&[prefix.as_bytes()])
+            .unwrap()
+            .contains(&(key.clone(), original.clone()))
+    );
+    assert!(
+        store
+            .prefix_page_bounded(prefix.as_bytes(), b"", 16, 128, 65_536)
+            .unwrap()
+            .contains(&(key.clone(), original.clone()))
+    );
+    assert_eq!(
+        store
+            .page_with_metadata(&key, prefix.as_bytes(), b"", 16)
+            .unwrap()
+            .0,
+        Some(original)
+    );
+
+    let raw =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let is_json = |key: &[u8]| {
+        raw.query_row(
+            "SELECT substr(value, 1, 1)=X'7B' FROM durable_store_entries WHERE key=?1",
+            [key],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    };
+    assert!(!is_json(&key));
+    assert!(
+        is_json(&newer_key),
+        "writes after the captured version wait for the next window"
+    );
+
+    drop(raw);
+    drop(harness);
+    let mut harness = Harness::open_paused(path, options()).unwrap();
+    let replayed_fork = harness.fork_at(id, observation).unwrap();
+    for fork in [first_fork, replayed_fork] {
+        let branch = harness.conversation(fork).unwrap();
+        assert_eq!(branch.config.system_prompt, system_prompt);
+        assert_eq!(branch.messages, [message.clone()]);
+    }
+}
+
+#[tokio::test]
+async fn scheduler_packs_aged_fork_snapshots_and_keeps_the_cut_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("automatic-fork-history.sqlite");
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    let system_prompt = "large context ".repeat(1_024);
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: system_prompt.clone(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    scheduler
+        .start_fork_snapshot_packing(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(5),
+        )
+        .unwrap();
+    let key = format!("runtime/fork/{id}/{:020}", 1).into_bytes();
+    let raw =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let packed = raw
+                .query_row(
+                    "SELECT substr(value, 1, 1)=X'89' FROM durable_store_entries WHERE key=?1",
+                    [&key],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap();
+            if packed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let fork = scheduler.fork_at(id, crate::observer::Cursor(1)).unwrap();
+    assert_eq!(
+        scheduler.conversation(id).unwrap().config.system_prompt,
+        system_prompt
+    );
+    assert_eq!(
+        scheduler.conversation(fork).unwrap().config.system_prompt,
+        system_prompt
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[test]
 fn message_history_tracks_commit_state_across_batches_reset_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

@@ -7,6 +7,7 @@
 //! the database before deciding whether to retry a non-idempotent operation.
 
 pub mod controls;
+pub mod fork_snapshot_packing;
 #[cfg(feature = "experimental-graph-revision")]
 pub mod graph_revision;
 pub mod owner;
@@ -1791,13 +1792,20 @@ impl Store {
             if result.last().is_none_or(|frame| frame.0 != sequence) {
                 result.push((sequence, Vec::new()));
             }
-            result.last_mut().unwrap().1.push((
-                row.get(1)?,
-                Entry {
-                    value: row.get(2)?,
-                    version: row.get(3)?,
-                },
-            ));
+            result
+                .last_mut()
+                .unwrap()
+                .1
+                .push(fork_snapshot_packing::unpack_keyed_entry(
+                    (
+                        row.get(1)?,
+                        Entry {
+                            value: row.get(2)?,
+                            version: row.get(3)?,
+                        },
+                    ),
+                    None,
+                )?);
         }
         Ok(result)
     }
@@ -1807,7 +1815,7 @@ impl Store {
             return self.get_bounded(key, limit);
         }
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
-        Ok(conn
+        let entry = conn
             .query_row(
                 "SELECT value, version FROM durable_store_entries WHERE key=?1",
                 [key],
@@ -1818,7 +1826,11 @@ impl Store {
                     })
                 },
             )
-            .optional()?)
+            .optional()?;
+        drop(conn);
+        entry
+            .map(|entry| fork_snapshot_packing::unpack_entry(key, entry, None))
+            .transpose()
     }
     /// Read an entry without materializing a value above `max_bytes`.
     pub fn get_bounded(&self, key: &[u8], max_bytes: usize) -> Result<Option<Entry>, Error> {
@@ -1828,9 +1840,13 @@ impl Store {
             "SELECT CASE WHEN length(value)<=?2 THEN value ELSE NULL END,version,length(value) FROM durable_store_entries WHERE key=?1",
             params![key, cap], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).optional()?;
+        drop(conn);
         match row {
             None => Ok(None),
-            Some((Some(value), version, _)) => Ok(Some(Entry { value, version })),
+            Some((Some(value), version, _)) => {
+                fork_snapshot_packing::unpack_entry(key, Entry { value, version }, Some(max_bytes))
+                    .map(Some)
+            }
             Some(_) => Err(Error::DocumentFrameTooLarge),
         }
     }
@@ -1847,7 +1863,13 @@ impl Store {
                 },
             ))
         })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let entries = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(conn);
+        entries
+            .into_iter()
+            .map(|entry| fork_snapshot_packing::unpack_keyed_entry(entry, None))
+            .collect()
     }
 
     /// Read at most `limit` keys without allocating their values. Oversized
@@ -1904,17 +1926,28 @@ impl Store {
                 ))
             },
         )?;
-        rows.map(|row| {
-            let (key, value, version) = row?;
-            Ok((
-                key.ok_or(Error::InvalidSnapshot)?,
-                Entry {
-                    value: value.ok_or(Error::InvalidSnapshot)?,
-                    version,
-                },
-            ))
-        })
-        .collect()
+        let entries = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(conn);
+        entries
+            .into_iter()
+            .map(|(key, value, version)| {
+                fork_snapshot_packing::unpack_keyed_entry(
+                    (
+                        key.ok_or(Error::InvalidSnapshot)?,
+                        Entry {
+                            value: value.ok_or(Error::InvalidSnapshot)?,
+                            version,
+                        },
+                    ),
+                    Some(max_value_bytes),
+                )
+                .map_err(|error| match error {
+                    Error::DocumentFrameTooLarge => Error::InvalidSnapshot,
+                    other => other,
+                })
+            })
+            .collect()
     }
 
     /// Read multiple key ranges from one SQLite snapshot.
@@ -1936,7 +1969,11 @@ impl Store {
             result.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
         tx.commit()?;
-        Ok(result)
+        drop(conn);
+        result
+            .into_iter()
+            .map(|entry| fork_snapshot_packing::unpack_keyed_entry(entry, None))
+            .collect()
     }
     /// Read a metadata key and a bounded, ordered page from one SQLite snapshot.
     /// `after` is exclusive and must be a key in or before the prefix range.
@@ -1961,10 +1998,14 @@ impl Store {
             .optional()?;
         let metadata = metadata
             .map(|(value, version)| {
-                Ok::<_, Error>(Entry {
-                    value: value.ok_or(Error::DocumentFrameTooLarge)?,
-                    version,
-                })
+                fork_snapshot_packing::unpack_entry(
+                    metadata_key,
+                    Entry {
+                        value: value.ok_or(Error::DocumentFrameTooLarge)?,
+                        version,
+                    },
+                    metadata_limit,
+                )
             })
             .transpose()?;
         let end = prefix_end(prefix);
@@ -1986,13 +2027,16 @@ impl Store {
             })?;
             rows.map(|row| {
                 let (key, value, version) = row?;
-                Ok((
-                    key.ok_or(Error::DocumentFrameTooLarge)?,
-                    Entry {
-                        value: value.ok_or(Error::DocumentFrameTooLarge)?,
-                        version,
-                    },
-                ))
+                fork_snapshot_packing::unpack_keyed_entry(
+                    (
+                        key.ok_or(Error::DocumentFrameTooLarge)?,
+                        Entry {
+                            value: value.ok_or(Error::DocumentFrameTooLarge)?,
+                            version,
+                        },
+                    ),
+                    value_limit,
+                )
             })
             .collect::<Result<Vec<_>, Error>>()?
         };
