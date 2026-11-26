@@ -118,7 +118,7 @@ pub(super) fn count(session: &Session) -> usize {
 pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let branch = session.branch();
     let entries = session.current_message_entries();
-    let projection = Projection::new(branch.iter().copied());
+    let mut projection = Projection::new(branch.iter().copied());
     let mut imported_entries = HashMap::new();
     let mut import = None;
     let mut edits = HashMap::new();
@@ -126,9 +126,14 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let additional: HashMap<_, _> = additional_assistants(session, &entries)
         .map(|entry| (entry.record_id, entry))
         .collect();
+    let mut has_imported_shell_error = false;
     for record in &branch {
         if let Event::SourceEntry { format, entry } = &record.event {
             import = (format == "pi").then_some(entry);
+            has_imported_shell_error |= import.is_some_and(|entry| {
+                let message = &entry["message"];
+                message["role"] == "bashExecution" && message["fullOutputError"].is_string()
+            });
         } else if let Some(source) = import
             && !matches!(record.event, Event::ModelFinished { .. })
         {
@@ -144,6 +149,10 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
         {
             edits.insert(*target, replacement);
         }
+    }
+    if has_imported_shell_error {
+        projection.verified_pi_conversions =
+            session.validated_pi_conversion_counts().unwrap_or_default();
     }
     let mut extra_messages = branch
         .into_iter()
@@ -211,7 +220,12 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                     .unwrap_or_else(|| {
                         system_value(record, content, sections, tools_added, tools_removed)
                     }),
-                _ => shell_message(record)?,
+                _ => shell_message(
+                    session.records(),
+                    record,
+                    Some(MetadataSource::Session(session)),
+                    &projection.verified_pi_conversions,
+                )?,
             };
             Some((record.id, value))
         })
@@ -327,6 +341,7 @@ pub(super) struct Projection {
     models: HashMap<u64, u64>,
     request_identities: HashMap<u64, u64>,
     tools: HashMap<Uuid, (u64, usize)>,
+    verified_pi_conversions: BTreeMap<u64, u64>,
 }
 
 impl Projection {
@@ -562,7 +577,9 @@ impl Projection {
                 is_error: outcome.is_error(),
                 is_structured: Some(outcome.is_structured()),
             },
-            Event::BashExecution { .. } => return shell_message(record),
+            Event::BashExecution { .. } => {
+                return shell_message(records, record, metadata, &self.verified_pi_conversions);
+            }
             Event::SystemCheckpoint { content, .. } => Message::System {
                 content: content.clone(),
             },
@@ -612,7 +629,10 @@ impl Projection {
                 json!({"role":"system","content":content,"timestamp":timestamp})
             }
             Message::User { content } => match &record.event {
-                Event::BashExecution { .. } => shell_message(record).expect("shell record"),
+                Event::BashExecution { .. } => {
+                    shell_message(records, record, metadata, &self.verified_pi_conversions)
+                        .expect("shell record")
+                }
                 Event::BranchSummary { summary, from, .. } => {
                     json!({"role":"branchSummary","summary":summary,"fromId":from.map(|id| id.to_string()),"timestamp":timestamp})
                 }
@@ -880,13 +900,42 @@ fn imported_message(
     Some(message)
 }
 
-fn shell_message(record: &Record) -> Option<Value> {
+fn shell_message(
+    records: &[Record],
+    record: &Record,
+    metadata: Option<MetadataSource<'_>>,
+    verified_pi_conversions: &BTreeMap<u64, u64>,
+) -> Option<Value> {
     let Event::BashExecution { execution } = &record.event else {
         return None;
     };
     let mut value = serde_json::to_value(execution).ok()?;
     value["role"] = json!("bashExecution");
     value["timestamp"] = json!(record.timestamp_millis().unwrap_or_default());
+    let error = metadata
+        .and_then(|source| source.get(record.id))
+        .and_then(|value| value["fullOutputError"].as_str())
+        .or_else(|| {
+            let parent = records.get(record.parent?.checked_sub(1)? as usize)?;
+            // A Pi shell entry converts into exactly one adjacent record.
+            // Later native children can share the same parent.
+            if parent.id.checked_add(1) != Some(record.id)
+                || verified_pi_conversions.get(&parent.id) != Some(&1)
+            {
+                return None;
+            }
+            match &parent.event {
+                Event::SourceEntry { format, entry }
+                    if format == "pi" && entry["message"]["role"] == "bashExecution" =>
+                {
+                    entry["message"]["fullOutputError"].as_str()
+                }
+                _ => None,
+            }
+        });
+    if let Some(error) = execution.output_save_error(error) {
+        value["fullOutputError"] = json!(error);
+    }
     Some(value)
 }
 
@@ -934,6 +983,60 @@ pub(super) fn compaction_tokens(session: &Session, record: &Record) -> u64 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn imported_shell_save_error_is_only_projected_on_its_verified_conversion() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{
+                "role":"bashExecution","command":"fixture","output":"tail","exitCode":19,
+                "truncated":true,"fullOutputError":"disk full"
+            }}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let mut session = super::super::session_import::read(fixture.path()).unwrap();
+        let imported = session.head();
+        let source = session.records().last().unwrap().parent.unwrap();
+        let (messages, _) = snapshot(&session);
+        let result = messages
+            .iter()
+            .find(|message| message["role"] == "bashExecution")
+            .unwrap();
+        assert_eq!(result["output"], "tail");
+        assert_eq!(result["exitCode"], 19);
+        assert_eq!(result["fullOutputError"], "disk full");
+        assert!(result["fullOutputPath"].is_null());
+
+        session.checkout(source).unwrap();
+        for exclude_from_context in [false, true] {
+            session
+                .append_local_bash_result(pi_rs::BashExecution {
+                    command: "native fixture".into(),
+                    output: "native tail".into(),
+                    exit_code: Some(23),
+                    cancelled: false,
+                    truncated: true,
+                    full_output_path: None,
+                    exclude_from_context,
+                })
+                .unwrap();
+            assert_eq!(session.records().last().unwrap().parent, Some(source));
+            let (messages, _) = snapshot(&session);
+            let [message] = messages.as_slice() else {
+                panic!("expected only the native shell result, got {messages:?}");
+            };
+            assert_eq!(message["command"], "native fixture");
+            assert_eq!(message["output"], "native tail");
+            assert!(message.get("fullOutputError").is_none());
+            session.checkout(source).unwrap();
+        }
+
+        session.checkout(imported).unwrap();
+        let (messages, _) = snapshot(&session);
+        assert_eq!(messages[0]["fullOutputError"], "disk full");
+    }
 
     #[test]
     fn native_assistant_stop_is_preserved_when_an_edit_empties_the_reply() {

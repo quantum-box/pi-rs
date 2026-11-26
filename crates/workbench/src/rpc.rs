@@ -2648,6 +2648,9 @@ fn forward_event(
                     {
                         data["fullOutputPath"] = path.clone();
                     }
+                    if let Some(error) = execution["fullOutputError"].as_str() {
+                        data["fullOutputError"] = json!(error);
+                    }
                     Ok(Some(data))
                 };
                 response(&request, result)?;
