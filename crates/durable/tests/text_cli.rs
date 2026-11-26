@@ -533,6 +533,149 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     assert_eq!(bodies[12]["model"], "fixture");
 }
 
+#[test]
+fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let provider = thread::spawn(move || {
+        for step in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "provider request timed out");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept provider request: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = Some(value.trim().parse().unwrap());
+                }
+            }
+            let mut body = vec![0; length.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let events = if step == 0 {
+                let tools = request["tools"].as_array().unwrap();
+                assert_eq!(tools.len(), 4);
+                assert!(tools.iter().any(|tool| tool["name"] == "read"));
+                let call = json!({
+                    "type":"function_call", "call_id":"fixture-call", "name":"read",
+                    "arguments":json!({"path":"fixture.txt"}).to_string()
+                });
+                vec![
+                    json!({"type":"response.output_item.added","output_index":0,"item":call}),
+                    json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":call["arguments"]}),
+                    json!({"type":"response.completed","response":{"status":"completed","output":[call],"usage":{"input_tokens":1,"output_tokens":1}}}),
+                ]
+            } else {
+                assert!(request["input"].as_array().unwrap().iter().any(|item| {
+                    item["type"] == "function_call_output"
+                        && item["call_id"] == "fixture-call"
+                        && item["output"].to_string().contains("durable-file-content")
+                }));
+                vec![
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":"File read."}),
+                    json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"File read."}]}],"usage":{"input_tokens":1,"output_tokens":1}}}),
+                ]
+            };
+            let response = events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("durable.sqlite");
+    std::fs::write(dir.path().join("fixture.txt"), "durable-file-content").unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let rpc = |workspace: &std::path::Path, args: &[&str], requests: &[Value]| {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_pi-rs-durable"))
+            .env("OPENAI_API_KEY", "fixture-key")
+            .args(["--endpoint", &endpoint, "--rpc", "--db"])
+            .arg(&db)
+            .arg("--coding-tools")
+            .arg(workspace)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = process.stdin.take().unwrap();
+        for request in requests {
+            writeln!(input, "{request}").unwrap();
+        }
+        drop(input);
+        process.wait_with_output().unwrap()
+    };
+    let events = frames(rpc(
+        dir.path(),
+        &["--model", "fixture"],
+        &[
+            json!({"type":"get_state"}),
+            json!({"type":"prompt", "message":"Read the fixture"}),
+        ],
+    ));
+    let id = events[0]["data"]["sessionId"].as_str().unwrap();
+    let start = events
+        .iter()
+        .position(|event| event["type"] == "tool_execution_start")
+        .unwrap_or_else(|| panic!("missing tool event: {events:#?}"));
+    let end = events
+        .iter()
+        .position(|event| event["type"] == "tool_execution_end")
+        .unwrap_or_else(|| panic!("missing tool event: {events:#?}"));
+    assert!(start < end);
+    assert_eq!(events[start]["toolName"], "read");
+    assert_eq!(events[end]["isError"], false);
+    assert!(
+        events[end]["result"]["content"]
+            .to_string()
+            .contains("durable-file-content")
+    );
+    assert_eq!(events.last().unwrap()["type"], "agent_end");
+    assert_eq!(events.last().unwrap()["success"], true);
+    let reopened = frames(rpc(
+        dir.path(),
+        &["--conversation", id],
+        &[json!({"type":"get_messages"})],
+    ));
+    assert!(
+        reopened[0]["data"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"] == "toolResult"
+                    && message["durableInvocation"] == events[start]["durableInvocation"]
+                    && message["content"]
+                        .to_string()
+                        .contains("durable-file-content")
+            })
+    );
+    let wrong_workspace = rpc(other.path(), &["--conversation", id], &[]);
+    assert!(!wrong_workspace.status.success());
+    assert!(String::from_utf8_lossy(&wrong_workspace.stderr).contains("coding tools workspace"));
+    provider.join().unwrap();
+}
+
 fn frames(output: Output) -> Vec<Value> {
     assert!(
         output.status.success(),
