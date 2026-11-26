@@ -3533,6 +3533,11 @@ impl View {
                     is_error: false,
                     ..
                 } if name == "edit" => details["diff"].as_str().filter(|diff| !diff.is_empty()),
+                pi_rs::Outcome::StructuredWithDetails { data, details, .. }
+                    if name == "edit" && data["isError"] != true =>
+                {
+                    details["diff"].as_str().filter(|diff| !diff.is_empty())
+                }
                 _ => None,
             };
             *numbered_diff = diff.is_some();
