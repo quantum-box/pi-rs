@@ -3716,7 +3716,9 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         )
         .unwrap();
         let mut args = Cli::parse_from(["pi", "--no-trust"]);
-        args.workspace = directory.clone();
+        // Keep the user package outside the untrusted project workspace.
+        args.workspace = directory.join("workspace");
+        std::fs::create_dir(&args.workspace).unwrap();
         std::fs::remove_file(config::agent_dir().join("validated")).unwrap();
         config::update_object(&config::agent_dir().join("packages/index.json"), |index| {
             index.insert(key(&source), serde_json::to_value(old_cache).unwrap());
