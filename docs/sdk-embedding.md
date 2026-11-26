@@ -23,6 +23,15 @@ host-supplied metadata. They do not load config, access credentials, probe
 providers, or infer a default route. Listings are ordered by the registered
 identities, and lookup is case-sensitive.
 
+A host can register the model's selectable reasoning levels with
+`ModelCatalogBuilder::set_thinking_levels`. Use
+`catalog.thinking_levels(provider, model)` to populate a picker in the host's
+order. An empty list means the host declared no selectable levels. `None`
+means that no list is available. This is the host-owned catalog equivalent
+of [Pi's available thinking levels](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2827-L2838).
+The list describes capability metadata. The host still chooses a client
+configured for the selected level.
+
 For older journals that recorded a model name without its provider, the host
 may explicitly authorize that name with `session_builder_with_legacy_model`.
 Use this only when the host knows which provider the old name represents; the
@@ -42,6 +51,11 @@ fn session_builder(client: Arc<dyn Model>) -> pi_rs::Result<pi_rs::SessionBuilde
             display_name: Some("My model".into()),
             ..Default::default()
         },
+    )?;
+    models.set_thinking_levels(
+        "my-provider",
+        "my-model",
+        ["off", "low", "high"].map(str::to_owned),
     )?;
     let catalog = models.build();
     let model = catalog
