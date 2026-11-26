@@ -3050,6 +3050,120 @@ fn position_fork_uses_the_occurrence_commit_not_an_earlier_reference() {
 }
 
 #[test]
+fn session_info_is_append_only_and_forks_at_its_original_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let conversation = harness
+        .create_conversation(Config {
+            model: "fixture".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = harness.load(conversation).unwrap();
+    state.messages.push(Message::User {
+        content: "hello".into(),
+    });
+    harness.save(&state, Expected::Version(version)).unwrap();
+
+    let first = harness
+        .set_session_name(conversation, "  One\r\nTwo  ")
+        .unwrap();
+    let capture = harness.session_entries_start(conversation).unwrap();
+    let cleared = harness.set_session_name(conversation, "   ").unwrap();
+    assert_eq!(
+        harness.conversation(conversation).unwrap().session_name(),
+        None
+    );
+
+    let historical = harness.fork_by_entry_id(conversation, first).unwrap();
+    let inherited = harness.fork_by_entry_id(historical, first).unwrap();
+    let current = harness.fork(conversation).unwrap();
+    drop(harness);
+
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    for fork in [historical, inherited] {
+        let state = harness.conversation(fork).unwrap();
+        assert_eq!(state.session_name(), Some("One Two"));
+        assert_eq!(state.messages.len(), 1);
+        let page = harness
+            .session_entries(
+                &harness.session_entries_start(fork).unwrap(),
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].id(), first);
+        assert!(matches!(&page.entries[1], SessionEntry::Message(_)));
+        assert!(page.older.is_none());
+    }
+    assert_eq!(harness.conversation(current).unwrap().session_name(), None);
+    assert!(harness.fork_by_entry_id(historical, cleared).is_err());
+
+    let saved_page = harness
+        .session_entries(&capture, std::num::NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(saved_page.entries[0].id(), first);
+    assert!(matches!(
+        &harness
+            .session_entries(&saved_page.older.unwrap(), std::num::NonZeroUsize::MIN)
+            .unwrap()
+            .entries[0],
+        SessionEntry::Message(_)
+    ));
+    let latest_page = harness
+        .session_entries(
+            &harness.session_entries_start(conversation).unwrap(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .unwrap();
+    assert_eq!(latest_page.entries[0].id(), cleared);
+    assert!(
+        matches!(&latest_page.entries[0], SessionEntry::SessionInfo { entry, .. } if entry.name.is_none())
+    );
+}
+
+#[test]
+fn session_info_survives_an_inflight_worker_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    harness.submit(id, None, "question".into()).unwrap();
+    let mut worker = harness.worker();
+    let (mut candidate, baseline) = worker.load(id).unwrap();
+    candidate.messages.push(Message::Assistant {
+        content: "answer".into(),
+        calls: Vec::new(),
+        replay: None,
+    });
+    let name_entry = harness.set_session_name(id, "Concurrent rename").unwrap();
+    worker
+        .save(&candidate, Expected::Version(baseline))
+        .unwrap();
+
+    let state = harness.conversation(id).unwrap();
+    assert_eq!(state.session_name(), Some("Concurrent rename"));
+    let entries = harness
+        .session_entries(
+            &harness.session_entries_start(id).unwrap(),
+            std::num::NonZeroUsize::new(4).unwrap(),
+        )
+        .unwrap()
+        .entries;
+    assert_eq!(entries.len(), 3);
+    assert!(matches!(&entries[0], SessionEntry::Message(_)));
+    assert_eq!(entries[1].id(), name_entry);
+    assert!(matches!(&entries[2], SessionEntry::Message(_)));
+}
+
+#[test]
 fn message_history_tracks_commit_state_across_batches_reset_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
