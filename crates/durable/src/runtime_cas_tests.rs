@@ -1387,6 +1387,98 @@ fn session_checkout_projects_an_interior_append_and_keeps_the_old_path() {
 }
 
 #[test]
+fn interior_append_distinguishes_earlier_document_writes_from_atomic_writes() {
+    for atomic in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let config = Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let id = h.create_conversation(config.clone()).unwrap();
+        let other = h.create_conversation(config).unwrap();
+        let address = crate::document::Address {
+            scope: if atomic { id } else { other }.to_string(),
+            name: "checkout".into(),
+            key: "during-history".into(),
+        };
+        let key = address.storage_key().unwrap();
+        let documents = crate::task_store::OwnedBatch {
+            checks: vec![Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            }],
+            mutations: vec![Mutation::Put {
+                key,
+                value: br#"{"value":"separate"}"#.to_vec(),
+            }],
+        };
+        if !atomic {
+            h.owner
+                .store()
+                .commit(&documents.checks, &documents.mutations)
+                .unwrap();
+        }
+        let (mut state, version) = h.load(id).unwrap();
+        let retained = Uuid::new_v4();
+        let discarded = Uuid::new_v4();
+        for (message_id, text) in [(retained, "retained"), (discarded, "later")] {
+            state.content_blocks.insert(
+                state.messages.len(),
+                crate::transcript::MessageContentBlocks {
+                    message_id,
+                    blocks: vec![serde_json::json!({"type":"text","text":text})],
+                },
+            );
+            state.messages.push(Message::User {
+                content: String::new(),
+            });
+        }
+        h.save_composed_locked(
+            &state,
+            Expected::Version(version),
+            None,
+            &[],
+            &[],
+            atomic.then_some(&documents),
+        )
+        .unwrap();
+
+        let fork = h.fork_by_entry_id(id, retained);
+        let checkout = h.checkout_session_entry(id, retained);
+        if atomic {
+            assert!(matches!(
+                fork,
+                Err(Error::Fork(crate::fork::Error::InvalidSnapshot))
+            ));
+            assert!(matches!(
+                checkout,
+                Err(Error::Fork(crate::fork::Error::InvalidSnapshot))
+            ));
+            assert_eq!(h.conversation(id).unwrap().messages.len(), 2);
+        } else {
+            let fork = fork.unwrap();
+            checkout.unwrap();
+            drop(h);
+            let h = Harness::open_paused(&path, options()).unwrap();
+            for conversation in [id, fork] {
+                let state = h.conversation(conversation).unwrap();
+                assert_eq!(state.messages.len(), 1);
+                assert_eq!(state.content_blocks[&0].message_id, retained);
+                let entries = h.session_entries_start(conversation).unwrap();
+                assert_eq!(h.session_tree(&entries).unwrap().leaf_id, Some(retained));
+            }
+            assert_eq!(
+                h.document(&address).unwrap().unwrap().value["value"],
+                "separate"
+            );
+        }
+    }
+}
+
+#[test]
 fn session_branch_summary_reopens_at_proven_interior_cut_and_fences_stale_plan() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

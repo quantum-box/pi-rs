@@ -9598,6 +9598,30 @@ impl Harness {
         )
     }
 
+    fn append_documents_unchanged(
+        &self,
+        previous_key: &[u8],
+        append_key: &[u8],
+        revision: u64,
+    ) -> Result<bool, Error> {
+        let store = self.owner.store();
+        let Some(previous_revision) = store.document_cut(previous_key)? else {
+            return Ok(false);
+        };
+        if previous_revision >= revision {
+            return Ok(previous_revision == revision);
+        }
+        // A newer cut can include writes made between the two conversation
+        // commits. The latest document revision must predate the append itself.
+        let previous = store.first_commit_for_key(previous_key)?;
+        let documents = store.document_commit_sequence(revision)?;
+        let append = store.first_commit_for_key(append_key)?;
+        Ok(matches!((previous, documents, append),
+            (Some(previous), Some(documents), Some(append))
+                if previous < documents && documents < append
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn fork_at_selected(
         &mut self,
@@ -9642,7 +9666,12 @@ impl Harness {
                 .checked_sub(1)
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
             let previous_key = format!("runtime/fork/{}/{:020}", id, previous);
-            if self.owner.store().document_cut(previous_key.as_bytes())? != Some(revision) {
+            let unchanged = if reset_cut.is_none() {
+                self.append_documents_unchanged(previous_key.as_bytes(), key.as_bytes(), revision)?
+            } else {
+                self.owner.store().document_cut(previous_key.as_bytes())? == Some(revision)
+            };
+            if !unchanged {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             }
         }
@@ -11484,8 +11513,12 @@ impl Harness {
             }
             let previous = observation.0.checked_sub(1).ok_or(InvalidSnapshot)?;
             let previous_anchor = self.fork_anchor_checks(origin, previous)?;
-            let revision = store.document_cut(&anchor[1].key)?;
-            if revision.is_none() || store.document_cut(&previous_anchor[1].key)? != revision {
+            let revision = store.document_cut(&anchor[1].key)?.ok_or(InvalidSnapshot)?;
+            if !self.append_documents_unchanged(
+                &previous_anchor[1].key,
+                &anchor[1].key,
+                revision,
+            )? {
                 return Err(InvalidSnapshot.into());
             }
             checks.extend(previous_anchor);
@@ -13126,6 +13159,10 @@ impl Harness {
                         .value
                         .clone(),
                 )?;
+                let append_cut = matches!(
+                    source,
+                    TranscriptChange::AppendV3 { .. } | TranscriptChange::AppendV4 { .. }
+                );
                 let (stable_prefix, source_commit, source_origin, batch_len) = match source {
                     TranscriptChange::AppendV3 {
                         stable_prefix,
@@ -13176,7 +13213,16 @@ impl Harness {
                     .store()
                     .document_cut(current_key.as_bytes())?
                     .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                if self.owner.store().document_cut(previous_key.as_bytes())? != Some(revision)
+                let unchanged = if append_cut {
+                    self.append_documents_unchanged(
+                        previous_key.as_bytes(),
+                        current_key.as_bytes(),
+                        revision,
+                    )?
+                } else {
+                    self.owner.store().document_cut(previous_key.as_bytes())? == Some(revision)
+                };
+                if !unchanged
                     || stable_prefix.checked_add(batch_len) != Some(active.len())
                     || messages.len() <= stable_prefix
                     || messages.len() >= active.len()
