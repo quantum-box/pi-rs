@@ -502,6 +502,13 @@ replacement returns the last value and no operations. Local commits wake the
 watch immediately. The polling interval also covers writes through other
 SQLite connections.
 
+The unified history cursor also advances on changes to latest-only conversation
+documents and shared session documents, including retirements. The
+`latest_document_changes` and `session_document_changes` fields contain
+addresses to refresh through the document APIs. They carry no saved payload or
+operation batch. Shared addresses are visible only for commits during the
+conversation's current membership, including changes made by other members.
+
 Nested tool calls are journaled by parent operation and call order. The standalone
 `NestedHost::call_keyed` API also accepts explicit caller-scoped keys and reuses
 completed results across reordered replay, rejecting a changed tool or arguments.

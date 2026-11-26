@@ -26,6 +26,7 @@ pub struct Entry {
     pub version: u64,
 }
 pub type KeyedEntry = (Vec<u8>, Entry);
+pub type PutCommit = (u64, Vec<Vec<u8>>);
 pub type MetadataPage = (Option<Entry>, Vec<KeyedEntry>);
 pub type DocumentChange = (Vec<u8>, Option<Entry>);
 pub type DocumentCommit = (u64, Vec<DocumentChange>);
@@ -1711,6 +1712,51 @@ impl Store {
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
             result.push((row.get(0)?, row.get(1)?));
+        }
+        Ok(result)
+    }
+
+    /// Read the keys put under a prefix in complete commit frames. This reads
+    /// the commit index, so overwritten values need not be retained.
+    pub fn scoped_put_commits(
+        &self,
+        prefix: &[u8],
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<Vec<PutCommit>, Error> {
+        if prefix.is_empty() || limit == 0 || limit > 256 || after > through {
+            return Err(Error::InvalidSnapshot);
+        }
+        let end = prefix_end(prefix).ok_or(Error::InvalidSnapshot)?;
+        if through > self.commit_sequence()? {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "WITH chosen AS (
+                 SELECT DISTINCT sequence FROM durable_commit_versions
+                 WHERE key >= ?1 AND key < ?2 AND sequence > ?3 AND sequence <= ?4
+                 ORDER BY sequence LIMIT ?5
+             )
+             SELECT sequence, key, length(key) FROM durable_commit_versions
+             WHERE key >= ?1 AND key < ?2 AND sequence IN chosen ORDER BY sequence, key",
+        )?;
+        let mut rows = stmt.query(params![prefix, end, after, through, limit])?;
+        let mut result: Vec<PutCommit> = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(row) = rows.next()? {
+            let sequence = row.get(0)?;
+            if result.last().is_none_or(|(last, _)| *last != sequence) {
+                result.push((sequence, Vec::new()));
+                bytes = 0;
+            }
+            let (_, keys) = result.last_mut().expect("commit frame exists");
+            bytes = bytes.saturating_add(row.get::<_, usize>(2)?);
+            if keys.len() >= 256 || bytes > MAX_SCOPED_DOCUMENT_FRAME_BYTES {
+                return Err(Error::DocumentFrameTooLarge);
+            }
+            keys.push(row.get(1)?);
         }
         Ok(result)
     }

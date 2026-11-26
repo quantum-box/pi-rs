@@ -162,25 +162,38 @@ pub(crate) fn document_scope(
     store: &Store,
     conversation: Uuid,
 ) -> Result<(Uuid, [Check; 2]), crate::document::Error> {
-    let unavailable = || {
-        crate::document::Error::InvalidSessionAdmission(
-            "session documents require active conversation membership".into(),
-        )
-    };
+    optional_document_scope(store, conversation)?.ok_or_else(document_scope_unavailable)
+}
+
+fn document_scope_unavailable() -> crate::document::Error {
+    crate::document::Error::InvalidSessionAdmission(
+        "session documents require active conversation membership".into(),
+    )
+}
+
+pub(crate) fn optional_document_scope(
+    store: &Store,
+    conversation: Uuid,
+) -> Result<Option<(Uuid, [Check; 2])>, crate::document::Error> {
     let key = member_key(conversation);
-    let entry = store.get_bounded(&key, 4096)?.ok_or_else(unavailable)?;
+    let Some(entry) = store.get_bounded(&key, 4096)? else {
+        return Ok(None);
+    };
     let member: Membership = serde_json::from_slice(&entry.value)?;
     if member.version != 1 || member.conversation != conversation || member.session.is_nil() {
-        return Err(unavailable());
+        return Err(document_scope_unavailable());
     }
     let session = SessionMembership::new(store)
         .session(member.session)
         .map_err(|error| match error {
             Error::Store(error) => crate::document::Error::Store(error),
             Error::Json(error) => crate::document::Error::Json(error),
-            _ => unavailable(),
+            _ => document_scope_unavailable(),
         })?;
-    Ok((member.session, [checked(key, entry.version), session]))
+    Ok(Some((
+        member.session,
+        [checked(key, entry.version), session],
+    )))
 }
 
 /// Resolve authority from the owner's membership, never from a caller-supplied

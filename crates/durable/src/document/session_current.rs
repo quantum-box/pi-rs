@@ -71,8 +71,24 @@ impl<'a, T> From<&'a LatestConversationDocument<T>> for CurrentDefinition<'a, T>
 
 const CONVERSATION_PREFIX: &[u8] = b"durable/conversation-current-document/v1/";
 
-fn conversation_prefix(id: Uuid) -> Vec<u8> {
+pub(crate) fn conversation_prefix(id: Uuid) -> Vec<u8> {
     [CONVERSATION_PREFIX, format!("{id}/").as_bytes()].concat()
+}
+
+pub(crate) fn conversation_address(id: Uuid, storage_key: &[u8]) -> Result<super::Address, Error> {
+    let prefix = conversation_prefix(id);
+    let encoded = storage_key
+        .strip_prefix(prefix.as_slice())
+        .ok_or(Error::InvalidDocumentDefinition)?;
+    let (name, key) = serde_json::from_slice::<(String, String)>(encoded)?;
+    if conversation_key(id, &name, &key)? != storage_key {
+        return Err(Error::InvalidDocumentDefinition);
+    }
+    Ok(super::Address {
+        scope: id.to_string(),
+        name,
+        key,
+    })
 }
 
 fn conversation_key(id: Uuid, kind: &str, key: &str) -> Result<Vec<u8>, Error> {
@@ -100,10 +116,7 @@ pub(crate) fn append_latest_fork(
     });
     let prefix = conversation_prefix(parent);
     for (key, entry) in fork_rows(store, &prefix)? {
-        let (kind, family): (String, String) = serde_json::from_slice(&key[prefix.len()..])?;
-        if conversation_key(parent, &kind, &family)? != key {
-            return Err(Error::InvalidDocumentDefinition);
-        }
+        let address = conversation_address(parent, &key)?;
         let mut record: StoredDocument = serde_json::from_slice(&entry.value)?;
         if record.fork.is_none()
             || record.value.is_some() != record.definition.incarnation.is_some()
@@ -119,7 +132,7 @@ pub(crate) fn append_latest_fork(
             continue;
         }
         record.definition.incarnation = Some(Uuid::new_v4());
-        let key = conversation_key(child, &kind, &family)?;
+        let key = conversation_key(child, &address.name, &address.key)?;
         batch.checks.push(Check {
             key: key.clone(),
             expected: Expected::Missing,
@@ -204,10 +217,75 @@ impl StoredDocument {
     }
 }
 
+const SESSION_PREFIX: &[u8] = b"durable/session-current-document/v1/";
+
 fn storage_key(session: Uuid, kind: &str, key: &str) -> Result<Vec<u8>, Error> {
-    let mut storage_key = b"durable/session-current-document/v1/".to_vec();
+    let mut storage_key = SESSION_PREFIX.to_vec();
     storage_key.extend(serde_json::to_vec(&(session, kind, key))?);
     Ok(storage_key)
+}
+
+pub(crate) fn session_changes(
+    store: &Store,
+    conversation: Uuid,
+    after: u64,
+    through: u64,
+    limit: usize,
+) -> Result<Vec<(u64, Vec<super::Address>)>, Error> {
+    use crate::session_membership::optional_document_scope;
+
+    let Some(scope) = optional_document_scope(store, conversation)? else {
+        return Ok(Vec::new());
+    };
+    let session = scope.0;
+    let member = &scope.1[0];
+    let Expected::Version(version) = &member.expected else {
+        return Err(Error::InvalidDocumentDefinition);
+    };
+    // Membership grants access from its own admission, not to earlier changes.
+    // A legacy membership without tracked order predates the tracked history.
+    let admission = store
+        .commit_for_version(&member.key, *version)?
+        .unwrap_or(0);
+    if admission > through {
+        return Ok(Vec::new());
+    }
+    let prefix = [SESSION_PREFIX, format!("[\"{session}\",").as_bytes()].concat();
+    let commits = store.scoped_put_commits(
+        &prefix,
+        after.max(admission.saturating_sub(1)),
+        through,
+        limit,
+    )?;
+    // Check the same proof again before exposing addresses. Revocation or
+    // re-enrollment also changes the member version when the session is the same.
+    if optional_document_scope(store, conversation)? != Some(scope) {
+        return Ok(Vec::new());
+    }
+    commits
+        .into_iter()
+        .map(|(sequence, keys)| {
+            let addresses = keys
+                .into_iter()
+                .map(|key| {
+                    let encoded = key
+                        .strip_prefix(SESSION_PREFIX)
+                        .ok_or(Error::InvalidDocumentDefinition)?;
+                    let (owner, name, family) =
+                        serde_json::from_slice::<(Uuid, String, String)>(encoded)?;
+                    if owner != session || storage_key(session, &name, &family)? != key {
+                        return Err(Error::InvalidDocumentDefinition);
+                    }
+                    Ok(super::Address {
+                        scope: session.to_string(),
+                        name,
+                        key: family,
+                    })
+                })
+                .collect::<Result<_, Error>>()?;
+            Ok((sequence, addresses))
+        })
+        .collect()
 }
 
 struct Staged {
