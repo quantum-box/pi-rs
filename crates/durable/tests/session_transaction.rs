@@ -101,6 +101,123 @@ fn mutable_drafts_share_staged_edits_and_commit_with_entries() {
 }
 
 #[test]
+fn current_documents_follow_session_membership_and_keep_incarnations_across_migration() {
+    use pi_rs_durable::{document::SessionDocument, session_membership::SessionMembership};
+    use std::num::NonZeroU32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let root = harness.create_conversation(config()).unwrap();
+    let outsider = harness.create_conversation(config()).unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let memberships = SessionMembership::new(&store);
+    let session = memberships.create().unwrap();
+    let separate = memberships.create().unwrap();
+    memberships.enroll(session, root).unwrap();
+    memberships.enroll(separate, outsider).unwrap();
+    let fork = harness.fork(root).unwrap();
+
+    let old = SessionDocument {
+        kind: "prefs".into(),
+        version: NonZeroU32::MIN,
+        initial: object(1),
+    };
+    let new = SessionDocument {
+        kind: "prefs".into(),
+        version: NonZeroU32::new(2).unwrap(),
+        initial: object(10),
+    };
+    let original = harness
+        .session_transaction(root, |tx| {
+            tx.edit_session_document(&old, "main", |value| {
+                value.insert("n".into(), json!(2));
+                Ok(())
+            })?;
+            Ok(tx.read_session_document(&old, "main")?.unwrap())
+        })
+        .unwrap();
+    assert_eq!(
+        harness
+            .session_transaction(fork, |tx| tx.read_session_document(&old, "main"))
+            .unwrap(),
+        Some(original.clone())
+    );
+    assert!(
+        harness
+            .session_transaction(outsider, |tx| tx.read_session_document(&old, "main"))
+            .unwrap()
+            .is_none()
+    );
+
+    harness
+        .session_transaction(fork, |tx| {
+            tx.migrate_session_document(&old, &new, "main", |mut value| {
+                value.insert("migrated".into(), json!(true));
+                Ok(value)
+            })
+        })
+        .unwrap();
+    assert!(
+        harness
+            .session_transaction(root, |tx| tx.read_session_document(&old, "main"))
+            .is_err()
+    );
+    let migrated = harness
+        .session_transaction(root, |tx| tx.read_session_document(&new, "main"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(migrated.incarnation, original.incarnation);
+    assert_eq!(migrated.value["migrated"], true);
+    let revision = store.document_snapshot().unwrap();
+
+    let result = harness.session_transaction(fork, |tx| {
+        tx.retire_session_document(&new, "main")?;
+        memberships.revoke(session, fork).unwrap();
+        memberships.enroll(separate, fork).unwrap();
+        Ok(())
+    });
+    assert!(matches!(
+        result,
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    assert_eq!(
+        harness
+            .session_transaction(root, |tx| tx.read_session_document(&new, "main"))
+            .unwrap(),
+        Some(migrated)
+    );
+    assert!(
+        harness
+            .session_transaction(root, |tx| tx.retire_session_document(&new, "main"))
+            .unwrap()
+    );
+    harness
+        .session_transaction(root, |tx| {
+            tx.edit_session_document(&new, "main", |_| Ok(()))
+        })
+        .unwrap();
+    assert_eq!(store.document_snapshot().unwrap(), revision);
+    assert_eq!(
+        store
+            .list(b"durable/session-current-document/v1/")
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(store);
+    drop(harness);
+
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let reopened = harness
+        .session_transaction(root, |tx| tx.read_session_document(&new, "main"))
+        .unwrap()
+        .unwrap();
+    assert_ne!(reopened.incarnation, original.incarnation);
+    assert_eq!(reopened.value, new.initial);
+}
+
+#[test]
 fn typed_document_edits_keep_fields_and_commit_with_entries() {
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Settings {
