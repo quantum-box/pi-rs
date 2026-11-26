@@ -1149,6 +1149,37 @@ impl Host<'_, '_> {
 
 #[async_trait::async_trait]
 impl DurableTaskHost for Host<'_, '_> {
+    async fn wait_foreground_subagent(
+        &self,
+        child: &crate::owned_subagent::Admission,
+        timeout: std::time::Duration,
+    ) -> Result<Option<crate::runtime::Status>, String> {
+        use crate::runtime::Status;
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => Err("foreground subagent wait cancelled".into()),
+            result = tokio::time::timeout(timeout, async {
+                loop {
+                    let status = self.admission.checkpointable_subagent_status(child)
+                        .map_err(|error| error.to_string())?;
+                    match status {
+                        Status::Done { .. } | Status::Unanswered { .. } => return Ok(Some(status)),
+                        _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                    }
+                }
+            }) => result.unwrap_or(Ok(None)),
+        }
+    }
+
+    async fn start_foreground_subagent(
+        &self,
+        request: super::ForegroundSubagentRequest,
+    ) -> Result<crate::owned_subagent::Admission, String> {
+        self.admission
+            .admit_checkpointable_subagent(request, self.cancellation)
+            .map_err(|error| error.to_string())
+    }
+
     fn child_tools(&self) -> Vec<ToolSpec> {
         let mut tools: Vec<_> = self.children.values().map(|tool| tool.spec()).collect();
         tools.sort_unstable_by(|left, right| left.name.cmp(&right.name));

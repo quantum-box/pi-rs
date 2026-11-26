@@ -1544,13 +1544,18 @@ async fn descendant_input_and_write_commit_notify_and_reopen() {
     registry.register("write", true, DescendantWrite);
     let driver = h.start_tasks(registry).unwrap();
     driver.submit(&root).unwrap();
+    // The display write places without model work. Wait for its settlement,
+    // and for the input admission, before directly driving the conversation.
     wait_task(&path, input.id(), |s| matches!(s, TaskState::Waiting(_)));
-    assert_eq!(h.conversation(id).unwrap().submissions.len(), 2);
+    wait_task(&path, write.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    let staged = h.conversation(id).unwrap();
+    assert_eq!(staged.submissions.len(), 2);
+    assert_eq!(staged.application_writes.len(), 1);
+    assert!(staged.application_writes[0].placed);
     h.resume_conversation(id, &CancellationToken::new())
         .await
         .unwrap();
     wait_task(&path, input.id(), |s| matches!(s, TaskState::Succeeded(_)));
-    wait_task(&path, write.id(), |s| matches!(s, TaskState::Succeeded(_)));
     let store = Store::open(&path).unwrap();
     for id in [input.id(), write.id()] {
         assert!(
