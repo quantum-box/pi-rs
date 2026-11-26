@@ -8276,7 +8276,6 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
             .args([
                 "--no-session",
                 "--no-mcp",
-                "--offline",
                 "--provider",
                 provider,
                 "--model",
@@ -8382,7 +8381,6 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
         .args([
             "--no-session",
             "--no-mcp",
-            "--offline",
             "--model",
             "fixture-model",
             "--endpoint",
@@ -8469,7 +8467,6 @@ fn model_listing_uses_proxy_before_a_model_request() {
         .env_remove("NO_PROXY")
         .args([
             "--no-mcp",
-            "--offline",
             "--provider",
             "ollama",
             "--endpoint",
@@ -9034,7 +9031,7 @@ fn startup_replaces_only_missing_retired_builtin_defaults() {
     }
 }
 
-fn together_fixture_cli(root: &std::path::Path) -> Command {
+fn together_fixture_cli(root: &std::path::Path, trusted: bool) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
     command.env_clear();
     for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
@@ -9045,7 +9042,7 @@ fn together_fixture_cli(root: &std::path::Path) -> Command {
     command.current_dir(root).env("PI_RS_HOME", root).args([
         "--no-session",
         "--no-mcp",
-        "--no-trust",
+        if trusted { "--trust" } else { "--no-trust" },
         "--offline",
     ]);
     command
@@ -9056,7 +9053,7 @@ fn together_saved_model_rpc(
     extra: &[&str],
     credentials: &[(&str, &str)],
 ) -> std::process::Output {
-    let mut child = together_fixture_cli(root)
+    let mut child = together_fixture_cli(root, false)
         .envs(credentials.iter().copied())
         .args(["--mode", "rpc"])
         .args(extra)
@@ -9264,7 +9261,7 @@ fn together_retired_default_discovers_again_after_rpc_workspace_switch() {
         }
     });
 
-    let mut child = together_fixture_cli(root.path())
+    let mut child = together_fixture_cli(root.path(), false)
         .args(["--mode", "rpc", "--workspace"])
         .arg(&launch)
         .stdin(Stdio::piped())
@@ -9303,6 +9300,130 @@ fn together_retired_default_discovers_again_after_rpc_workspace_switch() {
         ("after", "relay-after-switch"),
     ] {
         assert_eq!(reply(id)["data"]["model"]["provider"], "together");
+        assert_eq!(reply(id)["data"]["model"]["id"], model, "{events:?}");
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn together_workspace_replacement_uses_the_local_route_without_proxying() {
+    let root = tempfile::tempdir().unwrap();
+    let launch = root.path().join("launch");
+    let target = root.path().join("target");
+    std::fs::create_dir(&launch).unwrap();
+    std::fs::create_dir_all(target.join(".pi")).unwrap();
+    let target_session = root.path().join("target.jsonl");
+    Session::open(&target_session)
+        .unwrap()
+        .set_working_directory(&target)
+        .unwrap();
+
+    let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", relay.local_addr().unwrap());
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let relay_key = if cfg!(unix) {
+        "!printf relay-fixture"
+    } else {
+        "relay-fixture"
+    };
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{
+            "ollama":{"baseUrl":format!("{base}/ollama/v1")},
+            "together":{
+                "baseUrl":format!("{base}/together/v1"), "apiKey":relay_key,
+                "models":[{"id":"separate-route", "baseUrl":format!("{base}/other/v1")}]
+            }
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"defaultProvider":"ollama","defaultModel":"launch-model","httpProxy":proxy_url})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        target.join(".pi/settings.json"),
+        json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling"}).to_string(),
+    )
+    .unwrap();
+
+    let server = std::thread::spawn(move || {
+        loop {
+            let (mut socket, mut reader, first) = accept_proxy_request(relay.try_clone().unwrap());
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            if first.starts_with("GET /ollama/api/ps ") {
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            assert!(first.starts_with("GET /together/v1/models "), "{first}");
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer relay-fixture")
+            );
+            let body = r#"{"data":[{"id":"relay-replacement"},{"id":"separate-route"}]}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            break;
+        }
+    });
+
+    let mut child = together_fixture_cli(root.path(), true)
+        .args(["--mode", "rpc", "--workspace"])
+        .arg(&launch)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for request in [
+        json!({"id":"start","type":"get_state"}),
+        json!({"id":"switch","type":"switch_session","sessionPath":target_session}),
+        json!({"id":"switched","type":"get_state"}),
+        json!({"id":"new","type":"new_session"}),
+        json!({"id":"after","type":"get_state"}),
+    ] {
+        writeln!(input, "{request}").unwrap();
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    proxy.set_nonblocking(true).unwrap();
+    assert_eq!(
+        proxy.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    let events: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let reply = |id| events.iter().find(|event| event["id"] == id).unwrap();
+    for id in ["switch", "new"] {
+        assert_eq!(reply(id)["success"], true, "{events:?}");
+    }
+    for (id, provider, model) in [
+        ("start", "ollama", "launch-model"),
+        ("switched", "together", "relay-replacement"),
+        ("after", "together", "relay-replacement"),
+    ] {
+        assert_eq!(reply(id)["data"]["model"]["provider"], provider);
         assert_eq!(reply(id)["data"]["model"]["id"], model, "{events:?}");
     }
     server.join().unwrap();
@@ -9378,7 +9499,7 @@ fn together_saved_retired_id_uses_the_configured_case_and_model_route() {
         let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
     });
-    let output = together_fixture_cli(root.path())
+    let output = together_fixture_cli(root.path(), false)
         .args(["--api-key", "inline-fixture", "--print", "fixture prompt"])
         .output()
         .unwrap();

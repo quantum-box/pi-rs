@@ -417,10 +417,13 @@ impl Cli {
     }
 
     fn allow_endpoint_probes(&self, endpoint: &str) -> bool {
-        !self.offline
-            || reqwest::Url::parse(endpoint).ok().is_some_and(|url| {
-                matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
-            })
+        !self.offline || Self::is_loopback_endpoint(endpoint)
+    }
+
+    fn is_loopback_endpoint(endpoint: &str) -> bool {
+        reqwest::Url::parse(endpoint)
+            .ok()
+            .is_some_and(|url| matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
     }
 
     fn tool_timeout(&self) -> Duration {
@@ -582,6 +585,7 @@ impl Cli {
         model: Option<&str>,
     ) -> Result<providers::Client> {
         let endpoint = self.model_endpoint_for(provider, model);
+        let direct = self.offline && Self::is_loopback_endpoint(endpoint);
         let adapter = model.map_or_else(
             || provider.adapter(),
             |model| self.model_profiles.model_adapter(provider, model),
@@ -612,7 +616,7 @@ impl Cli {
                 credential,
                 settings,
             )
-            .with_http_settings(&self.settings);
+            .with_http_settings_for_route(&self.settings, None, direct);
         }
         let token = credential
             .as_ref()
@@ -622,7 +626,7 @@ impl Cli {
         provider
             .connect_for_credential(adapter, endpoint, token, credential.as_ref())?
             .with_headers(headers)
-            .with_http_settings_and_env(&self.settings, settings.environment())
+            .with_http_settings_for_route(&self.settings, settings.environment(), direct)
     }
 
     fn activate_provider(&mut self, provider: Provider, model: Option<&str>) -> Result<()> {
@@ -950,14 +954,17 @@ impl Cli {
             return None;
         }
         let advertised = self.advertised_models(provider)?;
-        let mut models: Vec<_> = self
+        let endpoint = self.endpoint_for(provider);
+        let mut models: Vec<String> = Vec::new();
+        for id in self
             .model_profiles
             .configured_model_ids(provider)
-            .map(str::to_owned)
-            .collect();
-        for id in advertised {
-            if !models.iter().any(|model| model.eq_ignore_ascii_case(id)) {
-                models.push(id.clone());
+            .chain(advertised.iter().map(String::as_str))
+        {
+            if self.model_endpoint_for(provider, Some(id)) == endpoint
+                && !models.iter().any(|model| model.eq_ignore_ascii_case(id))
+            {
+                models.push(id.to_owned());
             }
         }
         Some(models)
@@ -1298,11 +1305,17 @@ impl Cli {
                     .as_ref()
                     .is_none_or(|ids| ids.iter().any(|id| id == model))
         };
-        let provider = if missing_retired_default && !self.connection_explicit {
-            fallback.provider.clone()
-        } else {
-            provider.clone()
-        };
+        // A fresh relay catalog can supply the new workspace's default even
+        // when the launch workspace used a different provider.
+        let workspace_relay_replacement =
+            workspace_changed && custom_fallback.as_ref().is_some_and(|ids| !ids.is_empty());
+        let provider =
+            if missing_retired_default && !self.connection_explicit && !workspace_relay_replacement
+            {
+                fallback.provider.clone()
+            } else {
+                provider.clone()
+            };
         let keep_fallback = provider == fallback.provider
             && eligible(&provider, &fallback.model)
             && !(missing_retired_default

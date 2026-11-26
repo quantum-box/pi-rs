@@ -298,6 +298,7 @@ fn catalog_client(
 }
 
 pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
+    let probe = probe && args.allow_endpoint_probes(args.endpoint_for(&provider));
     let mut models = args.model_profiles.model_ids(&provider);
     let client = catalog_client(args, &provider, &mut models)?.map(|client| {
         if provider == Provider::Radius {

@@ -420,6 +420,7 @@ pub(super) struct Deferred {
     credential: Option<Credential>,
     headers: RequestHeaders,
     http_settings: Option<super::config::Settings>,
+    direct_http: bool,
     options: Option<(Box<Cli>, bool)>,
     probe_context: bool,
     disable_message_thread_continuation: bool,
@@ -468,7 +469,8 @@ impl Deferred {
         {
             return None;
         }
-        if let Some(settings) = &self.http_settings
+        if !self.direct_http
+            && let Some(settings) = &self.http_settings
             && !super::http_proxy::configured(settings).ok()?.is_empty()
         {
             return None;
@@ -526,7 +528,11 @@ impl Deferred {
             _ => {}
         }
         if let Some(settings) = &self.http_settings {
-            client = client.with_http_settings_and_env(settings, self.headers.environment())?;
+            client = client.with_http_settings_for_route(
+                settings,
+                self.headers.environment(),
+                self.direct_http,
+            )?;
         }
         if let Some((args, reported)) = &self.options {
             client = client.with_model_options(args, *reported)?;
@@ -804,6 +810,7 @@ impl Client {
             credential,
             headers,
             http_settings: None,
+            direct_http: false,
             options: None,
             probe_context: true,
             disable_message_thread_continuation: false,
@@ -843,16 +850,14 @@ impl Client {
         }
     }
 
-    pub fn with_http_settings(self, settings: &super::config::Settings) -> Result<Self> {
-        self.with_http_settings_and_env(settings, None)
-    }
-
-    pub fn with_http_settings_and_env(
+    pub(super) fn with_http_settings_for_route(
         self,
         settings: &super::config::Settings,
         env: Option<&serde_json::Map<String, serde_json::Value>>,
+        direct: bool,
     ) -> Result<Self> {
         let this = match self {
+            Self::Bedrock(client) if direct => return Ok(Self::Bedrock(client)),
             Self::Bedrock(client) => {
                 return Ok(match super::http_proxy::bedrock_client(settings, env)? {
                     Some((runtime, credentials)) => {
@@ -863,7 +868,11 @@ impl Client {
             }
             other => other,
         };
-        let proxies = super::http_proxy::configured(settings)?;
+        let proxies = if direct {
+            Vec::new()
+        } else {
+            super::http_proxy::configured(settings)?
+        };
         let timeout = settings.http_idle_timeout();
         let retry = settings.provider_retry();
         Ok(match this {
@@ -894,6 +903,7 @@ impl Client {
             Self::Bedrock(_) => unreachable!("Bedrock handled above"),
             Self::Deferred(mut client) => {
                 client.http_settings = Some(settings.clone());
+                client.direct_http = direct;
                 Self::Deferred(client)
             }
         })

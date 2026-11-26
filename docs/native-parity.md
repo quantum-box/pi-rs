@@ -6339,9 +6339,12 @@ Together ID is absent from the official catalog or a successfully loaded
 catalog on a custom endpoint, saved defaults and resumed sessions use the
 existing retired-model fallback. Custom endpoints without a loaded catalog
 retain saved IDs. Switching to a different workspace refreshes the custom
-catalog for a saved retired default when endpoint probes are allowed. Only
-advertised and explicitly configured models are eligible for fallback on that
-endpoint. The fallback applies to
+catalog for a saved retired default when endpoint probes are allowed. A replacement
+from that catalog can become the new workspace default even when the launch
+workspace used another provider. Only advertised and explicitly configured models
+whose effective route matches that endpoint are eligible for its fallback. Offline
+loopback model discovery connects directly, and online discovery honors proxy
+settings. The fallback applies to
 `deepseek-ai/DeepSeek-V4-Pro-0813`, `MiniMaxAI/MiniMax-M3`,
 `openai/gpt-oss-120b`, and `thinkingmachines/Inkling`. The former IDs still
 participate in case-insensitive exact CLI selection and normal credential
