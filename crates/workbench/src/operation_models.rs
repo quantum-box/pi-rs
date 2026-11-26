@@ -268,10 +268,10 @@ async fn send_model_request(
         0
     };
     'attempt: for attempt in 0..=retries {
-        let request = request
+        let attempt_request = request
             .try_clone()
             .ok_or_else(|| Error::Config("model operation request cannot be retried".into()))?;
-        let mut response = match client.execute(request).await {
+        let mut response = match client.execute(attempt_request).await {
             Ok(response) => response,
             Err(error) if error.is_timeout() && attempt < retries => {
                 tokio::time::sleep(classifier_retry_delay(
@@ -341,6 +341,9 @@ async fn send_model_request(
             return Err(Error::Model("OpenAI Decisions error (504): the request timed out at the gateway. Very large inputs (above roughly 600K tokens) currently exceed its time limit.".into()));
         }
         if attempt == retries || !retryable_classifier_response(&response) {
+            if matches!(api, Api::PiDecision) {
+                return Err(pi_classifier::http_error(response, request.headers()).await);
+            }
             return Err(Error::Model(format!(
                 "model operation returned HTTP {}",
                 response.status().as_u16()
@@ -445,6 +448,7 @@ impl Catalogue {
         let mut combined: Map<String, Value> =
             serde_json::from_str(include_str!("../assets/operation-models-v1.6.0.json"))
                 .expect("pinned Pi model operation catalogue");
+        let mut decision_profiles = Vec::new();
         for (provider, configured) in providers {
             let name = provider.to_ascii_lowercase();
             let Some(configured) = configured.as_object() else {
@@ -472,21 +476,33 @@ impl Catalogue {
                     models.remove(index);
                 }
             }
-            models.extend(
-                configured
-                    .get("models")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .cloned(),
-            );
-            entry.extend(configured.clone());
+            if configured
+                .get("api")
+                .is_some_and(|api| api == "pi-decision")
+            {
+                // Keep the decision configuration off the remaining bundled
+                // operations, even when the provider name is built in.
+                decision_profiles.push((name.clone(), Value::Object(configured.clone())));
+            } else {
+                models.extend(
+                    configured
+                        .get("models")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+                entry.extend(configured.clone());
+            }
             entry.insert("models".into(), json!(models));
             combined.insert(name, json!(entry));
         }
         let mut result = Vec::new();
         let mut seen = BTreeSet::new();
-        for (name, provider) in &combined {
+        for (name, provider) in combined
+            .iter()
+            .chain(decision_profiles.iter().map(|(n, p)| (n, p)))
+        {
             let name = name.to_ascii_lowercase();
             // Bind configured credentials only to an unambiguous user-declared base.
             let configured_binding = if matches!(
@@ -497,6 +513,7 @@ impl Catalogue {
                 providers
                     .iter()
                     .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+                    .filter(|(_, configured)| configured["api"] != "pi-decision")
                     .and_then(|(_, configured)| {
                         if name == "cloudflare-workers-ai" {
                             configured["models"]
@@ -516,12 +533,13 @@ impl Catalogue {
             } else {
                 None
             };
-            let inferred_base =
-                if provider["baseUrl"].as_str().is_none() && official_base(&name).is_none() {
-                    unambiguous_model_base(provider)
-                } else {
-                    None
-                };
+            let inferred_base = if provider["baseUrl"].as_str().is_none()
+                && (provider["api"] == "pi-decision" || official_base(&name).is_none())
+            {
+                unambiguous_model_base(provider)
+            } else {
+                None
+            };
             for model in provider["models"].as_array().into_iter().flatten() {
                 let kind = match model["type"].as_str() {
                     Some("classifier") => Kind::Classifier,
@@ -1357,25 +1375,28 @@ impl Tool for Operations {
                 Outcome::Failed(message)
             };
         }
-        // Unfiltered catalogue lookups do not consult credentials in Pi.
-        // Preserve discovery even when auth.json is unreadable or malformed.
-        let keys = if args["action"] == "list" && args["available"] != true {
-            Keys::default()
-        } else {
-            match Keys::load_async().await {
-                Ok(keys) => keys,
-                Err(error) => return Outcome::Failed(error.to_string()),
-            }
-        };
         if args["action"] == "list" {
+            // Unfiltered catalogue lookups do not consult credentials in Pi.
+            let keys = if args["available"] == true {
+                match load_operation_keys(&context.cancellation).await {
+                    Ok(keys) => keys,
+                    Err(error) => return Outcome::Failed(error.to_string()),
+                }
+            } else {
+                Keys::default()
+            };
             let kind = serde_json::from_value::<Kind>(args["type"].clone()).unwrap_or(Kind::Chat);
             let entries = if kind == Kind::Chat {
                 self.chat_models(provider, args["id"].as_str(), args["available"] == true)
             } else {
                 let id = args["id"].as_str();
-                let mut entries = catalogue
-                    .list(kind, provider, id, args["available"] == true, &keys)
-                    .await;
+                let mut entries = tokio::select! {
+                    biased;
+                    _ = context.cancellation.cancelled() => {
+                        return Outcome::Failed(Error::Cancelled.to_string());
+                    }
+                    entries = catalogue.list(kind, provider, id, args["available"] == true, &keys) => entries,
+                };
                 if kind == Kind::Classifier && provider.is_none_or(|provider| provider == "radius")
                 {
                     let discovered = match self
@@ -1413,6 +1434,17 @@ impl Tool for Operations {
                 && Some(model.provider.as_str()) == provider
                 && Some(model.model.id.as_str()) == args["id"].as_str()
         });
+        let keys = match load_operation_keys(&context.cancellation).await {
+            Ok(keys) => keys,
+            Err(error) => {
+                if matches!(error, Error::Cancelled)
+                    && let Some(entry) = configured
+                {
+                    return finish_operation(operation_result(entry), Err(error));
+                }
+                return Outcome::Failed(error.to_string());
+            }
+        };
         let radius =
             if configured.is_none() && kind == Kind::Classifier && provider == Some("radius") {
                 let binding = tokio::select! {
@@ -1430,20 +1462,7 @@ impl Tool for Operations {
         let Some(model) = configured.or(radius.as_ref().map(|(model, _, _)| model)) else {
             return Outcome::Failed("unknown model for this operation".into());
         };
-        let mut data = json!({
-            "provider": provider.unwrap_or_default(),
-            "model": args["id"].as_str().unwrap_or_default(),
-            "stopReason": "stop",
-        });
-        data[if kind == Kind::Classifier {
-            "answers"
-        } else {
-            "output"
-        }] = if kind == Kind::Classifier {
-            json!({})
-        } else {
-            json!([])
-        };
+        let mut data = operation_result(model);
         let inputs = &args["context"];
         let has_images = if kind == Kind::Classifier {
             inputs["images"]
@@ -1454,8 +1473,9 @@ impl Tool for Operations {
                 .as_array()
                 .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
         };
-        initialize_result(model, &mut data);
-        let result = if has_images && self.args.settings.block_model_images() {
+        let result = if context.cancellation.is_cancelled() {
+            Err(Error::Cancelled)
+        } else if has_images && self.args.settings.block_model_images() {
             Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
         } else {
             let operation = self.perform_authenticated(
@@ -1473,18 +1493,41 @@ impl Tool for Operations {
                 result = operation => result,
             }
         };
-        if let Err(error) = result {
-            data["stopReason"] = json!(if matches!(error, Error::Cancelled) {
-                "aborted"
-            } else {
-                "error"
-            });
-            data["errorMessage"] = json!(error.to_string());
-        }
-        Outcome::Structured {
-            data,
-            attachments: vec![],
-        }
+        finish_operation(data, result)
+    }
+}
+
+async fn load_operation_keys(cancellation: &pi_rs::CancellationToken) -> Result<Keys> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        keys = Keys::load_async() => keys,
+    }
+}
+
+fn operation_result(entry: &Entry) -> Value {
+    let mut data = json!({"provider":entry.provider,"model":entry.model.id,"stopReason":"stop"});
+    if entry.api.kind() == Kind::Classifier {
+        data["answers"] = json!({});
+    } else {
+        data["output"] = json!([]);
+    }
+    initialize_result(entry, &mut data);
+    data
+}
+
+fn finish_operation(mut data: Value, result: Result<()>) -> Outcome {
+    if let Err(error) = result {
+        data["stopReason"] = json!(if matches!(error, Error::Cancelled) {
+            "aborted"
+        } else {
+            "error"
+        });
+        data["errorMessage"] = json!(error.to_string());
+    }
+    Outcome::Structured {
+        data,
+        attachments: vec![],
     }
 }
 

@@ -938,6 +938,9 @@ impl Profiles {
         let configured_providers = providers;
         let operations = super::operation_models::Catalogue::parse(configured_providers)?;
         let mut providers = configured_providers.clone();
+        // A provider-level decision route belongs to the operation catalogue.
+        // Its endpoint, headers and key must not replace the built-in chat route.
+        providers.retain(|_, entry| entry["api"] != "pi-decision");
         configure_cloudflare_workers(&mut providers, account)?;
         if let Some(route) = &cloudflare_gateway_route {
             let name = providers

@@ -122,6 +122,75 @@ pub(super) fn usage(cost: &Cost, usage: &Value) -> Option<Value> {
     }))
 }
 
+pub(super) async fn http_error(
+    mut response: reqwest::Response,
+    request_headers: &reqwest::header::HeaderMap,
+) -> Error {
+    const MAX_ERROR_BODY: usize = 16 * 1024;
+    let status = response.status().as_u16();
+    let fallback = || Error::Model(format!("Pi Decision returned HTTP {status}"));
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ERROR_BODY as u64)
+    {
+        return fallback();
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if chunk.len() <= MAX_ERROR_BODY - body.len() => {
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            _ => return fallback(),
+        }
+    }
+    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+        return fallback();
+    };
+    let diagnostic = &body["error"];
+    let clean = |field: &str, limit| {
+        let value = diagnostic[field].as_str()?;
+        // The server may echo any of the configured credentials, including
+        // values carried under custom header names. Omit sensitive fields.
+        if request_headers
+            .values()
+            .filter(|header| header.is_sensitive())
+            .any(|header| {
+                let Ok(secret) = std::str::from_utf8(header.as_bytes()) else {
+                    return false;
+                };
+                (!secret.is_empty() && value.contains(secret))
+                    || secret.split_once(' ').is_some_and(|(scheme, token)| {
+                        scheme.eq_ignore_ascii_case("bearer")
+                            && !token.is_empty()
+                            && value.contains(token)
+                    })
+            })
+        {
+            return Some("[redacted]".to_owned());
+        }
+        let value: String = value.chars().take(limit).map(|ch| {
+            if ch.is_control() || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                ' '
+            } else {
+                ch
+            }
+        }).collect();
+        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!value.is_empty()).then_some(value)
+    };
+    match (clean("code", 64), clean("message", 512)) {
+        (Some(code), Some(message)) => Error::Model(format!(
+            "Pi Decision returned HTTP {status} ({code}): {message}"
+        )),
+        (Some(detail), None) | (None, Some(detail)) => {
+            Error::Model(format!("Pi Decision returned HTTP {status}: {detail}"))
+        }
+        (None, None) => fallback(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,12 +309,53 @@ mod tests {
     fn decision_operations(base: &str) -> Operations {
         let mut args = Cli::parse_from(["pi"]);
         args.model_profiles = Profiles::parse(&json!({"providers":{"decision-fixture":{
-            "baseUrl":base,"apiKey":"fixture-decision-key","models":[{
-                "type":"classifier","api":"pi-decision","id":"judge","input":["text","image"]
+            "baseUrl":base,"api":"pi-decision","apiKey":"fixture-decision-key",
+            "headers":{"x-private-fixture":"fixture-private-header"},"models":[{
+                "type":"classifier","id":"judge","input":["text","image"]
             }]
         }}}))
         .unwrap();
         Operations::new(&args).unwrap()
+    }
+
+    #[test]
+    fn provider_level_decision_configuration_isolated_from_bundled_routes() {
+        let profiles = Profiles::parse(&json!({"providers":{"openai":{
+            "api":"pi-decision","baseUrl":"https://decision.invalid/v1",
+            "apiKey":"fixture-decision-key","headers":{"x-private-fixture":"private"},
+            "models":[{"type":"classifier","id":"judge"}]
+        }}}))
+        .unwrap();
+        let chat = profiles.provider("openai").unwrap();
+        assert_eq!(profiles.endpoint(&chat), chat.default_endpoint());
+        assert!(
+            profiles
+                .credential(&chat, profiles.endpoint(&chat))
+                .is_none()
+        );
+
+        let catalogue = &profiles.operations().0;
+        let decision = catalogue
+            .iter()
+            .find(|entry| entry.model.id == "judge")
+            .unwrap();
+        assert!(matches!(decision.api, Api::PiDecision));
+        assert_eq!(
+            decision.endpoint.as_str(),
+            "https://decision.invalid/v1/decision"
+        );
+        assert_eq!(decision.api_key.as_deref(), Some("fixture-decision-key"));
+        assert_eq!(decision.model.headers["x-private-fixture"], "private");
+        let builtin = catalogue
+            .iter()
+            .find(|entry| entry.provider == "openai" && matches!(entry.api, Api::OpenAiDecisions))
+            .unwrap();
+        assert_eq!(
+            builtin.endpoint.as_str(),
+            "https://api.openai.com/v1/decisions"
+        );
+        assert!(builtin.api_key.is_none());
+        assert!(!builtin.model.headers.contains_key("x-private-fixture"));
     }
 
     async fn invoke(operation: &Operations, args: Value, cancellation: CancellationToken) -> Value {
@@ -391,6 +501,7 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let request = tokio::spawn({
+            let operation = operation.clone();
             let cancel = cancel.clone();
             let args = classify(&text);
             async move { invoke(&operation, args, cancel).await }
@@ -406,6 +517,94 @@ mod tests {
         assert_eq!(aborted["answers"], json!({}));
         assert!(aborted.get("responseId").is_none());
         close.send(()).unwrap();
+        server.await.unwrap();
+
+        let auth_path = crate::config::agent_dir().join("auth.json");
+        let _lock = crate::auth_lock::acquire_async(&auth_path).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let pending = invoke(&operation, classify(&text), cancellation.clone());
+        tokio::pin!(pending);
+        tokio::select! {
+            biased;
+            result = &mut pending => panic!("operation finished with auth.json still locked: {result}"),
+            _ = tokio::task::yield_now() => (),
+        }
+        cancellation.cancel();
+        let aborted = tokio::time::timeout(Duration::from_secs(1), &mut pending)
+            .await
+            .expect("credential loading did not observe cancellation");
+        assert_eq!(aborted["stopReason"], "aborted");
+        assert_eq!(aborted["api"], "pi-decision");
+        assert_eq!(aborted["answers"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn pi_decision_preserves_only_bounded_sanitized_terminal_diagnostics() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let operation =
+            decision_operations(&format!("http://{}/v1", listener.local_addr().unwrap()));
+        let entry = operation
+            .args
+            .model_profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "decision-fixture")
+            .unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                ("429 Too Many Requests", json!({"error":{"message":"retry diagnostic"}}).to_string()),
+                ("400 Bad Request", json!({"error":{
+                    "code":"invalid_question", "message":format!("Invalid\nquestion\x1b {} hidden-tail", "a".repeat(600)),
+                    "details":{"value":"fixture-decision-key"}
+                }}).to_string()),
+                ("401 Unauthorized", json!({"error":{
+                    "code":"denied", "message":"echo: fixture-decision-key fixture-private-header"
+                }}).to_string()),
+                ("400 Bad Request", json!({"error":{"message":"x".repeat(17 * 1024)}}).to_string()),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (route, headers, _) = request(&mut socket).await;
+                assert_eq!(route, "POST /v1/decision HTTP/1.1\r\n");
+                assert_eq!(headers["authorization"], "Bearer fixture-decision-key");
+                assert_eq!(headers["x-private-fixture"], "fixture-private-header");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nRetry-After-Ms: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let context = json!({"state":{},"questions":questions()});
+        let terminal_error = || async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                operation.perform(entry, &context, &Keys::default(), &mut json!({})),
+            )
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+        };
+        let invalid = terminal_error().await;
+        assert!(
+            invalid.contains("HTTP 400 (invalid_question): Invalid question"),
+            "{invalid}"
+        );
+        assert!(!invalid.chars().any(char::is_control));
+        for omitted in ["retry diagnostic", "hidden-tail", "fixture-decision-key"] {
+            assert!(!invalid.contains(omitted));
+        }
+        let denied = terminal_error().await;
+        assert!(denied.contains("HTTP 401 (denied): [redacted]"), "{denied}");
+        assert!(!denied.contains("fixture-decision-key"));
+        assert!(!denied.contains("fixture-private-header"));
+        let oversized = terminal_error().await;
+        assert!(
+            oversized.ends_with("Pi Decision returned HTTP 400"),
+            "{oversized}"
+        );
         server.await.unwrap();
     }
 
