@@ -11441,7 +11441,8 @@ impl Harness {
             return Err(InvalidSnapshot.into());
         }
         let prefix_histories = if let Some((_, Some(count))) = position {
-            let (retain, batch_len) = self.checkout_prefix_len(&source, count)?;
+            let (retain, batch_len) =
+                self.checkout_prefix_len(&source, observation.0, count, &mut checks)?;
             if batch_len != messages.len()
                 || occurrences[..retain]
                     .iter()
@@ -11498,7 +11499,9 @@ impl Harness {
     fn checkout_prefix_len(
         &self,
         source: &crate::transcript::Cursor,
+        observation: u64,
         count: usize,
+        checks: &mut Vec<Check>,
     ) -> Result<(usize, usize), Error> {
         use crate::fork::Error::InvalidSnapshot;
 
@@ -11517,6 +11520,13 @@ impl Harness {
                 messages,
                 ..
             } => (stable_prefix, messages.len()),
+            TranscriptChange::ReplaceV2 { messages, .. } => {
+                let (_, evidence) = self
+                    .anchored_block_reset(source.transcript_id(), observation, source)?
+                    .ok_or(InvalidSnapshot)?;
+                checks.extend(evidence);
+                (0, messages.len())
+            }
             _ => return Err(InvalidSnapshot.into()),
         };
         if count == 0 || count >= appended {
