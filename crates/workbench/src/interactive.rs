@@ -5455,6 +5455,10 @@ fn slash(
             let workspace = args.workspace.canonicalize()?;
             if let Some(parent) = args.session.parent() {
                 for path in sessions::stored_paths(parent)? {
+                    let path = args.canonical_resume_path(path);
+                    if documents.contains_key(&path) {
+                        continue;
+                    }
                     if let Ok(session) = open_picker_session(args, &path) {
                         if session.host_binding().is_some() {
                             continue;
@@ -5526,22 +5530,7 @@ fn slash(
             view.picker = Some(picker);
         }
         "/resume" => {
-            let path = PathBuf::from(rest);
-            if !path.is_file() {
-                return Err(Error::Config("session file not found".into()));
-            }
-            if Worker::check_session_transition(
-                worker,
-                args,
-                pi_rs::BeforeSessionTransition::Switch {
-                    reason: pi_rs::SessionSwitchReason::Resume,
-                    target_session_file: Some(path.clone()),
-                },
-            )? {
-                view.append("Session resume cancelled");
-                return Ok(None);
-            }
-            switch_session(args, view, path)?;
+            resume_session(args, view, worker, PathBuf::from(rest))?;
         }
         "/compact" => {
             view.pending_request = Some(
@@ -8342,7 +8331,7 @@ fn is_busy(worker: &Option<Worker>) -> bool {
 }
 
 fn persist_pending_thinking(pending: &PendingThinking, args: &Cli) -> Result<()> {
-    let mut session = if args.bound_resume_workspace(&pending.session).is_some() {
+    let mut session = if args.bound_resume_paths(&pending.session).is_some() {
         super::program_resume::open_bound_session_at(args, &pending.session)?
     } else {
         Session::open(&pending.session)?
@@ -10064,7 +10053,7 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
 }
 
 fn open_picker_session(args: &Cli, path: &Path) -> Result<Session> {
-    if args.bound_resume_workspace(path).is_some() {
+    if args.bound_resume_paths(path).is_some() {
         super::program_resume::open_bound_session_at(args, path)
     } else {
         Session::open_existing(path)
@@ -10080,6 +10069,7 @@ fn select(
 ) -> Result<()> {
     match selection {
         Selection::RenameSession(path, name) => {
+            let path = args.canonical_resume_path(path);
             let mut session = open_picker_session(args, &path)?;
             if session.host_binding().is_some() {
                 return Err(Error::Session(
@@ -10101,6 +10091,7 @@ fn select(
             slash("/resume", args, view, None)?;
         }
         Selection::DeleteSession(path) => {
+            let path = args.canonical_resume_path(path);
             if path.canonicalize().ok() == args.session.canonicalize().ok() {
                 return Err(Error::Config("Cannot delete the active session".into()));
             }
@@ -10115,12 +10106,7 @@ fn select(
             slash("/resume", args, view, None)?;
         }
         Selection::Resume(path) => {
-            slash(
-                &format!("/resume {}", path.display()),
-                args,
-                view,
-                Some(worker),
-            )?;
+            resume_session(args, view, Some(worker), path)?;
         }
         Selection::Checkout(id) => {
             if id == Session::snapshot(&args.session)?.head() {
@@ -10477,10 +10463,34 @@ fn queued_transition_cancel(
     Ok(false)
 }
 
+fn resume_session(
+    args: &mut Cli,
+    view: &mut View,
+    worker: Option<&mut Option<Worker>>,
+    path: PathBuf,
+) -> Result<()> {
+    let path = args.canonical_resume_path(path);
+    if !path.is_file() {
+        return Err(Error::Config("session file not found".into()));
+    }
+    if Worker::check_session_transition(
+        worker,
+        args,
+        pi_rs::BeforeSessionTransition::Switch {
+            reason: pi_rs::SessionSwitchReason::Resume,
+            target_session_file: Some(path.clone()),
+        },
+    )? {
+        view.append("Session resume cancelled");
+        return Ok(());
+    }
+    switch_session(args, view, path)
+}
+
 fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> {
     let mut next = args.clone();
     next.settings.fork_worker_history();
-    next.session = path;
+    next.session = args.canonical_resume_path(path);
     next.session_transition = Some(pi_rs::SessionStartReason::Resume);
     if view.async_transitions {
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -10598,7 +10608,7 @@ fn initialize_open_session(args: &mut Cli, session: &mut Session) -> Result<()> 
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     let session = args.open_session()?;
-    if let Some(workspace) = args.bound_resume_workspace(&args.session) {
+    if let Some((_, workspace)) = args.bound_resume_paths(&args.session) {
         args.workspace = workspace.to_owned();
     } else if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);
@@ -15243,6 +15253,79 @@ exit {exit}
         );
         assert!(result.is_err());
         assert!(!path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn program_resume_picker_carries_bound_identity_through_an_alias() {
+        use clap::Parser;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = root.join("original");
+        let other = root.join("other");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&other).unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline", "--no-trust", "--no-extensions"]);
+        args.workspace = original.clone();
+        args.session = root.join("restored.jsonl");
+        let journal = args.session.clone();
+        pi_rs::Session::open(&journal)
+            .unwrap()
+            .set_working_directory(&original)
+            .unwrap();
+        let snapshot = super::super::program_resume::snapshot_bound_session(&args);
+        if cfg!(target_os = "linux") && snapshot.is_err() {
+            // Linux containers can place every temporary directory on overlayfs.
+            return;
+        }
+        snapshot.unwrap();
+        args.bind_existing_session();
+
+        let alias = root.join("directory alias");
+        symlink(&root, &alias).unwrap();
+        let aliased_journal = alias.join("restored.jsonl");
+        let file_alias = root.join("journal alias.jsonl");
+        symlink(&journal, &file_alias).unwrap();
+        assert_eq!(args.canonical_resume_path(file_alias.clone()), journal);
+
+        args.workspace = other.clone();
+        args.session = root.join("other.jsonl");
+        let mut view = super::View::default();
+        super::select(
+            super::Selection::Resume(aliased_journal.clone()),
+            &mut args,
+            &mut view,
+            &mut super::Theme::system(),
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(args.session, journal);
+        assert_eq!(args.workspace, original);
+
+        pi_rs::Session::open_existing(&journal)
+            .unwrap()
+            .set_working_directory(&other)
+            .unwrap();
+        let error = super::open_picker_session(&args, &aliased_journal)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from the registered workspace")
+        );
+
+        fs::remove_file(&journal).unwrap();
+        assert!(args.open_session().is_err());
+        assert_eq!(args.canonical_resume_path(aliased_journal.clone()), journal);
+        args.session = aliased_journal;
+        assert!(args.open_session().is_err());
+        args.session = file_alias;
+        assert!(args.open_session().is_err());
+        assert!(!journal.exists());
     }
 
     #[test]

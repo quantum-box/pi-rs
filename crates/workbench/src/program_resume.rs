@@ -107,13 +107,16 @@ pub(super) fn bind_worker(args: &mut Cli) -> Result<()> {
 pub(super) fn needs_fresh_approval(args: &Cli) -> bool {
     args.resume_requires_existing()
         && !args.terminal_resume_approved
-        && (args.terminal_resume_confirm_project || !protected_project(&args.workspace))
+        && (args.terminal_resume_confirm_project || !protected_project(&args.workspace, args))
 }
 
 pub(super) fn snapshot_bound_session(args: &Cli) -> Result<Session> {
-    require_journal_path(&args.session)?;
-    let session = Session::snapshot(&args.session)?;
-    check_workspace(&session, &args.workspace)?;
+    let (path, workspace) = args
+        .bound_resume_paths(&args.session)
+        .unwrap_or((&args.session, &args.workspace));
+    require_journal_path(path)?;
+    let session = Session::snapshot(path)?;
+    check_workspace(&session, workspace)?;
     Ok(session)
 }
 
@@ -122,8 +125,8 @@ pub(super) fn open_bound_session(args: &Cli) -> Result<Session> {
 }
 
 pub(super) fn open_bound_session_at(args: &Cli, path: &Path) -> Result<Session> {
-    let workspace = args
-        .bound_resume_workspace(path)
+    let (path, workspace) = args
+        .bound_resume_paths(path)
         .ok_or_else(|| Error::Config("terminal resume journal has no bound workspace".into()))?;
     require_journal_path(path)?;
     let session = Session::open_existing(path)?;
@@ -195,7 +198,7 @@ fn protected_workspace(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn protected_project(workspace: &Path) -> bool {
+fn protected_project(workspace: &Path, args: &Cli) -> bool {
     use super::resource_paths::{project_agent_skills, project_protection_roots};
 
     if !protected_workspace(workspace) {
@@ -211,9 +214,10 @@ fn protected_project(workspace: &Path) -> bool {
         return false;
     }
     let settings = project.join("settings.json");
+    let mcp = project.join("mcp.json");
     for path in [
         settings.clone(),
-        project.join("mcp.json"),
+        mcp.clone(),
         project.join("SYSTEM.md"),
         project.join("APPEND_SYSTEM.md"),
     ] {
@@ -223,6 +227,15 @@ fn protected_project(workspace: &Path) -> bool {
         }
     }
     // Only read declarations after their path passes the filesystem checks.
+    let mcp_requested = !args.no_mcp
+        && (!args.no_extensions || args.extensions.iter().any(|entry| entry == "builtin:mcp"));
+    if mcp_requested
+        && !super::config::read_object(&mcp)
+            .and_then(|project| super::mcp_config::project_stdio_requires_approval(&project))
+            .is_ok_and(|requires_approval| !requires_approval)
+    {
+        return false;
+    }
     let Ok(settings) = super::config::read_object(&settings) else {
         return false;
     };
@@ -365,7 +378,7 @@ fn protected_journal_path(_: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn protected_project(_: &Path) -> bool {
+fn protected_project(_: &Path, _: &Cli) -> bool {
     false
 }
 
@@ -516,7 +529,7 @@ impl Reporter {
         let body = if candidate.is_some()
             && args.trusted
             && canonical_workspace(&args.workspace)
-                .is_none_or(|workspace| !protected_project(&workspace))
+                .is_none_or(|workspace| !protected_project(&workspace, args))
         {
             report_body(&self.executable, args, true)
         } else {
@@ -566,6 +579,9 @@ fn report_body(executable: &Path, args: &Cli, confirm_project: bool) -> Option<S
         || args.endpoint_explicit
         || args.provider_argument.is_some()
         || !args.extension_flags.is_empty()
+        || args.system_prompt.is_some()
+        || !args.append_system_prompt.is_empty()
+        || args.instruction.is_some()
     {
         return None;
     }
@@ -782,6 +798,27 @@ mod tests {
         assert!(argv.is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn program_resume_suppresses_explicit_system_instructions() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        if !root.ancestors().all(enforces_posix_permissions) {
+            return;
+        }
+        let baseline = fixture_args(&root);
+        let executable = root.join("pi");
+        assert!(report_body(&executable, &baseline, false).is_some());
+        for flag in ["--system-prompt", "--append-system-prompt", "--instruction"] {
+            let mut args = Cli::parse_from(["pi", flag, "opaque fixture input"]);
+            args.session = baseline.session.clone();
+            args.workspace = root.clone();
+            assert!(report_body(&executable, &args, false).is_none(), "{flag}");
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn program_resume_rejects_unenforced_and_unknown_macos_mounts() {
@@ -890,6 +927,45 @@ mod tests {
         assert_eq!(args.project_trust().unwrap(), Some(true));
         args.terminal_resume_approved = false;
         args.resume_existing_session = None;
+        assert_eq!(args.project_trust().unwrap(), Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_resume_requires_approval_for_enabled_project_stdio() {
+        use std::fs;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        if !root.ancestors().all(enforces_posix_permissions) {
+            return;
+        }
+        let mut args = fixture_args(&root);
+        let project = root.join(".pi");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        args.bind_existing_session();
+        args.trusted = true;
+        args.no_trust = false;
+        args.no_mcp = false;
+        args.no_extensions = false;
+        args.trust = true;
+
+        let mcp = project.join("mcp.json");
+        let disabled_stdio = r#"{"command":"/usr/bin/true","enabled":false}"#;
+        for config in [disabled_stdio, r#"{"url":"https://fixture.invalid/mcp"}"#] {
+            fs::write(&mcp, format!(r#"{{"mcpServers":{{"fixture":{config}}}}}"#)).unwrap();
+            assert_eq!(args.project_trust().unwrap(), Some(true));
+        }
+
+        fs::write(
+            &mcp,
+            r#"{"mcpServers":{"fixture":{"command":"/usr/bin/true","cwd":"."}}}"#,
+        )
+        .unwrap();
+        assert_eq!(args.project_trust().unwrap(), None);
+        assert_report_requires_project_confirmation(&args, root.join("pi"));
+        args.no_mcp = true;
         assert_eq!(args.project_trust().unwrap(), Some(true));
     }
 

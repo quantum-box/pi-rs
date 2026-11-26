@@ -364,12 +364,44 @@ struct InitialSelection {
 
 impl Cli {
     fn resume_requires_existing(&self) -> bool {
-        self.bound_resume_workspace(&self.session).is_some()
+        self.bound_resume_paths(&self.session).is_some()
     }
 
-    fn bound_resume_workspace(&self, path: &std::path::Path) -> Option<&std::path::Path> {
+    fn bound_resume_paths(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<(&std::path::Path, &std::path::Path)> {
+        use std::path::Path;
+
         let (journal, workspace) = self.resume_existing_session.as_ref()?;
-        (journal == path).then_some(workspace)
+        fn parent(path: &Path) -> &Path {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+        }
+        let matches_entry = |path: &Path| {
+            path == journal
+                || path.file_name().is_some_and(|name| {
+                    parent(path)
+                        .canonicalize()
+                        .is_ok_and(|parent| parent.join(name) == *journal)
+                })
+        };
+        // Resolve the parent independently so a directory alias still matches
+        // when the protected journal has been removed. A direct file alias can
+        // still identify that entry even when the symlink is dangling.
+        (matches_entry(path)
+            || path.canonicalize().as_ref().ok() == Some(journal)
+            || std::fs::read_link(path)
+                .is_ok_and(|target| matches_entry(&parent(path).join(target))))
+        .then_some((journal, workspace))
+    }
+
+    fn canonical_resume_path(&self, path: PathBuf) -> PathBuf {
+        match self.bound_resume_paths(&path) {
+            Some((journal, _)) => journal.to_owned(),
+            None => path,
+        }
     }
 
     fn bind_existing_session(&mut self) {

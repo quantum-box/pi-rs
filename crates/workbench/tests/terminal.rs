@@ -735,20 +735,38 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
 
 #[test]
 fn terminal_resume_prompts_again_for_a_shared_workspace() {
-    assert_terminal_resume_project_trust(false, false);
+    assert_terminal_resume_project_trust(ResumeTrustFixture::SharedWorkspace, false);
 }
 
 #[test]
 fn terminal_resume_prompts_again_for_shared_project_configuration() {
-    assert_terminal_resume_project_trust(true, false);
+    assert_terminal_resume_project_trust(ResumeTrustFixture::SharedConfiguration, false);
 }
 
 #[test]
 fn terminal_resume_preserves_saved_project_denial() {
-    assert_terminal_resume_project_trust(true, true);
+    assert_terminal_resume_project_trust(ResumeTrustFixture::SharedConfiguration, true);
 }
 
-fn assert_terminal_resume_project_trust(shared_configuration: bool, saved_denial: bool) {
+#[test]
+fn terminal_resume_prompts_before_a_project_stdio_launch() {
+    assert_terminal_resume_project_trust(ResumeTrustFixture::Stdio, false);
+}
+
+#[test]
+fn terminal_resume_prompts_before_a_project_enables_global_stdio() {
+    assert_terminal_resume_project_trust(ResumeTrustFixture::StdioOverride, false);
+}
+
+#[derive(Clone, Copy)]
+enum ResumeTrustFixture {
+    SharedWorkspace,
+    SharedConfiguration,
+    Stdio,
+    StdioOverride,
+}
+
+fn assert_terminal_resume_project_trust(fixture: ResumeTrustFixture, saved_denial: bool) {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
@@ -756,18 +774,44 @@ fn assert_terminal_resume_project_trust(shared_configuration: bool, saved_denial
         return;
     }
     let workspace = root.join("shared workspace");
-    std::fs::create_dir(&workspace).unwrap();
-    let shared = if shared_configuration {
-        let project = workspace.join(".pi");
-        std::fs::create_dir(&project).unwrap();
-        std::fs::write(project.join("settings.json"), "{}").unwrap();
-        project
-    } else {
-        workspace.clone()
-    };
-    std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let project = workspace.join(".pi");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir(workspace.join(".git")).unwrap();
     let home = root.join("home");
     std::fs::create_dir(&home).unwrap();
+    let stdio = matches!(
+        fixture,
+        ResumeTrustFixture::Stdio | ResumeTrustFixture::StdioOverride
+    );
+    match fixture {
+        ResumeTrustFixture::SharedWorkspace | ResumeTrustFixture::SharedConfiguration => {
+            let shared = if matches!(fixture, ResumeTrustFixture::SharedWorkspace) {
+                &workspace
+            } else {
+                &project
+            };
+            std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        }
+        ResumeTrustFixture::Stdio => {
+            std::fs::write(
+                project.join("mcp.json"),
+                r#"{"mcpServers":{"fixture":{"command":"/usr/bin/true","cwd":"."}}}"#,
+            )
+            .unwrap();
+        }
+        ResumeTrustFixture::StdioOverride => {
+            std::fs::write(
+                home.join("mcp.json"),
+                r#"{"mcpServers":{"fixture":{"command":"/usr/bin/true","enabled":false}}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                project.join("mcp.json"),
+                r#"{"mcpServers":{"fixture":{"enabled":true}}}"#,
+            )
+            .unwrap();
+        }
+    }
     std::fs::write(
         home.join("settings.json"),
         r#"{"defaultProjectTrust":"always"}"#,
@@ -791,16 +835,13 @@ fn assert_terminal_resume_project_trust(shared_configuration: bool, saved_denial
         .current_dir(&workspace)
         .env("PI_RS_HOME", home)
         .env("TERM", "xterm-256color")
-        .args([
-            "--terminal-resume",
-            "--offline",
-            "--no-mcp",
-            "--no-extensions",
-            "--workspace",
-        ])
+        .args(["--terminal-resume", "--offline", "--workspace"])
         .arg(&workspace)
         .arg("--session")
         .arg(&journal);
+    if !stdio {
+        command.args(["--no-mcp", "--no-extensions"]);
+    }
     let (mut master, _slave, _process) = spawn_child_pty(&mut command);
     if saved_denial {
         output_until(&mut master, |text| {

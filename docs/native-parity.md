@@ -6138,22 +6138,26 @@ The command carries restrictive options such as `--no-trust`, `--no-mcp`,
 `--no-extensions`, `--offline`, and explicit tool selections. It also carries
 explicit request, output-token, output-budget, and model-time limits. Pi skips
 reporting for ephemeral sessions, pending trust decisions, and invocations
-whose explicit credentials, connection options, or extension flags cannot
-be carried safely. Automatic restore accepts an owner-only regular journal
-under protected directories on an allowlisted local filesystem. Linux accepts
-ext-family, XFS, Btrfs, and tmpfs. macOS accepts local APFS, HFS, and tmpfs
+whose explicit credentials, connection options, extension flags, system
+prompt overrides, or instructions cannot be carried safely. Automatic restore
+accepts an owner-only regular journal under protected directories on an
+allowlisted local filesystem. Linux accepts ext-family, XFS, Btrfs, and tmpfs.
+macOS accepts local APFS, HFS, and tmpfs
 with ownership enforced and without extended ACL grants. The checks reject
 unknown filesystem semantics, network filesystems, and mounts that ignore
-ownership. Workers and the session picker keep the existing-only journal
-policy for the restored session, including later reopens. An explicit new
-session can create a journal.
+ownership. The session picker keeps the canonical journal and original
+workspace when a path resolves through an alias. Workers and the picker use
+existing-only opens for that journal, including later reopens. An explicit
+new session can create a journal.
 
 If Pi cannot verify protection for the workspace or its project configuration
 and resource paths at report or restore time, the normal project trust prompt
 requires fresh approval before loading trusted project configuration. Project
-package declarations also require approval because preparation resolves their
-resource paths. A previously denied workspace remains untrusted. These
-safeguards are native restrictions on unattended restore.
+package declarations and enabled project stdio MCP servers also require
+approval because preparation or launch resolves dependencies beyond the
+configuration file. This includes project overrides that enable a user stdio
+server. A previously denied workspace remains untrusted. These safeguards
+are native restrictions on unattended restore.
 
 Session switches replace the report. Returning from suspend refreshes it
 immediately, including during package reload. A missing journal or a normal

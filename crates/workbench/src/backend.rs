@@ -1302,6 +1302,7 @@ async fn run_worker(
             session,
         } = request
         {
+            let session = args.canonical_resume_path(session);
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {

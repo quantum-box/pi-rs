@@ -251,16 +251,12 @@ fn configurations_with_project_scope(
                     .filter(|name| !servers.contains_key(*name))
                     .cloned(),
             );
-            project_definitions.extend(entries.iter().filter_map(|(name, entry)| {
-                entry
-                    .as_object()
-                    .filter(|entry| {
-                        ["command", "url", "type"]
-                            .iter()
-                            .any(|key| entry.contains_key(*key))
-                    })
-                    .map(|_| name.clone())
-            }));
+            project_definitions.extend(
+                entries
+                    .iter()
+                    .filter(|(_, entry)| defines_project_server(entry))
+                    .map(|(name, _)| name.clone()),
+            );
             project_overrides.extend(
                 entries
                     .keys()
@@ -279,6 +275,43 @@ fn configurations_with_project_scope(
     ))
 }
 
+fn defines_project_server(entry: &Value) -> bool {
+    ["command", "url", "type"]
+        .iter()
+        .any(|key| entry.get(*key).is_some())
+}
+
+#[cfg(unix)]
+pub(super) fn project_stdio_requires_approval(project: &Value) -> Result<bool> {
+    let Some(entries) = project.get("mcpServers") else {
+        return Ok(false);
+    };
+    let entries = entries
+        .as_object()
+        .ok_or_else(|| Error::Config("project mcpServers must be an object".into()))?;
+    let mut servers = if entries.values().any(|entry| !defines_project_server(entry)) {
+        config::read_object(&config::agent_dir().join("mcp.json"))?
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    merge_project_servers(&mut servers, entries)?;
+    for name in entries.keys() {
+        let server: ServerConfig = serde_json::from_value(servers[name].clone())?;
+        // Even a protected config cannot establish what the local process,
+        // its arguments, or environment will load relative to its cwd.
+        if server.enabled != Some(false)
+            && (server.command.is_some() || server.transport.as_deref() == Some("stdio"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn merge_project_servers(
     servers: &mut serde_json::Map<String, Value>,
     entries: &serde_json::Map<String, Value>,
@@ -290,9 +323,7 @@ fn merge_project_servers(
                 "project MCP server {name} cannot use auth.provider"
             )));
         }
-        if !["command", "url", "type"]
-            .iter()
-            .any(|key| entry.get(*key).is_some())
+        if !defines_project_server(entry)
             && let (Some(base), Some(overlay)) = (
                 servers.get_mut(name).and_then(Value::as_object_mut),
                 entry.as_object(),
