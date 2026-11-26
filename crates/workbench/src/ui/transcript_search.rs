@@ -432,13 +432,15 @@ mod tests {
         search.highlight(&mut lines, 0..2, &theme);
         let mut bytes = Vec::new();
         for line in &lines {
-            line.draw(&mut bytes, 20).unwrap();
+            line.draw(&mut bytes, 20, crate::ui::color::ColorMode::TrueColor)
+                .unwrap();
         }
         assert!(!bytes.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
         let (overlay, _, _) = search.overlay(&theme, &Keys::default(), 30);
         let mut bytes = Vec::new();
         for line in overlay {
-            line.draw(&mut bytes, 30).unwrap();
+            line.draw(&mut bytes, 30, crate::ui::color::ColorMode::TrueColor)
+                .unwrap();
         }
         assert!(!bytes.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
     }
@@ -475,7 +477,8 @@ mod tests {
         assert_eq!(joined.result(), "No matches");
         let mut bytes = Vec::new();
         for line in lines {
-            line.draw(&mut bytes, 80).unwrap();
+            line.draw(&mut bytes, 80, crate::ui::color::ColorMode::TrueColor)
+                .unwrap();
         }
         assert!(!bytes.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
     }
@@ -524,7 +527,9 @@ mod tests {
                 source.matches('\u{85}').count()
             );
             let mut bytes = Vec::new();
-            lines[0].draw(&mut bytes, 20).unwrap();
+            lines[0]
+                .draw(&mut bytes, 20, crate::ui::color::ColorMode::TrueColor)
+                .unwrap();
             assert!(!bytes.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
         }
     }
@@ -551,7 +556,8 @@ mod tests {
             search.highlight(&mut lines, 0..len, &theme);
             let mut output = Vec::new();
             for line in lines {
-                line.draw(&mut output, 40).unwrap();
+                line.draw(&mut output, 40, crate::ui::color::ColorMode::TrueColor)
+                    .unwrap();
             }
             assert!(!output.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
         }
@@ -587,7 +593,8 @@ mod tests {
         assert!(narrow[1].spans.iter().any(|span| span.text == "b"));
         let mut output = Vec::new();
         for line in lines.iter().chain(&overlay).chain(&narrow) {
-            line.draw(&mut output, 8).unwrap();
+            line.draw(&mut output, 8, crate::ui::color::ColorMode::TrueColor)
+                .unwrap();
         }
         assert!(!output.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
     }
@@ -617,7 +624,8 @@ mod tests {
         assert_eq!((row, column), (1, 3));
         let mut output = Vec::new();
         for line in lines.iter().chain(&overlay) {
-            line.draw(&mut output, 8).unwrap();
+            line.draw(&mut output, 8, crate::ui::color::ColorMode::TrueColor)
+                .unwrap();
         }
         assert!(!output.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
     }
