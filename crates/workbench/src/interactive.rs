@@ -4422,6 +4422,7 @@ render_call_id: None,
         TranscriptOptions {
             hidden_thinking_label: None,
             code_block_indent: None,
+            hyperlinks: args.settings.terminal_hyperlinks(),
             notices: args.settings.notices(),
             image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
                 .then(|| args.settings.terminal_image_width()),

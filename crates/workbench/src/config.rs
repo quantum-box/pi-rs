@@ -512,6 +512,9 @@ impl Settings {
     pub fn enable_skill_commands(&self) -> bool {
         self.boolean("enableSkillCommands").unwrap_or(true)
     }
+    pub fn terminal_hyperlinks(&self) -> Option<bool> {
+        self.value["terminal"]["hyperlinks"].as_bool()
+    }
     pub fn terminal_true_color(&self) -> Option<bool> {
         // Like Pi, other JSON values leave capability detection in charge.
         self.value["terminal"]["trueColor"].as_bool()
@@ -1466,6 +1469,26 @@ mod tests {
                 .notices()
                 .shows(NoticeKind::ReasoningDrops)
         );
+    }
+
+    #[test]
+    fn terminal_capability_settings_validate_boolean_or_auto() {
+        use serde_json::json;
+        use std::path::Path;
+
+        let path = Path::new("settings.json");
+        for key in ["hyperlinks", "trueColor"] {
+            for value in [json!(true), json!(false), json!("auto")] {
+                super::validate_settings(&json!({"terminal":{(key):value}}), path).unwrap();
+            }
+            let error =
+                super::validate_settings(&json!({"terminal":{(key):"unknown"}}), path).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("settings.json/terminal/{key}"))
+            );
+        }
     }
 
     #[test]

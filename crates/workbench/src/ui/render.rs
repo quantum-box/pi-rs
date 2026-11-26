@@ -378,6 +378,7 @@ pub struct TranscriptOptions<'a> {
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
     pub code_block_indent: Option<&'a str>,
+    pub hyperlinks: Option<bool>,
     pub hidden_thinking_label: Option<&'a str>,
     pub expand_key: Option<crossterm::event::KeyEvent>,
 }
@@ -472,7 +473,7 @@ impl Entry {
                             inner,
                             0,
                             options.mermaid,
-                            *HYPERLINKS,
+                            options.hyperlinks.unwrap_or_else(|| *HYPERLINKS),
                             false,
                         ));
                         lines.push(Line::default());
@@ -2006,7 +2007,7 @@ fn transcript_markdown(
         0,
         MarkdownOptions {
             mermaid: options.mermaid,
-            hyperlinks: *HYPERLINKS,
+            hyperlinks: options.hyperlinks.unwrap_or_else(|| *HYPERLINKS),
             preserve_source,
             code_block_indent: options
                 .code_block_indent

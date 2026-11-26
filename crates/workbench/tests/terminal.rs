@@ -445,12 +445,14 @@ fn reload_applies_saved_theme_changes_without_overriding_cli_selection() {
 }
 
 #[test]
-fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
+fn terminal_color_and_hyperlink_capabilities_apply_at_startup_and_reload_in_both_modes() {
     const RGB: &str = "\x1b[38;2;255;0;0m";
     const INDEXED: &str = "\x1b[38;5;196m";
     const RGB_BG: &str = "\x1b[48;2;128;128;128m";
     const INDEXED_BG: &str = "\x1b[48;5;244m";
-    const TRANSCRIPT: &str = "committed color fixture";
+    const TRANSCRIPT: &str = "committed terminal fixture";
+    const URL: &str = "https://example.com/terminal";
+    let osc_link = format!("\x1b]8;;{URL}\x1b\\");
     for mode in ["regular", "fullscreen"] {
         for (configured, env, before, after) in
             [(false, "1", INDEXED, RGB), (true, "0", RGB, INDEXED)]
@@ -461,12 +463,12 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
             let session_path = root.path().join("session.jsonl");
             pi_rs::Session::open(&session_path)
                 .unwrap()
-                .append_user_with_images(TRANSCRIPT.into(), vec![], None)
+                .append_user_with_images(format!("{TRANSCRIPT} {URL}"), vec![], None)
                 .unwrap();
             let settings = home.join("settings.json");
             std::fs::write(
                 &settings,
-                serde_json::json!({"theme":"color-fixture","terminal":{"trueColor":configured}})
+                serde_json::json!({"theme":"color-fixture","terminal":{"trueColor":configured,"hyperlinks":configured}})
                     .to_string(),
             )
             .unwrap();
@@ -510,6 +512,7 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
                     .env("PI_RS_HOME", &home)
                     .env("TERM", "xterm-256color")
                     .env("PI_TRUE_COLOR", env)
+                    .env("PI_HYPERLINKS", env)
                     .env_remove("NO_COLOR")
                     .args([
                         "--offline",
@@ -536,19 +539,33 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
                     assert!(!text.contains("\x1b[38;2;") && !text.contains("\x1b[48;2;"));
                 }
                 let background = if configured { RGB_BG } else { INDEXED_BG };
-                text.contains("Enter to send")
+                let ready = text.contains("Enter to send")
                     && text.contains(TRANSCRIPT)
                     && text.contains(before)
                     && text.contains(background)
+                    && text.contains(URL);
+                if ready {
+                    assert_eq!(text.contains(&osc_link), configured, "{mode}");
+                }
+                ready
             });
-            std::fs::write(&settings, br#"{"theme":"color-fixture"}"#).unwrap();
+            std::fs::write(
+                &settings,
+                br#"{"theme":"color-fixture","terminal":{"trueColor":"auto","hyperlinks":"auto"}}"#,
+            )
+            .unwrap();
             master.write_all(b"/reload\r").unwrap();
             output_until(&mut master, |text| {
                 let background = if configured { INDEXED_BG } else { RGB_BG };
-                text.contains("Reloaded settings")
+                let ready = text.contains("Reloaded settings")
                     && text.contains(TRANSCRIPT)
                     && text.contains(after)
                     && text.contains(background)
+                    && text.contains(URL);
+                if ready {
+                    assert_eq!(text.contains(&osc_link), !configured, "{mode}");
+                }
+                ready
             });
         }
     }

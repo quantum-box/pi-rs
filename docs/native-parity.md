@@ -6125,6 +6125,14 @@ into their logical blocks, and encrypted blocks stay separate. Replay is
 bound to the original endpoint and model. A loopback RPC check exercised
 restart, encrypted-only thinking and a switch to a different model endpoint.
 
+### Terminal hyperlink capability
+
+`terminal.hyperlinks` accepts `true`, `false`, and `"auto"`. An explicit
+boolean takes precedence over `PI_HYPERLINKS` and automatic terminal
+detection. Both transcript modes redraw Markdown links with the new
+OSC 8 setting after `/reload`. The settings schema validates both hyperlink
+and color capability values.
+
 ### Terminal color capability
 
 In regular and fullscreen mode, a boolean `terminal.trueColor` takes precedence

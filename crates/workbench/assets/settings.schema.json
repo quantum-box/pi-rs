@@ -112,6 +112,8 @@
       "type": "object",
       "properties": {
         "clearOnShrink": { "type": "boolean" },
+        "hyperlinks": { "enum": [true, false, "auto"] },
+        "trueColor": { "enum": [true, false, "auto"] },
         "showTerminalProgress": { "type": "boolean" },
         "showImages": { "type": "boolean" },
         "imageWidthCells": { "type": "integer", "minimum": 1 }
