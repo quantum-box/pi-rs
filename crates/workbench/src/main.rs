@@ -20,6 +20,7 @@ mod auth_cli;
 mod auth_lock;
 mod auth_login;
 mod backend;
+mod bug_report;
 mod builtin_chat;
 mod cache_stats;
 mod cache_warming;
