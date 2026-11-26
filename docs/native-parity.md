@@ -1064,6 +1064,10 @@ nonempty `ALACRITTY_WINDOW_ID` when it uses `TERM=xterm-256color`, matching Pi
 v1.6.0 even when `TERM_PROGRAM` is unset.
 Empty terminal-identification environment variables do not advertise OSC 8
 support or indicate a tmux session.
+On hyperlink-capable terminals, destinations beyond Pi's 8,192 UTF-16 unit
+limit retain their visible link text without OSC 8. Wrapping therefore cannot
+repeat a very long destination on every line.
+[Pinned Pi hyperlink limit](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/tui/src/terminal-image.ts#L795-L815)
 Bare HTTP, HTTPS and FTP URLs, `www.` links and email addresses receive link
 styling and the same terminal-dependent behavior. Bare URLs stop before CJK
 punctuation while explicit links retain it in their destination. Markdown
