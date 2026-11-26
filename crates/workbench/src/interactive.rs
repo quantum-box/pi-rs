@@ -4661,14 +4661,8 @@ render_call_id: None,
         let fullscreen = terminal.map_or(args.tui_mode != Some(TuiMode::Regular), |terminal| {
             terminal.alternate
         });
-        let cleared_regular = !fullscreen
-            && previous == Some(images::Protocol::Iterm2)
-            && self.graphics.regular_image_protocol() == previous;
         self.graphics
             .set_protocol(protocol, fullscreen, &mut std::io::stdout().lock())?;
-        if cleared_regular {
-            self.regular = RegularState::default();
-        }
         if previous.is_none() && protocol.is_some() {
             images::query_cell_size()?;
         }
@@ -4848,10 +4842,13 @@ render_call_id: None,
         {
             previous.output.inline_images = layout.output.inline_images;
         }
-        let redraw = self.regular.layout.is_some()
-            && (self.regular.redraw
-                || self.regular.layout.as_ref() != Some(&layout)
-                || self.lines.len() < self.regular.committed);
+        let stale_iterm2 = self.graphics.regular_image_protocol() == Some(images::Protocol::Iterm2)
+            && self.graphics.protocol() != Some(images::Protocol::Iterm2);
+        let redraw = stale_iterm2
+            || (self.regular.layout.is_some()
+                && (self.regular.redraw
+                    || self.regular.layout.as_ref() != Some(&layout)
+                    || self.lines.len() < self.regular.committed));
         self.regular.layout = Some(layout);
         self.regular.redraw = false;
         if self.lines.len() < self.regular.committed {
@@ -8504,7 +8501,8 @@ pub(super) async fn run(
                             args.settings =
                                 args.settings.reload_latest(&args.workspace, args.trusted)?;
                             args.extension_theme = None;
-                            // Reload preparation can be interrupted before the next frame.
+                            // Fullscreen exit replay uses the new protocol even
+                            // if reload preparation is interrupted.
                             dirty |= view.update_image_protocol(&args, _terminal.as_ref())?;
                             for warning in args.settings.diagnostics() {
                                 view.append(warning);

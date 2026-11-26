@@ -2565,8 +2565,10 @@ with `false`. Other values use `PI_IMAGE_PROTOCOL` and terminal detection.
 Both terminal modes read the setting at startup and on `/reload`. When the
 protocol changes, pi-rs releases its Kitty uploads or erases the old iTerm2
 image cells before redrawing. Regular-mode scrollback is purged for iTerm2
-cleanup only when the regular screen has displayed iTerm2 images. The selected
-protocol also controls Kitty's optimized image dimensions.
+cleanup only when the regular screen has displayed iTerm2 images. The purge
+and transcript redraw share one frame, so an exit during reload preparation
+preserves the existing regular transcript. The selected protocol also controls
+Kitty's optimized image dimensions.
 `terminal.showImages` independently controls visibility. Changes made in
 fullscreen apply to the regular transcript when returning to it, and retained
 attachments can be shown again after a settings change or resize.

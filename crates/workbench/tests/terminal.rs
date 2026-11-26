@@ -1007,6 +1007,7 @@ fn terminal_image_protocol_applies_at_startup_reload_and_resize_in_both_modes() 
             }) && completed_frame(text, |frame| {
                 frame.contains("Reloaded settings")
                     && frame.contains(IMAGE_TRANSCRIPT)
+                    && (mode != "regular" || frame.contains("\x1b[3J"))
                     && !frame.contains(ITERM_IMAGE)
                     && !frame.contains(KITTY_IMAGE)
             })
@@ -1103,18 +1104,10 @@ fn terminal_image_visibility_reflows_the_regular_screen_after_fullscreen_reload(
     }
 }
 
-#[test]
-fn terminal_image_exit_replay_uses_settings_from_an_interrupted_reload() {
+fn start_blocked_image_reload(root: &std::path::Path, master: &mut File) {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = tempfile::tempdir().unwrap();
-    let (mut master, _slave, process, _) =
-        spawn_image_terminal(root.path(), "fullscreen", "iterm2", true);
-    output_until(&mut master, |text| {
-        text.contains(ITERM_IMAGE) && text.contains("Enter to send")
-    });
-
-    let package = root.path().join("reload-package.sh");
+    let package = root.join("reload-package.sh");
     std::fs::write(
         &package,
         r#"#!/bin/sh
@@ -1131,7 +1124,7 @@ exit 1
     )
     .unwrap();
     std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let home = root.path().join("home");
+    let home = root.join("home");
     std::fs::write(
         home.join("settings.json"),
         serde_json::json!({"theme":"dark","terminal":{"images":"kitty"},"packages":[package]})
@@ -1139,6 +1132,18 @@ exit 1
     )
     .unwrap();
     master.write_all(b"/reload\r").unwrap();
+}
+
+#[test]
+fn terminal_image_exit_replay_uses_settings_from_an_interrupted_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _slave, process, _) =
+        spawn_image_terminal(root.path(), "fullscreen", "iterm2", true);
+    output_until(&mut master, |text| {
+        text.contains(ITERM_IMAGE) && text.contains("Enter to send")
+    });
+    start_blocked_image_reload(root.path(), &mut master);
+    let home = root.path().join("home");
     output_until(&mut master, |_| home.join("probe-started").exists());
     assert_eq!(
         unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGINT) },
@@ -1152,6 +1157,65 @@ exit 1
         replay.contains(IMAGE_TRANSCRIPT) && replay.contains(KITTY_IMAGE)
     });
     std::fs::File::create(home.join("probe-release")).unwrap();
+}
+
+#[test]
+fn terminal_image_interrupt_during_reload_keeps_regular_transcript() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, slave, mut process, _) =
+        spawn_image_terminal(root.path(), "regular", "iterm2", true);
+    output_until(&mut master, |text| {
+        completed_frame(text, |frame| {
+            frame.contains(IMAGE_TRANSCRIPT) && frame.contains(ITERM_IMAGE)
+        })
+    });
+    let terminal_flags = || {
+        let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), settings.as_mut_ptr()) },
+            0
+        );
+        unsafe { settings.assume_init().c_lflag }
+    };
+    let cooked_flags = libc::ICANON | libc::ECHO;
+    assert_eq!(terminal_flags() & cooked_flags, 0);
+
+    start_blocked_image_reload(root.path(), &mut master);
+    let home = root.path().join("home");
+    let erased = std::cell::Cell::new(false);
+    let record_erase = |text: &str| {
+        erased.set(erased.get() || text.contains("\x1b[2J") || text.contains("\x1b[3J"));
+    };
+    output_until(&mut master, |text| {
+        record_erase(text);
+        home.join("probe-started").exists()
+    });
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    output_until(&mut master, |text| {
+        record_erase(text);
+        text.contains("Resume this session with pi --session")
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pi did not exit during package preparation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    std::fs::File::create(home.join("probe-release")).unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(terminal_flags() & cooked_flags, cooked_flags);
+    assert!(
+        !erased.get(),
+        "interrupted reload erased the regular transcript"
+    );
 }
 
 #[test]

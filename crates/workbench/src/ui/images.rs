@@ -402,16 +402,10 @@ impl Renderer {
         if self.protocol == next {
             return Ok(false);
         }
-        if self.protocol == Some(Protocol::Iterm2)
-            && (fullscreen || self.regular_image_protocol == Some(Protocol::Iterm2))
-        {
-            // iTerm2 embeds images in the text cells. Erase the old surface
-            // before the first frame under the new protocol.
-            if fullscreen {
-                self.clear_fullscreen_frame(out)?;
-            } else {
-                self.purge_regular_transcript(out)?;
-            }
+        // The regular transcript erases iTerm2 cells in its redraw, after
+        // preparing the replacement rows.
+        if fullscreen && self.protocol == Some(Protocol::Iterm2) {
+            self.clear_fullscreen_frame(out)?;
             out.flush()?;
         }
         self.cleanup.clear_to(out)?;
@@ -844,8 +838,11 @@ mod tests {
 
             assert!(renderer.set_protocol(None, fullscreen, &mut out).unwrap());
             let erase = String::from_utf8_lossy(&out);
-            assert!(erase.contains("\x1b[2J"));
-            assert_eq!(erase.contains("\x1b[3J"), !fullscreen);
+            assert_eq!(erase.contains("\x1b[2J"), fullscreen);
+            assert!(!erase.contains("\x1b[3J"));
+            if !fullscreen {
+                assert_eq!(renderer.regular_image_protocol(), Some(Protocol::Iterm2));
+            }
             out.clear();
             renderer.paint(&line, &mut out, 0, 1).unwrap();
             assert!(out.is_empty());
