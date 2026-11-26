@@ -2214,6 +2214,8 @@ enum SuspendTrigger {
 
 fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
     let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
     let home = root.path().join("home");
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -2263,7 +2265,7 @@ fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
         command
             .args([
                 "--workspace",
-                root.path().to_str().unwrap(),
+                workspace.to_str().unwrap(),
                 "--no-trust",
                 "--no-mcp",
                 "--no-extensions",
@@ -2296,6 +2298,7 @@ fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
     }
     if trigger == SuspendTrigger::Reload {
         use std::os::unix::fs::PermissionsExt;
+        // The user-configured probe must be outside the untrusted workspace.
         let package = root.path().join("slow-package.sh");
         std::fs::write(
             &package,
