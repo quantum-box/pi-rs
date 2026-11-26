@@ -7,7 +7,7 @@ use super::{
 use crate::task::{Checkpoint, Task, WaitFor};
 use crate::task_scheduler::{AdmissionHandle, Handler, Scheduler, Step};
 use crate::task_tool::{NestedTaskResult, TaskTool};
-use pi_rs_core::{Outcome, Tool, ToolContext};
+use pi_rs_core::{Outcome, Tool, ToolContext, ToolSpec};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -1149,6 +1149,12 @@ impl Host<'_, '_> {
 
 #[async_trait::async_trait]
 impl DurableTaskHost for Host<'_, '_> {
+    fn child_tools(&self) -> Vec<ToolSpec> {
+        let mut tools: Vec<_> = self.children.values().map(|tool| tool.spec()).collect();
+        tools.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        tools
+    }
+
     async fn report_progress(&self, progress: DurableToolProgress) -> Result<(), String> {
         let mut current = self.progress.lock().map_err(|error| error.to_string())?;
         self.commit_progress(&progress)?;
