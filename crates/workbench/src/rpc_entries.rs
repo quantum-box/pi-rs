@@ -532,7 +532,10 @@ impl Cursor {
             }
             Event::SourceEntry { .. } => pi_rs::superseded_turn_partial(records, record)
                 .and_then(|target| self.positions[target as usize].visible)
-                .map(|target| json!({"type":"context_edit","targetId":target.to_string(),"replacement":null})),
+                .map(|target| {
+                    json!({"type":"context_edit","targetId":target.to_string(),"replacement":null,
+                    (pi_rs::pi_import::SUPERSEDED_PARTIAL_FIELD):true})
+                }),
             Event::ModelFinished { .. }
                 if pi_rs::turn_partial_failure(records, record).is_some() =>
             {

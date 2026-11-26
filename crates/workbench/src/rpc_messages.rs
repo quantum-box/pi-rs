@@ -1175,6 +1175,181 @@ mod tests {
         );
     }
 
+    #[test]
+    fn superseded_partial_round_trips_without_changing_model_context() {
+        use super::super::rpc_entries::Entries;
+
+        let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        initial
+            .append_user_with_images("first".into(), vec![], None)
+            .unwrap();
+        let mut records = initial.records().to_vec();
+        let mut append = |event| {
+            let parent = records.last().unwrap();
+            records.push(Record {
+                id: parent.id + 1,
+                parent: Some(parent.id),
+                version: parent.version,
+                timestamp: None,
+                run_id: None,
+                event,
+            });
+        };
+        append(Event::Assistant {
+            content: String::new(),
+            invocations: vec![],
+            usage: None,
+            request_id: None,
+        });
+        let operation_id = Uuid::new_v4();
+        append(Event::Assistant {
+            content: String::new(),
+            invocations: vec![Invocation {
+                operation_id,
+                call: pi_rs::ToolCall {
+                    id: "fixture-call".into(),
+                    name: "fixture".into(),
+                    arguments: "{}".into(),
+                },
+            }],
+            usage: None,
+            request_id: None,
+        });
+        append(Event::ToolStarted {
+            operation_id,
+            tool_execution: None,
+        });
+        append(Event::ToolFinished {
+            operation_id,
+            outcome: pi_rs::Outcome::Succeeded("fixture result".into()),
+            states: Default::default(),
+        });
+        append(Event::Assistant {
+            content: "measured answer".into(),
+            invocations: vec![],
+            usage: Some(Usage {
+                input_tokens: 83,
+                output_tokens: 7,
+            }),
+            request_id: None,
+        });
+        append(Event::User {
+            content: "second".into(),
+            input_id: None,
+        });
+        let request_id = Uuid::new_v4();
+        append(Event::SourceEntry {
+            format: "pi-rs:failed-turn-partial".into(),
+            entry: json!({"requestId":request_id}),
+        });
+        append(Event::ModelFinished {
+            request_id,
+            metadata: ModelMetadata::default(),
+            usage: UsageReport::Unconfirmed,
+            failure: Some(pi_rs::ModelFailure::Retryable),
+            partial: "partial answer".into(),
+            reply: None,
+        });
+        let mut explicit = Session::from_records(records.clone()).unwrap();
+        let partial = explicit.head();
+        explicit.edit_context(partial, None).unwrap();
+        records.push(Record {
+            id: partial + 1,
+            parent: Some(partial),
+            version: records.last().unwrap().version,
+            timestamp: None,
+            run_id: None,
+            event: Event::SourceEntry {
+                format: "pi-rs:retry-scheduled".into(),
+                entry: json!({"requestId":request_id}),
+            },
+        });
+        let scheduled = Session::from_records(records).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let round_trip = |session: &Session, superseded: bool| {
+            let path = directory.path().join("share.jsonl");
+            let body = Entries::new(session)
+                .write_share_branch(session, directory.path())
+                .unwrap();
+            let edit: Value = serde_json::from_slice(
+                body.trim_ascii_end()
+                    .rsplit(|byte| *byte == b'\n')
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(edit["type"], "context_edit");
+            assert!(edit["replacement"].is_null());
+            assert_eq!(
+                edit.get(pi_rs::pi_import::SUPERSEDED_PARTIAL_FIELD),
+                superseded.then_some(&Value::Bool(true))
+            );
+            std::fs::write(&path, body).unwrap();
+            super::super::session_import::read(&path).unwrap()
+        };
+
+        let expected = snapshot(&scheduled).1;
+        let mut imported = round_trip(&scheduled, true);
+        for _ in 0..2 {
+            let (visible, native) = snapshot(&imported);
+            assert_eq!(native, expected);
+            assert_eq!(native.len(), 6);
+            assert!(
+                matches!(&native[1], Message::Assistant { content, calls, .. } if content.is_empty() && calls.is_empty())
+            );
+            assert!(
+                matches!(&native[3], Message::Tool { call_id, .. } if call_id == "fixture-call")
+            );
+            assert!(
+                !visible
+                    .iter()
+                    .any(|message| message["stopReason"] == "error")
+            );
+            assert_eq!(
+                imported.last_assistant_text().as_deref(),
+                Some("measured answer")
+            );
+            let estimate = imported.context_usage_estimate();
+            assert_eq!(estimate.usage_tokens, 90);
+            assert!(estimate.last_usage_record.is_some());
+            imported = round_trip(&imported, true);
+        }
+
+        let imported = round_trip(&explicit, false);
+        assert_eq!(
+            imported.last_assistant_text().as_deref(),
+            Some("measured answer")
+        );
+        assert_eq!(imported.context_usage_estimate().last_usage_record, None);
+        assert_eq!(snapshot(&imported).1.len(), 5);
+
+        let bytes = Entries::new(&scheduled)
+            .write_share_branch(&scheduled, directory.path())
+            .unwrap();
+        let mut entries: Vec<Value> = bytes
+            .trim_ascii_end()
+            .split(|byte| *byte == b'\n')
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let measured = entries
+            .iter()
+            .find(|entry| entry["message"]["usage"]["input"] == 83)
+            .unwrap()["id"]
+            .clone();
+        entries.last_mut().unwrap()["targetId"] = measured;
+        let path = directory.path().join("flagged-edit-to-success.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for entry in entries {
+            writeln!(file, "{entry}").unwrap();
+        }
+        let imported = super::super::session_import::read(&path).unwrap();
+        assert_eq!(imported.context_usage_estimate().last_usage_record, None);
+        assert_eq!(
+            imported.last_assistant_text().as_deref(),
+            Some("partial answer")
+        );
+    }
+
     fn assert_turn_partial(failure: pi_rs::ModelFailure, marker: &str, stop: &str) {
         let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
         initial

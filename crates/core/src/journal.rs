@@ -1688,7 +1688,7 @@ impl Session {
             .rev()
             .find_map(|record| {
                 (matches!(record.event, Event::Compacted { .. })
-                    || is_model_context_edit(&self.records, &record.event)
+                    || is_model_context_edit(&branch, record)
                     || system_invalidations.contains(&record.id))
                 .then_some(record.id)
             })
@@ -1803,7 +1803,7 @@ impl Session {
                             fallback_model: Some(_),
                             ..
                         }
-                ) || is_model_context_edit(&self.records, &record.event))
+                ) || is_model_context_edit(&branch, record))
                 .then_some(record.id)
             })
             .unwrap_or(0);
@@ -1898,29 +1898,8 @@ impl Session {
     }
 
     pub(crate) fn imported_assistant_message(&self, source: u64) -> Option<&serde_json::Value> {
-        let assistant = self.records.get(source.checked_sub(1)? as usize)?;
-        let Event::Assistant {
-            request_id: Some(request_id),
-            ..
-        } = &assistant.event
-        else {
-            return None;
-        };
-        let completion = self
-            .records
-            .get(assistant.parent?.checked_sub(1)? as usize)?;
-        if !matches!(&completion.event, Event::ModelFinished { request_id: id, .. } if id == request_id)
-        {
-            return None;
-        }
-        let original = self
-            .records
-            .get(completion.parent?.checked_sub(1)? as usize)?;
-        let Event::SourceEntry { format, entry } = &original.event else {
-            return None;
-        };
-        (format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant")
-            .then_some(&entry["message"])
+        let lookup = |id: u64| self.records.get(id.checked_sub(1)? as usize);
+        imported_assistant_source(lookup(source)?, lookup).map(|(entry, _)| &entry["message"])
     }
 
     pub fn operations(&self) -> Vec<(Invocation, OperationState)> {
@@ -2675,29 +2654,26 @@ impl Session {
 
     /// A refresh during a run belongs to the latest unchanged model request.
     pub fn cache_request_current(&self, session_id: Uuid, request_id: Uuid) -> bool {
-        self.session_id() == session_id
-            && self.host_binding().is_none()
-            && self
-                .branch()
-                .into_iter()
-                .rev()
-                .find_map(|record| match record.event {
-                    Event::ModelRequested {
-                        request_id: current,
-                        ..
-                    } => Some(current == Some(request_id)),
-                    Event::Compacted { .. }
-                    | Event::BranchSummary { .. }
-                    | Event::BashExecution { .. }
-                    | Event::CustomMessage { .. }
-                    | Event::CustomMessageDelivered { .. }
-                    | Event::User { .. }
-                    | Event::UserWithImages { .. }
-                    | Event::UserImages { .. } => Some(false),
-                    _ if is_model_context_edit(&self.records, &record.event) => Some(false),
-                    _ => None,
-                })
-                == Some(true)
+        if self.session_id() != session_id || self.host_binding().is_some() {
+            return false;
+        }
+        let branch = self.branch();
+        branch.iter().rev().find_map(|record| match record.event {
+            Event::ModelRequested {
+                request_id: current,
+                ..
+            } => Some(current == Some(request_id)),
+            Event::Compacted { .. }
+            | Event::BranchSummary { .. }
+            | Event::BashExecution { .. }
+            | Event::CustomMessage { .. }
+            | Event::CustomMessageDelivered { .. }
+            | Event::User { .. }
+            | Event::UserWithImages { .. }
+            | Event::UserImages { .. } => Some(false),
+            _ if is_model_context_edit(&branch, record) => Some(false),
+            _ => None,
+        }) == Some(true)
     }
 
     pub(crate) fn append_cache_warm(
@@ -4858,10 +4834,80 @@ fn context_edits<'a>(path: &[&'a Record]) -> BTreeMap<u64, &'a Option<crate::Con
         .collect()
 }
 
-fn is_model_context_edit(records: &[Record], event: &Event) -> bool {
-    matches!(event, Event::ContextEdited { target, .. }
-        if !matches!(records.get(target.saturating_sub(1) as usize).map(|record| &record.event),
-            Some(Event::ModelFinished { .. })))
+fn imported_assistant_source<'a>(
+    assistant: &Record,
+    lookup: impl Fn(u64) -> Option<&'a Record>,
+) -> Option<(&'a serde_json::Value, Option<ModelFailure>)> {
+    let Event::Assistant {
+        request_id: Some(request),
+        ..
+    } = &assistant.event
+    else {
+        return None;
+    };
+    let completion = lookup(assistant.parent?)?;
+    let Event::ModelFinished {
+        request_id,
+        failure,
+        ..
+    } = &completion.event
+    else {
+        return None;
+    };
+    if request_id != request {
+        return None;
+    }
+    let Event::SourceEntry { format, entry } = &lookup(completion.parent?)?.event else {
+        return None;
+    };
+    (format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant")
+        .then_some((entry, *failure))
+}
+
+fn is_model_context_edit(branch: &[&Record], record: &Record) -> bool {
+    let Event::ContextEdited {
+        target,
+        replacement,
+    } = &record.event
+    else {
+        return false;
+    };
+    let lookup = |id| {
+        branch
+            .binary_search_by_key(&id, |record| record.id)
+            .ok()
+            .map(|index| branch[index])
+    };
+    let Some(target) = lookup(*target) else {
+        return true;
+    };
+    if matches!(target.event, Event::ModelFinished { .. }) {
+        return false;
+    }
+    if replacement.is_some() {
+        return true;
+    }
+    let Some(source) = record.parent.and_then(lookup) else {
+        return true;
+    };
+    let Event::SourceEntry { format, entry } = &source.event else {
+        return true;
+    };
+    // The flag is advisory. Only the imported conversion of a null edit
+    // targeting its original failed reply can omit display without editing context.
+    !(record.run_id.is_none()
+        && source.id + 1 == record.id
+        && source.timestamp == record.timestamp
+        && format == "pi"
+        && entry["type"] == "context_edit"
+        && entry["replacement"].is_null()
+        && entry[crate::pi_import::SUPERSEDED_PARTIAL_FIELD] == true
+        && imported_assistant_source(target, lookup).is_some_and(|(message, failure)| {
+            failure == Some(ModelFailure::Failed)
+                && entry["targetId"]
+                    .as_str()
+                    .is_some_and(|id| message["id"] == id)
+        }))
 }
 
 fn conversation_entries_since(
@@ -5175,7 +5221,12 @@ fn conversation_entries_since_inner(
             (source, message)
         })
         .collect();
-    if repair && !edits.is_empty() {
+    if repair
+        && !edits.is_empty()
+        && path
+            .iter()
+            .any(|record| is_model_context_edit(path, record))
+    {
         let thinking_sources: BTreeSet<_> = messages
             .iter()
             .filter_map(|(source, message)| {
