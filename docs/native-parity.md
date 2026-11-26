@@ -4100,6 +4100,13 @@ measured response is available. Unknown cost is returned as null; preservation o
 below. Live statistics are covered below. Complete message-variant counting and
 provider pricing remain open.
 
+Interactive restore skips the transcript card and cost notice for an imported
+Pi `branch_summary` with an empty string. The original entry, its branch
+position and billed usage remain in the journal. This also applies after a
+native export and reopen.
+[Pinned Pi summary projection](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/session-manager.ts#L458-L460)
+[Pinned Pi transcript restore](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L4371-L4383)
+
 Tests cover an imported multi-branch session with assistant, tool-result,
 standalone and summary usage. A loopback RPC test covers message and tool counts,
 cache accounting, summary usage deduplication and unknown post-compaction context.
@@ -4145,8 +4152,11 @@ catalogs, automatic native pricing and detailed cost provenance remain open.
 
 Session and owned SDK name reads trim ECMAScript whitespace from the latest
 stored name, as Pi does, including names imported from external JSONL. A
-whitespace-only name clears the title without falling back to an older name;
-reading preserves internal line breaks and does not rewrite the journal.
+whitespace-only name clears the title. The latest imported Pi `session_info`
+also clears the title when it omits `name`, even after checkout to an earlier
+branch. Native working-directory updates leave the title in place. Name reads
+preserve internal line breaks and leave the journal intact.
+[Pinned Pi session name lookup](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/session-manager.ts#L1339-L1350)
 
 ### SDK queued input inspection
 

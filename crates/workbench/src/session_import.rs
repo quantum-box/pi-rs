@@ -3283,6 +3283,40 @@ mod tests {
     }
 
     #[test]
+    fn omitted_pi_session_name_clears_title_across_checkout_and_reopen() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"session_info","id":"named","parentId":null,"name":"Planning"}),
+            json!({"type":"message","id":"work","parentId":"named","message":{"role":"user","content":"work"}}),
+            json!({"type":"session_info","id":"clear","parentId":"named"}),
+        ])
+        .unwrap();
+        assert_eq!(session.name(), None);
+        let work = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::User { .. }))
+            .unwrap()
+            .id;
+        session.checkout(work).unwrap();
+        assert_eq!(session.name(), None, "title follows file order");
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.name(), None);
+        let source = reopened.records().iter().find(|record| {
+            matches!(&record.event, Event::SourceEntry { format, entry }
+                if format == "pi" && entry["id"] == "clear" && entry.get("name").is_none())
+        });
+        assert!(source.is_some(), "the original entry stays unnamed");
+        reopened.set_name("Native rename").unwrap();
+        reopened.set_working_directory(directory.path()).unwrap();
+        assert_eq!(reopened.name(), Some("Native rename"));
+    }
+
+    #[test]
     fn imported_costs_survive_reopening_and_unknown_costs_are_not_zeroed() {
         let mut entries = vec![
             json!({"type":"session","version":3,"cwd":"/tmp/import"}),

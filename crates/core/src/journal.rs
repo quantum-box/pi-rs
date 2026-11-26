@@ -2218,9 +2218,19 @@ impl Session {
             .find_map(|record| match &record.event {
                 Event::SessionInfo {
                     name: Some(name), ..
-                } => Some(name.as_str()),
+                } => Some(Some(name.as_str())),
+                // Pi treats the latest session_info as the whole title update.
+                // Native SessionInfo records can update just the directory.
+                Event::SourceEntry { format, entry }
+                    if format == "pi"
+                        && entry["type"] == "session_info"
+                        && entry["name"].is_null() =>
+                {
+                    Some(None)
+                }
                 _ => None,
             })
+            .flatten()
             .map(|name| name.trim_matches(is_ecmascript_whitespace))
             .filter(|name| !name.is_empty())
     }

@@ -3302,6 +3302,34 @@ impl View {
             })
             .collect();
         let branch = session.branch();
+        let mut empty_pi_summary_sources = branch
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::SourceEntry { format, entry }
+                    if format == "pi"
+                        && entry["type"] == "branch_summary"
+                        && entry["summary"] == "" =>
+                {
+                    Some(record.id)
+                }
+                _ => None,
+            })
+            .peekable();
+        let hidden_summaries: std::collections::HashSet<_> =
+            if empty_pi_summary_sources.peek().is_some() {
+                let conversions = session.validated_pi_conversion_counts().unwrap_or_default();
+                // Imported summary usage can precede the summary in its conversion.
+                empty_pi_summary_sources
+                    .filter_map(|id| {
+                        conversions
+                            .get(&id)
+                            .filter(|&&count| count > 0)
+                            .map(|count| id + count)
+                    })
+                    .collect()
+            } else {
+                Default::default()
+            };
         let assistant_records: std::collections::HashMap<_, _> = branch
             .iter()
             .filter_map(|&record| match record.event {
@@ -3457,8 +3485,10 @@ impl View {
                 }
                 _ => {}
             }
-            self.add_summary(record, Some(session));
-            self.show_summary_billing(record, records);
+            if !hidden_summaries.contains(&record.id) {
+                self.add_summary(record, Some(session));
+                self.show_summary_billing(record, records);
+            }
             self.observe_cache(record, args);
             self.observe_reasoning_drop(record);
         }
@@ -13992,6 +14022,122 @@ exit {exit}
             Some(("fixture".into(), Some("high".into())))
         );
     }
+    #[test]
+    fn restore_hides_empty_pi_branch_summaries_without_losing_billing() {
+        use super::{Cli, Entry, NoticeKind, SummaryKind, View};
+        use clap::Parser;
+        use pi_rs::{Event, Session};
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"root"}}),
+            json!({"type":"message","id":"away","parentId":"root","message":{"role":"user","content":"away"}}),
+            json!({"type":"branch_summary","id":"billed","parentId":"root","fromId":"away","summary":"","usage":{"input":2,"output":1,"cost":{"total":0.125}}}),
+            json!({"type":"branch_summary","id":"empty","parentId":"billed","fromId":"away","summary":""}),
+            json!({"type":"branch_summary","id":"sibling","parentId":"root","fromId":"away","summary":" ","usage":{"input":4,"output":2,"cost":{"total":0.25}}}),
+            json!({"type":"message","id":"leaf","parentId":"empty","message":{"role":"user","content":"continuation"}}),
+        ];
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let path = directory.path().join("native.jsonl");
+        imported.export_jsonl(&path).unwrap();
+        let mut session = Session::open(&path).unwrap();
+        let leaf = session.head();
+        let branch = session.branch();
+        let summaries: Vec<_> = branch
+            .into_iter()
+            .filter(|record| matches!(&record.event, Event::BranchSummary { summary, .. } if summary.is_empty()))
+            .collect();
+        assert_eq!(summaries.len(), 2);
+        let billed = summaries[0];
+        let (usage, metadata) = billed.summary_usage(session.records()).unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (2, 1));
+        assert_eq!(
+            metadata
+                .and_then(|details| details.metadata.cost_usd)
+                .and_then(|cost| cost.as_f64()),
+            Some(0.125)
+        );
+        assert_eq!(session.statistics().cost, Some(0.375));
+
+        let native_summary = summaries[1].clone();
+        let args = Cli::parse_from(["pi", "--offline"]);
+        let mut view = View::default();
+        let summary_count = |view: &View| {
+            view.lines
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        Entry::Summary {
+                            kind: SummaryKind::Branch,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        let billing_count = |view: &View| {
+            view.lines
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        Entry::TranscriptNotice {
+                            kind: NoticeKind::CompactionCosts,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        view.restore_session(&args, &session).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (0, 0));
+
+        let sibling = session.records().iter().find(|record| {
+            matches!(&record.event, Event::BranchSummary { summary, .. } if summary == " ")
+        }).unwrap().id;
+        session.checkout(sibling).unwrap();
+        view.restore_session(&args, &session).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (1, 1));
+
+        session.checkout(leaf).unwrap();
+        view.restore_session(&args, &session).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (0, 0));
+        assert_eq!(session.statistics().cost, Some(0.375));
+
+        session.checkout(native_summary.parent.unwrap()).unwrap();
+        let mut records = session.records().to_vec();
+        let metadata = records
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|metadata| (record.id, metadata))
+            })
+            .collect();
+        let native_id = records.len() as u64 + 1;
+        records.push(pi_rs::Record {
+            id: native_id,
+            version: records.last().unwrap().version,
+            ..native_summary
+        });
+        let mixed = Session::from_records_with_metadata(records, metadata).unwrap();
+        view.restore_session(&args, &mixed).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (1, 0));
+    }
+
     #[test]
     fn imported_branch_checkout_fork_and_switch_restore_selection() {
         use clap::Parser;
