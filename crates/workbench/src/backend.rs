@@ -587,7 +587,8 @@ impl SessionSnapshot {
             let mut emitted = Vec::new();
             for index in start..end as usize {
                 emitted.extend(cursor.appended(
-                    &self.records[..=index],
+                    &self.records[..end as usize],
+                    index,
                     self.record_metadata.get(&self.records[index].id),
                     &self.record_metadata,
                 ));
@@ -705,7 +706,7 @@ impl SessionSnapshot {
             return Vec::new();
         }
         if changed {
-            self.replay = pi_rs::pi_import::StreamVerifier::new();
+            self.replay.restart();
             *cursor = super::rpc_entries::Cursor::default();
         }
         #[cfg(test)]
@@ -745,7 +746,8 @@ impl SessionSnapshot {
         let mut emitted = Vec::new();
         for index in start..observed_end {
             emitted.extend(cursor.appended(
-                &self.records[..=index],
+                &self.records[..observed_end],
+                index,
                 self.record_metadata.get(&self.records[index].id),
                 &self.record_metadata,
             ));
