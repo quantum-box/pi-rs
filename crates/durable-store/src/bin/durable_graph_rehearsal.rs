@@ -95,6 +95,86 @@ mod unix {
         Ok((counts, digest.finalize().into()))
     }
 
+    // An older source may not have all these tables. Compare the data in the
+    // tables that existed at the cut, allowing initialization to add new ones.
+    const HISTORY_TABLES: &[(&str, &str)] = &[
+        ("durable_commit_meta", "SELECT id,sequence,legacy_version FROM durable_commit_meta ORDER BY id"),
+        ("durable_commit_versions", "SELECT key,version,sequence FROM durable_commit_versions ORDER BY key,version"),
+        ("durable_document_history_meta", "SELECT id,revision FROM durable_document_history_meta ORDER BY id"),
+        ("durable_document_history", "SELECT key,revision,value,version FROM durable_document_history ORDER BY key,revision"),
+        ("durable_document_cuts", "SELECT key,revision FROM durable_document_cuts ORDER BY key"),
+        ("durable_document_cut_versions", "SELECT key,version,revision FROM durable_document_cut_versions ORDER BY key,version"),
+        ("durable_document_fence_versions", "SELECT key,version,revision FROM durable_document_fence_versions ORDER BY key,version"),
+        ("durable_application_history_meta", "SELECT id,first_revision FROM durable_application_history_meta ORDER BY id"),
+        ("durable_document_commit_meta", "SELECT id,boundary_revision,boundary_sequence FROM durable_document_commit_meta ORDER BY id"),
+        ("durable_document_commit_sequences", "SELECT revision,sequence FROM durable_document_commit_sequences ORDER BY revision"),
+        ("durable_task_document_owners", "SELECT document_key,owner FROM durable_task_document_owners ORDER BY document_key"),
+    ];
+
+    fn historical_fingerprint(connection: &Connection, query: &str) -> Result<[u8; 32]> {
+        use rusqlite::types::ValueRef;
+
+        let mut statement = connection.prepare(query)?;
+        let columns = statement.column_count();
+        let mut rows = statement.query([])?;
+        let mut digest = Sha256::new();
+        while let Some(row) = rows.next()? {
+            for index in 0..columns {
+                match row.get_ref(index)? {
+                    ValueRef::Null => digest.update([0]),
+                    ValueRef::Integer(value) => {
+                        digest.update([1]);
+                        digest.update(value.to_be_bytes());
+                    }
+                    ValueRef::Blob(value) => {
+                        digest.update([2]);
+                        digest.update((value.len() as u64).to_be_bytes());
+                        digest.update(value);
+                    }
+                    _ => return Err("unexpected Durable history column type".into()),
+                }
+            }
+        }
+        Ok(digest.finalize().into())
+    }
+
+    pub(super) struct HistoryFingerprint {
+        table: &'static str,
+        query: &'static str,
+        digest: [u8; 32],
+    }
+
+    pub(super) fn capture_history(connection: &Connection) -> Result<Vec<HistoryFingerprint>> {
+        let mut fingerprints = Vec::new();
+        for &(table, query) in HISTORY_TABLES {
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if exists {
+                fingerprints.push(HistoryFingerprint {
+                    table,
+                    query,
+                    digest: historical_fingerprint(connection, query)?,
+                });
+            }
+        }
+        Ok(fingerprints)
+    }
+
+    pub(super) fn verify_history(
+        connection: &Connection,
+        expected: &[HistoryFingerprint],
+    ) -> Result<()> {
+        for snapshot in expected {
+            if historical_fingerprint(connection, snapshot.query)? != snapshot.digest {
+                return Err(format!("{} differs from the backup cut", snapshot.table).into());
+            }
+        }
+        Ok(())
+    }
+
     fn open_legacy_connection(path: &Path) -> Result<Connection> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         connection.create_scalar_function(
@@ -140,6 +220,7 @@ mod unix {
         }
         check_integrity(&baseline)?;
         let snapshot = fingerprint(&baseline)?;
+        let history = capture_history(&baseline)?;
         drop(baseline);
 
         fs::copy(&backup, &migrated)?;
@@ -153,6 +234,7 @@ mod unix {
         if protocol(&migrated_read)? != Some(4) || fingerprint(&migrated_read)? != snapshot {
             return Err("the reopened v4 store differs from the backup cut".into());
         }
+        verify_history(&migrated_read, &history)?;
         check_integrity(&migrated_read)?;
         drop(migrated_read);
 
@@ -207,6 +289,7 @@ mod unix {
         {
             return Err("restoration did not return to the backup cut".into());
         }
+        verify_history(&restored, &history)?;
         let transaction = restored.transaction()?;
         transaction.execute(
             "INSERT INTO durable_store_entries(key,value,version)
@@ -251,7 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use super::unix::run;
+    use super::unix::{capture_history, run, verify_history};
     use rusqlite::{params, Connection};
 
     fn verify_rehearsal(v3: bool, backup_name: &str, restore_name: &str) {
@@ -304,6 +387,26 @@ mod tests {
         assert!(run(&output.join("migrated-v4.sqlite"), &rejected).is_err());
         assert!(!rejected.exists());
         assert_eq!(std::fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    fn rehearsal_detects_changed_historical_document_values() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE durable_document_history(key BLOB,revision INTEGER,value BLOB,version INTEGER);
+             INSERT INTO durable_document_history VALUES(X'01',1,X'02',1),(X'01',2,X'03',2);
+             INSERT INTO durable_document_history VALUES(X'04',2,NULL,NULL);",
+        )
+        .unwrap();
+        let expected = capture_history(&db).unwrap();
+        assert_eq!(expected.len(), 1);
+        verify_history(&db, &expected).unwrap();
+        db.execute(
+            "UPDATE durable_document_history SET value=X'ff' WHERE revision=1",
+            [],
+        )
+        .unwrap();
+        assert!(verify_history(&db, &expected).is_err());
     }
 
     #[test]

@@ -535,7 +535,9 @@ On Unix, `durable-graph-rehearsal` takes a standard Durable database or a
 v3 experimental database and creates a private output directory. It makes a
 consistent backup, a v4 migration copy, and a copy restored in the input format. It
 reports the original graph protocol (null for a standard database), record
-counts, and elapsed times. The source is opened read-only.
+counts, and elapsed times. The source is opened read-only. The checks compare
+existing commit history, document revisions, fork cuts, and task document
+ownership in addition to the live entries.
 
 1. Stop the scheduler and let all workers release the database. On Unix, run
    the migration only once the selected binary can acquire the owner lock.
