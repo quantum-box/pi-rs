@@ -1904,20 +1904,28 @@ async fn exercise_conversation_park_claim_with_late_publication(
                     .unwrap();
             });
         }
+        let mut controlled_writer = None;
         if case == "selection_hook_writer_busy" && !graph_aba {
             let path = path.clone();
-            let hold_for = if retry_after_busy { 6 } else { 20 };
+            let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+            crate::task_driver::after_pending_enqueue_for_test(root_id, move || {
+                let _ = pending_tx.send(());
+            });
             crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
+                let writer = std::thread::spawn(move || {
                     let conn = rusqlite::Connection::open(path).unwrap();
                     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
                     ready_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_secs(hold_for));
+                    let _ = release_rx.recv_timeout(Duration::from_secs(60));
                     conn.execute_batch("ROLLBACK").unwrap();
                 });
-                ready_rx.recv().unwrap();
+                ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                writer_tx.send(writer).unwrap();
             });
+            controlled_writer = Some((pending_rx, release_tx, writer_rx));
         }
         if matches!(
             case,
@@ -2021,14 +2029,30 @@ async fn exercise_conversation_park_claim_with_late_publication(
         }
         let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
         if case == "selection_hook_writer_busy" {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while after_calls.load(Ordering::SeqCst) == 0 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
+            let writer = if let Some((pending, release, writer)) = controlled_writer {
+                tokio::time::timeout(Duration::from_secs(30), pending)
+                    .await
+                    .expect("driver did not retain the pending cancel receipt")
+                    .unwrap();
+                Some((
+                    release,
+                    writer.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ))
+            } else {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while after_calls.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                None
+            };
             if retry_after_busy {
+                if let Some((release, writer)) = writer {
+                    release.send(()).unwrap();
+                    writer.join().unwrap();
+                }
                 tokio::time::timeout(Duration::from_secs(20), async {
                     while store.get(key.as_bytes()).unwrap().is_none() {
                         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2045,6 +2069,10 @@ async fn exercise_conversation_park_claim_with_late_publication(
                 tokio::time::sleep(Duration::from_secs(7)).await;
             }
             let report = driver.shutdown_with_pending().unwrap();
+            if let Some((release, writer)) = writer {
+                release.send(()).unwrap();
+                writer.join().unwrap();
+            }
             let known = report
                 .pending()
                 .iter()
@@ -4690,7 +4718,7 @@ fn exercise_claim_recovery_during_maintenance(conflicts: bool) {
             let db = rusqlite::Connection::open(writer_path).unwrap();
             db.execute_batch("BEGIN IMMEDIATE").unwrap();
             locked_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(60)).unwrap();
             db.execute_batch("COMMIT").unwrap();
         });
         locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -4712,15 +4740,14 @@ fn exercise_claim_recovery_during_maintenance(conflicts: bool) {
         continue_rx.recv_timeout(Duration::from_secs(30)).unwrap();
     });
     let driver = crate::task_driver::Driver::start_with_harness(task_scheduler, harness.worker());
+    let writer = writer_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("claim recovery did not acquire the fixture writer lock");
     busy_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(Duration::from_secs(30))
         .expect("claim recovery did not encounter writer lock");
     release_tx.send(()).unwrap();
-    writer_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .join()
-        .unwrap();
+    writer.join().unwrap();
     {
         // The driver is paused in its test-only busy hook while holding the
         // task gate. Insert the independent graph through the store seam.
