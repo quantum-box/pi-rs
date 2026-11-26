@@ -945,14 +945,16 @@ impl Profiles {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter(|model| {
-                    model["type"].as_str().is_none_or(|kind| kind == "chat")
-                        && model["api"].as_str().and_then(Adapter::named).is_some()
-                })
+                .filter(|model| model["type"].as_str().is_none_or(|kind| kind == "chat"))
                 .collect();
             for model in &models {
+                let id = model["id"].as_str().unwrap_or_default();
+                if model["api"].as_str().and_then(Adapter::named).is_none() {
+                    return Err(Error::Config(format!(
+                        "chat model {name}/{id} requires its own supported chat api in a pi-decision profile (for example, openai-completions)"
+                    )));
+                }
                 if model["baseUrl"].as_str().is_none() {
-                    let id = model["id"].as_str().unwrap_or_default();
                     return Err(Error::Config(format!(
                         "chat model {name}/{id} requires its own baseUrl in a pi-decision profile"
                     )));
