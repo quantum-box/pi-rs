@@ -10,7 +10,7 @@ use pi_rs::{
     AgentInput, CancellationToken, Compaction, Error, InputKind, LifecycleEvent, QueueMode,
     QueuedMessage, Result, Session, SessionShutdownReason, SessionStartReason,
 };
-use pi_rs_workbench::coding::CodingTools;
+use pi_rs_workbench::coding::{CodingTools, UserShellExecution};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -150,6 +150,9 @@ enum Request {
         request_id: Option<serde_json::Value>,
     },
     AbortBash,
+    ExtensionUiThemeClaim {
+        id: Uuid,
+    },
     ExtensionUiResponse {
         id: Uuid,
         value: pi_rs::UiResponse,
@@ -632,9 +635,17 @@ impl SessionSnapshot {
         }
     }
 
+    #[cfg(test)]
     fn record(&mut self, record: &pi_rs::Record) -> Vec<serde_json::Value> {
+        self.record_with_metadata(record, pi_rs::record_event_metadata(record.id))
+    }
+
+    fn record_with_metadata(
+        &mut self,
+        record: &pi_rs::Record,
+        metadata: Option<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
         self.revision = self.revision.wrapping_add(1);
-        let metadata = pi_rs::record_event_metadata(record.id);
         let metadata_changed = metadata
             .as_ref()
             .is_some_and(|value| self.record_metadata.get(&record.id) != Some(value))
@@ -945,7 +956,7 @@ impl pi_rs::ToolHost for QueueMessageHost {
 struct ShellCompletion {
     id: Uuid,
     request_id: Option<serde_json::Value>,
-    result: Result<pi_rs::BashExecution>,
+    result: Result<UserShellExecution>,
 }
 
 pub fn run(
@@ -2078,7 +2089,7 @@ fn save_shell(
 
 fn record_shell(
     session: &mut Session,
-    execution: &pi_rs::BashExecution,
+    execution: &UserShellExecution,
     args: &Cli,
     snapshot: &Mutex<SessionSnapshot>,
 ) -> Result<()> {
@@ -2086,11 +2097,16 @@ fn record_shell(
         session.set_working_directory(&args.workspace)?;
         refresh_snapshot(snapshot, session);
     }
-    session.append_local_bash_result(execution.clone())?;
-    observe_snapshot(
-        pi_rs::Notification::Committed(session.records().last().expect("saved shell execution")),
+    session.append_local_bash_result_with_output_error(
+        execution.execution.clone(),
+        execution.full_output_error.as_deref(),
+    )?;
+    let record = session.records().last().expect("saved shell execution");
+    observe_snapshot_with_metadata(
+        pi_rs::Notification::Committed(record),
         args.trace,
         snapshot,
+        session.record_metadata(record.id).cloned(),
     );
     Ok(())
 }
@@ -2104,7 +2120,7 @@ fn finish_shell(shell: &ShellCompletion, active: &Mutex<ControlState>) {
 fn report_shell_end(
     id: Uuid,
     request_id: Option<&serde_json::Value>,
-    result: &Result<pi_rs::BashExecution>,
+    result: &Result<UserShellExecution>,
 ) {
     match result {
         Ok(execution) => output(
@@ -2137,6 +2153,15 @@ fn observe_snapshot(
     trace: bool,
     snapshot: &Mutex<SessionSnapshot>,
 ) {
+    observe_snapshot_with_metadata(event, trace, snapshot, None);
+}
+
+fn observe_snapshot_with_metadata(
+    event: pi_rs::Notification<'_>,
+    trace: bool,
+    snapshot: &Mutex<SessionSnapshot>,
+    metadata: Option<serde_json::Value>,
+) {
     if let pi_rs::Notification::Committed(record) = &event
         && let pi_rs::Event::ToolFinished { operation_id, .. } = &record.event
     {
@@ -2168,7 +2193,10 @@ fn observe_snapshot(
     };
     let (entries, projection_error) = if let pi_rs::Notification::Committed(record) = &event {
         let mut snapshot = snapshot.lock().expect("session snapshot");
-        let entries = snapshot.record(record);
+        let entries = snapshot.record_with_metadata(
+            record,
+            metadata.or_else(|| pi_rs::record_event_metadata(record.id)),
+        );
         (entries, snapshot.projection_error.take())
     } else {
         (Vec::new(), None)
@@ -2578,29 +2606,29 @@ fn read_requests(
                                 let states = pi_rs::Session::from_records(records)?.extension_states();
                                 let event = pi_rs::UserBashEvent { command: command.clone(), exclude_from_context, cwd };
                                 let host = Arc::new(QueueMessageHost { inputs: host_inputs, cancellation: cancel.clone() });
-                                match registry.prepare_user_bash_with_host(&event, &states, &cancel, host.clone()).await? {
-                                    Some(pi_rs::UserBashReplacement::Result(result)) => {
+                                match registry.prepare_user_bash_with_output_error(&event, &states, &cancel, host.clone()).await? {
+                                    Some((pi_rs::UserBashReplacement::Result(result), full_output_error)) => {
                                         if !result.output.is_empty() {
                                             output(json!({"type":"bash_execution_update","executionId":id,"output":result.output,"id":request_id}));
                                         }
-                                        return Ok(pi_rs::BashExecution {
+                                        return Ok(UserShellExecution::new(pi_rs::BashExecution {
                                             command: command.clone(), output: result.output, exit_code: result.exit_code,
                                             cancelled: result.cancelled, truncated: result.truncated,
                                             full_output_path: result.full_output_path, exclude_from_context,
-                                        });
+                                        }, full_output_error.as_deref()));
                                     }
-                                    Some(pi_rs::UserBashReplacement::Operations { extension, state }) => {
-                                        return tools.execute_shell_operations_with_host(&event, extension.as_ref(), state.as_ref(), timeout, &cancel, &mut |chunk| {
+                                    Some((pi_rs::UserBashReplacement::Operations { extension, state }, _)) => {
+                                        return tools.execute_shell_operations_with_output_error(&event, extension.as_ref(), state.as_ref(), timeout, &cancel, &mut |chunk| {
                                             output(json!({"type":"bash_execution_update","executionId":id,"output":chunk,"id":request_id}));
                                         }, host).await;
                                     }
                                     None => {}
                                 }
                             }
-                            let mut execution = tools.execute_shell(&command, timeout, &cancel, &mut |chunk| {
+                            let mut execution = tools.execute_shell_with_output_error(&command, timeout, &cancel, &mut |chunk| {
                                 output(json!({"type":"bash_execution_update","executionId":id,"output":chunk,"id":request_id}));
                             }).await?;
-                            execution.exclude_from_context = exclude_from_context;
+                            execution.execution.exclude_from_context = exclude_from_context;
                             Ok(execution)
                         }.await;
                         let _ = completed.send(ShellCompletion { id, request_id, result }).await;
@@ -2642,6 +2670,10 @@ fn read_requests(
                     ) {
                         control_response("select_live_model", Some(json!(id)), Err(error));
                     }
+                }
+                Request::ExtensionUiThemeClaim { id } => {
+                    let theme = ui.claim_theme(id);
+                    output(json!({"type":"extension_ui_theme_claim","id":id,"theme":theme}));
                 }
                 Request::ExtensionUiResponse { id, value } => ui.resolve(id, value),
                 request @ (Request::Steer { .. }
