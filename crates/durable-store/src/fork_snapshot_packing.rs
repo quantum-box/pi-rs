@@ -159,15 +159,16 @@ impl Store {
         {
             return Err(Error::InvalidSnapshot);
         }
-        let page =
-            self.packing_candidates(PREFIX, cursor.after.as_deref().unwrap_or(PREFIX), limit)?;
+        let page = self.packing_candidates(
+            PREFIX,
+            cursor.after.as_deref().unwrap_or(PREFIX),
+            Some(cursor.through_version),
+            limit,
+        )?;
         let mut packed = 0;
         let mut reclaimed_bytes = 0;
         for (key, version) in &page {
-            if *version > cursor.through_version
-                || !canonical_key(key)
-                || self.document_cut_for_version(key, *version)?.is_none()
-            {
+            if !canonical_key(key) || self.document_cut_for_version(key, *version)?.is_none() {
                 continue;
             }
             if let Some(saved) = self.pack_stored_entry(key, *version)? {
@@ -196,4 +197,48 @@ fn packing_cursor(through_version: u64) -> Option<ForkSnapshotPackingCursor> {
         through_version,
         after: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newer_fork_snapshots_do_not_extend_an_aging_pass() {
+        let store = Store::memory().unwrap();
+        let conversation = Uuid::from_u128(1);
+        let append = |position| {
+            store
+                .commit(
+                    &[],
+                    &[Mutation::Put {
+                        key: format!("runtime/fork/{conversation}/{position:020}").into_bytes(),
+                        value: vec![b'x'; 4096],
+                    }],
+                )
+                .unwrap();
+        };
+
+        append(1);
+        append(2);
+        assert!(store.fork_snapshot_packing_due(100, 20).unwrap().is_none());
+        for position in 3..=7 {
+            append(position);
+        }
+
+        let cursor = store.fork_snapshot_packing_due(120, 20).unwrap().unwrap();
+        let first = store.pack_fork_snapshot_history(&cursor, 2).unwrap();
+        assert_eq!((first.examined, first.packed), (2, 2));
+        append(8);
+        let tail = store
+            .pack_fork_snapshot_history(&first.next.unwrap(), 2)
+            .unwrap();
+        assert_eq!(tail.examined, 0);
+        assert!(tail.next.is_none());
+
+        let next_window = store.fork_snapshot_packing_due(140, 20).unwrap().unwrap();
+        let later = store.pack_fork_snapshot_history(&next_window, 16).unwrap();
+        assert_eq!((later.examined, later.packed), (7, 5));
+        assert!(later.next.is_none());
+    }
 }
