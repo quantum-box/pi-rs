@@ -17,7 +17,7 @@ pub(super) enum MetadataSource<'a> {
 }
 
 impl<'a> MetadataSource<'a> {
-    fn get(self, id: u64) -> Option<&'a Value> {
+    pub(super) fn get(self, id: u64) -> Option<&'a Value> {
         match self {
             Self::Session(session) => session.record_metadata(id),
             Self::Snapshot(metadata) => metadata.get(&id),
