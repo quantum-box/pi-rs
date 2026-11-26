@@ -343,14 +343,23 @@ async fn send_model_request(
         }
         if attempt == retries || !retryable_classifier_response(&response) {
             if matches!(api, Api::PiDecision) {
-                return Err(pi_classifier::http_error(response, request.headers()).await);
+                return Err(Error::Model(
+                    pi_classifier::http_error_message(response, request.headers()).await,
+                ));
             }
             return Err(Error::Model(format!(
                 "model operation returned HTTP {}",
                 response.status().as_u16()
             )));
         }
-        let delay = classifier_retry_delay(response.headers(), attempt, chrono::Utc::now())?;
+        let delay = match classifier_retry_delay(response.headers(), attempt, chrono::Utc::now()) {
+            Ok(delay) => delay,
+            Err(Error::Model(reason)) if matches!(api, Api::PiDecision) => {
+                let message = pi_classifier::http_error_message(response, request.headers()).await;
+                return Err(Error::Model(format!("{message}. {reason}")));
+            }
+            Err(error) => return Err(error),
+        };
         drop(response);
         // Dropping this future on operation cancellation also drops the sleep.
         tokio::time::sleep(delay).await;
