@@ -103,7 +103,7 @@ struct Cli {
     #[arg(skip)]
     rpc_model_images: RpcModelImages,
     #[arg(skip)]
-    complete_catalogs: Vec<(String, String)>,
+    complete_catalogs: Vec<(String, String, Vec<String>)>,
     #[arg(skip)]
     session_transition: Option<pi_rs::SessionStartReason>,
     #[arg(skip)]
@@ -913,28 +913,81 @@ impl Cli {
         thinking::ant_ling_default(self).unwrap_or_else(|| "medium".into())
     }
 
-    fn retired_catalog_is_authoritative(&self, provider: &Provider) -> bool {
+    fn custom_together_endpoint(&self, provider: &Provider) -> bool {
+        provider.id() == "together" && self.endpoint_for(provider) != provider.default_endpoint()
+    }
+
+    fn advertised_models(&self, provider: &Provider) -> Option<&[String]> {
         let endpoint = self.endpoint_for(provider);
-        // Together's bundled catalog describes its default endpoint. A custom
-        // endpoint can still serve former models until discovery says otherwise.
-        provider.id() != "together"
-            || endpoint == provider.default_endpoint()
-            || self
-                .complete_catalogs
-                .iter()
-                .any(|(id, address)| id == provider.id() && address == endpoint)
+        self.complete_catalogs
+            .iter()
+            .find_map(|(id, address, models)| {
+                (id == provider.id() && address == endpoint).then_some(models.as_slice())
+            })
+    }
+
+    fn retired_model_is_missing(&self, provider: &Provider, model: &str) -> bool {
+        if !model_selection::is_unconfigured_retired_builtin_model(
+            &self.model_profiles,
+            provider,
+            model,
+        ) {
+            return false;
+        }
+        if self.custom_together_endpoint(provider) {
+            return self
+                .advertised_models(provider)
+                .is_some_and(|models| !models.iter().any(|id| id.eq_ignore_ascii_case(model)));
+        }
+        !self
+            .discovered_models
+            .iter()
+            .any(|(id, discovered)| id == provider.id() && model.eq_ignore_ascii_case(discovered))
+    }
+
+    fn custom_together_fallback_models(&self, provider: &Provider) -> Option<Vec<String>> {
+        if !self.custom_together_endpoint(provider) {
+            return None;
+        }
+        let advertised = self.advertised_models(provider)?;
+        let mut models: Vec<_> = self
+            .model_profiles
+            .configured_model_ids(provider)
+            .map(str::to_owned)
+            .collect();
+        for id in advertised {
+            if !models.iter().any(|model| model.eq_ignore_ascii_case(id)) {
+                models.push(id.clone());
+            }
+        }
+        Some(models)
     }
 
     fn restore_branch_selection(
         &mut self,
-        model: String,
+        mut model: String,
         thinking: Option<String>,
         provider: Option<&str>,
     ) {
-        let availability = self
+        let unavailable = self
             .model_profiles
             .provider(provider.unwrap_or("ollama"))
-            .map(|provider| {
+            .is_none_or(|provider| {
+                if let Some(id) = model_selection::configured_retired_model_id(
+                    &self.model_profiles,
+                    &provider,
+                    &model,
+                ) {
+                    model = id.to_owned();
+                }
+                let retired = model_selection::is_unconfigured_retired_builtin_model(
+                    &self.model_profiles,
+                    &provider,
+                    &model,
+                );
+                if retired && self.custom_together_endpoint(&provider) {
+                    return self.retired_model_is_missing(&provider, &model);
+                }
                 let endpoint = self.endpoint_for(&provider);
                 let known = self
                     .model_profiles
@@ -955,22 +1008,9 @@ impl Cli {
                 let official_catalog = !self.model_profiles.model_ids(&provider).is_empty()
                     && endpoint == provider.default_endpoint()
                     && matches!(provider, Provider::Anthropic | Provider::Google);
-                let complete = official_catalog
-                    || self
-                        .complete_catalogs
-                        .iter()
-                        .any(|(p, e)| p == provider.id() && e == endpoint);
-                let retired = model_selection::is_unconfigured_retired_builtin_model(
-                    &self.model_profiles,
-                    &provider,
-                    &model,
-                );
-                (
-                    known,
-                    complete || (retired && self.retired_catalog_is_authoritative(&provider)),
-                )
+                !known
+                    && (official_catalog || self.advertised_models(&provider).is_some() || retired)
             });
-        let unavailable = availability.is_none_or(|(known, complete)| !known && complete);
         if unavailable || !self.restore_model_selection(model, thinking.clone(), provider, true) {
             self.restore_initial_selection(thinking);
         }
@@ -1059,26 +1099,26 @@ impl Cli {
 
     /// Recreate the new-session defaults from the current workspace while
     /// retaining the original command-line overrides across session changes.
-    fn refresh_workspace_selection(&mut self) {
-        self.refresh_workspace_selection_with_timeout(Duration::from_secs(15));
+    fn refresh_workspace_selection(&mut self) -> Result<()> {
+        self.refresh_workspace_selection_with_timeout(Duration::from_secs(15))
     }
 
-    fn refresh_workspace_selection_with_timeout(&mut self, timeout: Duration) {
+    fn refresh_workspace_selection_with_timeout(&mut self, timeout: Duration) -> Result<()> {
         let patterns: Vec<String> = self
             .models
             .as_deref()
             .map(|value| value.split(',').map(str::to_owned).collect())
             .unwrap_or_else(|| self.settings.strings("enabledModels"));
         let mut catalogs = model_selection::cached_catalogs(self);
-        if self.selection_discovery_pending
-            || self
-                .selection_workspace
-                .as_ref()
-                .is_some_and(|cwd| cwd != &self.workspace)
-        {
-            // A previous runtime's negative catalog is not authoritative for
-            // this workspace, especially when rediscovery is unavailable.
+        let workspace_changed = self.selection_workspace.as_ref().is_some_and(|cwd| {
+            cwd != &self.workspace
+                && !matches!((cwd.canonicalize(), self.workspace.canonicalize()),
+                    (Ok(previous), Ok(current)) if previous == current)
+        });
+        if workspace_changed {
             self.complete_catalogs.clear();
+        }
+        if self.selection_discovery_pending || workspace_changed {
             let args = self.clone();
             let patterns = patterns.clone();
             let discovered = std::thread::spawn(move || {
@@ -1132,17 +1172,22 @@ impl Cli {
             self.selection_discovery_pending = discovered.as_ref().map_or(true, |results| {
                 results
                     .iter()
-                    .any(|result| !matches!(result, Ok(Ok(catalog)) if catalog.complete))
+                    .any(|result| !matches!(result, Ok(Ok(catalog)) if catalog.advertised_models.is_some()))
             });
             if let Ok(results) = discovered {
                 for catalog in results
                     .into_iter()
                     .filter_map(|result| result.ok().and_then(Result::ok))
                 {
-                    if catalog.complete {
+                    if let Some(advertised) = &catalog.advertised_models {
+                        let endpoint = self.endpoint_for(&catalog.provider).to_owned();
+                        self.complete_catalogs.retain(|(id, address, _)| {
+                            id != catalog.provider.id() || address != &endpoint
+                        });
                         self.complete_catalogs.push((
                             catalog.provider.id().to_owned(),
-                            self.endpoint_for(&catalog.provider).to_owned(),
+                            endpoint,
+                            advertised.clone(),
                         ));
                         catalogs.retain(|cached| cached.provider != catalog.provider);
                     } else if catalogs
@@ -1223,22 +1268,29 @@ impl Cli {
                 id
             }
         });
-        let missing_retired_default = self.retired_catalog_is_authoritative(&provider)
-            && configured_model.is_some_and(|model| {
-                model_selection::is_unconfigured_retired_builtin_model(
-                    &self.model_profiles,
-                    &provider,
-                    model,
-                ) && !self.discovered_models.iter().any(|(id, discovered)| {
-                    id == provider.id() && model.eq_ignore_ascii_case(discovered)
-                })
-            });
+        let configured_model = configured_model.map(|id| {
+            model_selection::configured_retired_model_id(&self.model_profiles, &provider, id)
+                .unwrap_or(id)
+        });
+        let missing_retired_default =
+            configured_model.is_some_and(|model| self.retired_model_is_missing(&provider, model));
+        let custom_fallback = missing_retired_default
+            .then(|| self.custom_together_fallback_models(&provider))
+            .flatten();
+        let requested_provider = &provider;
+        let eligible = |provider: &Provider, model: &str| {
+            provider != requested_provider
+                || custom_fallback
+                    .as_ref()
+                    .is_none_or(|ids| ids.iter().any(|id| id == model))
+        };
         let provider = if missing_retired_default && !self.connection_explicit {
             fallback.provider.clone()
         } else {
-            provider
+            provider.clone()
         };
         let keep_fallback = provider == fallback.provider
+            && eligible(&provider, &fallback.model)
             && !(missing_retired_default
                 && model_selection::is_unconfigured_retired_builtin_model(
                     &self.model_profiles,
@@ -1250,30 +1302,39 @@ impl Cli {
             .map(str::to_owned)
             .or_else(|| keep_fallback.then(|| fallback.model.clone()))
             .or_else(|| {
-                catalogs
-                    .iter()
-                    .find(|catalog| catalog.provider == provider)
-                    .and_then(|catalog| {
-                        model_selection::default_for_provider(&provider, &catalog.models)
-                    })
-                    .cloned()
+                let models = custom_fallback
+                    .as_deref()
+                    .filter(|_| &provider == requested_provider)
+                    .or_else(|| {
+                        catalogs
+                            .iter()
+                            .find(|catalog| catalog.provider == provider)
+                            .map(|catalog| catalog.models.as_slice())
+                    })?;
+                model_selection::default_for_provider(&provider, models).cloned()
             });
         let (provider, model) = model.map_or_else(
             || (fallback.provider.clone(), fallback.model.clone()),
             |model| (provider, model),
         );
-        let chosen = self
+        let mut choices = self
             .model_scope
             .iter()
+            .filter(|choice| eligible(&choice.provider, &choice.model));
+        let chosen = choices
+            .clone()
             .find(|choice| choice.provider == provider && choice.model == model)
             .or_else(|| {
-                self.model_scope
-                    .iter()
-                    .find(|choice| !self.connection_explicit || choice.provider == provider)
+                choices.find(|choice| !self.connection_explicit || choice.provider == provider)
             });
         let (provider, model) = chosen.map_or((provider, model), |choice| {
             (choice.provider.clone(), choice.model.clone())
         });
+        if self.cli_selection.is_none() && !eligible(&provider, &model) {
+            return Err(Error::Config(
+                "no model is available for the selected provider; pass --model".into(),
+            ));
+        }
         let endpoint = self
             .explicit_endpoint_for(&provider)
             .unwrap_or_else(|| self.model_profiles.endpoint(&provider))
@@ -1292,6 +1353,7 @@ impl Cli {
         if self.thinking_explicit {
             self.thinking = self.cli_thinking.clone();
         }
+        Ok(())
     }
 }
 
@@ -1803,6 +1865,17 @@ async fn run_cli() -> i32 {
             if let Some(model) = configured_model.filter(|_| args.provider == configured_provider) {
                 args.model = model.into();
                 args.model_is_literal = explicit_default_provider.is_some();
+                let id = if args.model_is_literal { model } else {
+                    model_selection::qualified_model(model, &args.model_profiles)
+                        .filter(|(provider, _)| *provider == args.provider)
+                        .map_or(model, |(_, id)| id)
+                };
+                if let Some(id) = model_selection::configured_retired_model_id(
+                    &args.model_profiles, &args.provider, id
+                ) {
+                    args.model = id.to_owned();
+                    args.model_is_literal = true;
+                }
             } else if args.provider != Provider::Ollama {
                 args.model.clear();
             }
@@ -2059,7 +2132,7 @@ async fn execute(
             Err(error)
                 if retired_default
                     && can_select_automatically
-                    && args.retired_catalog_is_authoritative(&args.provider) =>
+                    && !args.custom_together_endpoint(&args.provider) =>
             {
                 retired_catalog_error = Some(error);
                 Vec::new()
@@ -2084,19 +2157,19 @@ async fn execute(
         .collect();
     args.complete_catalogs = catalogs
         .iter()
-        .filter(|catalog| catalog.complete)
-        .map(|catalog| {
-            (
+        .filter_map(|catalog| {
+            Some((
                 catalog.provider.id().to_owned(),
                 args.endpoint_for(&catalog.provider).to_owned(),
-            )
+                catalog.advertised_models.clone()?,
+            ))
         })
         .collect();
-    let missing_retired_default = retired_default
-        && args.retired_catalog_is_authoritative(&args.provider)
-        && !available
-            .iter()
-            .any(|id| id.eq_ignore_ascii_case(saved_model) || id.eq_ignore_ascii_case(&args.model));
+    let missing_retired_default =
+        retired_default && args.retired_model_is_missing(&args.provider, saved_model);
+    let custom_fallback = missing_retired_default
+        .then(|| args.custom_together_fallback_models(&args.provider))
+        .flatten();
     if missing_retired_default {
         args.model.clear();
     }
@@ -2123,14 +2196,17 @@ async fn execute(
     }
     args.model_scope = scope;
     if !args.model_explicit {
-        let selected = args
-            .model_scope
-            .iter()
+        let mut choices = args.model_scope.iter().filter(|choice| {
+            choice.provider != args.provider
+                || custom_fallback
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&choice.model))
+        });
+        let selected = choices
+            .clone()
             .find(|choice| choice.provider == args.provider && choice.model == args.model)
             .or_else(|| {
-                args.model_scope
-                    .iter()
-                    .find(|choice| !args.connection_explicit || choice.provider == args.provider)
+                choices.find(|choice| !args.connection_explicit || choice.provider == args.provider)
             })
             .cloned();
         let selected = if selected.is_none()
@@ -2139,7 +2215,7 @@ async fn execute(
                 || (args.settings.string("defaultProvider").is_none()
                     && args.settings.string("defaultModel").is_none()))
         {
-            model_selection::automatic_startup_model(&args).await
+            model_selection::automatic_startup_model(&args, custom_fallback.as_deref()).await
         } else {
             selected
         };
@@ -2159,13 +2235,14 @@ async fn execute(
         if let Some(error) = retired_catalog_error {
             return Err(error);
         }
-        args.model = model_selection::default_for_provider(&args.provider, available)
-            .cloned()
-            .ok_or_else(|| {
-                Error::Config(
-                    "no model is available for the selected provider; pass --model".into(),
-                )
-            })?;
+        args.model = model_selection::default_for_provider(
+            &args.provider,
+            custom_fallback.as_deref().unwrap_or(available),
+        )
+        .cloned()
+        .ok_or_else(|| {
+            Error::Config("no model is available for the selected provider; pass --model".into())
+        })?;
     }
 
     args.bind_initial_model_endpoint();

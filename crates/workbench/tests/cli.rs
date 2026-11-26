@@ -9034,6 +9034,266 @@ fn startup_replaces_only_missing_retired_builtin_defaults() {
     }
 }
 
+fn together_fixture_cli(root: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command.env_clear();
+    for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.current_dir(root).env("PI_RS_HOME", root).args([
+        "--no-session",
+        "--no-mcp",
+        "--no-trust",
+        "--offline",
+    ]);
+    command
+}
+
+fn together_saved_model_rpc(
+    root: &std::path::Path,
+    extra: &[&str],
+    credentials: &[(&str, &str)],
+) -> std::process::Output {
+    let mut child = together_fixture_cli(root)
+        .envs(credentials.iter().copied())
+        .args(["--mode", "rpc"])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let write = child.stdin.take().unwrap().write_all(
+        b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n",
+    );
+    let output = child.wait_with_output().unwrap();
+    if output.status.success() {
+        write.unwrap();
+    }
+    output
+}
+
+fn together_saved_model_states(output: std::process::Output) -> [Value; 2] {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["id"] == "new" && event["success"] == true)
+    );
+    ["state", "after"]
+        .map(|id| events.iter().find(|event| event["id"] == id).unwrap()["data"]["model"].clone())
+}
+
+#[test]
+fn together_retired_fallback_uses_the_relay_catalog_across_workspace_restore() {
+    for (advertised, configured, relay_key, provider_flag, expected) in [
+        (
+            Some(vec!["relay-model"]),
+            None,
+            true,
+            true,
+            Some(("together", "relay-model")),
+        ),
+        (
+            Some(vec!["relay-model"]),
+            None,
+            true,
+            false,
+            Some(("together", "relay-model")),
+        ),
+        (
+            Some(vec!["relay-model"]),
+            None,
+            false,
+            false,
+            Some(("groq", "openai/gpt-oss-120b")),
+        ),
+        (
+            Some(vec![]),
+            Some("configured-model"),
+            true,
+            true,
+            Some(("together", "configured-model")),
+        ),
+        (Some(vec![]), None, true, true, None),
+        (
+            None,
+            None,
+            true,
+            true,
+            Some(("together", "thinkingmachines/Inkling")),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut profile = json!({"baseUrl":base, "models":configured.into_iter().map(|id| json!({"id":id})).collect::<Vec<_>>()});
+        if relay_key {
+            profile["apiKey"] = json!("relay-fixture");
+        }
+        std::fs::write(
+            root.path().join("models.json"),
+            json!({"providers":{"together":profile}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling"})
+                .to_string(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("GET /v1/models "), "{first}");
+            let mut auth = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("authorization")
+                {
+                    auth = Some(value.trim().to_owned());
+                }
+            }
+            assert_eq!(auth.as_deref(), relay_key.then_some("Bearer relay-fixture"));
+            let (status, body) = if let Some(ids) = advertised {
+                (
+                    "200 OK",
+                    json!({"data":ids.into_iter().map(|id| json!({"id":id})).collect::<Vec<_>>()}),
+                )
+            } else {
+                ("503 Service Unavailable", json!({}))
+            };
+            let body = body.to_string();
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        // Leaving --workspace unset lets RPC restore "." as an absolute path.
+        let flags: &[&str] = if provider_flag {
+            &["--provider", "together"]
+        } else {
+            &[]
+        };
+        let credentials: &[(&str, &str)] = if relay_key {
+            &[]
+        } else {
+            &[
+                ("GROQ_API_KEY", "official-fixture"),
+                ("TOGETHER_API_KEY", "official-together-fixture"),
+            ]
+        };
+        let output = together_saved_model_rpc(root.path(), flags, credentials);
+        server.join().unwrap();
+        if let Some((provider, id)) = expected {
+            for model in together_saved_model_states(output) {
+                assert_eq!(model["provider"], provider);
+                assert_eq!(model["id"], id);
+            }
+        } else {
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("no model is available for the selected provider")
+            );
+        }
+    }
+}
+
+#[test]
+fn together_saved_retired_id_uses_the_configured_case_and_model_route() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"together":{"baseUrl":"https://relay.example/v1","models":[{
+            "id":"ThinkingMachines/INKLING",
+            "api":"anthropic-messages",
+            "baseUrl":"https://retired-model.example/v1"
+        }]}}})
+        .to_string(),
+    )
+    .unwrap();
+    for settings in [
+        json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling"}),
+        json!({"defaultModel":"together/thinkingmachines/Inkling"}),
+    ] {
+        std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+        for model in together_saved_model_states(together_saved_model_rpc(root.path(), &[], &[])) {
+            assert_eq!(model["provider"], "together");
+            assert_eq!(model["id"], "ThinkingMachines/INKLING");
+            assert_eq!(model["api"], "anthropic-messages");
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let model_base = format!("http://{}/retired/v1", listener.local_addr().unwrap());
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"together":{"baseUrl":"https://relay.example/v1","models":[{
+            "id":"ThinkingMachines/INKLING",
+            "baseUrl":model_base
+        }]}}})
+        .to_string(),
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(
+            first.starts_with("POST /retired/v1/chat/completions "),
+            "{first}"
+        );
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Authorization: Bearer inline-fixture"))
+        );
+        let size = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; size];
+        reader.read_exact(&mut body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["model"], "ThinkingMachines/INKLING");
+        let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+    });
+    let output = together_fixture_cli(root.path())
+        .args(["--api-key", "inline-fixture", "--print", "fixture prompt"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
+    server.join().unwrap();
+}
+
 #[test]
 fn automatic_startup_uses_radius_catalogs_without_making_a_request() {
     let root = tempfile::tempdir().unwrap();

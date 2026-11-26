@@ -108,6 +108,18 @@ pub(super) fn is_unconfigured_retired_builtin_model(
     })
 }
 
+pub(super) fn configured_retired_model_id<'a>(
+    profiles: &'a super::model_profiles::Profiles,
+    provider: &Provider,
+    id: &str,
+) -> Option<&'a str> {
+    retired_builtin_model_id(provider, id)?;
+    profiles
+        .configured_model_ids(provider)
+        .filter(|configured| configured.eq_ignore_ascii_case(id))
+        .min_by_key(|configured| *configured != id)
+}
+
 fn retired_builtin_model_id(provider: &Provider, id: &str) -> Option<&'static str> {
     let ids: &[_] = match provider.id() {
         "ant-ling" => &["Ling-2.6-flash", "Ling-2.6-1T", "Ring-2.6-1T"],
@@ -126,7 +138,10 @@ fn retired_builtin_model_id(provider: &Provider, id: &str) -> Option<&'static st
 
 /// Choose from known catalog entries without resolving credential commands
 /// or refreshing OAuth on startup. Native Ollama remains the local fallback.
-pub(super) async fn automatic_startup_model(args: &Cli) -> Option<ScopedChoice> {
+pub(super) async fn automatic_startup_model(
+    args: &Cli,
+    current_provider_models: Option<&[String]>,
+) -> Option<ScopedChoice> {
     use super::{model_auth::Credential, providers::Client};
 
     let profiles = &args.model_profiles;
@@ -153,7 +168,13 @@ pub(super) async fn automatic_startup_model(args: &Cli) -> Option<ScopedChoice> 
             Vec::new()
         };
         let base_endpoint = profiles.endpoint(&provider);
-        let mut models = profiles.model_ids(&provider);
+        let mut models = if provider == args.provider
+            && let Some(models) = current_provider_models
+        {
+            models.to_vec()
+        } else {
+            profiles.model_ids(&provider)
+        };
         for id in &radius {
             if !models.contains(id) {
                 models.push(id.clone());
@@ -215,7 +236,7 @@ pub struct Catalog {
     pub models: Vec<String>,
     aliases: Vec<(String, String)>,
     probe_details: bool,
-    pub complete: bool,
+    pub advertised_models: Option<Vec<String>>,
 }
 
 impl Catalog {
@@ -296,15 +317,20 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
             .is_some())
         || super::builtin_chat::find(provider.id())
             .is_some_and(|builtin| builtin.is_default_endpoint(args.endpoint_for(&provider)));
-    let mut complete = false;
+    let mut advertised_models = None;
     if let Some(client) = &client
         && ((probe && !bundled) || provider == Provider::Radius)
     {
         match client.models(args.model_profiles.azure_api_version()).await {
             Ok(discovered) => {
-                complete = true;
                 let mut seen: std::collections::BTreeSet<_> = models.iter().cloned().collect();
-                models.extend(discovered.into_iter().filter(|id| seen.insert(id.clone())));
+                models.extend(
+                    discovered
+                        .iter()
+                        .filter(|id| seen.insert((*id).clone()))
+                        .cloned(),
+                );
+                advertised_models = Some(discovered);
                 probe_details = true;
             }
             Err(error) if models.is_empty() => return Err(error),
@@ -337,7 +363,7 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
         models,
         aliases,
         probe_details,
-        complete,
+        advertised_models,
     })
 }
 
@@ -419,7 +445,7 @@ pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
                 models,
                 aliases,
                 probe_details: false,
-                complete: false,
+                advertised_models: None,
             })
         })
         .collect()
@@ -1161,7 +1187,7 @@ mod tests {
         let catalog = super::catalog(&args, super::Provider::Ollama, false)
             .await
             .unwrap();
-        assert!(!catalog.complete);
+        assert!(catalog.advertised_models.is_none());
     }
 
     #[test]
@@ -1233,7 +1259,7 @@ mod tests {
                 .to_vec(),
                 aliases: Vec::new(),
                 probe_details: false,
-                complete: false,
+                advertised_models: None,
             },
             Catalog {
                 provider: Provider::Anthropic,
@@ -1250,7 +1276,7 @@ mod tests {
                 .to_vec(),
                 aliases: vec![("exact".into(), "alias".into())],
                 probe_details: false,
-                complete: false,
+                advertised_models: None,
             },
         ];
         let (choices, warnings) = scoped_choices(
@@ -1380,8 +1406,15 @@ mod tests {
             args.model = "moonshotai/Kimi-K3".into();
             args.remember_initial_selection();
             if let Some(endpoint) = catalog_endpoint {
-                args.complete_catalogs
-                    .push(("together".into(), endpoint.into()));
+                args.complete_catalogs.push((
+                    "together".into(),
+                    endpoint.into(),
+                    if listed {
+                        vec![retired.into()]
+                    } else {
+                        Vec::new()
+                    },
+                ));
             }
             if listed {
                 args.discovered_models

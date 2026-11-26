@@ -3005,6 +3005,7 @@ mod tests {
             "ollama".into(),
             args.endpoint_for(&super::super::Provider::Ollama)
                 .to_owned(),
+            Vec::new(),
         ));
         let unknown_dynamic = import_pi(vec![
             json!({"type":"session","version":3}),

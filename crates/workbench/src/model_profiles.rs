@@ -2008,12 +2008,17 @@ impl Profiles {
         }
     }
 
-    pub fn model_ids(&self, provider: &Provider) -> Vec<String> {
-        let mut ids: Vec<_> = self
-            .entries
+    pub(super) fn configured_model_ids(&self, provider: &Provider) -> impl Iterator<Item = &str> {
+        self.entries
             .get(provider.id())
             .into_iter()
-            .flat_map(|profile| profile.models.iter().map(|model| model.id.clone()))
+            .flat_map(|profile| profile.models.iter().map(|model| model.id.as_str()))
+    }
+
+    pub fn model_ids(&self, provider: &Provider) -> Vec<String> {
+        let mut ids: Vec<_> = self
+            .configured_model_ids(provider)
+            .map(str::to_owned)
             .collect();
         if let Some(models) = BUILTIN_MODELS.get(provider.id())
             && !(provider.id() == "openai" && provider.adapter() != Adapter::OpenAiResponses)
