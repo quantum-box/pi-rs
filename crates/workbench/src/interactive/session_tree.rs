@@ -231,7 +231,7 @@ fn tree_parent_is_native_thinking_marker(session: &Session, parent: Option<u64>)
         })
 }
 
-fn tree_description(
+pub(super) fn tree_description(
     heading: impl Into<String>,
     heading_role: &'static str,
     body: String,
@@ -244,7 +244,7 @@ fn tree_description(
     }
 }
 
-fn tree_preview(text: &str, limit: usize) -> String {
+pub(super) fn tree_preview(text: &str, limit: usize) -> String {
     tree_preview_chunks(std::iter::once(text), limit)
 }
 

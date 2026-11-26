@@ -613,6 +613,22 @@ fn rpc_session_name_is_sanitized_and_retained_on_reopen() {
         reopened[3]["data"]["tree"][0]["children"][0]["entry"],
         *new_entry
     );
+    let forked = rpc(
+        &["--conversation", id],
+        &[
+            json!({"type":"set_session_label","target":leaf,"label":"earlier"}),
+            json!({"type":"fork_at_entry","entryId":leaf}),
+            json!({"type":"get_state"}),
+            json!({"type":"get_tree"}),
+        ],
+    );
+    let child = forked[1]["data"]["sessionId"].as_str().unwrap();
+    assert_ne!(child, id);
+    assert_eq!(forked[2]["data"]["sessionId"], child);
+    assert_eq!(forked[2]["data"]["sessionName"], "Test Title");
+    assert_eq!(forked[3]["data"]["tree"][0]["label"], "earlier");
+    let parent = rpc(&["--conversation", id], &[json!({"type":"get_state"})]);
+    assert_eq!(parent[0]["data"]["sessionName"], "Updated");
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock

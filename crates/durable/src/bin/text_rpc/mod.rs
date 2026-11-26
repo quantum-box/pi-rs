@@ -211,12 +211,12 @@ impl Turn {
 
 pub(super) async fn run(
     scheduler: &mut Scheduler,
-    id: Uuid,
+    mut id: Uuid,
     model: &RoutedModel,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = prepare_input_adapter(scheduler, id, model.has_image_adapter)?;
-    let provider_model = model.provider_model(&state.config.model)?.to_owned();
-    let mut seen = state
+    let mut provider_model = model.provider_model(&state.config.model)?.to_owned();
+    let mut seen: HashSet<Uuid> = state
         .submissions
         .iter()
         .filter(|input| !matches!(input.status, Status::Queued | Status::Running))
@@ -245,6 +245,21 @@ pub(super) async fn run(
             }
             received = input.recv(), if input_open => {
                 match received {
+                    Some(Ok(request)) if request["type"] == "fork_at_entry" => {
+                        let result = fork_at_entry(scheduler, model, id, watching, &request)
+                            .map(|(child, state, child_model)| {
+                                id = child;
+                                provider_model = child_model;
+                                seen.clear();
+                                tools = model.has_coding_tools.then(|| ToolEvents::new(&state));
+                                Some(json!({
+                                    "sessionId": id,
+                                    "model": {"id": provider_model},
+                                    "messages": messages(&state)
+                                }))
+                            });
+                        reply(&request, result)?;
+                    }
                     Some(request) => {
                         watching |= respond(scheduler, id, &provider_model, model.has_image_adapter, &mut active, &mut seen, &mut tools, request).await?;
                     }
@@ -257,6 +272,36 @@ pub(super) async fn run(
         }
     }
     Ok(())
+}
+
+fn fork_at_entry(
+    scheduler: &mut Scheduler,
+    model: &RoutedModel,
+    source: Uuid,
+    watching: bool,
+    request: &Value,
+) -> Result<(Uuid, Conversation, String), String> {
+    let current = scheduler
+        .conversation(source)
+        .map_err(|error| error.to_string())?;
+    if watching || current.input_run_active() {
+        return Err("Wait for the current turn before forking".into());
+    }
+    let entry = request["entryId"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or("Invalid entry ID for forking")?;
+    let child = scheduler
+        .fork_by_entry_id(source, entry)
+        .map_err(|error| error.to_string())?;
+    let state = scheduler
+        .conversation(child)
+        .map_err(|error| error.to_string())?;
+    let provider_model = model
+        .provider_model(&state.config.model)
+        .map_err(|error| error.to_string())?
+        .to_owned();
+    Ok((child, state, provider_model))
 }
 
 fn input_reader() -> tokio::sync::mpsc::Receiver<Result<Value, String>> {
@@ -427,6 +472,19 @@ async fn respond(
         "get_entries" => session_history::snapshot(scheduler, id)
             .and_then(|tree| tree.entries_after(request.get("since")))
             .map(Some),
+        "set_session_label" => (|| {
+            let target = request["target"].as_str().and_then(|id| Uuid::parse_str(id).ok())
+                .ok_or("Invalid entry ID for labeling")?;
+            let label = match request.get("label") {
+                Some(Value::String(label)) => Some(label.as_str()),
+                None | Some(Value::Null) => None,
+                _ => return Err("Label must be text".into()),
+            };
+            scheduler.set_session_label(id, target, label).map_err(|error| error.to_string())?;
+            session_history::snapshot(scheduler, id)
+                .and_then(|tree| tree.entries_after(None))
+                .map(Some)
+        })(),
         _ => Err("unsupported durable RPC command".into()),
     };
     reply(&request, result)?;
