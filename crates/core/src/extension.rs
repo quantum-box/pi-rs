@@ -545,6 +545,20 @@ pub trait ToolHost: Send + Sync {
     async fn report_progress(&self, _partial_result: Value) -> ExtensionResult<()> {
         Ok(())
     }
+    /// Publish progress with a fallback to emit if the tool stops before
+    /// reporting settlement. A later update replaces or clears the fallback.
+    #[doc(hidden)]
+    async fn report_progress_with_settlement(
+        &self,
+        partial_result: Value,
+        _settlement: Option<Value>,
+    ) -> ExtensionResult<()> {
+        self.report_progress(partial_result).await
+    }
+    /// Refresh the omission count on a pending progress settlement without
+    /// sending another snapshot. Hosts may ignore this optional metadata.
+    #[doc(hidden)]
+    fn update_progress_omitted_calls(&self, _count: u64) {}
     fn has_ui(&self) -> bool {
         false
     }
@@ -705,6 +719,12 @@ pub trait Tool: Send + Sync {
     /// `invoke_transaction_with_timeout`. The scheduler still bounds settlement
     /// and handles caller cancellation. This applies to direct calls.
     fn settles_host_timeout(&self) -> bool {
+        false
+    }
+    /// Opt in to a cumulative budget for progress hooks and stop those
+    /// hooks when the tool returns. Accepted events still reach the observer.
+    #[doc(hidden)]
+    fn bounds_progress_hooks(&self) -> bool {
         false
     }
     fn execution(&self) -> ToolExecution {
