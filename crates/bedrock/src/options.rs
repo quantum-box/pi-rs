@@ -335,6 +335,11 @@ pub(crate) fn reasoning_fields(
         }
         return Ok(Some(fields));
     }
+    if !has_any(&items, &["gpt-"]) {
+        // These models declare supported values through their thinking level map.
+        // Converse forwards model-specific fields without validating them.
+        return Ok(mapped.map(|effort| json!({"reasoning_effort":effort})));
+    }
     let Some(level) = level else { return Ok(None) };
     if level == ReasoningLevel::Off && mapped.is_none() {
         return Ok(None);
@@ -344,12 +349,9 @@ pub(crate) fn reasoning_fields(
             json!({"reasoning_effort":mapped.unwrap_or(level.oss_effort())}),
         ));
     }
-    if has_any(&items, &["gpt-"]) {
-        return Ok(Some(
-            json!({"reasoning":{"effort":mapped.unwrap_or(level.gpt_effort())}}),
-        ));
-    }
-    Ok(None)
+    Ok(Some(
+        json!({"reasoning":{"effort":mapped.unwrap_or(level.gpt_effort())}}),
+    ))
 }
 
 #[cfg(test)]

@@ -1938,6 +1938,10 @@ impl Client {
                     )
                     .with_cache_retention(cache_retention(true))
                     .with_long_cache_support(long_cache_override)
+                    .with_reasoning_replay_support(
+                        args.model_profiles
+                            .bedrock_reasoning_replay_override(&args.provider, metadata.as_ref()),
+                    )
                     .with_strict_tool_support(
                         args.model_profiles
                             .chat_compatibility(&args.provider, metadata.as_ref())

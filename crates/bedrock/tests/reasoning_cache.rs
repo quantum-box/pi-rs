@@ -632,6 +632,76 @@ async fn required_thinking_models_keep_default_and_use_low_effort_for_summaries(
 }
 
 #[tokio::test]
+async fn mapped_bedrock_effort_and_reasoning_replay_follow_the_selected_model() {
+    use pi_rs_core::{ProviderReplay, ResolvedModelIdentity};
+
+    for (model, level, mapped, override_replay, expect_replay) in [
+        (
+            "global.moonshotai.kimi-k3",
+            Some("off"),
+            Some("none"),
+            None,
+            false,
+        ),
+        (
+            "us.moonshotai.kimi-k3.1",
+            Some("xhigh"),
+            Some("xhigh"),
+            None,
+            false,
+        ),
+        ("global.zai.glm-5.3", Some("high"), Some("high"), None, true),
+        ("us.zai.glm-5.3", None, None, Some(false), false),
+        ("amazon.nova-2-lite-v1:0", Some("high"), None, None, true),
+    ] {
+        let mut request = request(model, 1024);
+        request.messages.push(Message::Assistant {
+            content: "visible answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "amazon-bedrock".into(),
+                    model: model.into(),
+                },
+                blocks: vec![
+                    json!({"type":"reasoning","text":"prior reasoning"}),
+                    json!({"type":"text","text":"visible answer"}),
+                ],
+            })),
+        });
+        request.messages.push(Message::User {
+            content: "follow-up".into(),
+        });
+        let (body, _) = capture(
+            "us-east-1",
+            |client| {
+                client
+                    .with_reasoning(level, mapped)
+                    .unwrap()
+                    .with_reasoning_replay_support(override_replay)
+            },
+            request,
+            false,
+        )
+        .await;
+        assert_eq!(
+            body["additionalModelRequestFields"]["reasoning_effort"].as_str(),
+            mapped,
+            "{model}"
+        );
+        let blocks = body["messages"][1]["content"].as_array().unwrap();
+        assert!(blocks.iter().any(|block| block["text"] == "visible answer"));
+        assert_eq!(
+            blocks
+                .iter()
+                .any(|block| block.get("reasoningContent").is_some()),
+            expect_replay,
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn gpt_mapping_summary_and_unsupported_cache_models() {
     let (oss, _) = capture(
         "us-east-1",

@@ -56,6 +56,7 @@ pub struct Bedrock {
     credentials_http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     reasoning: Option<ReasoningLevel>,
     mapped_effort: Option<String>,
+    reasoning_replay_support: Option<bool>,
     thinking_budgets: ThinkingBudgets,
     configured_thinking_budgets: Option<Value>,
     thinking_display: ThinkingDisplay,
@@ -89,6 +90,7 @@ impl Bedrock {
             credentials_http_client: None,
             reasoning: None,
             mapped_effort: None,
+            reasoning_replay_support: None,
             thinking_budgets: ThinkingBudgets::default(),
             configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
@@ -206,6 +208,7 @@ impl Bedrock {
             credentials_http_client: None,
             reasoning: None,
             mapped_effort: None,
+            reasoning_replay_support: None,
             thinking_budgets: ThinkingBudgets::default(),
             configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
@@ -515,6 +518,17 @@ impl Bedrock {
             self.force_cache,
             self.summary,
         ));
+        let identity = if let Some(supported) = self.reasoning_replay_support {
+            identity.and_then(|id| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    id,
+                    "bedrock-reasoning-replay",
+                    supported,
+                ))
+            })
+        } else {
+            identity
+        };
         let identity = if let Some(choice) = &self.tool_choice {
             identity.and_then(|identity| {
                 pi_rs_core::protected_model_fingerprint(&(
@@ -582,6 +596,18 @@ impl Bedrock {
         self.prepared_identity = None;
         Ok(self)
     }
+    /// Override whether this route accepts reasoning from earlier assistant messages.
+    pub fn with_reasoning_replay_support(mut self, supported: Option<bool>) -> Self {
+        self.reasoning_replay_support = supported;
+        self.prepared_identity = None;
+        self
+    }
+
+    fn supports_reasoning_replay(&self, model: &str) -> bool {
+        self.reasoning_replay_support
+            .unwrap_or_else(|| !model.contains("moonshotai.kimi-k3"))
+    }
+
     /// Override per-level budgets for non-adaptive Claude thinking.
     pub fn with_thinking_budgets(mut self, budgets: ThinkingBudgets) -> Self {
         self.thinking_budgets = budgets;
@@ -946,6 +972,7 @@ fn replay_blocks(
     replay: &ProviderReplay,
     model: &str,
     is_claude: bool,
+    include_reasoning: bool,
     text: &str,
     calls: &[ToolCall],
     ids: &mut ToolIds,
@@ -1001,6 +1028,7 @@ fn replay_blocks(
                         .ok()?,
                 ));
             }
+            "reasoning" if !include_reasoning => continue,
             "reasoning" => {
                 let reasoning = if let Some(encoded) = b["redacted"].as_str() {
                     let bytes = base64::engine::general_purpose::STANDARD
@@ -1309,10 +1337,12 @@ impl Model for Bedrock {
                     return base;
                 };
                 let claude = self.is_claude(&request.model);
+                let include_reasoning = self.supports_reasoning_replay(&request.model);
                 if replay_blocks(
                     replay,
                     &request.model,
                     claude,
+                    include_reasoning,
                     content,
                     calls,
                     &mut ToolIds::default(),
@@ -1322,7 +1352,9 @@ impl Model for Bedrock {
                     return base;
                 }
                 let mut ids = ToolIds::default();
-                let blocks: Vec<_> = replay.blocks.iter().map(|block| match block["type"].as_str() {
+                let blocks: Vec<_> = replay.blocks.iter().filter(|block| {
+                    include_reasoning || block["type"] != "reasoning"
+                }).map(|block| match block["type"].as_str() {
                     Some("text") => serde_json::json!({"type":"text","text":block["text"]}),
                     Some("tool_use") => serde_json::json!({"type":"tool_use","id":ids.get(block["id"].as_str().unwrap_or_default()),"name":block["name"],"input":block["input"]}),
                     Some("reasoning") if block["redacted"].is_string() => serde_json::json!({"type":"reasoning","redacted":block["redacted"]}),
@@ -1473,7 +1505,15 @@ impl Bedrock {
                         .as_deref()
                         .filter(|_| !tool_free || calls.is_empty())
                         .and_then(|r| {
-                            replay_blocks(r, &request.model, is_claude, &content, &calls, &mut ids)
+                            replay_blocks(
+                                r,
+                                &request.model,
+                                is_claude,
+                                self.supports_reasoning_replay(&request.model),
+                                &content,
+                                &calls,
+                                &mut ids,
+                            )
                         })
                     {
                         (ConversationRole::Assistant, blocks)
@@ -1947,6 +1987,7 @@ mod tests {
         let blocks = replay_blocks(
             &replay,
             "anthropic.claude-opus-4-8",
+            true,
             true,
             "answer",
             &[],
@@ -2614,6 +2655,7 @@ mod tests {
             &replay,
             "anthropic.claude-test",
             true,
+            true,
             "first \nsecond   ",
             &[call],
             &mut ToolIds::default(),
@@ -2656,6 +2698,7 @@ mod tests {
             &replay,
             "anthropic.claude-test",
             true,
+            true,
             " \nvisible",
             std::slice::from_ref(&call),
             &mut ToolIds::default(),
@@ -2669,6 +2712,7 @@ mod tests {
         let blocks = replay_blocks(
             &signed,
             "anthropic.claude-test",
+            true,
             true,
             " \nvisible",
             &[call],
@@ -2709,6 +2753,7 @@ mod tests {
             let blocks = replay_blocks(
                 &replay,
                 "anthropic.claude-test",
+                true,
                 true,
                 "visible",
                 &[call],
@@ -2754,6 +2799,7 @@ mod tests {
                 &replay,
                 "anthropic.claude-test",
                 true,
+                true,
                 "answer",
                 std::slice::from_ref(&call),
                 &mut ToolIds::default()
@@ -2765,6 +2811,7 @@ mod tests {
                 &replay,
                 "other-model",
                 false,
+                true,
                 "answer",
                 std::slice::from_ref(&call),
                 &mut ToolIds::default()
@@ -2775,6 +2822,7 @@ mod tests {
             replay_blocks(
                 &replay,
                 "anthropic.claude-test",
+                true,
                 true,
                 "edited",
                 std::slice::from_ref(&call),
@@ -2790,6 +2838,7 @@ mod tests {
             replay_blocks(
                 &replay,
                 "anthropic.claude-test",
+                true,
                 true,
                 "answer",
                 &[changed],
@@ -2820,6 +2869,7 @@ mod tests {
                 &replay,
                 "model",
                 false,
+                true,
                 "",
                 std::slice::from_ref(&call),
                 &mut ToolIds::default()
@@ -2835,6 +2885,7 @@ mod tests {
                 &replay,
                 "model",
                 false,
+                true,
                 "",
                 &[changed],
                 &mut ToolIds::default()
@@ -2868,6 +2919,7 @@ mod tests {
                 &replay,
                 "model",
                 true,
+                true,
                 "",
                 std::slice::from_ref(&call),
                 &mut ToolIds::default(),
@@ -2884,6 +2936,7 @@ mod tests {
                 replay_blocks(
                     &replay,
                     "model",
+                    true,
                     true,
                     "",
                     &[edited],
