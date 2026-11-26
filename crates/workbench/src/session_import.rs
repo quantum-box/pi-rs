@@ -39,6 +39,13 @@ pub fn read(path: &Path) -> Result<Session> {
             continue;
         }
         match serde_json::from_str::<Value>(&line) {
+            Ok(entry) if is_pi_falsy(&entry) && (recover_pi || entries.is_empty()) => {
+                if !recover_pi {
+                    leading_error.get_or_insert_with(|| {
+                        Error::Session("native session import contains a non-record value".into())
+                    });
+                }
+            }
             Ok(entry) => {
                 if entries.is_empty() {
                     recover_pi = has_pi_header(&entry);
@@ -73,6 +80,16 @@ pub fn read(path: &Path) -> Result<Session> {
 
 pub(super) fn has_pi_header(entry: &Value) -> bool {
     entry["type"] == "session" && entry["id"].is_string()
+}
+
+pub(super) fn is_pi_falsy(entry: &Value) -> bool {
+    // Pi's JSONL reader only retains truthy JSON.parse results.
+    match entry {
+        Value::Null | Value::Bool(false) => true,
+        Value::Number(number) => number.as_f64() == Some(0.0),
+        Value::String(text) => text.is_empty(),
+        _ => false,
+    }
 }
 
 // Source entries form an append-only forest. Binary lifting lets repeated

@@ -295,11 +295,12 @@ fail before dispatch when an affinity default is needed; explicit headers win
 without validating an unused default. An ID containing NUL is omitted from the
 child process environment. Internal UUIDs remain accepted for native session
 lookup.
-The read-only importer skips malformed JSON lines when the first parsed entry
-is a Pi session header with a string ID. Session ID lookup recognizes a Pi
-header after malformed or blank lines within its existing scan limit.
+The read-only importer skips malformed JSON lines and falsy JSON values
+(`null`, `false`, zero, and the empty string) when the first truthy entry is
+a Pi session header with a string ID. Session ID lookup uses the same rule
+within its existing scan limit.
 Invalid UTF-8 in Pi sources is decoded with replacement characters before
-parsing each line. Native journal import requires valid UTF-8 and JSON.
+parsing each line. Native import requires valid UTF-8, JSON, and journal records.
 `--continue` selects an existing native journal without a host binding.
 Pi imports retain their entry-size, version, and reference validation.
 [Pinned Pi JSONL parser](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/session-manager.ts#L619-L688)

@@ -139,7 +139,7 @@ fn stored_ids(path: &Path) -> Option<(String, Option<String>)> {
     let mut line = Vec::new();
     let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     let mut header_scan = reader.by_ref().take(1024 * 1024);
-    let mut skipped_malformed = false;
+    let mut requires_pi_header = false;
     let record: serde_json::Value = loop {
         line.clear();
         if header_scan.read_until(b'\n', &mut line).ok()? == 0 {
@@ -155,13 +155,14 @@ fn stored_ids(path: &Path) -> Option<(String, Option<String>)> {
         if text.trim().is_empty() {
             continue;
         }
-        skipped_malformed |= matches!(text, std::borrow::Cow::Owned(_));
+        requires_pi_header |= matches!(text, std::borrow::Cow::Owned(_));
         match serde_json::from_str(&text) {
+            Ok(entry) if super::session_import::is_pi_falsy(&entry) => requires_pi_header = true,
             Ok(entry) => break entry,
-            Err(_) => skipped_malformed = true,
+            Err(_) => requires_pi_header = true,
         }
     };
-    if skipped_malformed && !super::session_import::has_pi_header(&record) {
+    if requires_pi_header && !super::session_import::has_pi_header(&record) {
         return None;
     }
     let Some(native_id) = record["event"]["session_id"].as_str() else {
@@ -1573,10 +1574,81 @@ mod tests {
     }
 
     #[test]
+    fn pi_import_and_id_lookup_skip_falsy_json_without_skipping_truthy_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.jsonl");
+        let header = r#"{"type":"session","version":3,"id":"falsy-pi"}"#;
+        let message = r#"{"type":"message","id":"message","parentId":null,"message":{"role":"user","content":"retained prompt"}}"#;
+        let falsy_lines = "null\nfalse\n0\n-0.0\n0e10\n\"\"\n";
+        let source = format!("{falsy_lines}{header}\n{falsy_lines}{message}\n{falsy_lines}");
+        std::fs::write(&path, &source).unwrap();
+        assert_eq!(stored_ids(&path), Some(("falsy-pi".into(), None)));
+        let session = super::super::session_import::read(&path).unwrap();
+        assert_eq!(session.external_session_id(), "falsy-pi");
+        assert!(session.branch().iter().any(|record| {
+            matches!(&record.event, Event::User { content, .. } if content == "retained prompt")
+        }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+
+        for truthy in ["true", "1", r#""nonempty""#, "{}", "[]"] {
+            std::fs::write(&path, format!("{falsy_lines}{truthy}\n{header}\n")).unwrap();
+            assert!(stored_ids(&path).is_none(), "{truthy}");
+            assert!(
+                super::super::session_import::read(&path).is_err(),
+                "{truthy}"
+            );
+            std::fs::write(&path, format!("{header}\n{truthy}\n{message}\n")).unwrap();
+            assert!(
+                super::super::session_import::read(&path).is_err(),
+                "{truthy}"
+            );
+        }
+
+        let native_path = directory.path().join("native.jsonl");
+        session.export_jsonl(&native_path).unwrap();
+        let native = std::fs::read(&native_path).unwrap();
+        for falsy in falsy_lines.lines() {
+            let line = format!("{falsy}\n");
+            std::fs::write(&path, [line.as_bytes(), &native].concat()).unwrap();
+            assert!(stored_ids(&path).is_none(), "{falsy}");
+            assert!(
+                super::super::session_import::read(&path).is_err(),
+                "{falsy}"
+            );
+            std::fs::write(&path, [native.as_slice(), line.as_bytes()].concat()).unwrap();
+            assert!(
+                super::super::session_import::read(&path).is_err(),
+                "{falsy}"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_import_applies_physical_line_cap_before_skipping_falsy_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.jsonl");
+        let mut source = br#"{"type":"session","version":3,"id":"falsy-cap"}"#.to_vec();
+        source.push(b'\n');
+        let start = source.len();
+        source.extend_from_slice(b"false");
+        source.resize(start + 16 * 1024 * 1024, b' ');
+        source.push(b'\n');
+        std::fs::write(&path, &source).unwrap();
+        assert!(super::super::session_import::read(&path).is_ok());
+        source.insert(start, b' ');
+        std::fs::write(&path, &source).unwrap();
+        let result = super::super::session_import::read(&path);
+        assert!(
+            matches!(result, Err(Error::Session(message)) if message == "imported entry exceeds 16 MiB")
+        );
+    }
+
+    #[test]
     fn session_id_lookup_rejects_a_header_truncated_at_the_scan_limit() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("truncated.jsonl");
-        let mut line = br#"{"type":"session","version":3,"id":"scan-limit"}"#.to_vec();
+        let mut line = b"null\nfalse\n0\n\"\"\n".to_vec();
+        line.extend_from_slice(br#"{"type":"session","version":3,"id":"scan-limit"}"#);
         line.resize(1024 * 1024, b' ');
         std::fs::write(&path, &line).unwrap();
         assert_eq!(stored_ids(&path), Some(("scan-limit".into(), None)));
