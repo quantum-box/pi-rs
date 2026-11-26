@@ -2555,6 +2555,117 @@ async fn paused_scheduler_resumes_only_explicitly_scheduled_conversations() {
 }
 
 #[tokio::test]
+async fn unified_history_keeps_document_operations_in_commit_order_after_reopen() {
+    use durable_store::{Expected, Store};
+    use pi_rs_durable::{
+        document::{Address, Documents, Transaction},
+        state::AdmissionOptions,
+    };
+    use serde_json::json;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    let address = Address {
+        scope: id.to_string(),
+        name: "shared".into(),
+        key: "draft".into(),
+    };
+    let unrelated = Address {
+        scope: uuid::Uuid::new_v4().to_string(),
+        ..address.clone()
+    };
+    let initial = json!({"n": 1});
+    h.submit_with_documents(
+        id,
+        None,
+        "same commit".into(),
+        AdmissionOptions::default(),
+        |tx| {
+            assert!(tx.get(&address)?.is_none());
+            tx.put(&address, initial.as_object().unwrap().clone())
+        },
+    )
+    .unwrap();
+
+    let store = Store::open(&path).unwrap();
+    let docs = Documents::new(&store);
+    let initial_version = docs.get(&address).unwrap().unwrap().version;
+    let mut tx = Transaction::new();
+    tx.put(&unrelated, Expected::Missing, initial.as_object().unwrap())
+        .unwrap();
+    tx.commit(&store).unwrap();
+    let ops = vec![json!(["s", ["n"], 2])];
+    let mut tx = Transaction::new();
+    tx.apply_operations(&store, &address, initial_version, &ops)
+        .unwrap();
+    tx.commit(&store).unwrap();
+
+    let captured = h.unified_history_start(id, false).unwrap();
+    let first = h.unified_history(&captured, NonZeroUsize::MIN).unwrap();
+    let admission = h.unified_history(&first.next, NonZeroUsize::MIN).unwrap();
+    assert!(admission.has_more);
+    let frame = &admission.commits[0];
+    assert!(
+        frame
+            .snapshots
+            .iter()
+            .any(|record| record.value.to_string().contains("same commit"))
+    );
+    assert_eq!(frame.documents.len(), 1);
+    assert_eq!(frame.documents[0].0, address);
+    assert_eq!(
+        frame.documents[0].1.document.as_ref().unwrap().value["n"],
+        1
+    );
+    let saved = serde_json::to_string(&admission.next).unwrap();
+
+    let mut tx = Transaction::new();
+    let last_version = docs.get(&address).unwrap().unwrap().version;
+    tx.delete(&address, last_version).unwrap();
+    tx.commit(&store).unwrap();
+    drop(store);
+    drop(h);
+
+    let h = Harness::open_paused(&path, opts()).unwrap();
+    let cursor = serde_json::from_str(&saved).unwrap();
+    let update = h.unified_history(&cursor, NonZeroUsize::MIN).unwrap();
+    assert!(!update.has_more);
+    let frame = &update.commits[0];
+    assert!(frame.snapshots.is_empty());
+    assert_eq!(frame.documents.len(), 1);
+    assert_eq!(frame.documents[0].0, address);
+    assert!(frame.documents[0].1.actual);
+    assert_eq!(frame.documents[0].1.ops, ops);
+    assert_eq!(
+        frame.documents[0].1.document.as_ref().unwrap().value["n"],
+        2
+    );
+
+    let live = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.watch_unified_history(&update.next, NonZeroUsize::MIN, Duration::from_millis(1)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let frame = &live.commits[0];
+    assert!(frame.sequence > update.commits[0].sequence);
+    assert_eq!(frame.documents.len(), 1);
+    assert_eq!(frame.documents[0].0, address);
+    assert!(frame.documents[0].1.retired);
+    assert!(frame.documents[0].1.document.is_none());
+}
+
+#[tokio::test]
 async fn unified_history_pages_survive_reopen_and_show_fork_snapshots() {
     use pi_rs_durable::{
         document::TaskDocuments,
