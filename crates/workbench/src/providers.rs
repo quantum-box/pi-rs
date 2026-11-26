@@ -4825,13 +4825,13 @@ mod estimation_tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut args = super::super::Cli::parse_from(["pi"]);
-        let mut data = json!({"providers":{"azure-relay":{
+        let data = json!({"providers":{"azure-relay":{
             "api":"azure-openai-responses",
             "baseUrl":format!("http://{}/tenant/openai/v1", listener.local_addr().unwrap()),
             "apiKey":"fixture"
         }}});
         args.model_profiles =
-            super::super::model_profiles::Profiles::parse_with_azure_env(&mut data, |name| {
+            super::super::model_profiles::Profiles::parse_with_azure_env(&data, |name| {
                 (name == "AZURE_OPENAI_API_VERSION").then(|| "preview".into())
             })
             .unwrap();
@@ -4893,7 +4893,7 @@ mod estimation_tests {
             let mut args = super::super::Cli::parse_from(["pi"]);
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}/openai/v1", listener.local_addr().unwrap());
-            let mut data = if provider == "azure" {
+            let data = if provider == "azure" {
                 json!({"providers":{"azure":{"apiKey":"fixture"}}})
             } else {
                 json!({"providers":{provider:{
@@ -4901,18 +4901,16 @@ mod estimation_tests {
                     "models":[{"id":model, "reasoning":true}]
                 }}})
             };
-            args.model_profiles =
-                super::super::model_profiles::Profiles::parse_with_azure_env(&mut data, |key| {
-                    match key {
-                        "AZURE_OPENAI_BASE_URL" if provider == "azure" => Some(base.clone()),
-                        "AZURE_OPENAI_API_VERSION" => Some("preview".into()),
-                        "AZURE_OPENAI_DEPLOYMENT_NAME_MAP" => {
-                            Some(format!("{model}=my-deployment"))
-                        }
-                        _ => None,
-                    }
-                })
-                .unwrap();
+            args.model_profiles = super::super::model_profiles::Profiles::parse_with_azure_env(
+                &data,
+                |key| match key {
+                    "AZURE_OPENAI_BASE_URL" if provider == "azure" => Some(base.clone()),
+                    "AZURE_OPENAI_API_VERSION" => Some("preview".into()),
+                    "AZURE_OPENAI_DEPLOYMENT_NAME_MAP" => Some(format!("{model}=my-deployment")),
+                    _ => None,
+                },
+            )
+            .unwrap();
             let selected = args.model_profiles.provider(provider).unwrap();
             args.activate_provider(selected, Some(model)).unwrap();
             args.model = model.into();

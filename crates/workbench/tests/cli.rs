@@ -6661,6 +6661,66 @@ fn model_fixture_with_config(
     model_fixture_with_gate(effort, finish, expected_token, None)
 }
 
+#[test]
+fn mixed_decision_profile_lists_and_runs_model_scoped_chat() {
+    let root = tempfile::tempdir().unwrap();
+    let (chat_endpoint, server) = model_fixture_with_config(None, "stop", Some("fixture-chat-key"));
+    let chat_base = chat_endpoint.strip_suffix("/chat/completions").unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"mixed-fixture":{
+            "api":"pi-decision","baseUrl":"http://127.0.0.1:1/v1","apiKey":"fixture-decision-key",
+            "models":[
+                {"id":"judge","type":"classifier"},
+                {"id":"chat-fixture","name":"Fixture Chat","type":"chat","api":"openai-completions","baseUrl":chat_base}
+            ]
+        }}}).to_string(),
+    ).unwrap();
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-tools",
+                "--no-session",
+                "--provider",
+                "mixed-fixture",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let listed = run(&["--mode", "json", "--list-models"]);
+    assert!(listed.status.success(), "{listed:?}");
+    let rows: Vec<Value> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["provider"], "mixed-fixture");
+    assert_eq!(rows[0]["model"], "chat-fixture");
+    assert_eq!(rows[0]["name"], "Fixture Chat");
+
+    for selection in ["--model", "--models"] {
+        let prompted = run(&[
+            selection,
+            "chat-fixture",
+            "--api-key",
+            "fixture-chat-key",
+            "--print",
+            "same input",
+        ]);
+        assert!(prompted.status.success(), "{prompted:?}");
+        assert_eq!(prompted.stdout, b"fixture answer\n");
+    }
+    server.join().unwrap();
+}
+
 fn model_fixture_with_gate(
     effort: Option<&'static str>,
     finish: &'static str,

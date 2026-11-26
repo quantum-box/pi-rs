@@ -443,6 +443,21 @@ struct Entry {
 #[derive(Clone, Default)]
 pub(super) struct Catalogue(Vec<Entry>);
 
+/// Whether the provider defaults describe operations rather than chat routes.
+pub(super) fn decision_operation_defaults(provider: &Value) -> bool {
+    if !provider["api"].is_null() {
+        return provider["api"] == "pi-decision";
+    }
+    provider["models"].as_array().is_some_and(|models| {
+        models
+            .iter()
+            .all(|model| matches!(model["type"].as_str(), Some("classifier" | "image")))
+            && models
+                .iter()
+                .any(|model| model["type"] == "classifier" && model["api"] == "pi-decision")
+    })
+}
+
 impl Catalogue {
     pub fn parse(providers: &Map<String, Value>) -> Result<Self> {
         let mut combined: Map<String, Value> =
@@ -451,6 +466,7 @@ impl Catalogue {
         let mut decision_profiles = Vec::new();
         for (provider, configured) in providers {
             let name = provider.to_ascii_lowercase();
+            let operation_defaults = decision_operation_defaults(configured);
             let Some(configured) = configured.as_object() else {
                 continue;
             };
@@ -476,10 +492,7 @@ impl Catalogue {
                     models.remove(index);
                 }
             }
-            if configured
-                .get("api")
-                .is_some_and(|api| api == "pi-decision")
-            {
+            if operation_defaults {
                 // Keep the decision configuration off the remaining bundled
                 // operations, even when the provider name is built in.
                 let mut decision = configured.clone();
@@ -505,9 +518,14 @@ impl Catalogue {
         }
         let mut result = Vec::new();
         let mut seen = BTreeSet::new();
-        for (name, provider) in combined
+        for (name, provider, operation_defaults) in combined
             .iter()
-            .chain(decision_profiles.iter().map(|(n, p)| (n, p)))
+            .map(|(name, provider)| (name, provider, false))
+            .chain(
+                decision_profiles
+                    .iter()
+                    .map(|(name, provider)| (name, provider, true)),
+            )
         {
             let name = name.to_ascii_lowercase();
             // Bind configured credentials only to an unambiguous user-declared base.
@@ -519,7 +537,7 @@ impl Catalogue {
                 providers
                     .iter()
                     .find(|(key, _)| key.eq_ignore_ascii_case(&name))
-                    .filter(|(_, configured)| configured["api"] != "pi-decision")
+                    .filter(|(_, configured)| !decision_operation_defaults(configured))
                     .and_then(|(_, configured)| {
                         if name == "cloudflare-workers-ai" {
                             configured["models"]
@@ -540,7 +558,7 @@ impl Catalogue {
                 None
             };
             let inferred_base = if provider["baseUrl"].as_str().is_none()
-                && (provider["api"] == "pi-decision" || official_base(&name).is_none())
+                && (operation_defaults || official_base(&name).is_none())
             {
                 unambiguous_model_base(provider)
             } else {
