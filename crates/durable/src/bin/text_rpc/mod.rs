@@ -48,8 +48,7 @@ impl Turn {
 
     fn emit_user(&mut self, input: &Submission) -> io::Result<()> {
         let user = submission_message(input);
-        emit(&json!({"type":"message_start","message":user}))?;
-        emit(&json!({"type":"message_end","message":user}))?;
+        emit_committed_message(&user)?;
         self.users.push(user);
         Ok(())
     }
@@ -119,7 +118,9 @@ impl Turn {
     }
 
     fn end_attempt(&mut self, text: &str, failure: Option<&str>) -> io::Result<Value> {
-        self.finish_attempt(text, failure, text_message("assistant", text))
+        let message = self.finish_attempt(text, failure, text_message("assistant", text))?;
+        emit_turn_end(&message, &[])?;
+        Ok(message)
     }
 
     fn finish_attempt(
@@ -146,7 +147,6 @@ impl Turn {
             message["errorMessage"] = json!(reason);
         }
         emit(&json!({"type":"message_end","message":message}))?;
-        emit(&json!({"type":"turn_end","message":message,"toolResults":[]}))?;
         self.partial.clear();
         self.assistant_open = false;
         self.attempt = None;
@@ -725,6 +725,9 @@ fn publish_turns(
             }
             return Ok(());
         }
+        if let Some(tools) = tools {
+            tools.finish_pending_turn()?;
+        }
         turn.settle(state, failure.clone())?;
         *active = None;
     }
@@ -739,10 +742,26 @@ fn message_update(message: Value, mut event: Value) -> io::Result<()> {
     }))
 }
 
+fn emit_committed_message(message: &Value) -> io::Result<()> {
+    emit(&json!({"type":"message_start","message":message}))?;
+    emit(&json!({"type":"message_end","message":message}))
+}
+
+fn emit_turn_end(message: &Value, results: &[Value]) -> io::Result<()> {
+    emit(&json!({"type":"turn_end", "message":message, "toolResults":results}))
+}
+
+struct PendingToolTurn {
+    assistant: Value,
+    results: Vec<Value>,
+    remaining: usize,
+}
+
 struct ToolEvents {
     delivered: usize,
     answered_submission: Option<Uuid>,
     partial: Option<(ToolAttempt, Value)>,
+    pending_turn: Option<PendingToolTurn>,
 }
 
 impl ToolEvents {
@@ -751,7 +770,15 @@ impl ToolEvents {
             delivered: messages(state).len(),
             answered_submission: None,
             partial: None,
+            pending_turn: None,
         }
+    }
+
+    fn finish_pending_turn(&mut self) -> io::Result<()> {
+        if let Some(turn) = self.pending_turn.take() {
+            emit_turn_end(&turn.assistant, &turn.results)?;
+        }
+        Ok(())
     }
 
     fn publish_progress(
@@ -793,6 +820,7 @@ impl ToolEvents {
         for (index, message) in history.iter().enumerate().skip(self.delivered) {
             self.delivered = index + 1;
             if let Some(invocations) = message["durableInvocations"].as_array() {
+                self.finish_pending_turn()?;
                 let text = message["content"]
                     .as_array()
                     .into_iter()
@@ -805,7 +833,12 @@ impl ToolEvents {
                     turn.begin_attempt(None)?;
                 }
                 let assistant = turn.finish_attempt(&text, None, message.clone())?;
-                turn.users.push(assistant);
+                turn.users.push(assistant.clone());
+                self.pending_turn = Some(PendingToolTurn {
+                    assistant,
+                    results: Vec::with_capacity(invocations.len()),
+                    remaining: invocations.len(),
+                });
                 for invocation in invocations {
                     let call = &invocation["call"];
                     let args = call["arguments"]
@@ -829,8 +862,17 @@ impl ToolEvents {
                     "durableInvocation":message["durableInvocation"],
                     "durableOutcome":message["durableOutcome"]
                 }))?;
+                emit_committed_message(message)?;
                 turn.users.push(message.clone());
+                if let Some(pending) = &mut self.pending_turn {
+                    pending.results.push(message.clone());
+                    pending.remaining -= 1;
+                    if pending.remaining == 0 {
+                        self.finish_pending_turn()?;
+                    }
+                }
             } else if message["role"] == "assistant" {
+                self.finish_pending_turn()?;
                 // The terminal assistant message belongs to this submission.
                 // Leave later tool frames for the next queued run if both
                 // runs completed between two polling ticks.
@@ -844,12 +886,17 @@ impl ToolEvents {
 
 fn messages(state: &Conversation) -> Vec<Value> {
     let mut pending: HashMap<&str, VecDeque<Invocation>> = HashMap::new();
-    let mut metadata: HashMap<&str, VecDeque<_>> = HashMap::new();
+    let mut metadata_by_block = HashMap::new();
+    let mut legacy_metadata: HashMap<&str, VecDeque<_>> = HashMap::new();
     for result in &state.tool_results {
-        metadata
-            .entry(&result.call_id)
-            .or_default()
-            .push_back(result);
+        if let Some(id) = result.content_block_id {
+            metadata_by_block.insert(id, result);
+        } else {
+            legacy_metadata
+                .entry(&result.call_id)
+                .or_default()
+                .push_back(result);
+        }
     }
     state
         .messages
@@ -896,12 +943,20 @@ fn messages(state: &Conversation) -> Vec<Value> {
                 ..
             } => {
                 let invocation = pending.get_mut(call_id.as_str())?.pop_front()?;
-                let result = metadata
-                    .get_mut(call_id.as_str())
-                    .and_then(VecDeque::pop_front);
+                let blocks = state.content_blocks.get(&index);
+                let result = match blocks {
+                    Some(blocks) => metadata_by_block
+                        .get(&blocks.message_id)
+                        .copied()
+                        .filter(|result| result.call_id == *call_id),
+                    None => legacy_metadata
+                        .get_mut(call_id.as_str())
+                        .and_then(VecDeque::pop_front),
+                };
+                let is_error = result.map_or(*is_error, |result| result.is_error);
                 let details = result.and_then(|result| result.details.clone());
                 let mut message = text_message("toolResult", content);
-                let outcome = if let Some(blocks) = state.content_blocks.get(&index) {
+                let outcome = if let Some(blocks) = blocks {
                     message["content"] = json!(blocks.blocks);
                     let data = json!({"content":blocks.blocks, "isError":is_error});
                     let attachments = result
@@ -919,7 +974,7 @@ fn messages(state: &Conversation) -> Vec<Value> {
                     Outcome::TextResult {
                         output: content.clone(),
                         details: details.clone(),
-                        is_error: *is_error,
+                        is_error,
                     }
                 };
                 message["toolCallId"] = json!(call_id);
