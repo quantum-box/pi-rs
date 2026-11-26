@@ -6662,6 +6662,52 @@ fn model_fixture_with_config(
 }
 
 #[test]
+fn mixed_azure_decision_profile_lists_only_routed_chat_models() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"azure":{
+            "api":"pi-decision","baseUrl":"http://127.0.0.1:1/v1","apiKey":"fixture-decision-key",
+            "models":[
+                {"id":"judge","type":"classifier"},
+                {"id":"chat-fixture","name":"Fixture Chat","type":"chat","api":"azure-openai-responses","baseUrl":"http://127.0.0.1:2"}
+            ]
+        }}}).to_string(),
+    )
+    .unwrap();
+    let listed = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .env_remove("AZURE_OPENAI_BASE_URL")
+        .env_remove("AZURE_OPENAI_RESOURCE_NAME")
+        .env_remove("AZURE_OPENAI_API_KEY")
+        .env_remove("PI_RS_MODEL_TOKEN")
+        .args([
+            "--offline",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-session",
+            "--provider",
+            "azure",
+            "--mode",
+            "json",
+            "--list-models",
+        ])
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "{listed:?}");
+    let rows: Vec<Value> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["provider"], "azure");
+    assert_eq!(rows[0]["model"], "chat-fixture");
+    assert_eq!(rows[0]["name"], "Fixture Chat");
+}
+
+#[test]
 fn mixed_decision_profile_lists_and_runs_model_scoped_chat() {
     let root = tempfile::tempdir().unwrap();
     let (chat_endpoint, server) = model_fixture_with_config(None, "stop", Some("fixture-chat-key"));

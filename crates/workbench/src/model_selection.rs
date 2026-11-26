@@ -235,25 +235,26 @@ impl Catalog {
 fn catalog_client(
     args: &Cli,
     provider: &Provider,
-    models: &[String],
+    models: &mut Vec<String>,
 ) -> Result<Option<super::providers::Client>> {
-    // Model-scoped routes supply a static catalogue and no discovery endpoint.
-    if args.endpoint_for(provider).is_empty()
-        && !models.is_empty()
-        && models.iter().all(|model| {
+    if args.endpoint_for(provider).is_empty() {
+        let has_model_endpoint = |model: &String| {
             args.model_profiles
                 .model_endpoint(provider, model)
                 .is_some_and(|endpoint| !endpoint.is_empty())
-        })
-    {
-        return Ok(None);
+        };
+        if models.iter().any(has_model_endpoint) {
+            // Bundled and cached model IDs may have no route in this profile.
+            models.retain(has_model_endpoint);
+            return Ok(None);
+        }
     }
     args.connect_provider(provider, None).map(Some)
 }
 
 pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
     let mut models = args.model_profiles.model_ids(&provider);
-    let client = catalog_client(args, &provider, &models)?.map(|client| {
+    let client = catalog_client(args, &provider, &mut models)?.map(|client| {
         if provider == Provider::Radius {
             client.with_context_probes(probe)
         } else {
@@ -359,7 +360,6 @@ pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
     providers
         .filter_map(|provider| {
             let mut models = args.model_profiles.model_ids(&provider);
-            let client = catalog_client(args, &provider, &models).ok()?;
             for model in args
                 .discovered_models
                 .iter()
@@ -376,6 +376,7 @@ pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
                     models.push(model.clone());
                 }
             }
+            let client = catalog_client(args, &provider, &mut models).ok()?;
             let endpoint = args.endpoint_for(&provider);
             if matches!(
                 args.model_credential_for(&provider, endpoint),
@@ -1110,6 +1111,28 @@ mod tests {
             .await
             .unwrap();
         assert!(!catalog.complete);
+    }
+
+    #[test]
+    fn cached_azure_catalog_omits_unrouted_bundled_and_cached_models() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.model_profiles = crate::model_profiles::Profiles::parse_with_azure_env(
+            &json!({"providers":{"azure":{
+                "models":[{"id":"routed","api":"azure-openai-responses","baseUrl":"http://127.0.0.1:2"}]
+            }}}),
+            |_| None,
+        ).unwrap();
+        args.discovered_models
+            .push(("azure".into(), "old-deployment".into()));
+        let catalog = super::cached_catalogs(&args)
+            .into_iter()
+            .find(|catalog| catalog.provider.id() == "azure")
+            .unwrap();
+        assert_eq!(catalog.models, ["routed"]);
+        assert!(catalog.client.is_none());
     }
 
     #[test]

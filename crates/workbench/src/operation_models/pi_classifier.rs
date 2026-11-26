@@ -1,5 +1,6 @@
 //! Shared decision and legacy classifier wire format.
 use pi_rs::{Error, Result};
+use reqwest::header::{AUTHORIZATION, COOKIE, HeaderMap, PROXY_AUTHORIZATION};
 use serde_json::{Map, Value, json};
 
 use super::{Api, Cost, Entry, wire};
@@ -138,9 +139,29 @@ fn normalize_diagnostic(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn bearer_token(value: &str) -> Option<&str> {
+    let mut fields = value.split_ascii_whitespace();
+    let scheme = fields.next()?;
+    let token = fields.next()?;
+    (scheme.eq_ignore_ascii_case("bearer")
+        && fields.next().is_none()
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._~+/=".contains(&byte)))
+    .then_some(token)
+}
+
+fn has_opaque_credentials(headers: &HeaderMap) -> bool {
+    headers.iter().any(|(name, value)| {
+        name == COOKIE
+            || ((name == AUTHORIZATION || name == PROXY_AUTHORIZATION)
+                && value.to_str().ok().and_then(bearer_token).is_none())
+    })
+}
+
 pub(super) async fn http_error(
     mut response: reqwest::Response,
-    request_headers: &reqwest::header::HeaderMap,
+    request_headers: &HeaderMap,
 ) -> Error {
     const MAX_ERROR_BODY: usize = 16 * 1024;
     let status = response.status().as_u16();
@@ -165,6 +186,29 @@ pub(super) async fn http_error(
         return fallback();
     };
     let diagnostic = &body["error"];
+    if has_opaque_credentials(request_headers) {
+        // A cookie or structured authorization value can contain several
+        // credentials. Keep only known codes instead of echoing arbitrary text.
+        return match diagnostic["code"].as_str() {
+            Some(
+                code @ ("authentication_error"
+                | "forbidden"
+                | "insufficient_quota"
+                | "internal_error"
+                | "invalid_api_key"
+                | "invalid_question"
+                | "invalid_request"
+                | "invalid_request_error"
+                | "not_found"
+                | "permission_denied"
+                | "rate_limit_exceeded"
+                | "server_error"
+                | "service_unavailable"
+                | "unauthorized"),
+            ) => Error::Model(format!("Pi Decision returned HTTP {status} ({code})")),
+            _ => fallback(),
+        };
+    }
     let clean = |field: &str, limit| {
         let value = normalize_diagnostic(diagnostic[field].as_str()?);
         // The server may echo any of the configured credentials, including
@@ -179,11 +223,7 @@ pub(super) async fn http_error(
                 };
                 let secret = normalize_diagnostic(secret);
                 (!secret.is_empty() && value.contains(&secret))
-                    || secret.split_once(' ').is_some_and(|(scheme, token)| {
-                        scheme.eq_ignore_ascii_case("bearer")
-                            && !token.is_empty()
-                            && value.contains(token)
-                    })
+                    || bearer_token(&secret).is_some_and(|token| value.contains(token))
             })
         {
             return Some("[redacted]".to_owned());
@@ -792,6 +832,78 @@ mod tests {
             oversized.ends_with("Pi Decision returned HTTP 400"),
             "{oversized}"
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pi_decision_suppresses_diagnostics_for_opaque_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let operation =
+            decision_operations(&format!("http://{}/v1", listener.local_addr().unwrap()));
+        let entry = operation
+            .args
+            .model_profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "decision-fixture")
+            .unwrap();
+        let cases = [
+            (
+                "cookie",
+                "session=fixture-session; other=fixture-other",
+                "invalid_api_key",
+                "fixture-session",
+            ),
+            (
+                "authorization",
+                "Basic Zml4dHVyZQ==",
+                "Zml4dHVyZQ==",
+                "Zml4dHVyZQ==",
+            ),
+            (
+                "cookie",
+                "session=fixture-session",
+                "fixture-session",
+                "fixture-session",
+            ),
+        ];
+        let server = tokio::spawn(async move {
+            for (header, value, code, component) in cases {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (route, headers, _) = request(&mut socket).await;
+                assert_eq!(route, "POST /v1/decision HTTP/1.1\r\n");
+                assert_eq!(headers[header], value);
+                let body = json!({"error":{"code":code,"message":format!("Denied {component}")}})
+                    .to_string();
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let context = json!({"state":{},"questions":questions()});
+        for (header, value, code, component) in cases {
+            let mut entry = entry.clone();
+            entry.model.headers.insert(header.into(), value.into());
+            let diagnostic = tokio::time::timeout(
+                Duration::from_secs(5),
+                operation.perform(&entry, &context, &Keys::default(), &mut json!({})),
+            )
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+            let expected = if code == "invalid_api_key" {
+                "Pi Decision returned HTTP 401 (invalid_api_key)"
+            } else {
+                "Pi Decision returned HTTP 401"
+            };
+            assert!(diagnostic.ends_with(expected), "{diagnostic}");
+            assert!(!diagnostic.contains(component), "{diagnostic}");
+            assert!(!diagnostic.contains("Denied"), "{diagnostic}");
+        }
         server.await.unwrap();
     }
 
