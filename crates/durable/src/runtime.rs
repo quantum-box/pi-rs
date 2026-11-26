@@ -7788,8 +7788,10 @@ impl Harness {
                 }
             }
         }
+        let preserve_block_prefix = checkout.is_none() && !reset_proven && !block_compaction;
         if let Some(previous) = old
             && !previous.content_blocks.is_empty()
+            && preserve_block_prefix
         {
             let unchanged = state.messages.starts_with(&previous.messages)
                 && previous
@@ -7798,7 +7800,7 @@ impl Harness {
                     .all(|(i, b)| state.content_blocks.get(i) == Some(b))
                 && previous.context_generation == state.context_generation
                 && state.resets == previous.resets;
-            if !unchanged && !reset_proven && !block_compaction && checkout.is_none() {
+            if !unchanged {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
             }
         }
@@ -7842,8 +7844,7 @@ impl Harness {
                     false,
                 )
                 .is_none()
-                || (!block_compaction
-                    && !reset_proven
+                || (preserve_block_prefix
                     && index < old_len
                     && old.and_then(|s| s.content_blocks.get(&index)) != Some(binding))
             {

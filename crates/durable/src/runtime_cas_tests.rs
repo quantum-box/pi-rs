@@ -1099,6 +1099,11 @@ fn session_checkout_keeps_ordered_content_blocks_and_rejects_pending_input() {
         .reset_with_blocks(id, Some("older".into()), vec![blocks.clone()])
         .unwrap();
     h.reset(id, Some("next context".into())).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.push(Message::User {
+        content: "text at the old block position".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
     let later = h
         .session_tree(&h.session_entries_start(id).unwrap())
         .unwrap()
