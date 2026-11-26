@@ -4393,13 +4393,17 @@ render_call_id: None,
     fn suspend_terminal(
         &mut self,
         terminal: &mut Option<Terminal>,
-        mode: Option<TuiMode>,
+        args: &Cli,
+        resume: Option<&mut super::program_resume::Reporter>,
     ) -> Result<()> {
-        if mode == Some(TuiMode::Regular) {
+        if args.tui_mode == Some(TuiMode::Regular) {
             self.finish_regular()?;
         }
-        if let Err(error) = Terminal::suspend(terminal, mode, self.graphics.cleanup()) {
+        if let Err(error) = Terminal::suspend(terminal, args.tui_mode, self.graphics.cleanup()) {
             self.append(&error.to_string());
+        }
+        if let Some(reporter) = resume {
+            reporter.report(args, true)?;
         }
         if self.graphics.enabled() {
             images::query_cell_size()?;
@@ -5951,6 +5955,7 @@ pub(super) async fn run(
         std::fs::create_dir_all(parent)?;
     }
     let reported_settings = args.settings.diagnostics().to_vec();
+    let terminal_resume = args.terminal_resume;
     args = prepare_initial_session_async(args).await?;
     for warning in args.settings.diagnostics() {
         if !reported_settings.contains(warning) {
@@ -5985,7 +5990,11 @@ pub(super) async fn run(
     };
     let changelog_path = super::config::agent_dir().join("pi-rs-changelog.json");
     let mut extension_changelog_session = {
-        let session = Session::open(&args.session)?;
+        let session = if terminal_resume {
+            super::program_resume::open_bound_session(&args)?
+        } else {
+            Session::open(&args.session)?
+        };
         view.restore_session(&args, &session)?;
         let empty = session.current_messages().is_empty();
         if empty
@@ -6040,7 +6049,6 @@ pub(super) async fn run(
         )
         .collect();
     let mut resume = resume_token.and_then(super::program_resume::Reporter::new);
-    let mut resume_after_suspend = false;
     let mut dirty = true;
     let frame_interval = Duration::from_millis(16);
     let mut last_frame = Instant::now() - frame_interval;
@@ -6063,8 +6071,7 @@ pub(super) async fn run(
         if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
             && _terminal.is_some()
         {
-            view.suspend_terminal(&mut _terminal, args.tui_mode)?;
-            resume_after_suspend = true;
+            view.suspend_terminal(&mut _terminal, &args, resume.as_mut())?;
             dirty = true;
         }
         #[cfg(any(unix, windows))]
@@ -6825,12 +6832,7 @@ pub(super) async fn run(
             }
         }
         if let Some(reporter) = &mut resume {
-            let force = std::mem::take(&mut resume_after_suspend);
-            if args.no_session {
-                reporter.clear()?;
-            } else {
-                reporter.report(&args.session, &args.workspace, force)?;
-            }
+            reporter.report(&args, false)?;
         }
         if let Some(title) = view.pending_terminal_title.take() {
             execute!(std::io::stdout(), crossterm::terminal::SetTitle(title))?;
@@ -7836,8 +7838,7 @@ pub(super) async fn run(
                     "app.suspend" => {
                         #[cfg(unix)]
                         {
-                            view.suspend_terminal(&mut _terminal, args.tui_mode)?;
-                            resume_after_suspend = true;
+                            view.suspend_terminal(&mut _terminal, &args, resume.as_mut())?;
                         }
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
@@ -8138,8 +8139,7 @@ pub(super) async fn run(
                                             }
                                             #[cfg(unix)]
                                             if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                                                view.suspend_terminal(&mut _terminal, args.tui_mode)?;
-                                                resume_after_suspend = true;
+                                                view.suspend_terminal(&mut _terminal, &args, resume.as_mut())?;
                                             }
                                         },
                                     }
@@ -10510,7 +10510,12 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
     Ok(())
 }
 
-async fn prepare_initial_session_async(args: Cli) -> Result<Cli> {
+async fn prepare_initial_session_async(mut args: Cli) -> Result<Cli> {
+    if std::mem::take(&mut args.terminal_resume) {
+        let mut session = super::program_resume::open_bound_session(&args)?;
+        initialize_open_session(&mut args, &mut session)?;
+        return Ok(args);
+    }
     let (sender, receiver) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let mut args = args;
@@ -10560,6 +10565,10 @@ fn prepare_initial_session(args: &mut Cli) -> Result<()> {
 
 fn initialize_session(args: &mut Cli) -> Result<()> {
     let mut session = Session::open(&args.session)?;
+    initialize_open_session(args, &mut session)
+}
+
+fn initialize_open_session(args: &mut Cli, session: &mut Session) -> Result<()> {
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),
@@ -10571,9 +10580,9 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
-    args.restore_session_model(&session)?;
+    args.restore_session_model(session)?;
     super::thinking::adjust(args);
-    args.record_automatic_model_selection(&mut session)?;
+    args.record_automatic_model_selection(session)?;
     Ok(())
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {

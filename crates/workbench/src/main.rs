@@ -161,6 +161,9 @@ struct Cli {
     /// Path to the private append-only session journal.
     #[arg(long, default_value_os_t = interactive::new_session_path())]
     session: PathBuf,
+    /// Internal OSC restore with an explicit journal and workspace binding.
+    #[arg(long, hide = true, requires_all = ["session", "workspace"])]
+    terminal_resume: bool,
     /// Open or create a named session in this workspace's session directory.
     #[arg(long, conflicts_with_all = ["session", "continue_session", "resume_session", "no_session"], value_parser = sessions::validate_id)]
     session_id: Option<String>,
@@ -1556,6 +1559,9 @@ async fn run_cli(resume_token: Option<String>) -> i32 {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        if args.terminal_resume {
+            program_resume::bind_startup(&mut args)?;
+        }
         if let Some(plan) = export_plan {
             if plan.input.as_os_str().is_empty() {
                 return Err(Error::Config("export input is required".into()));
@@ -2178,7 +2184,7 @@ async fn execute(
         if !args.session.is_file() {
             return Err(Error::Config("session file not found".into()));
         }
-    } else if args.fork_session.is_none() {
+    } else if args.fork_session.is_none() && !args.terminal_resume {
         args.session = sessions::resolve_reference(&args.session, &directory)?;
     }
     if args

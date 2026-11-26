@@ -554,14 +554,24 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
     }
 }
 
+fn resume_report_bodies<'a>(text: &'a str, token: &'a str) -> impl Iterator<Item = &'a str> {
+    use sha2::{Digest, Sha256};
+    text.split("\x1b]7577;").skip(1).filter_map(move |report| {
+        let (report, _) = report.split_once("\x1b\\")?;
+        let (body, mac) = report.rsplit_once(":mac=")?;
+        assert_eq!(
+            mac,
+            format!("{:x}", Sha256::digest(format!("{body}:{token}")))
+        );
+        assert!(!report.contains(token));
+        Some(body)
+    })
+}
+
 #[test]
 fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use sha2::{Digest, Sha256};
-
     const TOKEN: &str = "terminal-test-token";
-    const PREFIX: &str = "\x1b]7577;";
-    const END: &str = "\x1b\\";
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().canonicalize().unwrap();
     let session_path = workspace.join("session with spaces.jsonl");
@@ -609,8 +619,11 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
                 "--no-trust",
                 "--no-mcp",
                 "--no-extensions",
-                "--session",
+                "--terminal-resume",
+                "--workspace",
             ])
+            .arg(&workspace)
+            .arg("--session")
             .arg(&session_path)
             .arg("--session-dir")
             .arg(&session_dir)
@@ -621,38 +634,32 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
             .unwrap(),
     );
 
-    let verify = |text: &str, expected: &str| {
-        text.split(PREFIX).skip(1).any(|report| {
-            let Some((report, _)) = report.split_once(END) else {
-                return false;
-            };
-            let Some((body, mac)) = report.rsplit_once(":mac=") else {
-                return false;
-            };
-            if !body.ends_with(expected) {
-                return false;
-            }
-            assert_eq!(
-                mac,
-                format!("{:x}", Sha256::digest(format!("{body}:{TOKEN}")))
-            );
-            assert!(!report.contains(TOKEN));
-            true
+    let verify = |text: &str, path: &std::path::Path| {
+        let expected = [
+            "--terminal-resume",
+            "--session",
+            path.to_str().unwrap(),
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--offline",
+            "--session-dir",
+            session_dir.to_str().unwrap(),
+        ];
+        let expected = expected.map(|arg| STANDARD.encode(arg)).join(",");
+        resume_report_bodies(text, TOKEN).any(|body| {
+            body.ends_with(&format!(
+                ",{expected}:cwd={}",
+                STANDARD.encode(workspace.to_str().unwrap())
+            ))
         })
     };
-    let session = STANDARD.encode(session_path.to_str().unwrap());
-    let cwd = STANDARD.encode(workspace.to_str().unwrap());
-    let expected = format!(",LS1zZXNzaW9u,{session}:cwd={cwd}");
     output_until(&mut master, |text| {
-        text.contains("Enter to send") && verify(text, &expected)
+        text.contains("Enter to send") && verify(text, &session_path)
     });
 
-    master
-        .write_all(b"!test -z \"${OSC7577_TOKEN+x}\" && touch child-token-absent\r")
-        .unwrap();
-    output_until(&mut master, |text| {
-        workspace.join("child-token-absent").is_file() && text.contains("Enter to send")
-    });
     master.write_all(b"/new\r").unwrap();
     output_until(&mut master, |text| {
         let Some(new_path) = std::fs::read_dir(&session_dir)
@@ -662,11 +669,18 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
             return false;
         };
         assert_ne!(new_path, session_path);
-        let new_session = STANDARD.encode(new_path.to_str().unwrap());
-        verify(text, &format!(",LS1zZXNzaW9u,{new_session}:cwd={cwd}"))
+        verify(text, &new_path)
+    });
+    master
+        .write_all(b"!test -z \"${OSC7577_TOKEN+x}\" && touch child-token-absent\r")
+        .unwrap();
+    output_until_with_timeout(&mut master, Duration::from_secs(20), |_| {
+        workspace.join("child-token-absent").is_file()
     });
     master.write_all(b"/quit\r").unwrap();
-    output_until(&mut master, |text| verify(text, ":clear=1"));
+    output_until(&mut master, |text| {
+        resume_report_bodies(text, TOKEN).any(|body| body.ends_with(":clear=1"))
+    });
 }
 
 #[test]
@@ -2048,6 +2062,7 @@ enum SuspendTrigger {
 }
 
 fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
+    const TOKEN: &str = "test-suspend-resume-token";
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let mut master_fd = -1;
@@ -2106,6 +2121,7 @@ fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
                 mode,
             ])
             .env("PI_RS_HOME", &home)
+            .env("OSC7577_TOKEN", TOKEN)
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -2113,7 +2129,10 @@ fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
             .spawn()
             .unwrap(),
     );
-    output_until(&mut master, |text| text.contains("Enter to send"));
+    output_until(&mut master, |text| {
+        text.contains("Enter to send")
+            && resume_report_bodies(text, TOKEN).any(|body| body.contains(":argv="))
+    });
     for round in 0..16 {
         size.ws_col = 90 + round;
         assert_eq!(
@@ -2216,16 +2235,22 @@ exit 1
         unsafe { libc::kill(-(process.0.id() as libc::pid_t), libc::SIGCONT) },
         0
     );
-    let expected_after_resume = if trigger == SuspendTrigger::Reload {
+    if trigger == SuspendTrigger::Reload {
+        output_until(&mut master, |text| {
+            assert!(!text.contains("\x1b]11;?"));
+            resume_report_bodies(text, TOKEN).any(|body| body.contains(":argv="))
+                && text.contains("\x1b[>4;2m")
+        });
         std::fs::File::create(home.join("probe-release")).unwrap();
-        "Reloaded settings"
+        output_until(&mut master, |text| text.contains("Reloaded settings"));
     } else {
-        "resume-draft"
-    };
-    output_until(&mut master, |text| {
-        assert!(!text.contains("\x1b]11;?"));
-        text.contains(expected_after_resume) && text.contains("\x1b[>4;2m")
-    });
+        output_until(&mut master, |text| {
+            assert!(!text.contains("\x1b]11;?"));
+            text.contains("resume-draft")
+                && text.contains("\x1b[>4;2m")
+                && resume_report_bodies(text, TOKEN).any(|body| body.contains(":argv="))
+        });
+    }
     // An old or foreign DA1 and late OSC must not launch another query after
     // the shell owned the terminal, and ordinary input must still be usable.
     master

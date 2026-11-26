@@ -6127,14 +6127,26 @@ restart, encrypted-only thinking and a switch to a different model endpoint.
 
 ### Terminal session restoration
 
-An interactive native session reports an OSC 7577 resume command when
-launched with `OSC7577_TOKEN` by a supporting terminal. The report contains
-the native executable, the absolute session journal path, and the working
-directory. Native journals are resumable as soon as their file exists.
-Session switches replace the report and returning from suspend refreshes it.
-A normal quit clears it so the session is not reopened on terminal restart.
-The token is removed before starting the runtime or child processes and is
-never written into the journal. Ephemeral sessions do not report a command.
+An interactive native session can report an OSC 7577 resume command when
+a supporting terminal supplies `OSC7577_TOKEN`. The report binds the native
+executable, canonical journal path, and canonical workspace. Automatic restore
+checks that workspace before reading the journal or evaluating project trust.
+A journal with a different saved workspace is rejected. Ordinary `--session`
+and `--resume` retain their existing workspace behavior.
+
+The command carries restrictive options such as `--no-trust`, `--no-mcp`,
+`--no-extensions`, `--offline`, and explicit tool selections. Pi skips
+reporting for ephemeral sessions, pending trust decisions, and invocations
+whose explicit credentials, connection options, or extension flags cannot
+be carried safely. Automatic restore currently requires Unix permissions,
+including an owner-only regular journal and directories protected against
+replacement by other users. On macOS, extended ACL grants also make a
+path ineligible.
+
+Session switches replace the report. Returning from suspend refreshes it
+immediately, including during package reload. A missing journal or a normal
+quit clears the record. Pi removes the token before starting the runtime or
+child processes and keeps it out of the journal. [Pinned upstream reporter](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/modes/interactive/program-resume-reporter.ts).
 
 ### Terminal color capability
 
