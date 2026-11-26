@@ -2013,7 +2013,14 @@ fn ant_ling_print_sends_binary_thinking_for_the_default_model() {
             listener.local_addr().unwrap()
         );
         let server = std::thread::spawn(move || {
-            let (mut socket, mut reader, request) = accept_proxy_request(listener);
+            let (mut socket, mut reader, mut request) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            if request.starts_with("GET /v1/models ") {
+                // The loopback endpoint enables discovery. An empty list leaves
+                // selection to the bundled Ant Ling catalog.
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").unwrap();
+                (socket, reader, request) = accept_proxy_request(listener);
+            }
             assert!(
                 request.starts_with("POST /v1/chat/completions "),
                 "{request}"
