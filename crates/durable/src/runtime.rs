@@ -27455,6 +27455,22 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         }
         _ => false,
     };
+    old.as_object_mut().and_then(|v| v.remove("held_inputs"));
+    new.as_object_mut().and_then(|v| v.remove("held_inputs"));
+    let held_admissions_only = latest.held_inputs.difference(&base.held_inputs).all(|id| {
+        latest
+            .submissions
+            .iter()
+            .skip(base.submissions.len())
+            .any(|input| {
+                input.id == *id && input.status == Status::Queued && input.on_abort == OnAbort::Keep
+            })
+    }) && base.held_inputs.difference(&latest.held_inputs).all(|id| {
+        latest.submissions.iter().any(|input| {
+            input.id == *id
+                && matches!(&input.status, Status::Unanswered { reason } if reason == "aborted")
+        })
+    });
     let old_modes = old.as_object_mut().and_then(|v| v.remove("input_modes"));
     let new_modes = new.as_object_mut().and_then(|v| v.remove("input_modes"));
     let modes_unchanged = match (old_modes, new_modes) {
@@ -27472,6 +27488,7 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         && notifications_unchanged
         && pending_ok
         && modes_unchanged
+        && held_admissions_only
         && resets_unchanged
         && reset_blocks_unchanged
         && fitted_receipts_unchanged

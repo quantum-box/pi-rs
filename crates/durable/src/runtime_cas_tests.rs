@@ -1152,6 +1152,49 @@ fn cas_merges_admission_and_boundary_retries_instead_of_losing_steer() {
 }
 
 #[test]
+fn idle_queue_staging_and_withdrawal_merge_with_stale_worker_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let conversation = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 5,
+        })
+        .unwrap();
+    let mut worker = harness.worker();
+    let (stale, version) = worker.load(conversation).unwrap();
+    let staged = harness
+        .submit_internal_with_options(
+            conversation,
+            None,
+            "idle queue input".into(),
+            AdmissionOptions {
+                on_abort: OnAbort::Keep,
+                ..Default::default()
+            },
+            true,
+            &mut |_| Ok(()),
+            None,
+            None,
+        )
+        .unwrap();
+    worker.save(&stale, Expected::Version(version)).unwrap();
+
+    let (stale, version) = worker.load(conversation).unwrap();
+    assert!(stale.held_inputs.contains(&staged));
+    assert!(!stale.has_runnable_input());
+    assert_eq!(harness.clear_input_queue(conversation).unwrap().len(), 1);
+    worker.save(&stale, Expected::Version(version)).unwrap();
+
+    let state = harness.conversation(conversation).unwrap();
+    assert!(state.held_inputs.is_empty());
+    assert!(
+        matches!(&state.submissions[0].status, Status::Unanswered { reason } if reason == "aborted")
+    );
+}
+
+#[test]
 fn concurrent_duplicate_and_distinct_admissions_retry_cas() {
     let dir = tempfile::tempdir().unwrap();
     let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
