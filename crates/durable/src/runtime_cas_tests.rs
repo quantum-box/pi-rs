@@ -3100,6 +3100,85 @@ fn packing_keeps_a_runtime_message_cut_forkable_across_reset_and_reopen() {
     }
 }
 
+#[tokio::test]
+async fn scheduler_transcript_retention_keeps_existing_and_new_forks_readable() {
+    use std::{num::NonZeroUsize, time::Duration};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("aged-history.sqlite");
+    let mut scheduler = Scheduler::open_paused(&path, options()).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let original = Message::User {
+        content: "retained transcript ".repeat(512),
+    };
+    let (mut state, version) = scheduler.harness.load(id).unwrap();
+    state.messages.push(original.clone());
+    scheduler
+        .harness
+        .save(&state, Expected::Version(version))
+        .unwrap();
+    let row = scheduler
+        .harness
+        .view_positioned(id, NonZeroUsize::MIN)
+        .unwrap()
+        .entries
+        .remove(0);
+    let history = row.history.unwrap();
+    let old_fork = scheduler.harness.fork_by_entry_id(id, history.id).unwrap();
+    scheduler
+        .harness
+        .reset(id, Some("new context".into()))
+        .unwrap();
+    scheduler
+        .start_transcript_packing(Duration::from_millis(10), Duration::from_millis(5))
+        .unwrap();
+    let raw =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let packed = raw
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM durable_store_entries
+                   WHERE substr(key,1,?1)=?2 AND substr(value,1,1)=X'89')",
+                    rusqlite::params![
+                        b"durable/transcript/entry/".len(),
+                        b"durable/transcript/entry/"
+                    ],
+                    |result| result.get::<_, bool>(0),
+                )
+                .unwrap();
+            if packed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(raw);
+    scheduler.shutdown().await.unwrap();
+
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let page = harness
+        .view_positioned_page(id, row.position, NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(page.entries[0].history.as_ref(), Some(&history));
+    let new_fork = harness.fork_by_entry_id(id, history.id).unwrap();
+    for child in [old_fork, new_fork] {
+        assert_eq!(
+            harness.conversation(child).unwrap().messages,
+            std::slice::from_ref(&original)
+        );
+    }
+}
+
 #[test]
 fn aged_fork_snapshot_packing_preserves_saved_forks_and_history_across_reopen() {
     use std::num::NonZeroUsize;

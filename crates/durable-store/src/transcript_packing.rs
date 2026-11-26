@@ -3,13 +3,13 @@
 
 use std::io::{Read, Write};
 
-use flate2::{bufread::ZlibDecoder, write::ZlibEncoder, Compression};
-use rusqlite::{params, OptionalExtension};
+use flate2::{Compression, bufread::ZlibDecoder, write::ZlibEncoder};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{prefix_end, read_limit, Entry, Error, Store};
+use crate::{Check, Entry, Error, Expected, Mutation, Store, prefix_end, read_limit};
 
 const PREFIX: &[u8] = b"durable/transcript/entry/";
 pub(crate) const MAGIC: &[u8] = b"\x89PI-TRANSCRIPT\0\x01";
@@ -17,6 +17,8 @@ pub(crate) const HEADER: usize = MAGIC.len() + 4 + 32;
 const MIN_BYTES: usize = 1024;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_LIMIT: usize = 64;
+const WINDOW: &[u8] = b"runtime/transcript-packing/window/v1";
+const SWEEP: &[u8] = b"runtime/transcript-packing/sweep/v1";
 
 /// A finite database-local pass. The boundary excludes writes after capture.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +35,13 @@ pub struct PackingPage {
     pub reclaimed_bytes: usize,
     /// Continue the same pass, or start a new one to include later writes.
     pub next: Option<PackingCursor>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Sweep {
+    completed: u64,
+    cursor: Option<PackingCursor>,
 }
 
 fn key_for(id: Uuid) -> Vec<u8> {
@@ -85,7 +94,72 @@ pub(crate) fn unpack(value: Vec<u8>, max_bytes: Option<usize>) -> Result<Vec<u8>
     Ok(decoded)
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Window {
+    eligible: u64,
+    pending: u64,
+    observed_ms: u64,
+}
+
+pub(crate) fn eligible_packing_boundary(value: &[u8]) -> Result<u64, Error> {
+    let window: Window = serde_json::from_slice(value).map_err(|_| Error::InvalidSnapshot)?;
+    Ok(window.eligible)
+}
+
 impl Store {
+    pub(crate) fn aged_packing_boundary(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+        retain_ms: u64,
+    ) -> Result<u64, Error> {
+        if retain_ms == 0 {
+            return Err(Error::InvalidSnapshot);
+        }
+        loop {
+            let previous = self.get_bounded(key, 256)?;
+            let boundary = self.put_version()?;
+            let mut window = if let Some(entry) = &previous {
+                let window: Window =
+                    serde_json::from_slice(&entry.value).map_err(|_| Error::InvalidSnapshot)?;
+                if window.eligible > window.pending || window.pending > boundary {
+                    return Err(Error::InvalidSnapshot);
+                }
+                if now_ms.saturating_sub(window.observed_ms) < retain_ms {
+                    return Ok(window.eligible);
+                }
+                window
+            } else {
+                Window {
+                    eligible: 0,
+                    pending: 0,
+                    observed_ms: now_ms,
+                }
+            };
+            window.eligible = window.pending;
+            window.pending = boundary;
+            window.observed_ms = now_ms;
+            let value = serde_json::to_vec(&window).map_err(|_| Error::InvalidSnapshot)?;
+            match self.commit(
+                &[Check {
+                    key: key.to_vec(),
+                    expected: previous
+                        .as_ref()
+                        .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+                }],
+                &[Mutation::Put {
+                    key: key.to_vec(),
+                    value,
+                }],
+            ) {
+                Ok(()) => return Ok(window.eligible),
+                Err(Error::Conflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Read the logical bytes of one transcript entry, including packed entries.
     /// Apply the same byte ceiling to the original representation.
     pub fn get_transcript_entry(
@@ -124,11 +198,84 @@ impl Store {
         cursor: &PackingCursor,
         limit: usize,
     ) -> Result<PackingPage, Error> {
+        self.pack_transcript_page(cursor, None, limit)
+    }
+
+    /// Pack one page of entries that have aged past the persisted boundary.
+    /// A page interrupted before its checkpoint can be packed again safely.
+    pub fn sweep_transcript_history(
+        &self,
+        now_ms: u64,
+        retain_ms: u64,
+        limit: usize,
+    ) -> Result<(), Error> {
+        if retain_ms == 0 || !(1..=MAX_LIMIT).contains(&limit) {
+            return Err(Error::InvalidSnapshot);
+        }
+        let checkpoint = self.get_bounded(SWEEP, 1024)?;
+        let mut sweep: Sweep = checkpoint
+            .as_ref()
+            .map(|entry| serde_json::from_slice(&entry.value))
+            .transpose()
+            .map_err(|_| Error::InvalidSnapshot)?
+            .unwrap_or_default();
+        let through = self.aged_packing_boundary(WINDOW, now_ms, retain_ms)?;
+        if sweep.completed > through {
+            return Err(Error::InvalidSnapshot);
+        }
+        let cursor = match sweep.cursor.take() {
+            Some(cursor)
+                if cursor.through_version > sweep.completed
+                    && cursor.through_version <= through =>
+            {
+                cursor
+            }
+            Some(_) => return Err(Error::InvalidSnapshot),
+            None if through == sweep.completed => return Ok(()),
+            None => PackingCursor {
+                through_version: through,
+                after: None,
+            },
+        };
+        let page = self.pack_transcript_page(&cursor, Some(sweep.completed), limit)?;
+        sweep.cursor = page.next;
+        if sweep.cursor.is_none() {
+            sweep.completed = cursor.through_version;
+        }
+        let value = serde_json::to_vec(&sweep).map_err(|_| Error::InvalidSnapshot)?;
+        match self.commit(
+            &[Check {
+                key: SWEEP.to_vec(),
+                expected: checkpoint
+                    .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+            }],
+            &[Mutation::Put {
+                key: SWEEP.to_vec(),
+                value,
+            }],
+        ) {
+            Ok(()) | Err(Error::Conflict { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn pack_transcript_page(
+        &self,
+        cursor: &PackingCursor,
+        since_version: Option<u64>,
+        limit: usize,
+    ) -> Result<PackingPage, Error> {
         if !(1..=MAX_LIMIT).contains(&limit) || cursor.through_version > self.put_version()? {
             return Err(Error::InvalidSnapshot);
         }
         let after = cursor.after.map_or_else(|| PREFIX.to_vec(), key_for);
-        let page = self.packing_candidates(PREFIX, &after, None, None, limit)?;
+        let page = self.packing_candidates(
+            PREFIX,
+            &after,
+            since_version.map(|since| (since, cursor.through_version)),
+            since_version.map(|_| PREFIX.len() + 16),
+            limit,
+        )?;
         let next = page
             .last()
             .filter(|_| page.len() == limit)
@@ -224,6 +371,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aged_transcript_sweep_resumes_and_preserves_logical_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transcript.sqlite");
+        let text = b"transcript content".repeat(512);
+        let key = |id| key_for(Uuid::from_u128(id));
+        let put = |store: &Store, id| {
+            store
+                .commit(
+                    &[],
+                    &[Mutation::Put {
+                        key: key(id),
+                        value: text.clone(),
+                    }],
+                )
+                .unwrap();
+        };
+        let stored = |store: &Store, id| store.get(&key(id)).unwrap().unwrap();
+        let checkpoint = |store: &Store| -> Sweep {
+            serde_json::from_slice(&store.get(SWEEP).unwrap().unwrap().value).unwrap()
+        };
+        let store = Store::open(&path).unwrap();
+        put(&store, 2);
+        put(&store, 3);
+        let through = store.put_version().unwrap();
+        let before = stored(&store, 3);
+        let sequence = store.commit_for_version(&key(3), before.version).unwrap();
+        store.sweep_transcript_history(100, 20, 1).unwrap();
+        put(&store, 1);
+        store.sweep_transcript_history(99, 20, 1).unwrap();
+        store.sweep_transcript_history(119, 20, 1).unwrap();
+        assert_eq!(stored(&store, 2).value, text);
+        store.sweep_transcript_history(120, 20, 1).unwrap();
+        assert!(stored(&store, 2).value.starts_with(MAGIC));
+        let saved = checkpoint(&store).cursor.unwrap();
+        assert_eq!(saved.after, Some(Uuid::from_u128(2)));
+        assert_eq!(saved.through_version, through);
+        assert_eq!(stored(&store, 3), before);
+        assert_eq!(stored(&store, 1).value, text);
+        // The row may be packed before the page checkpoint is committed.
+        assert_eq!(
+            store
+                .pack_transcript_page(&saved, Some(0), 1)
+                .unwrap()
+                .packed,
+            1
+        );
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        store.sweep_transcript_history(121, 20, 1).unwrap();
+        assert_eq!(
+            checkpoint(&store).cursor.unwrap().after,
+            Some(Uuid::from_u128(3))
+        );
+        assert_eq!(
+            store.get_transcript_entry(&key(3), None).unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            store.commit_for_version(&key(3), before.version).unwrap(),
+            sequence
+        );
+        store.sweep_transcript_history(122, 20, 1).unwrap();
+        assert_eq!(checkpoint(&store).completed, through);
+        assert!(checkpoint(&store).cursor.is_none());
+        assert_eq!(stored(&store, 1).value, text);
+        store.sweep_transcript_history(140, 20, 1).unwrap();
+        assert!(stored(&store, 1).value.starts_with(MAGIC));
+    }
+
+    #[test]
     fn packing_page_advances_past_ineligible_keys_and_later_writes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("packing.sqlite")).unwrap();
@@ -281,12 +499,14 @@ mod tests {
         assert_eq!(logical, Entry { value, version });
         assert_eq!(store.commit_for_version(&key, version).unwrap(), commit);
         let connection = rusqlite::Connection::open(path).unwrap();
-        assert!(connection
-            .execute(
-                "UPDATE durable_store_entries SET value=X'00' WHERE key=?1",
-                [&key]
-            )
-            .is_err());
+        assert!(
+            connection
+                .execute(
+                    "UPDATE durable_store_entries SET value=X'00' WHERE key=?1",
+                    [&key]
+                )
+                .is_err()
+        );
     }
 
     #[test]

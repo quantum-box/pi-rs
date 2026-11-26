@@ -1,7 +1,7 @@
 //! Losslessly compact aged fork evidence without changing its logical version.
 use crate::{
-    transcript_packing::{unpack, HEADER, MAGIC, MAX_LIMIT},
     Check, Entry, Error, Expected, Mutation, Store,
+    transcript_packing::{HEADER, MAGIC, MAX_LIMIT, unpack},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -25,14 +25,6 @@ pub struct ForkSnapshotPackingPage {
     pub packed: usize,
     pub reclaimed_bytes: usize,
     pub next: Option<ForkSnapshotPackingCursor>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Window {
-    eligible: u64,
-    pending: u64,
-    observed_ms: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -105,50 +97,9 @@ impl Store {
         now_ms: u64,
         retain_ms: u64,
     ) -> Result<Option<ForkSnapshotPackingCursor>, Error> {
-        if retain_ms == 0 {
-            return Err(Error::InvalidSnapshot);
-        }
-        loop {
-            let previous = self.get_bounded(WINDOW, 256)?;
-            let boundary = self.put_version()?;
-            let mut window = if let Some(entry) = &previous {
-                let window: Window =
-                    serde_json::from_slice(&entry.value).map_err(|_| Error::InvalidSnapshot)?;
-                if window.eligible > window.pending || window.pending > boundary {
-                    return Err(Error::InvalidSnapshot);
-                }
-                if now_ms.saturating_sub(window.observed_ms) < retain_ms {
-                    return Ok(packing_cursor(window.eligible));
-                }
-                window
-            } else {
-                Window {
-                    eligible: 0,
-                    pending: 0,
-                    observed_ms: now_ms,
-                }
-            };
-            window.eligible = window.pending;
-            window.pending = boundary;
-            window.observed_ms = now_ms;
-            let value = serde_json::to_vec(&window).map_err(|_| Error::InvalidSnapshot)?;
-            match self.commit(
-                &[Check {
-                    key: WINDOW.to_vec(),
-                    expected: previous
-                        .as_ref()
-                        .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
-                }],
-                &[Mutation::Put {
-                    key: WINDOW.to_vec(),
-                    value,
-                }],
-            ) {
-                Ok(()) => return Ok(packing_cursor(window.eligible)),
-                Err(Error::Conflict { .. }) => continue,
-                Err(error) => return Err(error),
-            }
-        }
+        Ok(packing_cursor(
+            self.aged_packing_boundary(WINDOW, now_ms, retain_ms)?,
+        ))
     }
 
     /// Pack aged canonical fork snapshots in bounded pages. Payload bytes are
@@ -161,11 +112,10 @@ impl Store {
         let window = self
             .get_bounded(WINDOW, 256)?
             .ok_or(Error::InvalidSnapshot)?;
-        let window: Window =
-            serde_json::from_slice(&window.value).map_err(|_| Error::InvalidSnapshot)?;
+        let eligible = crate::transcript_packing::eligible_packing_boundary(&window.value)?;
         if !(1..=MAX_LIMIT).contains(&limit)
             || cursor.since_version >= cursor.through_version
-            || cursor.through_version > window.eligible
+            || cursor.through_version > eligible
             || cursor.through_version > self.put_version()?
             || cursor
                 .after

@@ -23311,6 +23311,7 @@ pub struct Scheduler {
     progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     published_progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     fork_snapshot_packing: Option<tokio::task::JoinHandle<Result<(), Error>>>,
+    transcript_packing: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
     worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
     summary_tasks: HashMap<Uuid, SummaryTask>,
@@ -24138,6 +24139,7 @@ impl Scheduler {
             progress_retention: None,
             published_progress_retention: None,
             fork_snapshot_packing: None,
+            transcript_packing: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -25891,6 +25893,44 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Losslessly pack transcript entries after the observed retention period.
+    /// Reattach after reopening to resume the persisted sweep.
+    pub fn start_transcript_packing(
+        &mut self,
+        retain_for: Duration,
+        interval: Duration,
+    ) -> Result<(), Error> {
+        let retain_ms = u64::try_from(retain_for.as_millis())
+            .ok()
+            .filter(|time| *time > 0)
+            .ok_or_else(|| Error::Invalid("invalid transcript retention".into()))?;
+        if interval.is_zero() || self.transcript_packing.is_some() {
+            return Err(Error::Invalid(
+                "transcript packing needs a nonzero interval and one worker".into(),
+            ));
+        }
+        let owner = self.harness.owner.clone();
+        let cancel = self.reporter_cancel.clone();
+        self.transcript_packing = Some(tokio::spawn(async move {
+            while !cancel.is_cancelled() {
+                let owner = owner.clone();
+                tokio::task::spawn_blocking(move || {
+                    owner
+                        .store()
+                        .sweep_transcript_history(unix_ms(), retain_ms, 4)
+                })
+                .await
+                .map_err(|error| Error::Invalid(format!("transcript packing worker: {error}")))??;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => (),
+                }
+            }
+            Ok(())
+        }));
+        Ok(())
+    }
+
     /// Most recent background reporter failure, if any. Reopen after storage errors.
     pub fn reporter_error(&self) -> Option<String> {
         self.reporter_error
@@ -26181,6 +26221,7 @@ impl Scheduler {
             self.progress_retention.take(),
             self.published_progress_retention.take(),
             self.fork_snapshot_packing.take(),
+            self.transcript_packing.take(),
         ]
         .into_iter()
         .flatten()
