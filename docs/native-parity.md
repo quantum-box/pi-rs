@@ -4204,9 +4204,11 @@ Legacy `custom` and `hookMessage` message records likewise retain their display
 metadata and enter model context without being rendered as user prompts.
 Imported message-form branch summaries use Pi's summary context framing while
 retaining their original RPC representation and branch reference.
-When checkout or a branch summary inherits an SDK-cycled selection, Workbench
-uses its recorded thinking level for branch selection and emits it as a
+When checkout or a branch summary inherits a valid SDK-cycled selection,
+Workbench restores its recorded thinking level and emits it as a
 `thinking_level_change` entry in RPC history and Pi-format JSONL exports.
+Missing or malformed bindings use the branch default on restore and emit
+`off` in RPC history and Pi-format exports.
 Message-form compaction summaries are displayed as summaries and framed for
 model context without performing another compaction or removing earlier entries.
 

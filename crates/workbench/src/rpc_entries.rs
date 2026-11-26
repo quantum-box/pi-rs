@@ -492,7 +492,10 @@ impl Cursor {
         live_metadata: Option<&Value>,
     ) -> Vec<Value> {
         let record_metadata = |id| metadata.and_then(|source| source.get(id));
-        let branch_thinking = |id| sdk_branch_thinking(record_metadata(id));
+        let branch_thinking = |id: u64| {
+            let record = records.get(id.checked_sub(1)? as usize)?;
+            record.sdk_model_binding_thinking(record_metadata(id)?)
+        };
         let mut entries = Vec::new();
         self.messages.record(record);
         let parent = record
@@ -1014,18 +1017,6 @@ fn with_identity(mut entry: Value, id: &str, parent: Option<String>, record: &Re
 
 fn wire_id(id: Option<u64>) -> Option<String> {
     id.map(|id| id.to_string())
-}
-
-pub(super) fn sdk_branch_thinking(metadata: Option<&Value>) -> Option<&str> {
-    let metadata = metadata?;
-    let binding = uuid::Uuid::parse_str(metadata.get("sdkCycleBinding")?.as_str()?).ok()?;
-    if binding.is_nil() {
-        return None;
-    }
-    metadata
-        .get("sdkCycleThinking")?
-        .as_str()
-        .filter(|thinking| !thinking.trim().is_empty())
 }
 
 fn selection<'a>(
@@ -1716,6 +1707,10 @@ mod tests {
     #[test]
     fn branch_fallback_projects_selection_and_summary() {
         use super::*;
+        use crate::session_import::{BranchSelection, branch_selection, read};
+
+        let directory = tempfile::tempdir().unwrap();
+        let pi_path = directory.path().join("pi.jsonl");
         for summary in [false, true] {
             let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
             session
@@ -1754,39 +1749,121 @@ mod tests {
             });
             let restored = Session::from_records(records).unwrap();
             assert_eq!(
-                super::super::session_import::branch_selection(&restored, |_, _| None),
-                super::super::session_import::BranchSelection::Selected {
+                branch_selection(&restored, |_, _| None),
+                BranchSelection::Selected {
                     provider: "new".into(),
                     model: "shared".into(),
                     thinking: None
                 }
             );
             let binding = uuid::Uuid::new_v4();
-            for malformed in [
-                json!({"sdkCycleThinking":"high"}),
-                json!({"sdkCycleBinding":"invalid","sdkCycleThinking":"high"}),
-                json!({"sdkCycleBinding":uuid::Uuid::nil(),"sdkCycleThinking":"high"}),
-                json!({"sdkCycleBinding":binding}),
-                json!({"sdkCycleBinding":binding,"sdkCycleThinking":42}),
-                json!({"sdkCycleBinding":binding,"sdkCycleThinking":" "}),
+            for (marker, thinking) in [
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":"high","sdkThinkingOnly":"true"}),
+                    None,
+                ),
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":"high","sdkThinkingOnly":false}),
+                    None,
+                ),
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":"high","sdkThinkingOnly":null}),
+                    None,
+                ),
+                (json!({"sdkCycleThinking":"high"}), None),
+                (
+                    json!({"sdkCycleBinding":"invalid","sdkCycleThinking":"high"}),
+                    None,
+                ),
+                (
+                    json!({"sdkCycleBinding":uuid::Uuid::nil(),"sdkCycleThinking":"high"}),
+                    None,
+                ),
+                (json!({"sdkCycleBinding":binding}), None),
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":42}),
+                    None,
+                ),
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":" "}),
+                    None,
+                ),
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":"high","sdkThinkingOnly":true}),
+                    Some("high"),
+                ),
             ] {
-                let malformed = Session::from_records_with_metadata(
+                let metadata = std::collections::BTreeMap::from([(3, marker.clone())]);
+                let session = Session::from_records_with_metadata(
                     restored.records().to_vec(),
-                    [(3, malformed)].into_iter().collect(),
+                    metadata.clone(),
                 )
                 .unwrap();
+                let projected_level = thinking.unwrap_or("off");
                 assert_eq!(
-                    super::super::session_import::branch_selection(&malformed, |_, _| None),
-                    super::super::session_import::BranchSelection::Selected {
+                    branch_selection(&session, |_, _| None),
+                    BranchSelection::Selected {
                         provider: "new".into(),
                         model: "shared".into(),
-                        thinking: None,
+                        thinking: thinking.map(str::to_owned),
+                    },
+                    "summary={summary}, metadata={marker}"
+                );
+                let entries = Entries::new(&session);
+                let projected =
+                    &entries.values[entries.values.len() - if summary { 3 } else { 2 }..];
+                assert_eq!(projected.last().unwrap()["thinkingLevel"], projected_level);
+                assert_eq!(changes(&session, 2).unwrap(), projected);
+                let mut cursor = Cursor::default();
+                assert_eq!(
+                    cursor.appended(session.records(), 2, Some(&marker), &metadata),
+                    projected
+                );
+                assert_eq!(session.model_selection().unwrap().1.as_deref(), thinking);
+
+                let bytes = entries
+                    .write_share_branch(&session, directory.path())
+                    .unwrap();
+                std::fs::write(&pi_path, bytes).unwrap();
+                let imported = read(&pi_path).unwrap();
+                assert_eq!(
+                    branch_selection(&imported, |_, _| None),
+                    BranchSelection::Selected {
+                        provider: "new".into(),
+                        model: "shared".into(),
+                        thinking: Some(projected_level.into()),
                     }
                 );
+
+                let mut records = session.records().to_vec();
+                records.push(Record {
+                    id: 4,
+                    parent: Some(3),
+                    version: records[2].version,
+                    run_id: None,
+                    timestamp: None,
+                    event: Event::ModelSelected {
+                        provider: Some("new".into()),
+                        model: "shared".into(),
+                        thinking: Some("high".into()),
+                    },
+                });
+                let repeated =
+                    Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+                let delta = changes(&repeated, 3).unwrap();
                 assert_eq!(
-                    Entries::new(&malformed).values.last().unwrap()["thinkingLevel"],
-                    "off"
+                    cursor.appended(repeated.records(), 3, None, &metadata),
+                    delta
                 );
+                if thinking.is_some() {
+                    assert!(delta.is_empty());
+                } else {
+                    let [entry] = delta.as_slice() else {
+                        panic!("expected one thinking change, got {delta:?}");
+                    };
+                    assert_eq!(entry["type"], "thinking_level_change");
+                    assert_eq!(entry["thinkingLevel"], "high");
+                }
             }
             let entries = Entries::new(&restored);
             let last = &entries.values[entries.values.len() - 1];

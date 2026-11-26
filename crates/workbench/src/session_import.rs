@@ -76,7 +76,9 @@ pub(super) fn branch_selection(
                 fallback_model: Some(_),
                 ..
             } => Some(
-                super::rpc_entries::sdk_branch_thinking(session.record_metadata(record.id))
+                session
+                    .record_metadata(record.id)
+                    .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
                     .map(str::to_owned),
             ),
             Event::SourceEntry { format, entry }

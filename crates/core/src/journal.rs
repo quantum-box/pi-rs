@@ -491,6 +491,15 @@ impl Record {
             .ok()
             .map(|timestamp| timestamp.timestamp_millis())
     }
+
+    /// The recorded thinking level of a valid SDK model binding.
+    #[doc(hidden)]
+    pub fn sdk_model_binding_thinking<'a>(
+        &'a self,
+        metadata: &'a serde_json::Value,
+    ) -> Option<&'a str> {
+        Session::parse_sdk_model_binding(self, metadata).map(|(_, _, _, thinking)| thinking)
+    }
 }
 
 /// Independent request binding retained even when auxiliary metadata is lost.
@@ -1982,11 +1991,16 @@ impl Session {
                     .any(|key| metadata.get(key).is_some())
             });
             if let Some(metadata) = metadata {
-                return Self::parse_sdk_model_binding(record, metadata)
-                    .map(Some)
-                    .ok_or_else(|| {
+                let (id, provider, model, thinking) =
+                    Self::parse_sdk_model_binding(record, metadata).ok_or_else(|| {
                         Error::Session(format!("invalid SDK cycle binding at record {}", record.id))
-                    });
+                    })?;
+                return Ok(Some(CycledModelSelection {
+                    id,
+                    provider: provider.to_owned(),
+                    model: model.to_owned(),
+                    thinking: thinking.to_owned(),
+                }));
             }
             if Self::is_model_selection(record) {
                 break;
@@ -1995,10 +2009,10 @@ impl Session {
         Ok(None)
     }
 
-    fn parse_sdk_model_binding(
-        record: &Record,
-        metadata: &serde_json::Value,
-    ) -> Option<CycledModelSelection> {
+    fn parse_sdk_model_binding<'a>(
+        record: &'a Record,
+        metadata: &'a serde_json::Value,
+    ) -> Option<(Uuid, &'a str, &'a str, &'a str)> {
         let id = Uuid::parse_str(metadata.get("sdkCycleBinding")?.as_str()?).ok()?;
         let thinking = metadata.get("sdkCycleThinking")?.as_str()?;
         if id.is_nil()
@@ -2027,12 +2041,7 @@ impl Session {
         if provider.trim().is_empty() || model.trim().is_empty() {
             return None;
         }
-        Some(CycledModelSelection {
-            id,
-            provider: provider.clone(),
-            model: model.clone(),
-            thinking: thinking.to_owned(),
-        })
+        Some((id, provider, model, thinking))
     }
 
     pub(crate) fn select_cycled_model(&mut self, selection: &CycledModelSelection) -> Result<()> {
@@ -2080,8 +2089,7 @@ impl Session {
                     Some(provider.clone()),
                     model.clone(),
                     self.record_metadata(record.id)
-                        .and_then(|marker| marker.get("sdkCycleThinking"))
-                        .and_then(serde_json::Value::as_str)
+                        .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
                         .map(str::to_owned),
                 )),
                 Event::BranchSummary {
@@ -2091,8 +2099,7 @@ impl Session {
                     Some(selection.provider.clone()),
                     selection.model.clone(),
                     self.record_metadata(record.id)
-                        .and_then(|marker| marker.get("sdkCycleThinking"))
-                        .and_then(serde_json::Value::as_str)
+                        .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
                         .map(str::to_owned),
                 )),
                 _ => None,
