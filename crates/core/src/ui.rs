@@ -261,6 +261,41 @@ pub struct UiThemeInfo {
     pub path: Option<std::path::PathBuf>,
 }
 
+/// A color as used by the native terminal renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiThemeColor {
+    Rgb { r: u8, g: u8, b: u8 },
+    Indexed { index: u8 },
+    Reset,
+}
+
+/// A resolved palette for a named terminal theme.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiThemePalette {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<std::path::PathBuf>,
+    pub colors: std::collections::BTreeMap<String, UiThemeColor>,
+    pub dim: std::collections::BTreeSet<String>,
+}
+
+/// A named frontend theme or a session-local resolved palette.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UiThemeSelection {
+    Name(String),
+    Palette(UiThemePalette),
+}
+
+/// The frontend's result after applying a theme selection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiThemeChange {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Configure the indicator shown while the interactive agent is working.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -431,6 +466,16 @@ pub enum UiRequest {
     GetEditorComponent,
     /// List the frontend's built-in and loaded file themes.
     GetAllThemes,
+    /// Look up an exact theme name without selecting the theme.
+    GetTheme {
+        name: String,
+    },
+    /// Read the palette used to render the terminal right now.
+    GetActiveTheme,
+    /// Select a theme. Named selections can persist, while palettes only affect the session.
+    SetTheme {
+        theme: UiThemeSelection,
+    },
     /// Read the terminal's current tool output expansion state.
     GetToolsExpanded,
     /// Change tool output expansion for the current terminal session.
@@ -456,6 +501,15 @@ impl UiRequest {
             > 1024 * 1024
         {
             return Err("extension UI request exceeds 1 MiB".into());
+        }
+        if let Self::SetTheme { theme } = self {
+            let name = match theme {
+                UiThemeSelection::Name(name) => name,
+                UiThemeSelection::Palette(palette) => &palette.name,
+            };
+            if name.trim().is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+                return Err("extension theme name must contain 1–256 non-control bytes".into());
+            }
         }
         if let Self::Select { options, .. } = self
             && (options.is_empty() || options.len() > 128)
@@ -552,6 +606,23 @@ impl UiRequest {
                 serde_json::to_vec(themes).is_ok_and(|value| value.len() <= 1024 * 1024)
             }
             (Self::GetEditorComponent, UiResponse::EditorComponent(component)) => component.valid(),
+            (Self::GetTheme { name }, UiResponse::Theme(theme)) => {
+                theme.name == *name
+                    && serde_json::to_vec(theme).is_ok_and(|value| value.len() <= 1024 * 1024)
+            }
+            (Self::GetActiveTheme, UiResponse::Theme(theme)) => {
+                serde_json::to_vec(theme).is_ok_and(|value| value.len() <= 1024 * 1024)
+            }
+            (Self::SetTheme { .. }, UiResponse::ThemeChanged(result)) => {
+                if result.success {
+                    result.error.is_none()
+                } else {
+                    result
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.len() <= 4096)
+                }
+            }
             (Self::Custom { actions, .. }, UiResponse::Text(value)) => {
                 actions.iter().any(|action| &action.value == value)
             }
@@ -573,6 +644,9 @@ impl UiRequest {
                 | Self::GetEditorText
                 | Self::GetEditorComponent
                 | Self::GetAllThemes
+                | Self::GetTheme { .. }
+                | Self::GetActiveTheme
+                | Self::SetTheme { .. }
                 | Self::GetToolsExpanded
         )
     }
@@ -584,6 +658,8 @@ pub enum UiResponse {
     Text(String),
     Confirmed(bool),
     Themes(Vec<UiThemeInfo>),
+    Theme(UiThemePalette),
+    ThemeChanged(UiThemeChange),
     EditorComponent(UiEditorComponent),
     Cancelled,
 }
@@ -595,6 +671,25 @@ pub trait ExtensionUi: Send + Sync {
         request: UiRequest,
         cancellation: CancellationToken,
     ) -> ExtensionResult<UiResponse>;
+}
+
+tokio::task_local! {
+    static UI_REQUESTER_CANCELLATION: CancellationToken;
+}
+
+/// Bind the transport lifetime while forwarding a UI request from an executable extension.
+#[doc(hidden)]
+pub async fn with_ui_requester_cancellation<F: std::future::Future>(
+    cancellation: CancellationToken,
+    request: F,
+) -> F::Output {
+    UI_REQUESTER_CANCELLATION.scope(cancellation, request).await
+}
+
+/// Capture the transport lifetime for any deferred UI mutation.
+#[doc(hidden)]
+pub fn ui_requester_cancellation() -> Option<CancellationToken> {
+    UI_REQUESTER_CANCELLATION.try_with(Clone::clone).ok()
 }
 
 #[cfg(test)]
@@ -635,6 +730,41 @@ mod tests {
         assert!(request.accepts_response(&response));
         assert!(!request.accepts_response(&UiResponse::Confirmed(true)));
         assert!(!UiRequest::GetEditorText.accepts_response(&response));
+    }
+
+    #[test]
+    fn named_theme_lookup_uses_a_palette_or_null() {
+        let wire = serde_json::json!({"method":"getTheme","name":"fixture"});
+        let request: UiRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        assert!(request.needs_response());
+
+        let wire = serde_json::json!({
+            "name":"fixture",
+            "path":"themes/fixture.json",
+            "colors":{
+                "accent":{"kind":"rgb","r":18,"g":52,"b":86},
+                "text":{"kind":"reset"},
+                "border":{"kind":"indexed","index":6}
+            },
+            "dim":["border"]
+        });
+        let response: UiResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&response).unwrap(), wire);
+        assert!(request.accepts_response(&response));
+        assert!(request.accepts_response(&UiResponse::Cancelled));
+        assert_eq!(
+            serde_json::to_value(UiResponse::Cancelled).unwrap(),
+            serde_json::Value::Null
+        );
+        assert!(!UiRequest::GetAllThemes.accepts_response(&response));
+        assert!(
+            !UiRequest::GetTheme {
+                name: "other".into()
+            }
+            .accepts_response(&response)
+        );
+        assert!(!request.accepts_response(&UiResponse::Themes(vec![])));
     }
 
     #[test]

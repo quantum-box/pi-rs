@@ -1281,6 +1281,67 @@ impl ExtensionWorkingStatus {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReasoningDropKind {
+    Anthropic,
+    OpenAi,
+}
+
+struct ReasoningDrop {
+    kind: ReasoningDropKind,
+    count: usize,
+    reasons: Vec<&'static str>,
+}
+
+impl ReasoningDrop {
+    fn from_diagnostic(diagnostic: &pi_rs::AssistantDiagnostic) -> Option<Self> {
+        use pi_rs::AssistantDiagnostic;
+
+        let mut reasons = Vec::new();
+        let mut remember = |reason| {
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        };
+        let (kind, count) = match diagnostic {
+            AssistantDiagnostic::AnthropicInputTransformations { details, .. } => {
+                details.thinking_drop_reasons().for_each(&mut remember);
+                (
+                    ReasoningDropKind::Anthropic,
+                    diagnostic.dropped_thinking_blocks(),
+                )
+            }
+            AssistantDiagnostic::OpenAiInputTransformations { details, .. } => {
+                details.reasons().for_each(&mut remember);
+                (ReasoningDropKind::OpenAi, details.removed_reasoning_items())
+            }
+            AssistantDiagnostic::AnthropicThreadFallback { .. } => return None,
+        };
+        (count > 0).then_some(Self {
+            kind,
+            count,
+            reasons,
+        })
+    }
+
+    fn notice(&self) -> String {
+        let (provider, noun) = match self.kind {
+            ReasoningDropKind::Anthropic => ("Anthropic", "thinking block"),
+            ReasoningDropKind::OpenAi => ("OpenAI", "reasoning item"),
+        };
+        let plural = if self.count == 1 { "" } else { "s" };
+        let reasons = if self.reasons.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", self.reasons.join(", "))
+        };
+        format!(
+            "{provider} dropped {} {noun}{plural}{reasons} (details in session)",
+            self.count
+        )
+    }
+}
+
 #[derive(Default)]
 struct View {
     live_model_choices: VecDeque<LiveModelChoice>,
@@ -1319,6 +1380,7 @@ struct View {
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
     theme_refresh_requested: bool,
+    terminal_closed: bool,
     thinking_settings: Option<ThinkingSettings>,
     toggle_settings_parent: Option<Picker>,
     anthropic_subscription_warning_shown: bool,
@@ -1363,8 +1425,9 @@ struct View {
     flash: Option<(String, Instant)>,
     tokens: u64,
     cache_stats: super::cache_stats::Tracker,
-    pending_thinking_drop: Option<(uuid::Uuid, usize)>,
-    previous_thinking_drop: usize,
+    pending_reasoning_drop: Option<(uuid::Uuid, ReasoningDrop)>,
+    pending_aborted_turn_partial: Option<(u64, uuid::Uuid)>,
+    previous_reasoning_drop: Option<(ReasoningDropKind, usize)>,
     cache_warming_status: Option<super::cache_warming::status::State>,
     model_operations: std::collections::HashSet<String>,
     history: Vec<String>,
@@ -1481,6 +1544,97 @@ impl View {
     fn cancel_extension_dialog(&mut self, id: &Value) {
         self.dialogs.retain(|dialog| json!(dialog.id) != *id);
     }
+    fn apply_extension_theme(
+        &mut self,
+        selection: super::extension_ui::PreparedTheme,
+        args: &mut Cli,
+        theme: &mut Theme,
+    ) -> pi_rs::UiResponse {
+        use super::extension_ui::PreparedTheme;
+        let result = match selection {
+            PreparedTheme::System => {
+                save_extension_theme_name(args, "system".into()).map(|()| Theme::system())
+            }
+            PreparedTheme::Named { palette, path } => {
+                save_extension_theme_name(args, palette.name.clone())
+                    .map(|()| Theme::from_named_palette(palette, path.map(PathBuf::from)))
+            }
+            PreparedTheme::Palette { palette } => Theme::from_extension_palette(palette),
+            PreparedTheme::Unavailable { error } => {
+                // Pi falls back to the system palette on a named load failure.
+                self.replace_extension_theme(theme, Theme::system());
+                Err(Error::Config(error))
+            }
+        };
+        pi_rs::UiResponse::ThemeChanged(match result {
+            Ok(next) => {
+                self.replace_extension_theme(theme, next);
+                pi_rs::UiThemeChange {
+                    success: true,
+                    error: None,
+                }
+            }
+            Err(error) => pi_rs::UiThemeChange {
+                success: false,
+                error: Some(error.to_string()),
+            },
+        })
+    }
+
+    fn replace_extension_theme(&mut self, theme: &mut Theme, next: Theme) {
+        *theme = next;
+        self.theme_refresh_requested = true;
+        self.regular.redraw = true;
+    }
+
+    fn theme_worker_event(
+        &mut self,
+        active: &mut Worker,
+        value: &Value,
+        args: &mut Cli,
+        theme: &mut Theme,
+    ) -> Result<bool> {
+        let id = || serde_json::from_value::<uuid::Uuid>(value["id"].clone());
+        let (id, response) = match value["type"].as_str() {
+            Some("extension_ui_theme_claim") => {
+                let id = id()?;
+                if !active.pending_theme_requests.remove(&id) || value["theme"].is_null() {
+                    return Ok(true);
+                }
+                let response = if self.terminal_closed {
+                    super::extension_ui::theme_unavailable()
+                } else {
+                    let selection = serde_json::from_value(value["theme"].clone())?;
+                    self.apply_extension_theme(selection, args, theme)
+                };
+                (id, response)
+            }
+            Some("extension_ui_request") => match value["method"].as_str() {
+                Some("setTheme") => {
+                    let id = id()?;
+                    active.pending_theme_requests.insert(id);
+                    active.send(json!({"type":"extension_ui_theme_claim","id":id}))?;
+                    return Ok(true);
+                }
+                Some("getActiveTheme") => (
+                    id()?,
+                    pi_rs::UiResponse::Theme(theme.clone().extension_palette()),
+                ),
+                Some("getTheme") if value["name"] == "system" => (
+                    id()?,
+                    pi_rs::UiResponse::Theme(Theme::system().extension_palette()),
+                ),
+                _ => return Ok(false),
+            },
+            Some("extension_ui_cancelled") => {
+                return Ok(id().is_ok_and(|id| active.pending_theme_requests.remove(&id)));
+            }
+            _ => return Ok(false),
+        };
+        active.send(json!({"type":"extension_ui_response","id":id,"value":response}))?;
+        Ok(true)
+    }
+
     fn ui_request(&mut self, value: &Value) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
         let id: uuid::Uuid = serde_json::from_value(value["id"].clone())?;
         let request: pi_rs::UiRequest = serde_json::from_value(value.clone())?;
@@ -1566,6 +1720,13 @@ impl View {
                         pi_rs::UiResponse::EditorComponent(editor.component.clone())
                     });
                 return Ok(Some((id, response)));
+            }
+            pi_rs::UiRequest::GetTheme { .. }
+            | pi_rs::UiRequest::GetActiveTheme
+            | pi_rs::UiRequest::SetTheme { .. } => {
+                return Err(Error::Config(
+                    "theme selection requires the terminal controller".into(),
+                ));
             }
             pi_rs::UiRequest::GetEditorText => {
                 return Ok(Some((
@@ -2731,29 +2892,49 @@ impl View {
         }
     }
 
-    fn observe_thinking_drop(&mut self, event: &pi_rs::Event) -> Option<usize> {
-        match event {
+    fn observe_reasoning_drop(&mut self, record: &pi_rs::Record) -> Option<ReasoningDrop> {
+        let pending_aborted = self.pending_aborted_turn_partial.take();
+        self.pending_aborted_turn_partial =
+            pi_rs::aborted_turn_partial_request(&record.event).map(|id| (record.id, id));
+        match &record.event {
+            pi_rs::Event::ModelFinished {
+                request_id,
+                failure: Some(pi_rs::ModelFailure::Cancelled),
+                partial,
+                ..
+            } if !partial.is_empty()
+                && pending_aborted.is_some_and(|(marker_id, pending_id)| {
+                    record.parent == Some(marker_id) && *request_id == pending_id
+                }) =>
+            {
+                self.pending_reasoning_drop = None;
+                self.previous_reasoning_drop = None;
+            }
             pi_rs::Event::ModelFinished {
                 request_id,
                 metadata,
                 failure: None,
                 ..
             } => {
-                let count = metadata
+                self.pending_reasoning_drop = metadata
                     .diagnostics
                     .iter()
-                    .map(pi_rs::AssistantDiagnostic::dropped_thinking_blocks)
-                    .sum();
-                self.pending_thinking_drop = Some((*request_id, count));
+                    .find_map(ReasoningDrop::from_diagnostic)
+                    .map(|drop| (*request_id, drop));
             }
             pi_rs::Event::Assistant { request_id, .. } => {
-                let count = self
-                    .pending_thinking_drop
+                let drop = self
+                    .pending_reasoning_drop
                     .take()
                     .filter(|(id, _)| Some(id) == request_id.as_ref())
-                    .map_or(0, |(_, count)| count);
-                let previous = std::mem::replace(&mut self.previous_thinking_drop, count);
-                return (count > previous).then_some(count);
+                    .map(|(_, drop)| drop);
+                let previous = std::mem::replace(
+                    &mut self.previous_reasoning_drop,
+                    drop.as_ref().map(|drop| (drop.kind, drop.count)),
+                );
+                return drop.filter(|drop| {
+                    !previous.is_some_and(|(kind, count)| kind == drop.kind && count >= drop.count)
+                });
             }
             _ => {}
         }
@@ -3101,7 +3282,7 @@ impl View {
         }
         self.receive(&value);
         if value["type"] == "record"
-            && matches!(
+            && (matches!(
                 value["record"]["event"]["type"].as_str(),
                 Some(
                     "model_selected"
@@ -3115,7 +3296,7 @@ impl View {
                         | "custom_message_delivered"
                         | "custom_entry"
                 )
-            )
+            ) || value["record"]["event"]["format"] == "pi-rs:aborted-turn-partial")
             && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
         {
             if let pi_rs::Event::CustomMessage { message }
@@ -3132,17 +3313,12 @@ impl View {
             self.add_summary(&record, None);
             self.show_summary_billing(&record, &[]);
             self.observe_cache(&record, args);
-            if let Some(count) = self.observe_thinking_drop(&record.event)
+            if let Some(drop) = self.observe_reasoning_drop(&record)
                 && args.settings.notices().shows(NoticeKind::ReasoningDrops)
             {
-                let noun = if count == 1 {
-                    "thinking block"
-                } else {
-                    "thinking blocks"
-                };
                 self.lines.push(Entry::TranscriptNotice {
                     kind: NoticeKind::ReasoningDrops,
-                    text: format!("Anthropic dropped {count} {noun} (details in session)"),
+                    text: drop.notice(),
                 });
             }
         }
@@ -3217,8 +3393,9 @@ impl View {
         self.history_index = None;
         self.tokens = 0;
         self.cache_stats = super::cache_stats::Tracker::default();
-        self.pending_thinking_drop = None;
-        self.previous_thinking_drop = 0;
+        self.pending_reasoning_drop = None;
+        self.pending_aborted_turn_partial = None;
+        self.previous_reasoning_drop = None;
         self.cache_warming_status = None;
         self.model_operations.clear();
         let records = session.records();
@@ -3400,7 +3577,7 @@ impl View {
             self.add_summary(record, Some(session));
             self.show_summary_billing(record, records);
             self.observe_cache(record, args);
-            self.observe_thinking_drop(&record.event);
+            self.observe_reasoning_drop(record);
         }
         if show_startup_header(args) {
             self.append(if crate::ui::keys::windows_keybindings() {
@@ -5750,6 +5927,45 @@ fn load_resolved_theme(
     Err(error)
 }
 
+fn save_extension_theme_name(args: &mut Cli, name: String) -> Result<()> {
+    if args.settings.string("theme") != Some(name.as_str()) {
+        args.settings.set_user("theme", json!(name))?;
+    }
+    args.extension_theme = Some(name);
+    Ok(())
+}
+
+fn notify_extension_selection(
+    worker: &mut Option<Worker>,
+    args: &mut Cli,
+    view: &mut View,
+    theme: &mut Theme,
+    event: &pi_rs::LifecycleEvent,
+) -> Result<bool> {
+    let mut handled = false;
+    if let Some((active, id)) = Worker::begin_selection(worker, args, event)? {
+        active.wait_selection(id, None, |active, value| {
+            let is_theme_event = view.theme_worker_event(active, value, args, theme)?;
+            handled |= is_theme_event;
+            Ok(is_theme_event)
+        })?;
+    }
+    Ok(handled)
+}
+
+fn reset_extension_theme_for_rebind(args: &Cli, view: &mut View, theme: &mut Theme) {
+    if theme.is_extension_instance() {
+        let next = load_resolved_theme(
+            args.theme_setting().unwrap_or("system"),
+            &args.theme_paths,
+            &args.workspace,
+            args.trusted,
+        )
+        .unwrap_or_else(|_| Theme::system());
+        view.replace_extension_theme(theme, next);
+    }
+}
+
 #[cfg(any(unix, windows))]
 fn follows_terminal_appearance(selection: Option<&str>) -> bool {
     let selection = selection.unwrap_or("system");
@@ -5760,7 +5976,7 @@ fn follows_terminal_appearance(selection: Option<&str>) -> bool {
 fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
     // A reported background remains authoritative until a newer color reply arrives.
     let changed = crate::ui::theme::set_appearance(dark);
-    let redraw_system = changed && theme.name == "system";
+    let redraw_system = changed && theme.uses_terminal_colors();
     if redraw_system {
         *theme = Theme::system();
     }
@@ -5781,12 +5997,12 @@ fn handle_terminal_appearance(
         crate::ui::theme::clear_terminal_palette();
     }
     let (changed, redraw) = apply_terminal_appearance(theme, dark);
-    if invalidate && theme.name == "system" && !redraw {
+    if invalidate && theme.uses_terminal_colors() && !redraw {
         *theme = Theme::system();
     }
     Ok((
         changed || invalidate,
-        redraw || (invalidate && theme.name == "system"),
+        redraw || (invalidate && theme.uses_terminal_colors()),
     ))
 }
 
@@ -5812,7 +6028,7 @@ fn apply_terminal_color_snapshot(
         }
         colors_reported = true;
     }
-    let redraw_system = colors_reported && theme.name == "system";
+    let redraw_system = colors_reported && theme.uses_terminal_colors();
     if redraw_system {
         *theme = Theme::system();
     }
@@ -5821,6 +6037,9 @@ fn apply_terminal_color_snapshot(
 
 #[cfg(any(unix, windows))]
 fn refresh_terminal_theme_selection(args: &Cli, view: &mut View, theme: &mut Theme) {
+    if theme.is_extension_instance() {
+        return;
+    }
     let selection = args.theme_setting().unwrap_or("system");
     if let (Some(settings), Some(picker)) = (&view.theme_settings, &view.picker) {
         if let Ok(next) = settings.preview(picker, args) {
@@ -5836,7 +6055,7 @@ fn refresh_terminal_theme_selection(args: &Cli, view: &mut View, theme: &mut The
 
 #[cfg(any(unix, windows))]
 fn finish_initial_terminal_colors(theme: &mut Theme) -> bool {
-    if crate::ui::theme::finish_terminal_colors_pending() && theme.name == "system" {
+    if crate::ui::theme::finish_terminal_colors_pending() && theme.uses_terminal_colors() {
         *theme = Theme::system();
         true
     } else {
@@ -6225,10 +6444,18 @@ pub(super) async fn run(
             view.append(&error.to_string());
             dirty = true;
         }
-        if let Some(reason) = args.session_transition.take()
-            && let Err(error) = Worker::transition(&mut worker, &args, reason)
-        {
-            view.append(&error.to_string());
+        if let Some(reason) = args.session_transition.take() {
+            if matches!(
+                reason,
+                pi_rs::SessionStartReason::New
+                    | pi_rs::SessionStartReason::Resume
+                    | pi_rs::SessionStartReason::Fork
+            ) {
+                reset_extension_theme_for_rebind(&args, &mut view, &mut theme);
+            }
+            if let Err(error) = Worker::transition(&mut worker, &args, reason) {
+                view.append(&error.to_string());
+            }
             dirty = true;
         }
         if worker
@@ -6277,9 +6504,18 @@ pub(super) async fn run(
         }
         if !is_busy(&worker) {
             for event in std::mem::take(&mut args.selection_events) {
-                if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
-                    view.append(&format!("Extension selection notification: {error}"));
-                    dirty = true;
+                match notify_extension_selection(
+                    &mut worker,
+                    &mut args,
+                    &mut view,
+                    &mut theme,
+                    &event,
+                ) {
+                    Ok(handled) => dirty |= handled,
+                    Err(error) => {
+                        view.append(&format!("Extension selection notification: {error}"));
+                        dirty = true;
+                    }
                 }
             }
         }
@@ -6490,6 +6726,10 @@ pub(super) async fn run(
                     }
                     continue;
                 }
+                if view.theme_worker_event(active, &value, &mut args, &mut theme)? {
+                    dirty = true;
+                    continue;
+                }
                 if value["type"] == "extension_ui_request" {
                     let was_expanded = view.expand_tools;
                     match view.ui_request(&value) {
@@ -6579,7 +6819,10 @@ pub(super) async fn run(
                 }
                 let resources_changed = value["type"] == "resources_discovered";
                 view.receive_worker(value, &mut args);
-                if resources_changed && let Some(name) = args.theme_setting() {
+                if resources_changed
+                    && !theme.is_extension_instance()
+                    && let Some(name) = args.theme_setting()
+                {
                     match load_resolved_theme(
                         name,
                         &args.theme_paths,
@@ -8111,6 +8354,7 @@ pub(super) async fn run(
                             ) {
                                 Ok(next) => {
                                     args.settings.set_user("theme", json!(name.trim()))?;
+                                    args.extension_theme = None;
                                     args.use_theme = Some(name.trim().into());
                                     theme = next;
                                     view.theme_refresh_requested = true;
@@ -8184,6 +8428,7 @@ pub(super) async fn run(
                             view.clear_extension_chrome();
                             args.settings =
                                 args.settings.reload_latest(&args.workspace, args.trusted)?;
+                            args.extension_theme = None;
                             for warning in args.settings.diagnostics() {
                                 view.append(warning);
                             }
@@ -8223,7 +8468,12 @@ pub(super) async fn run(
                                 args.trusted,
                             ) {
                                 Ok(next) => theme = next,
-                                Err(error) => view.append(&error.to_string()),
+                                Err(error) => {
+                                    if theme.is_extension_instance() {
+                                        view.replace_extension_theme(&mut theme, Theme::system());
+                                    }
+                                    view.append(&error.to_string());
+                                }
                             }
                             view.theme_refresh_requested = true;
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
@@ -8322,6 +8572,7 @@ pub(super) async fn run(
         Ok(())
     };
     drop(_terminal.take());
+    view.terminal_closed = true;
     finish?;
     if is_busy(&worker) {
         drop(worker.take());
@@ -8337,7 +8588,9 @@ pub(super) async fn run(
         }
     }
     for event in std::mem::take(&mut args.selection_events) {
-        if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
+        if let Err(error) =
+            notify_extension_selection(&mut worker, &mut args, &mut view, &mut theme, &event)
+        {
             eprintln!("Extension selection notification: {error}");
         }
     }
@@ -10420,6 +10673,7 @@ fn select(
                     args.trusted,
                 )?;
                 args.settings.set_user(&key, value.clone())?;
+                args.extension_theme = None;
                 args.use_theme = value.as_str().map(str::to_owned);
                 *theme = next;
                 view.theme_refresh_requested = true;
@@ -10468,6 +10722,7 @@ fn select(
             let next =
                 load_resolved_theme(&name, &args.theme_paths, &args.workspace, args.trusted)?;
             args.settings.set_user("theme", json!(name))?;
+            args.extension_theme = None;
             args.use_theme = Some(name);
             *theme = next;
             view.theme_refresh_requested = true;
@@ -11701,6 +11956,245 @@ mod tests {
             }
         }
         assert_eq!(view.cache_stats.missed_tokens, 25_000);
+    }
+
+    #[test]
+    fn cancelled_turn_partial_resets_reasoning_drop_baseline_live_and_on_restore() {
+        use super::*;
+        use clap::Parser;
+        use pi_rs::{AssistantDiagnostic, Event, ModelFailure, ModelMetadata, UsageReport};
+
+        let mut args = Cli::parse_from(["pi", "--offline"]);
+        let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        initial
+            .append_user_with_images("question".into(), vec![], None)
+            .unwrap();
+        let answered = uuid::Uuid::new_v4();
+        let aborted = uuid::Uuid::new_v4();
+        let request = |id| Event::ModelRequested {
+            model: "fixture".into(),
+            messages: 1,
+            tools: 0,
+            max_output_tokens: 64,
+            request_id: Some(id),
+            context_head: None,
+            context_sha256: None,
+            context_transformed: None,
+            context_configuration_sha256: None,
+            tool_decision: None,
+        };
+        let diagnostics = AssistantDiagnostic::from_pi_diagnostics(&json!([{
+            "type":"openai_input_transformations",
+            "timestamp":17,
+            "details":{"transformations":[{
+                "type":"reasoning","id":"rs_prefix","action":"removed","reason":"prefix_mismatch"
+            }]}
+        }]));
+        let events = [
+            request(answered),
+            Event::ModelFinished {
+                request_id: answered,
+                metadata: ModelMetadata {
+                    diagnostics,
+                    ..Default::default()
+                },
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            },
+            Event::Assistant {
+                request_id: Some(answered),
+                content: "answer".into(),
+                invocations: vec![],
+                usage: None,
+            },
+            request(aborted),
+            Event::SourceEntry {
+                format: "pi-rs:aborted-turn-partial".into(),
+                entry: json!({"requestId":aborted}),
+            },
+            Event::ModelFinished {
+                request_id: aborted,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Cancelled),
+                partial: "partial answer".into(),
+                reply: None,
+            },
+        ];
+        let mut records = initial.records().to_vec();
+        let mut live = View::default();
+        for event in events {
+            let parent = records.last().unwrap();
+            let record = pi_rs::Record {
+                version: parent.version,
+                id: parent.id + 1,
+                parent: Some(parent.id),
+                event,
+                timestamp: None,
+                run_id: None,
+            };
+            live.receive_worker(json!({"type":"record","record":record}), &mut args);
+            records.push(record);
+        }
+        assert!(live.previous_reasoning_drop.is_none());
+
+        let complete = Session::from_records(records.clone()).unwrap();
+        let mut reopened = View::default();
+        reopened.restore_session(&args, &complete).unwrap();
+        assert!(reopened.previous_reasoning_drop.is_none());
+
+        // Cancelling without a displayable partial leaves the preceding reply as the baseline.
+        let Event::ModelFinished { partial, .. } = &mut records.last_mut().unwrap().event else {
+            unreachable!("last record is the cancelled completion");
+        };
+        partial.clear();
+        reopened
+            .restore_session(&args, &Session::from_records(records).unwrap())
+            .unwrap();
+        assert!(matches!(
+            reopened.previous_reasoning_drop,
+            Some((ReasoningDropKind::OpenAi, 1))
+        ));
+    }
+
+    #[test]
+    fn openai_reasoning_drop_notices_follow_the_previous_assistant_type() {
+        use super::*;
+        use clap::Parser;
+        use pi_rs::{AssistantDiagnostic, ModelMetadata, UsageReport};
+
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.json");
+        let mut args = Cli::parse_from(["pi", "--offline"]);
+        let set_enabled = |args: &mut Cli, enabled| {
+            std::fs::write(
+                &settings,
+                json!({"notices":{"reasoningDrops":enabled}}).to_string(),
+            )
+            .unwrap();
+            args.settings =
+                crate::config::Settings::load_from_paths(directory.path(), false, &settings)
+                    .unwrap();
+        };
+        let prefix = json!({"type":"reasoning","id":"rs_prefix","action":"removed","reason":"prefix_mismatch"});
+        let organization = json!({"type":"reasoning","id":"rs_org","action":"removed","reason":"organization_mismatch"});
+        let openai = |transformations: Value| json!([{"type":"openai_input_transformations","timestamp":17,"details":{"transformations":transformations}}]);
+        let mut next_record = 10;
+        let mut receive = |view: &mut View, args: &mut Cli, diagnostics: Value| {
+            let request_id = uuid::Uuid::new_v4();
+            let events = [
+                pi_rs::Event::ModelFinished {
+                    request_id,
+                    metadata: ModelMetadata {
+                        diagnostics: AssistantDiagnostic::from_pi_diagnostics(&diagnostics),
+                        ..Default::default()
+                    },
+                    usage: UsageReport::Unconfirmed,
+                    failure: None,
+                    partial: String::new(),
+                    reply: None,
+                },
+                pi_rs::Event::Assistant {
+                    request_id: Some(request_id),
+                    content: "answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                },
+            ];
+            for event in events {
+                let record = pi_rs::Record {
+                    version: 2,
+                    id: next_record,
+                    parent: Some(next_record - 1),
+                    event,
+                    timestamp: None,
+                    run_id: None,
+                };
+                next_record += 1;
+                view.receive_worker(json!({"type":"record","record":record}), args);
+            }
+        };
+        let notices = |view: &View| {
+            view.lines
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::TranscriptNotice {
+                        kind: NoticeKind::ReasoningDrops,
+                        text,
+                    } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let single = "OpenAI dropped 1 reasoning item: prefix_mismatch (details in session)";
+        let multiple = "OpenAI dropped 3 reasoning items: prefix_mismatch, organization_mismatch (details in session)";
+        let mut view = View::default();
+        set_enabled(&mut args, false);
+        receive(&mut view, &mut args, openai(json!([prefix])));
+        assert!(notices(&view).is_empty());
+        set_enabled(&mut args, true);
+        receive(&mut view, &mut args, openai(json!([prefix])));
+        assert!(notices(&view).is_empty());
+        receive(
+            &mut view,
+            &mut args,
+            json!([{
+                "type":"anthropic_input_transformations", "timestamp":18,
+                "details":{"transformations":vec![json!({"type":"thinking_dropped","reason":"prefix_binding_mismatch"});4]}
+            }]),
+        );
+        receive(&mut view, &mut args, openai(json!([prefix])));
+        receive(
+            &mut view,
+            &mut args,
+            openai(json!([prefix, organization, prefix])),
+        );
+        receive(&mut view, &mut args, openai(json!([prefix, organization])));
+        receive(&mut view, &mut args, openai(json!([prefix, organization])));
+        receive(&mut view, &mut args, json!([]));
+        receive(&mut view, &mut args, openai(json!([prefix])));
+        assert_eq!(
+            notices(&view),
+            [
+                "Anthropic dropped 4 thinking blocks: prefix_binding_mismatch (details in session)",
+                single,
+                multiple,
+                single,
+            ]
+        );
+
+        let diagnostics = openai(json!([prefix, organization]));
+        let pi_path = directory.path().join("pi.jsonl");
+        std::fs::write(&pi_path, format!("{}\n{}\n", json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{
+                "role":"assistant","provider":"openai","api":"openai-responses","model":"gpt-6.2-sol",
+                "content":[{"type":"text","text":"answer"}],"diagnostics":diagnostics
+            }}))).unwrap();
+        let imported = crate::session_import::read(&pi_path).unwrap();
+        let native_path = directory.path().join("native.jsonl");
+        imported.export_jsonl(&native_path).unwrap();
+        let reopened = Session::open(&native_path).unwrap();
+        let context = reopened.model_conversation_at(reopened.head()).unwrap();
+        assert!(!json!(context).to_string().contains("rs_prefix"));
+        let share = crate::rpc_entries::Entries::new(&reopened)
+            .write_share_branch(&reopened, directory.path())
+            .unwrap();
+        std::fs::write(&pi_path, share).unwrap();
+        let reimported = crate::session_import::read(&pi_path).unwrap();
+        let (messages, _) = crate::rpc_messages::snapshot(&reimported);
+        assert_eq!(messages[0]["diagnostics"], diagnostics);
+        view.restore_session(&args, &reopened).unwrap();
+        assert!(notices(&view).is_empty());
+        receive(&mut view, &mut args, openai(json!([prefix, organization])));
+        assert!(notices(&view).is_empty());
+        receive(
+            &mut view,
+            &mut args,
+            openai(json!([prefix, organization, prefix])),
+        );
+        assert_eq!(notices(&view), [multiple]);
     }
 
     #[test]
@@ -16213,7 +16707,7 @@ exit {exit}
     }
 
     #[test]
-    fn resolved_theme_selection_and_extension_catalog_skip_the_same_oversized_duplicate() {
+    fn theme_selection_catalog_and_palette_skip_the_same_oversized_duplicate() {
         use super::*;
 
         let directory = tempfile::tempdir().unwrap();
@@ -16227,10 +16721,18 @@ exit {exit}
 
         let paths = [large, valid.clone()];
         let selected = load_resolved_theme("custom", &paths, directory.path(), false).unwrap();
-        let catalog = pi_rs_workbench::theme_resources::extension_theme_catalog(&paths).unwrap();
-        let listed = catalog.iter().find(|theme| theme.name == "custom").unwrap();
+        let snapshot = pi_rs_workbench::theme_resources::extension_theme_snapshot(&paths).unwrap();
+        let listed = snapshot
+            .catalog()
+            .iter()
+            .find(|theme| theme.name == "custom")
+            .unwrap();
         assert_eq!(selected.path, Some(valid));
         assert_eq!(listed.path, selected.path);
+        assert_eq!(
+            snapshot.palette("custom"),
+            Some(&selected.extension_palette())
+        );
     }
 
     #[test]
@@ -16284,6 +16786,141 @@ exit {exit}
         view.receive(&serde_json::json!({"type":"tool_call_delta","toolCallDelta":{"index":0,"name":"read","arguments":"{\"path\":\"x"}}));
         view.settle();
         assert!(view.streaming_tools.is_empty());
+    }
+
+    #[test]
+    fn extension_theme_instance_is_local_and_ignores_provenance_path() {
+        use super::*;
+        use crate::extension_ui::PreparedTheme;
+        use clap::Parser;
+        use crossterm::style::Color;
+        let mut args = Cli::parse_from(["pi", "--use-theme", "light"]);
+        let mut view = View::default();
+        let mut theme = Theme::system();
+        let palette = serde_json::from_value(json!({
+            "name":"system", "path":"relative.json", "colors":{
+                "accent":{"kind":"rgb","r":1,"g":2,"b":3}
+            }, "dim":["accent"]
+        }))
+        .unwrap();
+        assert_eq!(
+            view.apply_extension_theme(PreparedTheme::Palette { palette }, &mut args, &mut theme),
+            pi_rs::UiResponse::ThemeChanged(pi_rs::UiThemeChange {
+                success: true,
+                error: None,
+            })
+        );
+        assert_eq!(theme.color("accent"), Color::Rgb { r: 1, g: 2, b: 3 });
+        assert!(theme.is_dim("accent"));
+        assert!(theme.path.is_none());
+        assert!(!theme.uses_terminal_colors());
+        assert!(view.regular.redraw);
+        assert_eq!(args.theme_setting(), Some("light"));
+
+        let bad = serde_json::from_value(json!({"name":"invalid","colors":{},"dim":[]})).unwrap();
+        assert!(matches!(
+            view.apply_extension_theme(
+                PreparedTheme::Palette { palette: bad },
+                &mut args,
+                &mut theme
+            ),
+            pi_rs::UiResponse::ThemeChanged(pi_rs::UiThemeChange {
+                success: false,
+                error: Some(_),
+            })
+        ));
+        assert_eq!(theme.color("accent"), Color::Rgb { r: 1, g: 2, b: 3 });
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn extension_theme_instance_survives_ambient_picker_refresh() {
+        use super::*;
+        use clap::Parser;
+
+        let args = Cli::parse_from(["pi", "--use-theme", "light/dark"]);
+        let mut theme = Theme::from_extension_palette(Theme::system().extension_palette()).unwrap();
+        let expected = theme.clone().extension_palette();
+        let mut settings = ThemeSettings::new(Picker::new("Settings", vec![]), &args, &theme);
+        settings.stage = ThemeSettingsStage::Single;
+        let mut picker = settings.picker(&args);
+        picker.paste("light");
+        assert_eq!(settings.preview(&picker, &args).unwrap().name, "light");
+        let mut view = View {
+            picker: Some(picker),
+            theme_settings: Some(settings),
+            ..View::default()
+        };
+
+        refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+        assert!(theme.is_extension_instance());
+        assert_eq!(theme.clone().extension_palette(), expected);
+        view.picker = None;
+        view.theme_settings = None;
+        refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+        assert!(theme.is_extension_instance());
+        assert_eq!(theme.extension_palette(), expected);
+    }
+
+    #[test]
+    fn resolved_theme_load_does_not_expand_replaced_directories() {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = dir.path().join("replaced.json");
+        std::fs::create_dir(&resolved).unwrap();
+        let mut file: Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        file["name"] = json!("unlisted");
+        std::fs::write(resolved.join("unlisted.json"), file.to_string()).unwrap();
+        let paths = [resolved];
+        assert!(load_resolved_theme("unlisted", &paths, dir.path(), false).is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn extension_system_palette_follows_terminal_reports() {
+        use crate::ui::theme::{
+            Theme, begin_terminal_palette_query, finish_terminal_colors_pending,
+            mark_terminal_colors_pending, reset_terminal_background, set_terminal_color,
+            set_terminal_palette,
+        };
+        use pi_rs::UiThemeColor;
+
+        const CHILD: &str = "PI_RS_EXTENSION_SYSTEM_PALETTE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::extension_system_palette_follows_terminal_reports",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        reset_terminal_background();
+        mark_terminal_colors_pending();
+        let pending = Theme::system().extension_palette();
+        assert!(pending.path.is_none());
+        assert_eq!(pending.colors["accent"], UiThemeColor::Reset);
+        assert!(pending.dim.contains("muted"));
+
+        set_terminal_color(false, 0, 0, 0);
+        set_terminal_color(true, 255, 255, 255);
+        begin_terminal_palette_query();
+        for index in 0..16 {
+            set_terminal_palette(index, index, 40, 90);
+        }
+        assert!(finish_terminal_colors_pending());
+        let reported = Theme::system().extension_palette();
+        assert!(matches!(
+            reported.colors["accent"],
+            UiThemeColor::Rgb { .. }
+        ));
+        assert!(!reported.dim.contains("muted"));
     }
 
     #[cfg(any(unix, windows))]
