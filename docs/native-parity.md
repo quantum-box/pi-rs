@@ -1605,6 +1605,22 @@ The SDK defaults to SSE and uses a host-supplied OAuth access token on the
 exact `openai-codex` route. The typed client lets hosts select another Codex
 transport. ChatGPT plan clients use the separate `openai-responses` API.
 
+The native SDK supports `NativeModelApi::PiMessages` and `api: "pi-messages"`
+model declarations, including a host-authorized `radius` route. The SDK grant
+contains the complete Messages request URL, which upstream derives by
+appending `/messages` to the model base URL. The model file's declared base URL
+selects the grant. Both host credential kinds and explicitly granted file keys
+use the bearer scheme. SDK clients share the CLI's transcript encoding,
+SSE decoding and endpoint-scoped replay. SDK construction and preparation are
+offline and do not use the CLI's on-disk context fingerprint key. Inference
+uses the granted endpoint directly with redirects and
+implicit proxies disabled. The host supplies any refreshed credential and
+catalog metadata. Radius account discovery, OAuth refresh and environment
+defaults belong to the CLI. Loopback coverage exercises both credential
+kinds, ambient configuration isolation and redirect rejection.
+[Pinned Pi Messages API](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/ai/src/api/pi-messages.ts)
+[Pinned Radius provider](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/ai/src/providers/radius.ts)
+
 Hosts may resolve saved key variables with
 `AuthFileReadGrants::load_with_variables`. The resolver receives the exact
 route and variable name after checking saved inline values, and the loader
@@ -2925,7 +2941,27 @@ The first launch records a baseline without displaying notes, and `/changelog`
 always shows the full bundled notes. The parser accepts a version heading on
 the first line, including files with a UTF-8 BOM. The native version marker lives in
 `pi-rs-changelog.json` in the agent directory, separate from upstream Pi's
-version marker. Extension package changelogs remain outside this feature.
+version marker.
+
+The terminal also shows **Extension Updates** when it starts with no session
+messages and successfully loads an updated native package. Each package records
+a silent baseline on first launch. Later notices show version headings above
+the last seen version and up to the installed package version. The numeric
+major, minor and patch determine ordering, so a prerelease suffix or a Git
+revision alone does not repeat a notice. Packages are tracked by source and
+scope, with project baselines kept per workspace. The same native marker file
+stores the package baselines. `collapseChangelog` shows one line per changed
+package, and `/changelog` displays the bundled pi-rs notes.
+
+Native packages can put `CHANGELOG.md` at the package root or set a relative
+`changelogPath` in the package's `pi` metadata, including
+`[package.metadata.pi]` in Cargo.toml. An empty path opts out. A usable
+changelog must be a UTF-8 regular file of at most 1 MiB whose resolved path is
+inside the package root. The installed version comes from the native package
+index, which uses Cargo metadata for Cargo builds and the manifest version for
+other packages. A package needs at least one enabled executable in the
+terminal worker's registry. Standalone executables and packages that only
+supply skills, prompts or themes do not produce these notices.
 pi-rs preserves the upstream `enableInstallTelemetry` key in shared settings
 files. Native pi-rs sends no install or update reports to `pi.dev` and never
 adds upstream Pi attribution headers as a side effect of that setting.
@@ -6558,22 +6594,37 @@ the metadata. Custom declarations merge individual limit, resize, and
 lifetime fields. Release checks covered the offline catalogs, nested
 overrides, invalid values, and the existing image resize and cost paths.
 
-### Cache miss notices checkpoint
+### Transcript notices checkpoint
 
-`showCacheMissNotices` is available from `/settings` and defaults off.
-Both terminal modes derive notices from measured, completed chat turns
-during a run and when reopening a session. Model switches and recorded
-idle gaps appear in the notice. `/session` totals re-billed tokens and
-estimated cost even when notices are disabled. Compaction and branch
-summaries reset the comparison baseline. Failed requests and summary
-usage stay out of the conversation cache comparison.
+The `/settings` Notices submenu controls `notices.cacheMisses`,
+`notices.cacheWarming`, `notices.compactionCosts`, and
+`notices.reasoningDrops` independently. All four default off, matching
+upstream. Each settings layer migrates a legacy `showCacheMissNotices`
+boolean into any missing notice fields before user and trusted-project
+settings are merged. An explicit field wins within its layer. Loading
+leaves the files untouched. A user settings edit saves any migrated user
+fields and the edited value, without copying project values or defaults.
+Malformed settings retain the usual native validation diagnostics.
+[Pinned settings schema](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/core/settings-schema.ts)
+[Pinned settings manager](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/core/settings-manager.ts)
+
+Both terminal modes update retained cache miss, cache warming and summary
+cost notices when the corresponding setting changes. Cache misses are
+derived from measured, completed chat turns during a run and when
+reopening a session. Model switches and recorded idle gaps appear in the
+notice. `/session` totals re-billed tokens and estimated cost even when
+notices are disabled. Compaction and branch summaries reset the
+comparison baseline. Failed requests and summary usage stay out of the
+conversation cache comparison.
 
 ### Imported cache refresh checkpoint
 
 Imported Pi session entries with `kind: "cache_warm"` preserve their
 cache refresh notice, optional note, and billed cost. They also reset
 the cache comparison baseline to the measured prompt at the refresh
-timestamp. The original usage remains part of session billing. An
+timestamp. `notices.cacheWarming` controls display for both imported and
+native cache refreshes. The separate user setting `cacheWarming` controls
+whether warm-up requests run. The original usage remains part of session billing. An
 offline session import verified display and totals without duplicate
 billing or an additional conversation message.
 
@@ -6640,8 +6691,8 @@ status for the previous head.
 
 Measured summary usage and cost stay attached to compaction and branch
 summary entries, including when a fork omits the original model request.
-The terminal shows the billed tokens and cost when cache notices are
-enabled. RPC session entries expose the cache breakdown and provider
+The terminal shows the billed tokens and cost when
+`notices.compactionCosts` is enabled. RPC session entries expose the cache breakdown and provider
 total. Older native journals recover usage details from the adjacent
 model completion when available. Imported Pi usage remains intact and
 session statistics count each completed summary once.
@@ -6663,9 +6714,10 @@ Anthropic Messages responses retain bounded input transformation diagnostics
 in the assistant's journal metadata and RPC message. A final SSE array
 supersedes the initial array, including when it is empty. Pi JSONL imports
 retain the diagnostic timestamp and transformation type, path, and reason.
-With `showCacheMissNotices` enabled, both terminal modes warn when the
-number of dropped thinking blocks increases compared to the previous
-assistant response on the active branch. Reopening restores that baseline.
+With `notices.reasoningDrops` enabled, both terminal modes warn during a
+live run when the number of dropped thinking blocks increases compared
+to the previous assistant response on the active branch. Reopening
+restores that baseline.
 
 ### Tool-result extension hooks
 
@@ -6965,6 +7017,16 @@ Tree search also matches the first 200 UTF-16 units of tool-result text.
 Focused selector tests cover linear chains, branches, hidden records, search,
 and fold/unfold behavior. Other tree layout and navigation differences remain.
 
+### Shell output without a retained file
+
+A truncated user shell result shows `Output truncated` in terminal history and
+in the model context when no full output path is available. The terminal
+keeps the notice visible when the tool output is collapsed. Stored paths
+still appear in the notice, and shell output marked excluded stays outside model
+context. This matches
+[Pi's default shell truncation notice](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/messages.ts#L94-L107).
+Pi's distinct `fullOutputError` detail remains outside this checkpoint.
+
 ### Sparse custom-message import checkpoint
 
 Pi custom-message entries with missing or null content now import as empty
@@ -7103,6 +7165,15 @@ Provider-less legacy selections return `None`; an unavailable historical model
 returns an error rather than the builder default. A busy journal or an
 unreconciled direct journal selection or revoked client binding also returns an
 error. This is a point-in-time check, not a guarantee of later availability.
+
+The Rust SDK exposes `AgentSession::session_id`, `session_file` and
+`session_name` for the same display metadata as
+[Pi's session properties](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L1744-L1757).
+Reopened sessions keep their ID and committed name. Pi imports can retain an
+external ID distinct from the native journal UUID. Forks receive their own ID.
+The file getter reports paths managed by the SDK. Hosts that supply their own
+journal store retain responsibility for its location. ID and name reads return
+an error while the journal is locked.
 
 ### SDK skill commands
 
