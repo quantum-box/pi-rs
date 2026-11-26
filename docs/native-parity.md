@@ -1145,6 +1145,11 @@ User settings and keybindings use the existing `~/.pi-rs` agent directory (or
 theme. `/reload` reloads settings, context, skills, prompts, native extensions, MCP,
 keybindings and themes. Remaining application key actions are tracked above.
 
+Scrollable native custom dialogs use `tui.select.pageUp` and
+`tui.select.pageDown` in regular and fullscreen terminals. An extension action
+bound to the same key takes priority over scrolling.
+[Upstream selection paging](https://github.com/earendil-works/pi/commit/3bae85274a9ea64d035a8a35753c93031489b659)
+
 In fullscreen mode with `fullscreenCopyOnSelect` disabled, the configured
 `app.message.copy` shortcut copies the active mouse selection before falling
 back to the last assistant message. The fallback reads a session snapshot, so
