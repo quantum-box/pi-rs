@@ -240,6 +240,197 @@ fn auth_login_sigint_exits_while_waiting_for_browser_authorization() {
 }
 
 #[test]
+fn bug_report_completion_consent_and_branch_export_in_both_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            br#"{"relay":{"type":"api_key","key":"test-credential-value"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            br#"{"defaultModel":"test-settings-value"}"#,
+        )
+        .unwrap();
+        let session_path = root.path().join("session.jsonl");
+        let saved_workspace = root.path().join("saved-workspace");
+        std::fs::create_dir(&saved_workspace).unwrap();
+        let mut session = pi_rs::Session::open(&session_path).unwrap();
+        session.set_working_directory(&saved_workspace).unwrap();
+        let anchor = session.head();
+        session
+            .append_user_with_images("inactive branch fixture".into(), vec![], None)
+            .unwrap();
+        session.checkout(anchor).unwrap();
+        session
+            .append_user_with_images("active branch fixture".into(), vec![], None)
+            .unwrap();
+        let session_id = session.session_id();
+        drop(session);
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(size),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let _process = Process(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(root.path())
+                .env("PI_RS_HOME", &home)
+                .env("PI_RS_BUG_TEST_SECRET", "test-environment-value")
+                .env("TERM", "xterm-256color")
+                .args([
+                    "--no-trust",
+                    "--no-mcp",
+                    "--no-extensions",
+                    "--offline",
+                    "--provider",
+                    "ollama",
+                    "--model",
+                    "fixture",
+                    "--tui-mode",
+                    mode,
+                    "--session",
+                ])
+                .arg(&session_path)
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+        let archives = || {
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "zip"))
+                .collect::<Vec<_>>()
+        };
+        output_until(&mut master, |text| text.contains("Enter to send"));
+        let journal = std::fs::read(&session_path).unwrap();
+        master.write_all(b"/bu\t").unwrap();
+        output_until(&mut master, |text| text.contains("/bug"));
+        master.write_all(b" cancelled description\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Metadata and diagnostics only")
+        });
+        assert!(archives().is_empty());
+        master.write_all(b"\x1b").unwrap();
+        output_until(&mut master, |text| text.contains("Bug report cancelled"));
+        assert!(archives().is_empty());
+
+        master.write_all(b"/bug example description\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Include current-branch transcript")
+        });
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| text.contains("Bug report exported to:"));
+        let paths = archives();
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o077, 0);
+        let mut archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 2);
+        assert!(archive.by_name("session.jsonl").is_err());
+        let mut metadata = String::new();
+        archive
+            .by_name("report.json")
+            .unwrap()
+            .read_to_string(&mut metadata)
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(report["description"], "example description");
+        assert_eq!(report["sessionId"], session_id.to_string());
+        assert_eq!(report["transcriptIncluded"], false);
+        let mut diagnostics = String::new();
+        archive
+            .by_name("diagnostics.json")
+            .unwrap()
+            .read_to_string(&mut diagnostics)
+            .unwrap();
+        let details: serde_json::Value = serde_json::from_str(&diagnostics).unwrap();
+        assert_eq!(details["userMessages"], 1);
+        for marker in [
+            "active branch fixture",
+            "inactive branch fixture",
+            "test-credential-value",
+            "test-settings-value",
+            "test-environment-value",
+            "cancelled description",
+        ] {
+            assert!(!metadata.contains(marker) && !diagnostics.contains(marker));
+        }
+        drop(archive);
+        std::fs::remove_file(path).unwrap();
+
+        master.write_all(b"/bug\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Include current-branch transcript")
+        });
+        master.write_all(b"\x1b[B\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Bug report exported to:") && !archives().is_empty()
+        });
+        let paths = archives();
+        assert_eq!(paths.len(), 1);
+        let mut archive = zip::ZipArchive::new(File::open(&paths[0]).unwrap()).unwrap();
+        assert_eq!(archive.len(), 3);
+        let report: serde_json::Value =
+            serde_json::from_reader(archive.by_name("report.json").unwrap()).unwrap();
+        assert!(report["description"].is_null());
+        assert_eq!(report["transcriptIncluded"], true);
+        let mut file = archive.by_name("session.jsonl").unwrap();
+        assert_eq!(file.unix_mode().unwrap() & 0o777, 0o600);
+        let mut transcript = String::new();
+        file.read_to_string(&mut transcript).unwrap();
+        let records = transcript
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let branch = pi_rs::Session::from_serialized_records(records).unwrap();
+        assert_eq!(branch.current_messages().len(), 1);
+        assert!(transcript.contains("active branch fixture"));
+        assert!(!transcript.contains("inactive branch fixture"));
+        assert_eq!(std::fs::read(&session_path).unwrap(), journal);
+        assert!(!saved_workspace.read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "zip")
+        }));
+    }
+}
+
+#[test]
 fn typing_redraws_in_a_synchronized_frame() {
     for mode in ["regular", "fullscreen"] {
         let root = tempfile::tempdir().unwrap();
@@ -457,12 +648,14 @@ fn reload_applies_saved_theme_changes_without_overriding_cli_selection() {
 }
 
 #[test]
-fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
+fn terminal_color_and_hyperlink_capabilities_apply_at_startup_and_reload_in_both_modes() {
     const RGB: &str = "\x1b[38;2;255;0;0m";
     const INDEXED: &str = "\x1b[38;5;196m";
     const RGB_BG: &str = "\x1b[48;2;128;128;128m";
     const INDEXED_BG: &str = "\x1b[48;5;244m";
-    const TRANSCRIPT: &str = "committed color fixture";
+    const TRANSCRIPT: &str = "committed terminal fixture";
+    const URL: &str = "https://example.com/terminal";
+    let osc_link = format!("\x1b]8;;{URL}\x1b\\");
     for mode in ["regular", "fullscreen"] {
         for (configured, env, before, after) in
             [(false, "1", INDEXED, RGB), (true, "0", RGB, INDEXED)]
@@ -473,12 +666,12 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
             let session_path = root.path().join("session.jsonl");
             pi_rs::Session::open(&session_path)
                 .unwrap()
-                .append_user_with_images(TRANSCRIPT.into(), vec![], None)
+                .append_user_with_images(format!("{TRANSCRIPT} {URL}"), vec![], None)
                 .unwrap();
             let settings = home.join("settings.json");
             std::fs::write(
                 &settings,
-                serde_json::json!({"theme":"color-fixture","terminal":{"trueColor":configured}})
+                serde_json::json!({"theme":"color-fixture","terminal":{"trueColor":configured,"hyperlinks":configured}})
                     .to_string(),
             )
             .unwrap();
@@ -489,39 +682,13 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
             theme["colors"]["userMessageBg"] = serde_json::json!("#808080");
             std::fs::write(home.join("themes/color-fixture.json"), theme.to_string()).unwrap();
 
-            let mut master_fd = -1;
-            let mut slave_fd = -1;
-            let mut size = libc::winsize {
-                ws_row: 32,
-                ws_col: 110,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            assert_eq!(
-                unsafe {
-                    libc::openpty(
-                        &mut master_fd,
-                        &mut slave_fd,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::addr_of_mut!(size),
-                    )
-                },
-                0
-            );
-            let mut master = unsafe { File::from_raw_fd(master_fd) };
-            let slave = unsafe { File::from_raw_fd(slave_fd) };
-            let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
-            assert_eq!(
-                unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
-                0
-            );
-            let _process = Process(
+            let (mut master, _process) = spawn_capability_test_terminal(
                 Command::new(env!("CARGO_BIN_EXE_pi"))
                     .current_dir(root.path())
                     .env("PI_RS_HOME", &home)
                     .env("TERM", "xterm-256color")
                     .env("PI_TRUE_COLOR", env)
+                    .env("PI_HYPERLINKS", env)
                     .env_remove("NO_COLOR")
                     .args([
                         "--offline",
@@ -532,12 +699,7 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
                         mode,
                         "--session",
                     ])
-                    .arg(&session_path)
-                    .stdin(Stdio::from(slave.try_clone().unwrap()))
-                    .stdout(Stdio::from(slave.try_clone().unwrap()))
-                    .stderr(Stdio::from(slave))
-                    .spawn()
-                    .unwrap(),
+                    .arg(&session_path),
             );
             output_until(&mut master, |text| {
                 assert!(
@@ -548,21 +710,162 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
                     assert!(!text.contains("\x1b[38;2;") && !text.contains("\x1b[48;2;"));
                 }
                 let background = if configured { RGB_BG } else { INDEXED_BG };
-                text.contains("Enter to send")
+                let ready = text.contains("Enter to send")
                     && text.contains(TRANSCRIPT)
                     && text.contains(before)
                     && text.contains(background)
+                    && text.contains(URL);
+                if ready {
+                    assert_eq!(text.contains(&osc_link), configured, "{mode}");
+                }
+                ready
             });
-            std::fs::write(&settings, br#"{"theme":"color-fixture"}"#).unwrap();
+            std::fs::write(
+                &settings,
+                br#"{"theme":"color-fixture","terminal":{"trueColor":"auto","hyperlinks":"auto"}}"#,
+            )
+            .unwrap();
             master.write_all(b"/reload\r").unwrap();
             output_until(&mut master, |text| {
                 let background = if configured { INDEXED_BG } else { RGB_BG };
-                text.contains("Reloaded settings")
+                let ready = text.contains("Reloaded settings")
                     && text.contains(TRANSCRIPT)
                     && text.contains(after)
                     && text.contains(background)
+                    && text.contains(URL);
+                if ready {
+                    assert_eq!(text.contains(&osc_link), !configured, "{mode}");
+                }
+                ready
             });
         }
+    }
+}
+
+fn spawn_capability_test_terminal(command: &mut Command) -> (File, Process) {
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let process = Process(
+        command
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    (master, process)
+}
+
+#[test]
+fn terminal_hyperlink_capabilities_reprobe_tmux_after_override() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const LABEL: &str = "tmux link fixture";
+    const URL: &str = "https://example.com/tmux-link";
+    let osc_link = format!("\x1b]8;;{URL}\x1b\\");
+    let fallback = format!(" ({URL})");
+
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let settings = home.join("settings.json");
+        let features = root.path().join("features");
+        let probe_log = root.path().join("probe-log");
+        let tmux = root.path().join("tmux");
+        std::fs::write(
+            &tmux,
+            "#!/bin/sh\nprintf 'probe\\n' >> \"$PI_TEST_TMUX_PROBE_LOG\"\n/bin/cat \"$PI_TEST_TMUX_FEATURES\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&features, "RGB\n").unwrap();
+        std::fs::write(
+            &settings,
+            br#"{"terminal":{"hyperlinks":null,"trueColor":null}}"#,
+        )
+        .unwrap();
+        let session_path = root.path().join("session.jsonl");
+        pi_rs::Session::open(&session_path)
+            .unwrap()
+            .append_user_with_images(format!("[{LABEL}]({URL})"), vec![], None)
+            .unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(root.path().to_owned()).chain(
+                std::env::var_os("PATH")
+                    .iter()
+                    .flat_map(std::env::split_paths),
+            ),
+        )
+        .unwrap();
+        let (mut master, _process) = spawn_capability_test_terminal(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(root.path())
+                .env("PI_RS_HOME", &home)
+                .env("TERM", "xterm-256color")
+                .env("TMUX", "fixture")
+                .env("PATH", path)
+                .env("PI_TEST_TMUX_FEATURES", &features)
+                .env("PI_TEST_TMUX_PROBE_LOG", &probe_log)
+                .env_remove("PI_HYPERLINKS")
+                .args([
+                    "--offline",
+                    "--no-trust",
+                    "--no-mcp",
+                    "--no-extensions",
+                    "--tui-mode",
+                    mode,
+                    "--session",
+                ])
+                .arg(&session_path),
+        );
+        let probes = || std::fs::read_to_string(&probe_log).unwrap().lines().count();
+        output_until(&mut master, |text| {
+            text.contains("Enter to send") && text.contains(LABEL) && text.contains(&fallback)
+        });
+        assert_eq!(probes(), 1, "{mode}");
+
+        std::fs::write(&settings, br#"{"terminal":{"hyperlinks":true}}"#).unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Reloaded settings") && text.contains(&osc_link)
+        });
+        assert_eq!(probes(), 1, "{mode}");
+
+        std::fs::write(&features, "RGB,hyperlinks\n").unwrap();
+        std::fs::write(&settings, br#"{"terminal":{"hyperlinks":"auto"}}"#).unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Reloaded settings") && text.contains(&osc_link) && probes() == 2
+        });
+        master.write_all(b"cached probe fixture").unwrap();
+        output_until(&mut master, |text| text.contains("cached probe fixture"));
+        assert_eq!(probes(), 2, "{mode}");
     }
 }
 
@@ -1397,15 +1700,20 @@ fn debug_command_and_global_shortcut_write_session_snapshots() {
 }
 
 #[test]
-fn startup_extension_lists_an_explicit_theme_path() {
+fn startup_extension_lists_and_reads_named_theme_palettes() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().unwrap();
     let theme_path = root.path().join("explicit-theme.json");
     let mut theme: serde_json::Value =
         serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
-    theme["name"] = serde_json::json!("startup-fixture-theme");
+    theme["name"] = serde_json::json!("startup:fixture-theme");
+    theme["colors"]["accent"] = serde_json::json!("#123456");
     std::fs::write(&theme_path, format!("\u{feff}{theme}")).unwrap();
+    let project_themes = root.path().join(".pi/themes");
+    std::fs::create_dir_all(&project_themes).unwrap();
+    theme["name"] = serde_json::json!("untrusted-project-theme");
+    std::fs::write(project_themes.join("project.json"), theme.to_string()).unwrap();
     let extension = root.path().join("theme-catalog");
     std::fs::write(&extension, r##"#!/usr/bin/env python3
 import json, os, sys
@@ -1415,14 +1723,71 @@ if '--pi-rs-extension-v1' in sys.argv:
     print(json.dumps({'version':1,'response':{'Ok':result}}))
 else:
     frame = json.loads(sys.stdin.readline())
-    if frame['request']['event']['type'] == 'session_start':
+    event = frame['request']['event']
+    def active():
+        print(json.dumps({'type':'ui','request':{'method':'getActiveTheme'}}), flush=True)
+        return json.loads(sys.stdin.readline())['Ok']
+    def notify(message):
+        print(json.dumps({'type':'ui','request':{'method':'notify','message':message}}), flush=True)
+        assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    if event['type'] == 'session_start' and event['reason'] == 'new':
+        assert active()['name'] == 'light'
+        notify('Rebound theme palette verified')
+    elif event['type'] == 'session_start':
         print(json.dumps({'type':'ui','request':{'method':'getAllThemes'}}), flush=True)
         response = json.loads(sys.stdin.readline())['Ok']
         assert response[0] == {'name':'system'}, response
         expected = os.path.realpath(os.environ['PI_TEST_THEME_PATH'])
-        assert {'name':'startup-fixture-theme','path':expected} in response, response
-        print(json.dumps({'type':'ui','request':{'method':'notify','message':'Startup theme catalog verified'}}), flush=True)
-        assert json.loads(sys.stdin.readline()) == {'Ok':None}
+        assert {'name':'startup:fixture-theme','path':expected} in response, response
+        def lookup(name):
+            print(json.dumps({'type':'ui','request':{'method':'getTheme','name':name}}), flush=True)
+            return json.loads(sys.stdin.readline())['Ok']
+        selected = lookup('startup:fixture-theme')
+        assert selected['path'] == expected and selected['name'] == 'startup:fixture-theme', selected
+        assert selected['colors']['accent'] == {'kind':'rgb','r':18,'g':52,'b':86}, selected
+        light = lookup('light')
+        assert light['name'] == 'light' and 'path' not in light and light['colors'], light
+        system = lookup('system')
+        assert system['name'] == 'system' and 'path' not in system and system['colors'], system
+        assert lookup('untrusted-project-theme') is None
+        assert lookup(expected) is None
+        assert lookup('light/dark') is None
+        def select(theme):
+            print(json.dumps({'type':'ui','request':{'method':'setTheme','theme':theme}}), flush=True)
+            return json.loads(sys.stdin.readline())['Ok']
+        assert select('startup:fixture-theme') == {'success':True}
+        assert active() == selected
+        settings_path = os.path.join(os.environ['PI_RS_HOME'], 'settings.json')
+        def settings_bytes():
+            with open(settings_path, 'rb') as file:
+                return file.read()
+        for missing in ['untrusted-project-theme', 'light/dark', expected, 'Startup:fixture-theme']:
+            assert select('light') == {'success':True}
+            assert active() == light
+            saved = settings_bytes()
+            result = select(missing)
+            assert result['success'] is False and result['error'], result
+            fallback = active()
+            assert fallback['name'] == 'system' and 'path' not in fallback, fallback
+            assert settings_bytes() == saved
+        assert select('light') == {'success':True}
+        saved = settings_bytes()
+        with open(settings_path, 'wb') as file:
+            file.write(b'{')
+        try:
+            result = select('startup:fixture-theme')
+            assert result['success'] is False and result['error'], result
+            assert active() == light
+            assert settings_bytes() == b'{'
+        finally:
+            with open(settings_path, 'wb') as file:
+                file.write(saved)
+        assert select(selected) == {'success':True}
+        palette = active()
+        assert palette['name'] == selected['name'], palette
+        assert palette['colors'] == selected['colors'], palette
+        assert 'path' not in palette, palette
+        notify('Startup theme palettes verified')
     print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
 "##).unwrap();
     std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1466,7 +1831,7 @@ else:
             ])
             .arg("--theme")
             .arg(&theme_path)
-            .args(["--use-theme", "startup-fixture-theme"])
+            .args(["--use-theme", "startup:fixture-theme"])
             .arg("--extension")
             .arg(&extension)
             .env("PI_RS_HOME", root.path().join("home"))
@@ -1479,7 +1844,305 @@ else:
             .unwrap(),
     );
     output_until(&mut master, |text| {
-        text.contains("Startup theme catalog verified")
+        text.contains("Startup theme palettes verified")
+    });
+    master.write_all(b"/new\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Rebound theme palette verified")
+    });
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings["theme"], "light");
+}
+
+fn start_theme_extension(root: &std::path::Path, args: &[&str], handler: &str) -> (File, Process) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("settings.json"), br#"{"theme":"dark"}"#).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        br#"{"providers":{"ollama":{"models":[{"id":"fixture","reasoning":true},{"id":"alternate","reasoning":true}]}}}"#,
+    )
+    .unwrap();
+    let extension = root.join("theme-extension.py");
+    let fixture = r#"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request = json.load(sys.stdin)
+    result = {'id':'theme-extension','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'lifecycle_host_calls':True,'session_lifecycle_hook':True,'model_selection_hook':True} if request['type'] == 'describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+    sys.exit(0)
+event = json.loads(sys.stdin.readline())['request']['event']
+def ui(method, **fields):
+    print(json.dumps({'type':'ui','request':{'method':method,**fields}}), flush=True)
+    response = json.loads(sys.stdin.readline())
+    assert 'Ok' in response, response
+    return response['Ok']
+def active():
+    return ui('getActiveTheme')['name']
+def notify(message):
+    assert ui('notify', message=message) is None
+"#;
+    std::fs::write(
+        &extension,
+        format!("{fixture}{handler}\nprint(json.dumps({{'type':'complete','response':{{'Ok':None}}}}), flush=True)\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (mut master, mut slave) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root)
+            .env("PI_RS_HOME", home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--model",
+                "fixture",
+                "--thinking",
+                "off",
+            ])
+            .arg("--extension")
+            .arg(extension)
+            .args(args)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    master.write_all(b"\x1b[?1;2c").unwrap();
+    (master, process)
+}
+
+#[test]
+fn theme_requests_finish_during_selection_callbacks() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _process) = start_theme_extension(
+        root.path(),
+        &[],
+        r#"
+if event['type'] == 'session_start':
+    notify('Theme selection fixture ready')
+elif event['type'] == 'thinking_level_select' and event['level'] == 'low':
+    assert active() == 'dark'
+    assert ui('getTheme', name='system')['name'] == 'system'
+    assert ui('setTheme', theme='light') == {'success':True}
+    assert active() == 'light'
+    notify('Selection callback finished with light theme')
+elif event['type'] == 'model_select':
+    assert active() == 'light'
+    assert ui('setTheme', theme='dark') == {'success':True}
+    assert active() == 'dark'
+    notify('Model callback finished with dark theme')
+"#,
+    );
+    output_until(&mut master, |text| {
+        text.contains("Theme selection fixture ready")
+    });
+    master.write_all(b"/thinking low\r").unwrap();
+    output_until_with_timeout(&mut master, Duration::from_secs(5), |text| {
+        assert!(!text.contains("timed out"), "{text}");
+        text.contains("Selection callback finished with light theme")
+    });
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings["theme"], "light");
+    master.write_all(b"/model ollama/alternate\r").unwrap();
+    output_until_with_timeout(&mut master, Duration::from_secs(5), |text| {
+        assert!(!text.contains("timed out"), "{text}");
+        text.contains("Model callback finished with dark theme")
+    });
+}
+
+#[test]
+fn final_selection_callback_can_read_but_cannot_change_theme() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, mut process) = start_theme_extension(
+        root.path(),
+        &[],
+        r#"
+import os, pathlib
+if event['type'] == 'session_start':
+    notify('Final selection fixture ready')
+elif event['type'] == 'thinking_level_select':
+    result = [active(), ui('getTheme', name='system')['name'], ui('setTheme', theme='light'), active()]
+    path = pathlib.Path(os.environ['PI_RS_HOME']) / 'final-selection.json'
+    path.write_text(json.dumps(result))
+"#,
+    );
+    output_until(&mut master, |text| {
+        text.contains("Final selection fixture ready")
+    });
+    master
+        .write_all(b"!echo shell-$(printf waiting); sleep 20\r")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("shell-waiting"));
+    // Shift-Tab queues a thinking change while the shell keeps the worker busy.
+    master.write_all(b"\x1b[Z").unwrap();
+    output_until(&mut master, |text| text.contains("Thinking level:"));
+    let home = root.path().join("home");
+    let result = home.join("final-selection.json");
+    assert!(!result.exists());
+    master.write_all(b"/quit\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            assert!(status.success(), "interactive process failed: {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "final selection did not settle");
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+    assert_eq!(
+        result,
+        serde_json::json!(["dark", "system", {"success":false,"error":"UI not available"}, "dark"])
+    );
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["theme"], "dark");
+}
+
+#[test]
+fn reload_discards_extension_palette_if_saved_theme_is_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _process) = start_theme_extension(
+        root.path(),
+        &[],
+        r#"
+if event['type'] == 'session_start' and event['reason'] == 'startup':
+    palette = ui('getTheme', name='light')
+    palette['name'] = 'local-palette'
+    assert ui('setTheme', theme=palette) == {'success':True}
+    assert active() == 'local-palette'
+    notify('Local palette installed')
+elif event['type'] == 'session_start' and event['reason'] == 'reload':
+    assert active() == 'system', active()
+    notify('Reload replaced the local palette with system')
+"#,
+    );
+    output_until(&mut master, |text| text.contains("Local palette installed"));
+    std::fs::write(
+        root.path().join("home/settings.json"),
+        br#"{"theme":"missing-theme"}"#,
+    )
+    .unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Reload replaced the local palette with system")
+    });
+}
+
+#[test]
+fn reload_reads_saved_theme_after_named_extension_selection() {
+    for cli_theme in [None, Some("system")] {
+        let root = tempfile::tempdir().unwrap();
+        let args = cli_theme.map(|name| ["--use-theme", name]);
+        let (mut master, _process) = start_theme_extension(
+            root.path(),
+            args.as_ref().map_or(&[], |args| &args[..]),
+            r#"
+if event['type'] == 'session_start' and event['reason'] == 'startup':
+    assert ui('setTheme', theme='light') == {'success':True}
+    assert active() == 'light'
+    notify('Named extension theme installed')
+elif event['type'] == 'session_start' and event['reason'] == 'reload':
+    notify('Theme after reload is ' + active())
+"#,
+        );
+        output_until(&mut master, |text| {
+            text.contains("Named extension theme installed")
+        });
+        std::fs::write(
+            root.path().join("home/settings.json"),
+            br#"{"theme":"dark"}"#,
+        )
+        .unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        let expected = format!("Theme after reload is {}", cli_theme.unwrap_or("dark"));
+        output_until(&mut master, |text| text.contains(&expected));
+    }
+}
+
+#[test]
+fn named_theme_lookup_and_selection_share_snapshot_until_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("theme.json");
+    let mut theme: serde_json::Value =
+        serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+    theme["name"] = serde_json::json!("original");
+    std::fs::write(&path, theme.to_string()).unwrap();
+    let (mut master, _process) = start_theme_extension(
+        root.path(),
+        &["--theme", path.to_str().unwrap()],
+        r#"
+if event['type'] == 'session_start' and event['reason'] == 'startup':
+    assert ui('getTheme', name='original')['name'] == 'original'
+    notify('Original theme snapshot ready')
+elif event['type'] == 'session_info_changed':
+    assert ui('getTheme', name='renamed') is None
+    assert ui('setTheme', theme='renamed')['success'] is False
+    original = ui('getTheme', name='original')
+    assert ui('setTheme', theme='original') == {'success':True}
+    assert ui('getActiveTheme') == original
+    notify('Lookup and selection used the original snapshot')
+elif event['type'] == 'session_start' and event['reason'] == 'reload':
+    assert ui('getTheme', name='original') is None
+    renamed = ui('getTheme', name='renamed')
+    assert ui('setTheme', theme='renamed') == {'success':True}
+    assert ui('getActiveTheme') == renamed
+    notify('Lookup and selection used the refreshed snapshot')
+"#,
+    );
+    output_until(&mut master, |text| {
+        text.contains("Original theme snapshot ready")
+    });
+    theme["name"] = serde_json::json!("renamed");
+    theme["colors"]["accent"] = serde_json::json!("#123456");
+    std::fs::write(&path, theme.to_string()).unwrap();
+    master.write_all(b"/name refresh-test\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Lookup and selection used the original snapshot")
+    });
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Lookup and selection used the refreshed snapshot")
     });
 }
 
