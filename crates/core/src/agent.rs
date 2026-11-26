@@ -7145,16 +7145,35 @@ struct ProgressReporter {
 struct ProgressSettlement {
     closed: bool,
     pending: Option<TurnProgress>,
+    omitted_calls: u64,
 }
 
 impl ProgressReporter {
     fn close(&self) -> Option<TurnProgress> {
         let mut settlement = self.settlement.lock().expect("tool progress settlement");
         settlement.closed = true;
-        settlement.pending.take()
+        let mut pending = settlement.pending.take()?;
+        if let TurnProgress::Event(event) = &mut pending
+            && let crate::LifecycleEvent::ToolExecutionUpdate { partial_result, .. } =
+                event.as_mut()
+            && let Some(count) = partial_result.pointer_mut("/details/omittedCalls")
+            && count
+                .as_u64()
+                .is_some_and(|reported| reported < settlement.omitted_calls)
+        {
+            *count = settlement.omitted_calls.into();
+        }
+        Some(pending)
     }
 
     fn event(&self, partial_result: serde_json::Value) -> crate::ExtensionResult<TurnProgress> {
+        // Leave room for the settlement counter to grow to any u64 value.
+        let counter_bytes = partial_result
+            .pointer("/details/omittedCalls")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |count| {
+                20 - (count.checked_ilog10().unwrap_or(0) as usize + 1)
+            });
         let event = crate::LifecycleEvent::ToolExecutionUpdate {
             tool_call_id: self.tool_call_id.clone(),
             tool_name: self.tool_name.clone(),
@@ -7164,7 +7183,7 @@ impl ProgressReporter {
         };
         // Count the entire event, including escaped arguments and identifiers,
         // without allocating a second copy of its serialized representation.
-        serde_json::to_writer(ProgressSizeLimit(1024 * 1024), &event)
+        serde_json::to_writer(ProgressSizeLimit(1024 * 1024 - counter_bytes), &event)
             .map_err(|_| "tool progress event exceeds size limit".to_owned())?;
         Ok(TurnProgress::Event(Box::new(event)))
     }
@@ -7252,6 +7271,18 @@ impl ToolHost for NestedHost {
         self.progress.as_ref().map_or(Ok(()), |progress| {
             progress.report(partial_result, settlement, true, &self.cancellation)
         })
+    }
+
+    fn update_progress_omitted_calls(&self, count: u64) {
+        if let Some(progress) = &self.progress {
+            let mut settlement = progress
+                .settlement
+                .lock()
+                .expect("tool progress settlement");
+            if !settlement.closed {
+                settlement.omitted_calls = count;
+            }
+        }
     }
 
     fn has_ui(&self) -> bool {

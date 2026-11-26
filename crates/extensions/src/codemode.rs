@@ -71,7 +71,7 @@ struct CallProgress {
 struct NestedProgress {
     operation: String,
     calls: Vec<CallProgress>,
-    omitted: usize,
+    omitted: u64,
 }
 
 impl NestedProgress {
@@ -92,10 +92,11 @@ impl NestedProgress {
 
     async fn publish(&self, host: &dyn ToolHost, settle: bool) {
         let fallback = (!settle
-            && self
-                .calls
-                .iter()
-                .any(|call| call.status == CallStatus::Running))
+            && (self.calls.len() == MAX_PROGRESS_CALLS
+                || self
+                    .calls
+                    .iter()
+                    .any(|call| call.status == CallStatus::Running)))
         .then(|| self.snapshot(true));
         // Reporting is best effort. A slow embedder must not hold the script
         // or its shutdown window open.
@@ -109,6 +110,7 @@ impl NestedProgress {
     async fn start(&mut self, host: &dyn ToolHost, name: &str, arguments: &str) -> Option<usize> {
         if self.calls.len() == MAX_PROGRESS_CALLS {
             self.omitted = self.omitted.saturating_add(1);
+            host.update_progress_omitted_calls(self.omitted);
             if self.omitted == 1 {
                 self.publish(host, false).await;
             }
@@ -438,6 +440,9 @@ impl Tool for ScriptTool {
         false
     }
     fn settles_host_timeout(&self) -> bool {
+        true
+    }
+    fn bounds_progress_hooks(&self) -> bool {
         true
     }
     fn output_limit(&self) -> usize {
@@ -4728,14 +4733,131 @@ mod tests {
                     ),
                     "{result:?}"
                 );
-                assert!(operations.iter().any(|(invocation, state)| {
-                    invocation.call.name == ID
-                        && matches!(state, pi_rs_core::OperationState::Finished(Outcome::Failed(message))
-                            if message.contains("Script timed out: Execution timed out after 500 ms"))
-                }));
+                // An interrupted child can require reconciliation before the
+                // parent finishes formatting its timeout reply.
+                let parent = operations
+                    .iter()
+                    .find(|(call, _)| call.call.name == ID)
+                    .unwrap();
+                match &parent.1 {
+                    pi_rs_core::OperationState::Finished(Outcome::Failed(message)) => {
+                        assert!(
+                            message.contains("Script timed out: Execution timed out after 500 ms")
+                        );
+                    }
+                    pi_rs_core::OperationState::Finished(Outcome::Unknown(reason)) => {
+                        assert_eq!(reason, "cancelled after dispatch was committed");
+                    }
+                    state => panic!("unexpected parent state: {state:?}"),
+                }
             }
             session.close().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn codemode_abort_keeps_omissions_after_the_last_progress_snapshot() {
+        use pi_rs_core::{Error, Message, ModelEvent, ModelStream, ToolCall};
+
+        struct WaitingTool(Arc<tokio::sync::Notify>);
+        #[async_trait::async_trait]
+        impl Tool for WaitingTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "overflow_probe".into(),
+                    description: "Reports when the last call is waiting".into(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+
+            async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+                if args["wait"] == true {
+                    self.0.notify_one();
+                    std::future::pending().await
+                } else {
+                    Outcome::Succeeded("done".into())
+                }
+            }
+        }
+
+        struct Tools(Arc<tokio::sync::Notify>);
+        impl Extension for Tools {
+            fn id(&self) -> &str {
+                "progress-overflow-fixture"
+            }
+
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                vec![Arc::new(WaitingTool(self.0.clone()))]
+            }
+        }
+
+        struct OverflowModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for OverflowModel {
+            async fn stream(&self, request: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+                assert!(
+                    !request
+                        .messages
+                        .iter()
+                        .any(|message| matches!(message, Message::Tool { .. }))
+                );
+                let code = format!(
+                    "for (let i = 0; i < {}; i++) await tools.overflow_probe({{}}); await tools.overflow_probe({{wait:true}});",
+                    MAX_PROGRESS_CALLS + 3
+                );
+                Ok(Box::pin(futures_util::stream::iter([Ok(
+                    ModelEvent::Complete {
+                        calls: vec![ToolCall {
+                            id: "overflow-script".into(),
+                            name: ID.into(),
+                            arguments: json!({"code":code}).to_string(),
+                        }],
+                        usage: None,
+                    },
+                )])))
+            }
+        }
+
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(OverflowModel), "fixture")
+            .extension(Arc::new(Codemode::default()))
+            .unwrap()
+            .extension(Arc::new(Tools(waiting.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let mut updates = Vec::new();
+        let mut observe = |event: pi_rs_core::Notification<'_>| {
+            if let Some(details) = codemode_update(event) {
+                updates.push(details);
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let (result, ()) = tokio::join!(
+                session.prompt_with_observer("fixture", &mut observe),
+                async {
+                    // The fourth omitted call has entered the host and cannot
+                    // return normally, so the reporter has to settle it.
+                    waiting.notified().await;
+                    control.abort();
+                }
+            );
+            result
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(Error::Cancelled | Error::Reconciliation(_))),
+            "{result:?}"
+        );
+        assert_eq!(updates[updates.len() - 2]["omittedCalls"], 1);
+        let terminal = updates.last().unwrap();
+        assert_eq!(terminal["omittedCalls"], 4);
+        let calls = terminal["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), MAX_PROGRESS_CALLS);
+        assert!(calls.iter().all(|call| call["status"] == "ok"));
+        session.close().await.unwrap();
     }
 
     #[tokio::test]

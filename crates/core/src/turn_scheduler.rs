@@ -2964,14 +2964,15 @@ impl Agent<'_> {
                                 let progress_output = progress_output.clone();
                                 let progress_registry = self.registry.clone();
                                 let progress_states = states.clone();
-                                let progress_timeout = self.limits.model_timeout.min(TOOL_PROGRESS_HOOK_BUDGET);
+                                let bounded_progress_hooks = matches!(&prepared, TurnPreparation::Ready { tool, .. } if tool.tool.bounds_progress_hooks());
+                                let progress_timeout = self.limits.model_timeout;
+                                let mut hook_budget = bounded_progress_hooks.then(|| progress_timeout.min(TOOL_PROGRESS_HOOK_BUDGET));
                                 let stop_progress_hooks = calls[index].cancellation.child_token();
                                 let hook_cancel = stop_progress_hooks.clone();
                                 let hook_host = lifecycle_host.clone();
                                 let progress_worker = async move {
                                     let mut errors = Vec::new();
                                     let mut closing = false;
-                                    let mut hook_budget = progress_timeout;
                                     loop {
                                         let message = tokio::select! {
                                             _ = &mut finish_signal, if !closing => { closing = true; progress_input.close(); continue; },
@@ -2980,21 +2981,30 @@ impl Agent<'_> {
                                         match message {
                                             TurnProgress::Event(event) => {
                                                 let _ = progress_output.send(TurnProgress::Event(event.clone())).await;
-                                                if observe_progress && !hook_budget.is_zero() && !hook_cancel.is_cancelled() {
+                                                if observe_progress && !hook_cancel.is_cancelled() && hook_budget.is_none_or(|remaining| !remaining.is_zero()) {
                                                     let began = platform_time::Instant::now();
                                                     let mut collect = |notification: Notification<'_>| {
                                                         if let Notification::ExtensionLifecycleError { extension, event, message } = notification {
                                                             errors.push((extension.to_owned(), event, message.to_owned()));
                                                         }
                                                     };
+                                                    let notify = crate::lifecycle::notify_with_host(
+                                                        &progress_registry, *event, &progress_states, hook_budget.unwrap_or(progress_timeout), &mut collect, hook_host.clone()
+                                                    );
                                                     tokio::select! {
                                                         biased;
                                                         _ = hook_cancel.cancelled() => {},
-                                                        _ = platform_time::timeout(hook_budget, crate::lifecycle::notify_with_host(
-                                                            &progress_registry, *event, &progress_states, hook_budget, &mut collect, hook_host.clone()
-                                                        )) => {}
+                                                        _ = async {
+                                                            if let Some(remaining) = hook_budget {
+                                                                let _ = platform_time::timeout(remaining, notify).await;
+                                                            } else {
+                                                                notify.await;
+                                                            }
+                                                        } => {}
                                                     }
-                                                    hook_budget = hook_budget.saturating_sub(began.elapsed());
+                                                    if let Some(remaining) = &mut hook_budget {
+                                                        *remaining = remaining.saturating_sub(began.elapsed());
+                                                    }
                                                 }
                                             }
                                             TurnProgress::Custom(input, reply) => { let _ = progress_output.send(TurnProgress::Custom(input, reply)).await; }
@@ -3026,7 +3036,9 @@ impl Agent<'_> {
                                         let duration = ran.then(|| start.elapsed().as_millis().min(u64::MAX as u128) as u64);
                                         // Forward queued events and settlement without waiting for
                                         // extension observers once the tool has returned.
-                                        stop_progress_hooks.cancel();
+                                        if bounded_progress_hooks {
+                                            stop_progress_hooks.cancel();
+                                        }
                                         if let Some(settlement) = reporter.close() {
                                             let _ = updates.send(settlement).await;
                                         }
@@ -3253,6 +3265,7 @@ mod start_tests {
 
     #[derive(Default)]
     struct ProgressProbe {
+        bounded_hooks: bool,
         finish_on_first_hook: bool,
         entered: tokio::sync::Notify,
         starts: AtomicUsize,
@@ -3267,6 +3280,10 @@ mod start_tests {
                 description: "Reports fixture updates".into(),
                 parameters: serde_json::json!({"type":"object"}),
             }
+        }
+
+        fn bounds_progress_hooks(&self) -> bool {
+            self.bounded_hooks
         }
 
         async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
@@ -3353,9 +3370,12 @@ mod start_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn progress_hooks_share_one_budget_and_never_hold_settlement_open() {
-        for finish_on_first_hook in [false, true] {
+    async fn progress_hooks_only_cut_off_for_tools_that_opt_in() {
+        for (bounded_hooks, finish_on_first_hook) in
+            [(true, false), (true, true), (false, false), (false, true)]
+        {
             let probe = Arc::new(ProgressProbe {
+                bounded_hooks,
                 finish_on_first_hook,
                 ..Default::default()
             });
@@ -3379,7 +3399,11 @@ mod start_tests {
                 .unwrap();
             assert_eq!(answer, "answer");
             assert_eq!(updates, [0, 1, 2, 3, 4]);
-            if finish_on_first_hook {
+            if !bounded_hooks {
+                assert_eq!(probe.starts.load(Ordering::SeqCst), 5);
+                assert_eq!(probe.completions.load(Ordering::SeqCst), 5);
+                assert!(started.elapsed() >= Duration::from_millis(500));
+            } else if finish_on_first_hook {
                 assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
                 assert_eq!(probe.completions.load(Ordering::SeqCst), 0);
                 assert!(started.elapsed() < Duration::from_millis(100));

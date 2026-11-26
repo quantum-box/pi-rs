@@ -2124,9 +2124,11 @@ The terminal shows recent call states. RPC and JSON attach the snapshot as
 `codemodeProgress` on the parent's `tool_execution_end` event. The snapshot
 is transient and leaves tool-result messages, journal records, model output,
 and the store transaction intact. The scheduler bounds complete progress
-events, omits large parent arguments, and gives extension observers a single
-250 ms maximum budget per tool. Observer callbacks stop when the tool settles
-while the remaining events still reach presentation consumers. The snapshot covers
+events and omits large parent arguments. Codemode gives extension observers a
+single 250 ms maximum budget and stops those callbacks when the tool returns.
+Ordinary tools still drain accepted updates. Queued Codemode events reach
+presentation consumers, and caller abort preserves the latest omission count
+even if the script cannot publish its final snapshot. The snapshot covers
 `tools.*` calls. `models.*` calls remain outside it.
 [Pinned Codemode nested tool lifecycle](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/extensions/codemode/execute.ts#L514-L550)
 
