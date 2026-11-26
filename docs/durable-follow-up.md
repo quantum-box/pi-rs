@@ -42,5 +42,6 @@ cargo run -p pi-rs-durable --features text-cli --bin pi-rs-durable -- \
 `experimental-graph-scope` と `experimental-graph-revision` は明示的な有効化を継続する。走査上限に達する負荷があり、v4 から標準ビルドに戻るには移行前のバックアップが必要になる。合成負荷では、4,096ルートで無関係な書き込みの p95 が約45 ms、8,192ルートでは40回すべてで走査上限に達した。測定条件と現在の上限は[キャンセル設計書](durable-conversation-cancel-design.md)を参照。
 
 - 会話、親子タスク、文書を含む256件の合成レコードで、v3 から v4 への移行、再オープン、旧書き込み接続の拒否、バックアップ復元を検証した。復元先にはバックアップ以降の書き込みが含まれないことも確認した。実運用を代表するDBのコピーで、同じ手順と復旧時間を検証する。
+- Unix では `cargo run -p durable-store --features experimental-graph-revision --bin durable-graph-rehearsal -- V3_BACKUP.sqlite OUTPUT_DIRECTORY` で検証できる。入力は読み取り専用で開き、新規ディレクトリにバックアップ、移行先、復元先を作る。標準出力の JSON に件数と各段階の所要時間を記録する。履歴の内容やキーは出力しない。
 - 代表的なグラフ規模と更新頻度で、書き込み遅延、走査上限への到達率、手動照合が必要になった件数を測る。許容値を決め、超過時の運用手順を残す。
 - **完了条件**　移行・復元の手順と測定結果から、既定化するか、明示有効化を継続するかを判断し、根拠を設計書に記録する。
