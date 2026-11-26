@@ -1,103 +1,38 @@
 //! Native HTML transcript rendering and export for SDK hosts.
 
-use std::io::{ErrorKind, Write};
 use std::path::Path;
 
-use pi_rs::{AgentSession, Error, Event, Result, Session};
+use pi_rs::{AgentSession, Event, Result, Session};
 
 /// Export the selected branch of an owned SDK session to an explicit path.
 ///
-/// Replacing a destination requires a managed journal and confirmation that
-/// the destination is distinct from the open journal file. Otherwise the
-/// export may only create a new file. The destination's parent must exist.
+/// The destination's parent must exist. An existing destination returns
+/// [`std::io::ErrorKind::AlreadyExists`] in an I/O error. Publication creates
+/// the destination atomically without replacing another file.
 /// A busy journal returns the same error as [`AgentSession::journal`].
-/// A directory sync error can be returned after successful publication.
+/// On Unix, a directory sync error can be returned after publication.
 pub fn export_agent_session(session: &AgentSession, destination: &Path) -> Result<()> {
-    let (document, replace) = {
+    let document = {
         let journal = session.journal()?;
-        let document = render(&journal);
-        let replace = if session.session_file().is_some() {
-            match journal.backing_file_matches(destination) {
-                Ok(Some(true)) => return Err(source_destination_error()),
-                Ok(Some(false)) => true,
-                Ok(None) | Err(_) => false,
-            }
-        } else {
-            false
-        };
-        (document, replace)
+        render(&journal)
     };
-    publish(&document, destination, replace)
+    publish(&document, destination)
 }
 
-/// Export the selected branch of a journal to an explicit path.
+/// Export the selected branch of a shared journal to an explicit path.
 ///
-/// Supply the source path for a file-backed journal or imported snapshot.
-/// With a source path, an existing destination can be replaced unless it refers
-/// to the source file. Without one, publication never replaces an existing file.
-/// The destination's parent must exist.
-/// A directory sync error can be returned after successful publication.
-pub fn export(session: &Session, destination: &Path, source: Option<&Path>) -> Result<()> {
-    if let Some(source) = source {
-        match destination.canonicalize() {
-            Ok(destination) => {
-                let source = source.canonicalize()?;
-                if same_export_file(&source, &destination)? {
-                    return Err(source_destination_error());
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    publish(&render(session), destination, source.is_some())
+/// The destination's parent must exist. An existing destination returns
+/// [`std::io::ErrorKind::AlreadyExists`] in an I/O error. Publication creates
+/// the destination atomically without replacing another file.
+/// On Unix, a directory sync error can be returned after publication.
+pub fn export(session: &Session, destination: &Path) -> Result<()> {
+    publish(&render(session), destination)
 }
 
-fn source_destination_error() -> Error {
-    Error::Config("Cannot export HTML over the source session file".into())
-}
-
-fn publish(document: &str, destination: &Path, replace: bool) -> Result<()> {
-    let parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    #[cfg(unix)]
-    let parent_dir = std::fs::File::open(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(document.as_bytes())?;
-    temporary.as_file().sync_all()?;
-    let published = if replace {
-        temporary.persist(destination)
-    } else {
-        temporary.persist_noclobber(destination)
-    };
-    published.map_err(|error| Error::Io(error.error))?;
-    #[cfg(unix)]
-    parent_dir.sync_all()?;
-    Ok(())
-}
-
-/// Compare canonical paths without reading their contents.
-#[doc(hidden)]
-pub fn same_export_file(source: &Path, destination: &Path) -> std::io::Result<bool> {
-    if source == destination {
-        return Ok(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let source = source.metadata()?;
-        let destination = destination.metadata()?;
-        Ok(source.dev() == destination.dev() && source.ino() == destination.ino())
-    }
-    #[cfg(not(unix))]
-    {
-        if !destination.metadata()?.is_file() {
-            return Ok(false);
-        }
-        same_file::is_same_file(source, destination)
-    }
+fn publish(document: &str, destination: &Path) -> Result<()> {
+    crate::session_html_output::publish(document, destination, |temporary, path| {
+        temporary.persist_noclobber(path)
+    })
 }
 
 fn escape(text: &str) -> String {

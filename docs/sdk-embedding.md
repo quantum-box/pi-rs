@@ -174,18 +174,16 @@ Use `pi_rs_workbench::session_html::export_agent_session(&session, &path)`
 from the native host to export the selected branch. The host chooses the
 destination, for example through a native save dialog in a Tauri command.
 Both disk-backed and in-memory sessions use the CLI and RPC renderer. Export
-is synchronous and reports a busy journal through the usual SDK error. For
-an SDK-managed disk session, replacement checks the identity of the open
-journal even if it has moved. If the identity cannot be verified, export can
-only create a new file.
+is synchronous and reports a busy journal through the usual SDK error.
 
 For a shared `Session`, `session_html::render(&journal)` returns the document
-without filesystem access. `session_html::export(&journal, &path, Some(&source))`
-atomically writes the document and rejects destinations that refer to the
-source journal. Supply the source path for host-managed file stores and
-imported snapshots. Exports without a known source create a new file without
-replacing an existing destination. The destination's parent must already exist.
-On Unix, a directory sync error after publication can leave the HTML in place.
+without filesystem access. Use `session_html::export(&journal, &path)` to
+write it to a file.
+
+Both file exporters atomically create a new destination whose parent
+directory already exists. If the destination exists at publication, the
+exporter returns an I/O error with kind `AlreadyExists`. On Unix, a directory
+sync error after publication can leave the HTML in place.
 
 Pi's SDK chooses a default output filename, supports a theme override, and
 uses extension tool HTML renderers. The native SDK export requires an explicit

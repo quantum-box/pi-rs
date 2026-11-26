@@ -65,6 +65,7 @@ mod rpc_entries;
 mod rpc_events;
 mod rpc_messages;
 mod runtime;
+mod session_html_output;
 mod session_import;
 mod sessions;
 mod share_refresh;
@@ -1852,7 +1853,7 @@ fn export_from_file(paths: &[PathBuf], protected_inputs: &[PathBuf]) -> Result<(
             let path = std::path::absolute(normalize(path)?)?;
             match path.canonicalize() {
                 Ok(input) => {
-                    if pi_rs_workbench::session_html::same_export_file(&input, &output)? {
+                    if sessions::same_export_file(&input, &output)? {
                         return Err(Error::Config(
                             "Cannot export HTML over an input session file".into(),
                         ));

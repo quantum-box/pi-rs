@@ -590,13 +590,6 @@ pub trait SessionStore: Send {
     fn load(&mut self) -> Result<Vec<Record>>;
     fn append(&mut self, record: &Record) -> Result<()>;
 
-    /// Compare an existing path with the open backing file, if known.
-    /// Use the open file's identity so this works after a rename.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn backing_file_matches(&self, _path: &Path) -> std::io::Result<Option<bool>> {
-        Ok(None)
-    }
-
     /// Whether this store supports atomic auxiliary record metadata.
     fn supports_record_metadata(&self) -> bool {
         false
@@ -717,13 +710,6 @@ pub struct Session {
 pub(crate) const MAX_USER_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 impl Session {
-    /// Compare an existing path with the open journal file. A store without
-    /// native file identity returns `None`.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub fn backing_file_matches(&self, path: &Path) -> std::io::Result<Option<bool>> {
-        self.store.backing_file_matches(path)
-    }
-
     /// Preserve journal IDs and branch selection while validating drafts
     /// independently of the live store.
     pub(crate) fn extension_boundary_snapshot(&self) -> Self {
@@ -4318,11 +4304,6 @@ fn read_complete_records(reader: impl Read) -> Result<CompleteRecords> {
 struct ShareFileStore(FileStore);
 
 impl SessionStore for ShareFileStore {
-    #[cfg(any(unix, windows))]
-    fn backing_file_matches(&self, path: &Path) -> std::io::Result<Option<bool>> {
-        self.0.backing_file_matches(path)
-    }
-
     fn encoded_record_limit(&self) -> Option<usize> {
         Some(MAX_RECORD_BYTES)
     }
@@ -4358,23 +4339,6 @@ impl SessionStore for ShareFileStore {
 }
 
 impl SessionStore for FileStore {
-    #[cfg(unix)]
-    fn backing_file_matches(&self, path: &Path) -> std::io::Result<Option<bool>> {
-        use std::os::unix::fs::MetadataExt;
-        let source = self.file.metadata()?;
-        let destination = path.metadata()?;
-        Ok(Some(
-            source.dev() == destination.dev() && source.ino() == destination.ino(),
-        ))
-    }
-
-    #[cfg(windows)]
-    fn backing_file_matches(&self, path: &Path) -> std::io::Result<Option<bool>> {
-        let source = same_file::Handle::from_file(self.file.try_clone()?)?;
-        let destination = same_file::Handle::from_path(path)?;
-        Ok(Some(source == destination))
-    }
-
     fn encoded_record_limit(&self) -> Option<usize> {
         Some(MAX_RECORD_BYTES)
     }

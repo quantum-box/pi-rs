@@ -326,7 +326,7 @@ pub fn export(session: &Session, destination: &Path) -> Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    pi_rs_workbench::session_html::export(session, destination, None)
+    pi_rs_workbench::session_html::export(session, destination)
 }
 
 pub(super) fn default_html_destination(source: &Path) -> PathBuf {
@@ -336,7 +336,42 @@ pub(super) fn default_html_destination(source: &Path) -> PathBuf {
 }
 
 pub(super) fn export_html(session: &Session, source: &Path, destination: &Path) -> Result<()> {
-    pi_rs_workbench::session_html::export(session, destination, Some(source))
+    match destination.canonicalize() {
+        Ok(resolved) => {
+            if same_export_file(&source.canonicalize()?, &resolved)? {
+                return Err(Error::Config(
+                    "Cannot export HTML over the source session file".into(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let document = pi_rs_workbench::session_html::render(session);
+    super::session_html_output::publish(&document, destination, |temporary, path| {
+        temporary.persist(path)
+    })
+}
+
+/// Compare canonical paths without reading their contents.
+pub(super) fn same_export_file(source: &Path, destination: &Path) -> std::io::Result<bool> {
+    if source == destination {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let source = source.metadata()?;
+        let destination = destination.metadata()?;
+        Ok(source.dev() == destination.dev() && source.ino() == destination.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        if !destination.metadata()?.is_file() {
+            return Ok(false);
+        }
+        same_file::is_same_file(source, destination)
+    }
 }
 
 #[cfg(test)]
