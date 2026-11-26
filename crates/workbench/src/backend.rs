@@ -150,6 +150,9 @@ enum Request {
         request_id: Option<serde_json::Value>,
     },
     AbortBash,
+    ExtensionUiThemeClaim {
+        id: Uuid,
+    },
     ExtensionUiResponse {
         id: Uuid,
         value: pi_rs::UiResponse,
@@ -2642,6 +2645,10 @@ fn read_requests(
                     ) {
                         control_response("select_live_model", Some(json!(id)), Err(error));
                     }
+                }
+                Request::ExtensionUiThemeClaim { id } => {
+                    let theme = ui.claim_theme(id);
+                    output(json!({"type":"extension_ui_theme_claim","id":id,"theme":theme}));
                 }
                 Request::ExtensionUiResponse { id, value } => ui.resolve(id, value),
                 request @ (Request::Steer { .. }

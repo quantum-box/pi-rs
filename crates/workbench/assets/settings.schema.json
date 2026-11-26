@@ -104,6 +104,7 @@
     "markdown": {
       "type": "object",
       "properties": {
+        "codeBlockIndent": { "type": "string", "default": "  " },
         "mermaid": { "enum": ["off", "final", "streaming"] }
       }
     },
