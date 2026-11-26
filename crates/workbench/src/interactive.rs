@@ -13524,8 +13524,8 @@ exit {exit}
             ));
             drop(session_lock);
             let task = view.remote_task.take().unwrap();
-            // Logout publishes this event after cleanup. A concurrent config
-            // read may fall back to a read-only snapshot if the lock is busy.
+            // Dropping the session-store lock lets cleanup proceed. Wait for
+            // its notification before reading the credentials again.
             assert!(matches!(
                 task.receiver
                     .recv_timeout(std::time::Duration::from_secs(15))
