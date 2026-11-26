@@ -15973,6 +15973,27 @@ exit {exit}
     }
 
     #[test]
+    fn resolved_theme_selection_and_extension_catalog_skip_the_same_oversized_duplicate() {
+        use super::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let large = directory.path().join("large.json");
+        let valid = directory.path().join("valid.json");
+        let mut theme: Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        theme["name"] = json!("custom");
+        std::fs::write(&large, format!("{}{}", " ".repeat(256 * 1024), theme)).unwrap();
+        std::fs::write(&valid, theme.to_string()).unwrap();
+
+        let paths = [large, valid.clone()];
+        let selected = load_resolved_theme("custom", &paths, directory.path(), false).unwrap();
+        let catalog = pi_rs_workbench::theme_resources::extension_theme_catalog(&paths).unwrap();
+        let listed = catalog.iter().find(|theme| theme.name == "custom").unwrap();
+        assert_eq!(selected.path, Some(valid));
+        assert_eq!(listed.path, selected.path);
+    }
+
+    #[test]
     fn theme_settings_preview_skips_unrelated_invalid_theme() {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();

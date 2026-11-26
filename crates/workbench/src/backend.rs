@@ -972,7 +972,11 @@ async fn run_worker(
             json!({"type":"worker_extension_sources", "sources":runtime.extension_sources}),
         );
     }
-    let ui = Arc::new(super::extension_ui::Broker::default());
+    let ui = Arc::new(super::extension_ui::Broker::new(
+        args.terminal_managed_worker,
+    ));
+    let base_theme_paths = runtime.resources.themes.clone();
+    ui.refresh_themes(&base_theme_paths);
     runtime.registry.set_ui(ui.clone());
     let active = Arc::new(Mutex::new(ControlState::default()));
     let stopping = Arc::new(AtomicBool::new(false));
@@ -1075,10 +1079,11 @@ async fn run_worker(
     drop(session);
     *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
     *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
-    resources_ready.send_replace(true);
     if runtime.registry.has_resource_discovery_hooks() {
+        ui.refresh_themes(&runtime.resources.themes);
         output(json!({"type":"resources_discovered","resources":discovered}));
     }
+    resources_ready.send_replace(true);
     if args.terminal_managed_worker {
         let messages = runtime.registry.custom_message_renderers();
         let entries = runtime.registry.custom_entry_renderers();
@@ -1327,6 +1332,7 @@ async fn run_worker(
             model_reports_thinking = reported_thinking;
             refresh_snapshot(&snapshot, &Session::open(&args.session)?);
             if switched {
+                ui.refresh_themes(&base_theme_paths);
                 notify_session_lifecycle(
                     &args,
                     &runtime,
@@ -1352,10 +1358,11 @@ async fn run_worker(
                 drop(session);
                 *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
                 *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
-                resources_ready.send_replace(true);
                 if runtime.registry.has_resource_discovery_hooks() {
+                    ui.refresh_themes(&runtime.resources.themes);
                     output(json!({"type":"resources_discovered","resources":discovered}));
                 }
+                resources_ready.send_replace(true);
             }
             {
                 let mut snapshot = snapshot.lock().expect("session snapshot");

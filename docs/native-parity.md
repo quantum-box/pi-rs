@@ -951,6 +951,22 @@ arbitrary live components and passes a footer data provider to its
 factory. Native extensions supply updated rows through non-blocking host UI
 requests, including in terminal session and selection callbacks.
 
+### Native extension theme discovery
+
+Extensions can query `getAllThemes` and receive `UiResponse::Themes`. The
+terminal worker snapshots its resolved theme files at startup and refreshes
+the catalog after resource discovery. Session start can query the base catalog,
+then later calls see the additional discovered files. Headless RPC returns an
+empty list locally, as Pi does. It does not ask the RPC client for a reply.
+
+The list puts `system` first and sorts other names by the host locale. The first
+valid source wins for duplicate names. Embedded themes and paths that cannot be
+represented in UTF-8 omit their file path. The snapshot skips invalid files, includes explicit `--theme` paths and
+uses the native theme resource read limits. Theme selection and the catalog
+both accept a UTF-8 BOM. Native theme objects and switching
+through extension UI remain open.
+[Pi theme listing](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L403-L434)
+
 ### Native extension working indicator
 
 Native extensions can change the working message, hide the working display,
