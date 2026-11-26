@@ -15,6 +15,7 @@ pub enum NativeModelApi {
     OpenAiCodexResponses,
     ChatGptResponses,
     AnthropicMessages,
+    PiMessages,
     GoogleGemini,
     BedrockConverse,
 }
@@ -65,7 +66,8 @@ impl ModelClientFactory {
     /// Construct a client for an exact registered provider and endpoint.
     /// The host must authorize the endpoint and manage the lifetime of any
     /// returned client. Replacing a snapshot does not revoke existing clients.
-    /// Chat, Responses and Messages endpoints are complete request URLs; Gemini uses
+    /// Chat, Responses, Anthropic Messages and Pi Messages use complete request
+    /// URLs. Pi Messages sends either host credential kind as a bearer. Gemini uses
     /// an API base URL and appends its model-specific streaming path. Granting a
     /// Gemini base authorizes those derived paths. Bedrock uses a regional
     /// Runtime endpoint and appends the model's ConverseStream path. Model discovery probes,
@@ -89,6 +91,14 @@ impl ModelClientFactory {
             }
             NativeModelApi::AnthropicMessages => {
                 Ok(Arc::new(self.anthropic_client(provider, endpoint)?))
+            }
+            NativeModelApi::PiMessages => {
+                let credential = self.credential(provider, endpoint)?;
+                Ok(Arc::new(crate::native_pi_messages::HostModel::new(
+                    provider,
+                    endpoint,
+                    credential.secret().to_owned(),
+                )?))
             }
             NativeModelApi::GoogleGemini => Ok(Arc::new(self.gemini_client(provider, endpoint)?)),
             NativeModelApi::BedrockConverse => Ok(Arc::new(self.bedrock_client(
