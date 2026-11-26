@@ -176,7 +176,7 @@ impl Snapshot {
     }
 }
 
-fn key(id: Uuid) -> Vec<u8> {
+pub(crate) fn key(id: Uuid) -> Vec<u8> {
     format!("durable/generation-progress/{id}").into_bytes()
 }
 fn encode(state: &State) -> Result<Vec<u8>, Error> {
