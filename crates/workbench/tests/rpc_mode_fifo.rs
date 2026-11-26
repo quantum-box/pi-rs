@@ -850,7 +850,11 @@ else:
     if r['type']=='invoke':
         print(json.dumps({'type':'ui','request':{'method':'confirm','title':'Ready','message':'Continue?'}}),flush=True)
         reply=json.loads(sys.stdin.readline())
-        with open(os.path.join(os.environ['PI_RS_HOME'],'ui-reply'),'w') as f: json.dump(reply,f)
+        # The Rust fixture sends abort when this marker appears. Publish only
+        # after closing the file so abort cannot interrupt JSON serialization.
+        path=os.path.join(os.environ['PI_RS_HOME'],'ui-reply')
+        with open(path+'.tmp','w') as f: json.dump(reply,f)
+        os.replace(path+'.tmp',path)
         result={'outcome':{'status':'succeeded','detail':'confirmed'}}
     else: result=None
     print(json.dumps({'type':'complete','response':{'Ok':result}}),flush=True)
