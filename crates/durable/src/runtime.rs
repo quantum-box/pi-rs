@@ -2529,6 +2529,8 @@ pub struct ConversationView {
     pub live: Option<crate::progress::State>,
     /// Latest committed partial for the current tool attempt.
     pub tool_progress: Option<crate::tool_progress::State>,
+    /// Up to 16 recently admitted foreground conversations of the active tool.
+    pub foreground_subagents: Vec<Uuid>,
     pub entries: Vec<Message>,
     pub older: Option<ViewCursor>,
 }
@@ -2710,6 +2712,7 @@ fn view_fingerprint(view: &ConversationView) -> Result<serde_json::Value, Error>
         "state": serde_json::to_value(&view.state)?,
         "live": serde_json::to_value(&view.live)?,
         "tool_progress": serde_json::to_value(&view.tool_progress)?,
+        "foreground_subagents": view.foreground_subagents,
     }))
 }
 
@@ -10394,7 +10397,7 @@ impl Harness {
     pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
         self.subagent_store()?;
         let store = self.owner.store();
-        let (mut state, live, tool_progress) = loop {
+        let (mut state, live, tool_progress, foreground_subagents) = loop {
             let entry = store.get(&Self::key(id))?.ok_or(Error::NotFound)?;
             let state: Conversation = serde_json::from_slice(&entry.value)?;
             let request = match &state.phase {
@@ -10434,11 +10437,17 @@ impl Harness {
                     .transpose()?
                     .and_then(|snapshot| snapshot.is_persisted().then(|| snapshot.state().clone()))
             };
+            let foreground_subagents = match &state.phase {
+                Phase::TaskPending { task, .. } if !state.abort_requested => {
+                    crate::owned_subagent::foreground_view(store, *task)?
+                }
+                _ => Vec::new(),
+            };
             if store
                 .get(&Self::key(id))?
                 .is_some_and(|current| current.version == entry.version)
             {
-                break (state, live, tool_progress);
+                break (state, live, tool_progress, foreground_subagents);
             }
         };
         let cursor = state.transcript.clone().ok_or_else(|| {
@@ -10460,6 +10469,7 @@ impl Harness {
             state,
             live,
             tool_progress,
+            foreground_subagents,
             entries: page.entries,
             older: page.older,
         })

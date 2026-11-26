@@ -22,6 +22,7 @@ struct Turn {
     attempt: Option<Uuid>,
     assistant_open: bool,
     emitted_failures: HashSet<Uuid>,
+    foreground_subagents: Vec<Uuid>,
 }
 
 impl Turn {
@@ -37,7 +38,19 @@ impl Turn {
             attempt: None,
             assistant_open: false,
             emitted_failures: HashSet::new(),
+            foreground_subagents: Vec::new(),
         })
+    }
+
+    fn update_foreground_subagents(&mut self, conversations: Vec<Uuid>) -> io::Result<()> {
+        if self.foreground_subagents != conversations {
+            emit(&json!({
+                "type": "durable_foreground_subagents",
+                "conversationIds": conversations,
+            }))?;
+            self.foreground_subagents = conversations;
+        }
+        Ok(())
     }
 
     fn begin_attempt(&mut self, attempt: Option<Uuid>) -> io::Result<()> {
@@ -135,6 +148,7 @@ impl Turn {
     }
 
     fn settle(&mut self, state: &Conversation, failure: Option<String>) -> io::Result<()> {
+        self.update_foreground_subagents(Vec::new())?;
         self.emit_retried_attempts(state)?;
         let status = state
             .submissions
@@ -296,6 +310,7 @@ async fn respond(
                 "pendingMessageCount": state.submissions.iter().filter(|s| matches!(s.status, Status::Queued)).count()
             }))
         }).map_err(|error| error.to_string()),
+        "get_foreground_subagent" => foreground_subagent_view(scheduler, id, &request).map(Some),
         "get_messages" => scheduler.conversation(id).map(|state| {
             let mut data = json!({"messages":messages(&state)});
             if request["includeNative"] == true {
@@ -310,6 +325,35 @@ async fn respond(
         *active = Some(Turn::start(submission, message)?);
     }
     Ok(())
+}
+
+fn foreground_subagent_view(
+    scheduler: &Scheduler,
+    parent: Uuid,
+    request: &Value,
+) -> Result<Value, String> {
+    let child = request["conversationId"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or("conversationId must be a UUID")?;
+    let parent_view = scheduler
+        .view(parent, NonZeroUsize::MIN)
+        .map_err(|error| error.to_string())?;
+    if !parent_view.foreground_subagents.contains(&child) {
+        return Err(
+            "foreground subagent is not attached to this conversation's active tool".into(),
+        );
+    }
+    let limit = NonZeroUsize::new(32).expect("nonzero transcript read limit");
+    let child_view = scheduler
+        .view(child, limit)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "conversationId": child,
+        "messages": child_view.entries.into_iter().rev().collect::<Vec<_>>(),
+        "live": child_view.live,
+        "toolProgress": child_view.tool_progress,
+    }))
 }
 
 fn reply(request: &Value, result: Result<Option<Value>, String>) -> io::Result<()> {
@@ -340,6 +384,7 @@ async fn advance(
         .any(|worker| worker.kind == WorkerKind::Conversation && worker.id == id)
     {
         let view = scheduler.view(id, NonZeroUsize::MIN)?;
+        turn.update_foreground_subagents(view.foreground_subagents)?;
         turn.emit_retried_attempts(&view.state)?;
         if let Some(request_id) = view.state.model_request_id(turn.submission)
             && let Some(progress::State::Running(partial)) = view.live
