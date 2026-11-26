@@ -1478,34 +1478,34 @@ mod tests {
         ];
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("history.jsonl");
-        for (parent, target, replacement, expected_usage, expected_assistants) in [
+        for (parent, target, replacement, expected) in [
             (
                 "label",
                 "retry",
                 Some(Value::Null),
-                90,
-                &["older partial", "measured answer"][..],
+                Some((90, &["older partial", "measured answer"][..])),
             ),
             (
                 "measured",
                 "early",
                 Some(Value::Null),
-                0,
-                &["measured answer"],
+                Some((0, &["measured answer"][..])),
             ),
+            ("label", "sibling", Some(Value::Null), None),
             (
                 "label",
-                "sibling",
+                "missing",
                 Some(Value::Null),
-                0,
-                &["older partial", "measured answer", "retry partial"],
+                Some((
+                    90,
+                    &["older partial", "measured answer", "retry partial"][..],
+                )),
             ),
             (
                 "label",
                 "retry",
                 None,
-                0,
-                &["older partial", "measured answer"],
+                Some((0, &["older partial", "measured answer"][..])),
             ),
         ] {
             let mut edit = json!({"type":"context_edit","id":"edit","parentId":parent,"targetId":target,
@@ -1517,7 +1517,13 @@ mod tests {
             for entry in history.iter().chain(std::iter::once(&edit)) {
                 writeln!(file, "{entry}").unwrap();
             }
-            let imported = super::super::session_import::read(&path).unwrap();
+            let imported = super::super::session_import::read(&path);
+            let Some((expected_usage, expected_assistants)) = expected else {
+                let error = imported.err().expect("known sibling edit must be rejected");
+                assert!(error.to_string().contains("outside its branch"), "{edit}");
+                continue;
+            };
+            let imported = imported.unwrap();
             let estimate = imported.context_usage_estimate();
             assert_eq!(estimate.usage_tokens, expected_usage, "{edit}");
             assert_eq!(
