@@ -3911,6 +3911,14 @@ mod tests {
                 .unwrap(),
                 Some(expected)
             );
+            if length == 12 {
+                let messages = command(&json!({"type":"get_messages"}), &mut args, &mut None)
+                    .unwrap()
+                    .unwrap();
+                let last = messages["messages"].as_array().unwrap().last().unwrap();
+                assert_eq!(last["stopReason"], "stop");
+                assert_eq!(last["content"], json!([]));
+            }
         }
     }
 

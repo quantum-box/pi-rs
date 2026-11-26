@@ -14,6 +14,8 @@ use crate::{
 
 mod assistant_transcript;
 
+pub use assistant_transcript::{AssistantTranscriptEntry, native_assistant_stop_reason};
+
 pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
 const BRANCH_FALLBACK_JOURNAL_VERSION: u32 = 4;
 pub(crate) const TOOL_DECISION_JOURNAL_VERSION: u32 = 5;

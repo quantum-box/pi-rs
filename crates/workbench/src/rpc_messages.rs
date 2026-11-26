@@ -35,7 +35,7 @@ struct ModelIdentity<'a> {
 struct Finished<'a> {
     metadata: &'a ModelMetadata,
     usage: Option<Usage>,
-    successful: bool,
+    failure: Option<pi_rs::ModelFailure>,
     record_id: u64,
 }
 
@@ -75,62 +75,31 @@ fn display_only(record: &Record, compaction: Option<&Record>) -> bool {
     }
 }
 
-// Older journals without a marker keep their previous projection.
-fn turn_partial_records(
-    records: &[Record],
-    branch: &[&Record],
-    compaction: Option<&Record>,
-) -> HashSet<u64> {
-    let retain_from = compaction.and_then(|entry| match entry.event {
-        Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(entry.id)),
-        _ => None,
-    });
-    let assistants: HashSet<Uuid> = branch
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::Assistant {
-                request_id: Some(id),
-                ..
-            } => Some(*id),
-            _ => None,
+fn additional_assistants<'a>(
+    session: &'a Session,
+    entries: &[(u64, Message)],
+) -> impl Iterator<Item = pi_rs::AssistantTranscriptEntry<'a>> {
+    let projected: HashSet<_> = entries.iter().map(|(id, _)| *id).collect();
+    session
+        .assistant_transcript()
+        .into_iter()
+        .filter(move |entry| {
+            !projected.contains(&entry.record_id)
+                && (entry.stop_reason == Some("stop")
+                    || entry.is_edited()
+                    || matches!(
+                        session.records()[entry.record_id as usize - 1].event,
+                        Event::ModelFinished { .. }
+                    ))
         })
-        .collect();
-    branch
-        .iter()
-        .filter_map(|record| {
-            let Event::ModelFinished { request_id, .. } = &record.event else {
-                return None;
-            };
-            (!assistants.contains(request_id)
-                && retain_from.is_none_or(|retain| record.id >= retain)
-                && pi_rs::turn_partial_failure(records, record).is_some())
-            .then_some(record.id)
-        })
-        .collect()
 }
 
 pub(super) fn count(session: &Session) -> usize {
     let branch = session.branch();
     let compaction = latest_compaction(&branch);
-    let partials = turn_partial_records(session.records(), &branch, compaction);
-    let deleted: HashSet<u64> = branch
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::ContextEdited {
-                target,
-                replacement,
-            } if partials.contains(target) => Some((*target, replacement.is_none())),
-            _ => None,
-        })
-        .fold(HashMap::new(), |mut latest, (target, deleted)| {
-            latest.insert(target, deleted);
-            latest
-        })
-        .into_iter()
-        .filter_map(|(target, deleted)| deleted.then_some(target))
-        .collect();
-    session.current_message_entries().len()
-        + partials.difference(&deleted).count()
+    let entries = session.current_message_entries();
+    entries.len()
+        + additional_assistants(session, &entries).count()
         + branch
             .iter()
             .filter(|record| display_only(record, compaction))
@@ -152,10 +121,11 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let projection = Projection::new(branch.iter().copied());
     let mut imported_entries = HashMap::new();
     let mut import = None;
-    let mut edited = HashSet::new();
-    let mut partial_edits = HashMap::new();
+    let mut edits = HashMap::new();
     let compaction = latest_compaction(&branch);
-    let partials = turn_partial_records(session.records(), &branch, compaction);
+    let additional: HashMap<_, _> = additional_assistants(session, &entries)
+        .map(|entry| (entry.record_id, entry))
+        .collect();
     for record in &branch {
         if let Event::SourceEntry { format, entry } = &record.event {
             import = (format == "pi").then_some(entry);
@@ -172,18 +142,17 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             replacement,
         } = &record.event
         {
-            edited.insert(*target);
-            partial_edits.insert(*target, replacement);
+            edits.insert(*target, replacement);
         }
     }
     let mut extra_messages = branch
         .into_iter()
-        .filter(|record| display_only(record, compaction) || partials.contains(&record.id))
+        .filter(|record| display_only(record, compaction) || additional.contains_key(&record.id))
         .filter_map(|record| {
             let value = match &record.event {
-                Event::ModelFinished { .. } if partials.contains(&record.id) => {
+                Event::ModelFinished { .. } if additional.contains_key(&record.id) => {
                     let mut value = projection.turn_partial(session.records(), record)?;
-                    if let Some(replacement) = partial_edits.get(&record.id) {
+                    if let Some(replacement) = edits.get(&record.id) {
                         match replacement {
                             None => return None,
                             Some(pi_rs::ContextContent::Text(text)) => {
@@ -195,6 +164,33 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                         }
                     }
                     value
+                }
+                Event::Assistant { .. } => {
+                    // Tool-pair repair can elide an empty reply from model
+                    // context. Its original stop still matters in the transcript.
+                    let edited = edits.contains_key(&record.id);
+                    let metadata = Some(MetadataSource::Session(session));
+                    let value = if edited {
+                        let message = Message::Assistant {
+                            content: additional.get(&record.id)?.text().into_owned(),
+                            calls: vec![],
+                            replay: None,
+                        };
+                        projection.message(session.records(), record, &message, true, metadata)
+                    } else {
+                        projection.raw_message(session.records(), record, metadata)?
+                    };
+                    imported_entries
+                        .get(&record.id)
+                        .and_then(|source| {
+                            imported_message(
+                                source,
+                                &value,
+                                record.timestamp_millis().unwrap_or_default(),
+                                edited,
+                            )
+                        })
+                        .unwrap_or(value)
                 }
                 Event::SystemCheckpoint {
                     content,
@@ -259,14 +255,14 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                 session.records(),
                 record,
                 &message,
-                edited.contains(&id),
+                edits.contains_key(&id),
                 Some(MetadataSource::Session(session)),
             )
         };
         let value = imported_entries
             .get(&id)
             .filter(|source| source["type"] != "compaction")
-            .and_then(|source| imported_message(source, &value, timestamp, edited.contains(&id)))
+            .and_then(|source| imported_message(source, &value, timestamp, edits.contains_key(&id)))
             .unwrap_or(value);
         let mut value = value;
         if matches!(record.event, Event::ImportedUnattributedToolResult { .. }) {
@@ -470,7 +466,7 @@ impl Projection {
         Some(Finished {
             metadata,
             usage,
-            successful: failure.is_none(),
+            failure: *failure,
             record_id: *request,
         })
     }
@@ -506,11 +502,11 @@ impl Projection {
             replay: None,
         };
         let mut value = self.message(records, &assistant_record, &message, false, None);
-        value["stopReason"] = json!(if failure == pi_rs::ModelFailure::Cancelled {
-            "aborted"
-        } else {
-            "error"
-        });
+        value["stopReason"] = json!(pi_rs::native_assistant_stop_reason(
+            None,
+            Some(failure),
+            false
+        ));
         Some(value)
     }
 
@@ -631,11 +627,14 @@ impl Projection {
                 calls,
                 replay,
             } => {
-                let (request, usage) = match &record.event {
+                let (request, usage, has_calls) = match &record.event {
                     Event::Assistant {
-                        request_id, usage, ..
-                    } => (*request_id, *usage),
-                    _ => (None, None),
+                        request_id,
+                        usage,
+                        invocations,
+                        ..
+                    } => (*request_id, *usage, !invocations.is_empty()),
+                    _ => (None, None, !calls.is_empty()),
                 };
                 let finalized = request.and_then(|request| self.finished(records, request));
                 let model = request
@@ -732,7 +731,7 @@ impl Projection {
                 if !edited
                     && api == "anthropic-messages"
                     && let Some(projected) = finalized
-                        .filter(|entry| entry.successful)
+                        .filter(|entry| entry.failure.is_none())
                         .and_then(|entry| {
                             metadata.and_then(|metadata| metadata.get(entry.record_id))
                         })
@@ -740,15 +739,11 @@ impl Projection {
                 {
                     blocks = projected;
                 }
-                let stop = if finalized
-                    .is_some_and(|entry| entry.metadata.finish_reason.as_deref() == Some("length"))
-                {
-                    "length"
-                } else if calls.is_empty() {
-                    "stop"
-                } else {
-                    "toolUse"
-                };
+                let stop = pi_rs::native_assistant_stop_reason(
+                    finalized.and_then(|entry| entry.metadata.finish_reason.as_deref()),
+                    finalized.and_then(|entry| entry.failure),
+                    has_calls,
+                );
                 let empty = ModelMetadata::default();
                 let metadata = finalized.map_or(&empty, |entry| entry.metadata);
                 let usage = finalized
@@ -932,6 +927,120 @@ pub(super) fn compaction_tokens(session: &Session, record: &Record) -> u64 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn native_assistant_stop_is_preserved_when_an_edit_empties_the_reply() {
+        for (has_calls, stop, selected) in [(false, "stop", None), (true, "toolUse", Some("older"))]
+        {
+            let initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            let mut records = initial.records().to_vec();
+            let mut append = |event| {
+                let parent = records.last().unwrap();
+                let id = parent.id + 1;
+                records.push(Record {
+                    id,
+                    parent: Some(parent.id),
+                    version: parent.version,
+                    timestamp: None,
+                    run_id: None,
+                    event,
+                });
+                id
+            };
+            append(Event::Assistant {
+                content: "older".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            });
+            let request_id = Uuid::new_v4();
+            let operation_id = Uuid::new_v4();
+            append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    finish_reason: Some("vendor-complete".into()),
+                    ..Default::default()
+                },
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            });
+            let target = append(Event::Assistant {
+                content: if has_calls { "" } else { "newer" }.into(),
+                invocations: has_calls
+                    .then(|| Invocation {
+                        operation_id,
+                        call: pi_rs::ToolCall {
+                            id: "call".into(),
+                            name: "fixture".into(),
+                            arguments: "{}".into(),
+                        },
+                    })
+                    .into_iter()
+                    .collect(),
+                usage: None,
+                request_id: Some(request_id),
+            });
+            if has_calls {
+                append(Event::ToolStarted {
+                    operation_id,
+                    tool_execution: None,
+                });
+                append(Event::ToolFinished {
+                    operation_id,
+                    outcome: pi_rs::Outcome::Succeeded("result".into()),
+                    states: Default::default(),
+                });
+            }
+            let mut session = Session::from_records(records).unwrap();
+            let (before, _) = snapshot(&session);
+            assert_eq!(before[1]["stopReason"], stop);
+            if has_calls {
+                assert_eq!(before[1]["content"][0]["type"], "toolCall");
+                assert_eq!(session.last_assistant_text().as_deref(), selected);
+            }
+            session
+                .edit_context(target, Some(pi_rs::ContextContent::Text(" ".into())))
+                .unwrap();
+            assert_eq!(snapshot(&session).0[1]["stopReason"], stop);
+            assert_eq!(session.last_assistant_text().as_deref(), selected);
+            session
+                .edit_context(target, Some(pi_rs::ContextContent::Blocks(vec![])))
+                .unwrap();
+            let (visible, native) = snapshot(&session);
+            assert_eq!(native.len(), 1);
+            assert_eq!(visible.len(), 2);
+            assert_eq!(count(&session), visible.len());
+            assert_eq!(visible[1]["stopReason"], stop);
+            assert_eq!(visible[1]["content"], json!([]));
+            assert_eq!(session.last_assistant_text().as_deref(), selected);
+        }
+    }
+
+    #[test]
+    fn imported_assistant_stop_remains_verbatim_after_an_edit() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{
+                "role":"assistant","stopReason":"stop","content":[{"type":"text","text":"older"}]
+            }}),
+            json!({"type":"message","id":"b","parentId":"a","message":{
+                "role":"assistant","stopReason":"vendor-complete","content":[{"type":"text","text":"newer"}]
+            }}),
+            json!({"type":"context_edit","id":"c","parentId":"b","targetId":"b","replacement":{"content":[]}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(fixture.path()).unwrap();
+        let (visible, native) = snapshot(&session);
+        assert_eq!(native.len(), 1);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[1]["stopReason"], "vendor-complete");
+        assert_eq!(visible[1]["content"], json!([]));
+        assert_eq!(session.last_assistant_text().as_deref(), Some("older"));
+    }
 
     #[test]
     fn last_assistant_text_skips_nonfinal_messages_without_visible_text() {

@@ -1688,7 +1688,15 @@ mod tests {
                 json!({"type":"context_edit","id":"eu","parentId":"a","targetId":"u","replacement":null}),
             ];
             let session = import_pi(entries.clone()).unwrap();
-            assert!(super::super::rpc_messages::snapshot(&session).0.is_empty());
+            let (visible, native) = super::super::rpc_messages::snapshot(&session);
+            assert!(native.is_empty());
+            if reason == "stop" {
+                assert_eq!(visible.len(), 1);
+                assert_eq!(visible[0]["stopReason"], "stop");
+                assert_eq!(visible[0]["content"], json!([]));
+            } else {
+                assert!(visible.is_empty());
+            }
             assert!(
                 super::super::rpc_entries::Entries::new(&session)
                     .has_session_context()

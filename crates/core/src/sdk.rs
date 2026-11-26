@@ -10397,6 +10397,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_last_assistant_text_treats_custom_finish_reason_without_calls_as_stop() {
+        struct CustomFinish;
+        #[async_trait::async_trait]
+        impl Model for CustomFinish {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("reply".into())),
+                    Ok(ModelEvent::Metadata(crate::ModelMetadata {
+                        finish_reason: Some("vendor-complete".into()),
+                        ..Default::default()
+                    })),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        let mut session = SessionBuilder::new(Arc::new(CustomFinish), "fixture")
+            .in_memory()
+            .unwrap();
+        session.prompt("older").await.unwrap();
+        session.prompt("newer").await.unwrap();
+        let mut journal = session.journal().unwrap();
+        let target = journal.current_message_entries().last().unwrap().0;
+        journal
+            .edit_context(target, Some(crate::ContextContent::Blocks(vec![])))
+            .unwrap();
+        drop(journal);
+        assert_eq!(session.get_last_assistant_text().unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn sdk_last_assistant_text_tracks_edits_branches_and_compaction() {
         let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
             .in_memory()
