@@ -180,9 +180,24 @@ regular and fullscreen terminals. The header uses the startup banner slot.
 The footer replaces the working directory and model/usage rows. An extension
 can supply updated rows from terminal session and selection callbacks. These
 callbacks can publish UI updates without waiting for input. Overrides reset
-when switching sessions or replacing the extension worker. Pi's arbitrary
-live components and footer data provider remain specific to its TypeScript UI
-API.
+when switching sessions or replacing the extension worker.
+
+For a dynamic header, implement `Extension::header_renderer` and send
+`UiRequest::SetHeaderRenderer { enabled: true }` from a terminal presentation
+lifecycle callback, such as `SessionStart`. The host mounts the returned
+`HeaderRenderer` and calls it with the current column count and effective
+theme palette. Send `UiRequest::InvalidateHeaderRenderer` from a presentation
+callback when the renderer's data changes. Only the owner can invalidate a
+mount. A repeated setter replaces the existing mount, and either disabling
+the renderer or clearing the static header restores the built-in banner.
+
+The executable protocol uses the same UI requests as `setHeaderRenderer` and
+`invalidateHeaderRenderer` and calls `render_header` with the read-only
+`context` in the existing v1 render protocol. Executable callbacks can read
+their own state on each request. Return styled rows, an empty row list to
+hide the header, or null for the built-in banner. Renders have a 500 ms
+deadline and the same row limits as static headers. Pi's arbitrary
+components and live footer data provider remain specific to its TypeScript UI.
 
 ## Customize the working indicator
 

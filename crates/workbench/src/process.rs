@@ -835,6 +835,12 @@ impl Worker {
             replacing_session.then(|| args.session.clone()),
         ));
         let mut pending_events = std::mem::take(&mut active.pending_events);
+        pending_events.retain(|event| {
+            !matches!(
+                event["type"].as_str(),
+                Some("header_renderer_changed" | "header_renderer_invalidated" | "header_rendered")
+            ) && !(event["type"] == "extension_ui_request" && event["method"] == "setHeader")
+        });
         let extension_sources = std::mem::take(&mut active.extension_sources);
         let fallback = Self::settings_for(slot, args).cloned();
         drop(slot.take());

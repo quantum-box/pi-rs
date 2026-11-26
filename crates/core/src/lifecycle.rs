@@ -400,6 +400,7 @@ pub async fn notify_filtered_with_ui(
 }
 
 struct LifecycleUiHost {
+    extension: std::sync::Weak<dyn crate::Extension>,
     ui: std::sync::Arc<dyn crate::ExtensionUi>,
     cancellation: crate::CancellationToken,
 }
@@ -420,6 +421,39 @@ impl ToolHost for LifecycleUiHost {
 
     async fn ui(&self, request: crate::UiRequest) -> crate::ExtensionResult<crate::UiResponse> {
         request.validate()?;
+        if self.cancellation.is_cancelled() {
+            return Err("extension UI cancelled".into());
+        }
+        match request {
+            crate::UiRequest::SetHeaderRenderer { enabled } => {
+                let extension = self
+                    .extension
+                    .upgrade()
+                    .ok_or("extension callback has finished")?;
+                let renderer = if enabled {
+                    Some(
+                        extension
+                            .header_renderer()
+                            .ok_or("extension has no header renderer")?,
+                    )
+                } else {
+                    None
+                };
+                self.ui
+                    .set_header_renderer(extension.id(), renderer, &self.cancellation)?;
+                return Ok(crate::UiResponse::Cancelled);
+            }
+            crate::UiRequest::InvalidateHeaderRenderer => {
+                let extension = self
+                    .extension
+                    .upgrade()
+                    .ok_or("extension callback has finished")?;
+                self.ui
+                    .invalidate_header_renderer(extension.id(), &self.cancellation)?;
+                return Ok(crate::UiResponse::Cancelled);
+            }
+            _ => {}
+        }
         if request.needs_response() && !matches!(request, crate::UiRequest::GetAllThemes) {
             return Err("lifecycle presentation does not support prompts".into());
         }
@@ -874,6 +908,7 @@ async fn notify_inner_once(
                             let _lifetime = cancellation.clone().drop_guard();
                             let ui_host = ui.map(|ui| {
                                 std::sync::Arc::new(LifecycleUiHost {
+                                    extension: std::sync::Arc::downgrade(extension),
                                     ui: ui.clone(),
                                     cancellation,
                                 })
