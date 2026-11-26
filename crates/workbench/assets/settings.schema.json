@@ -113,6 +113,10 @@
       "properties": {
         "clearOnShrink": { "type": "boolean" },
         "showTerminalProgress": { "type": "boolean" },
+        "images": {
+          "description": "Use kitty or iterm2, or false to disable inline image protocols. Other values use detection.",
+          "default": "auto"
+        },
         "showImages": { "type": "boolean" },
         "imageWidthCells": { "type": "integer", "minimum": 1 }
       }

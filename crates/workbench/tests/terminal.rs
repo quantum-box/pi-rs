@@ -746,6 +746,167 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
 }
 
 #[test]
+fn terminal_image_protocol_applies_at_startup_reload_and_resize_in_both_modes() {
+    use base64::Engine;
+
+    const KITTY: &str = "\x1b_Ga=t,";
+    const DELETE_KITTY: &str = "\x1b_Ga=d,d=I,";
+    const ITERM: &str = "\x1b]1337;File=inline=1;";
+    const QUERY_CELL: &str = "\x1b[16t";
+    const TRANSCRIPT: &str = "saved image fixture";
+    fn completed_frame(text: &str, check: impl Fn(&str) -> bool) -> bool {
+        text.split("\x1b[?2026h")
+            .skip(1)
+            .filter_map(|frame| frame.split_once("\x1b[?2026l"))
+            .any(|(frame, _)| check(frame))
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgba8(201, 101)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let attachment = pi_rs::ImageContent {
+        data: base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+        mime_type: "image/png".into(),
+    };
+
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let path = root.path().join("session.jsonl");
+        pi_rs::Session::open(&path)
+            .unwrap()
+            .append_user_with_images(TRANSCRIPT.into(), vec![attachment.clone()], None)
+            .unwrap();
+        let settings = home.join("settings.json");
+        let write_settings = |images: serde_json::Value, show_images: bool| {
+            let value = serde_json::json!({
+                "theme": "dark",
+                "terminal": {"images": images, "showImages": show_images},
+            });
+            std::fs::write(&settings, value.to_string()).unwrap();
+        };
+        write_settings(serde_json::json!("kitty"), true);
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut size = libc::winsize {
+            ws_row: 42,
+            ws_col: 110,
+            ws_xpixel: 990,
+            ws_ypixel: 756,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(size),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let process = Process(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(root.path())
+                .env("PI_RS_HOME", &home)
+                .env("TERM", "xterm-256color")
+                .env("PI_IMAGE_PROTOCOL", "iterm2")
+                .args([
+                    "--offline",
+                    "--no-trust",
+                    "--no-mcp",
+                    "--no-extensions",
+                    "--tui-mode",
+                    mode,
+                    "--session",
+                ])
+                .arg(path)
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave.try_clone().unwrap()))
+                .spawn()
+                .unwrap(),
+        );
+        output_until(&mut master, |text| {
+            assert!(!text.contains(ITERM), "{mode}");
+            text.contains(TRANSCRIPT)
+                && text.contains(KITTY)
+                && text.contains(",c=60,r=15,")
+                && text.contains("Enter to send")
+        });
+
+        write_settings(serde_json::json!("iterm2"), true);
+        master.write_all(b"\x1b[?1;2c/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            let Some((before, after)) = text.split_once(ITERM) else {
+                return false;
+            };
+            assert!(before.contains(DELETE_KITTY), "{mode}");
+            after.contains(";width=60;height=16;") && text.contains("Reloaded settings")
+        });
+
+        size.ws_col = 100;
+        size.ws_xpixel = 900;
+        assert_eq!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGWINCH) },
+            0
+        );
+        output_until(&mut master, |text| {
+            text.split_once(QUERY_CELL)
+                .is_some_and(|(_, frame)| frame.contains(ITERM))
+        });
+
+        write_settings(serde_json::json!(false), true);
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains(if mode == "regular" {
+                "\x1b[3J"
+            } else {
+                "\x1b[2J"
+            }) && completed_frame(text, |frame| {
+                frame.contains("Reloaded settings")
+                    && frame.contains(TRANSCRIPT)
+                    && !frame.contains(ITERM)
+                    && !frame.contains(KITTY)
+            })
+        });
+
+        write_settings(serde_json::json!("auto"), false);
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            let Some((_, frame)) = text.split_once(QUERY_CELL) else {
+                return false;
+            };
+            completed_frame(frame, |frame| {
+                frame.contains("Reloaded settings")
+                    && !frame.contains(ITERM)
+                    && !frame.contains(KITTY)
+            })
+        });
+
+        write_settings(serde_json::json!("auto"), true);
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains(ITERM) && text.contains("Reloaded settings")
+        });
+    }
+}
+
+#[test]
 fn initial_appearance_report_keeps_late_color_replies() {
     let root = tempfile::tempdir().unwrap();
     let mut master_fd = -1;

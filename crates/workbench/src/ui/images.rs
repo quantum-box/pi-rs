@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Write};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use base64::Engine;
 use crossterm::{
@@ -19,6 +19,25 @@ pub enum Protocol {
     Kitty,
     Iterm2,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProtocolOverride {
+    #[default]
+    Auto,
+    Disabled,
+    Forced(Protocol),
+}
+
+impl ProtocolOverride {
+    fn resolve(self, detected: Option<Protocol>) -> Option<Protocol> {
+        match self {
+            Self::Auto => detected,
+            Self::Disabled => None,
+            Self::Forced(protocol) => Some(protocol),
+        }
+    }
+}
+
 fn detect(get: impl Fn(&str) -> Option<String>) -> Option<Protocol> {
     match get("PI_IMAGE_PROTOCOL")
         .map(|value| value.to_lowercase())
@@ -59,8 +78,38 @@ static NEXT_ID: LazyLock<AtomicU32> = LazyLock::new(|| {
         u32::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..4].try_into().unwrap()).max(1),
     )
 });
+/// Keep the encoded attachment available while inline images are disabled.
+/// Prepare it once when it first becomes visible and release the source then.
+pub struct InlineAttachment {
+    source: Mutex<Option<pi_rs::ImageContent>>,
+    prepared: OnceLock<Option<Arc<InlineImage>>>,
+}
+
+impl InlineAttachment {
+    pub fn new(source: pi_rs::ImageContent) -> Arc<Self> {
+        Arc::new(Self {
+            source: Mutex::new(Some(source)),
+            prepared: OnceLock::new(),
+        })
+    }
+
+    pub fn lines(
+        &self,
+        width: usize,
+        image_width: usize,
+        padding: usize,
+        protocol: Protocol,
+    ) -> Option<Vec<Line>> {
+        let image = self.prepared.get_or_init(|| {
+            let source = self.source.lock().expect("inline image source").take()?;
+            InlineImage::decode(&source)
+        });
+        Some(image.as_ref()?.lines(width, image_width, padding, protocol))
+    }
+}
+
 #[derive(Debug)]
-pub struct InlineImage {
+struct InlineImage {
     id: u32,
     data: String,
     bytes: usize,
@@ -68,7 +117,7 @@ pub struct InlineImage {
     height: u32,
 }
 impl InlineImage {
-    pub fn decode(content: &pi_rs::ImageContent) -> Option<Arc<Self>> {
+    fn decode(content: &pi_rs::ImageContent) -> Option<Arc<Self>> {
         content.validate().ok()?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&content.data)
@@ -90,18 +139,23 @@ impl InlineImage {
             height: prepared.height,
         }))
     }
-    pub fn lines(self: &Arc<Self>, width: usize, image_width: usize, padding: usize) -> Vec<Line> {
+    fn lines(
+        self: &Arc<Self>,
+        width: usize,
+        image_width: usize,
+        padding: usize,
+        protocol: Protocol,
+    ) -> Vec<Line> {
         let maximum_columns = width.saturating_sub(2 * padding).min(image_width).max(1);
         let cell = cell_dimensions();
         let maximum_rows = ((maximum_columns as f64 * cell.0) / cell.1).ceil().max(1.0) as usize;
-        let optimize = detect(|key| std::env::var(key).ok()) == Some(Protocol::Kitty);
         let (columns, rows) = dimensions(
             self.width,
             self.height,
             maximum_columns,
             maximum_rows,
             cell,
-            optimize,
+            protocol,
         );
         (0..rows)
             .map(|offset| Line {
@@ -172,7 +226,7 @@ fn dimensions(
     max_columns: usize,
     max_rows: usize,
     cell: (f64, f64),
-    optimize: bool,
+    protocol: Protocol,
 ) -> (usize, usize) {
     let width = f64::from(width.max(1));
     let height = f64::from(height.max(1));
@@ -185,7 +239,7 @@ fn dimensions(
     let mut rows = (height * scale / cell.1).ceil().max(1.0) as usize;
     columns = columns.min(max_columns);
     rows = rows.min(max_rows);
-    if optimize {
+    if protocol == Protocol::Kitty {
         if width_scale <= height_scale {
             rows = less_distorted(rows, columns as f64 * cell.0 * height / (width * cell.1));
         } else {
@@ -251,16 +305,20 @@ pub fn visible_rows(lines: &[Line]) -> usize {
 pub struct Cleanup(Arc<Mutex<BTreeSet<u32>>>);
 impl Cleanup {
     pub fn clear(&self) {
+        let _ = self.clear_to(&mut std::io::stdout().lock());
+    }
+
+    fn clear_to(&self, out: &mut impl Write) -> std::io::Result<()> {
         let mut ids = self.0.lock().expect("image registry");
         if ids.is_empty() {
-            return;
+            return Ok(());
         }
-        let mut out = std::io::stdout().lock();
         for id in ids.iter() {
-            let _ = write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
+            write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
         }
-        let _ = out.flush();
+        out.flush()?;
         ids.clear();
+        Ok(())
     }
 }
 struct CroppedImage {
@@ -269,6 +327,7 @@ struct CroppedImage {
 }
 
 pub struct Renderer {
+    detected: Option<Protocol>,
     protocol: Option<Protocol>,
     uploaded: BTreeSet<u32>,
     placed: BTreeSet<(u32, u32)>,
@@ -277,19 +336,26 @@ pub struct Renderer {
 }
 impl Default for Renderer {
     fn default() -> Self {
+        Self::new(ProtocolOverride::Auto)
+    }
+}
+impl Renderer {
+    pub fn new(selection: ProtocolOverride) -> Self {
+        let detected = detect(|key| std::env::var(key).ok());
         Self {
-            protocol: detect(|key| std::env::var(key).ok()),
+            detected,
+            protocol: selection.resolve(detected),
             uploaded: BTreeSet::new(),
             placed: BTreeSet::new(),
             cleanup: Cleanup::default(),
             crops: BTreeMap::new(),
         }
     }
-}
-impl Renderer {
+
     #[cfg(test)]
     pub(crate) fn test_with_protocol(protocol: Option<Protocol>) -> Self {
         Self {
+            detected: protocol,
             protocol,
             uploaded: BTreeSet::new(),
             placed: BTreeSet::new(),
@@ -299,6 +365,40 @@ impl Renderer {
     }
     pub fn enabled(&self) -> bool {
         self.protocol.is_some()
+    }
+    pub fn protocol(&self) -> Option<Protocol> {
+        self.protocol
+    }
+
+    pub fn resolve_protocol(&self, selection: ProtocolOverride) -> Option<Protocol> {
+        selection.resolve(self.detected)
+    }
+
+    pub fn set_protocol(
+        &mut self,
+        next: Option<Protocol>,
+        fullscreen: bool,
+        out: &mut impl Write,
+    ) -> std::io::Result<bool> {
+        if self.protocol == next {
+            return Ok(false);
+        }
+        if self.protocol == Some(Protocol::Iterm2) {
+            // iTerm2 embeds images in the text cells. Erase the old surface
+            // before the first frame under the new protocol.
+            if fullscreen {
+                self.clear_fullscreen_frame(out)?;
+            } else {
+                self.purge_regular_transcript(out)?;
+            }
+            out.flush()?;
+        }
+        self.cleanup.clear_to(out)?;
+        self.uploaded.clear();
+        self.placed.clear();
+        self.crops.clear();
+        self.protocol = next;
+        Ok(true)
     }
     pub fn cleanup(&self) -> Cleanup {
         self.cleanup.clone()
@@ -547,6 +647,7 @@ mod tests {
     }
     fn renderer(protocol: Protocol) -> Renderer {
         Renderer {
+            detected: Some(protocol),
             protocol: Some(protocol),
             uploaded: BTreeSet::new(),
             placed: BTreeSet::new(),
@@ -616,11 +717,30 @@ mod tests {
             from(&[("TMUX", ""), ("TERM_PROGRAM", "kitty")]),
             Some(Protocol::Kitty)
         );
+        let detected = from(&[
+            ("PI_IMAGE_PROTOCOL", "kitty"),
+            ("TERM_PROGRAM", "iTerm.app"),
+        ]);
+        assert_eq!(
+            ProtocolOverride::Auto.resolve(detected),
+            Some(Protocol::Kitty)
+        );
+        assert_eq!(ProtocolOverride::Disabled.resolve(detected), None);
+        assert_eq!(
+            ProtocolOverride::Forced(Protocol::Iterm2).resolve(detected),
+            Some(Protocol::Iterm2)
+        );
     }
     #[test]
     fn sizing_and_transcoding_preserve_bounds_and_alpha() {
-        assert_eq!(dimensions(2, 2, 60, 20, (9.0, 18.0), false), (40, 20));
-        assert_eq!(dimensions(600, 1200, 60, 20, (9.0, 18.0), false), (20, 20));
+        assert_eq!(
+            dimensions(2, 2, 60, 20, (9.0, 18.0), Protocol::Iterm2),
+            (40, 20)
+        );
+        assert_eq!(
+            dimensions(600, 1200, 60, 20, (9.0, 18.0), Protocol::Iterm2),
+            (20, 20)
+        );
         let image = fixture();
         assert_eq!((image.width, image.height), (18, 36));
         let decoded = image::load_from_memory(
@@ -645,13 +765,69 @@ mod tests {
             (1000, 1, 60, 30, (8.0, 16.0), (60, 1), (60, 1)),
         ] {
             assert_eq!(
-                dimensions(width, height, columns, rows, cell, false),
+                dimensions(width, height, columns, rows, cell, Protocol::Iterm2),
                 ordinary
             );
             assert_eq!(
-                dimensions(width, height, columns, rows, cell, true),
+                dimensions(width, height, columns, rows, cell, Protocol::Kitty),
                 optimized
             );
+        }
+    }
+
+    #[test]
+    fn protocol_switch_releases_old_images_before_painting_and_reuploads_on_restore() {
+        for fullscreen in [false, true] {
+            let mut renderer = renderer(Protocol::Kitty);
+            let line = Line {
+                image: Some(Placement {
+                    image: fixture(),
+                    columns: 2,
+                    column: 0,
+                    rows: 1,
+                    offset: 0,
+                }),
+                ..Line::default()
+            };
+            let id = line.image.as_ref().unwrap().image.id;
+            let mut out = Vec::new();
+            renderer.paint(&line, &mut out, 0, 1).unwrap();
+            assert!(String::from_utf8_lossy(&out).contains("a=t,f=100"));
+            out.clear();
+
+            assert!(
+                !renderer
+                    .set_protocol(Some(Protocol::Kitty), fullscreen, &mut out)
+                    .unwrap()
+            );
+            assert!(out.is_empty());
+            assert!(
+                renderer
+                    .set_protocol(Some(Protocol::Iterm2), fullscreen, &mut out)
+                    .unwrap()
+            );
+            assert!(String::from_utf8_lossy(&out).contains(&format!("a=d,d=I,i={id},q=2")));
+            assert!(renderer.cleanup.0.lock().unwrap().is_empty());
+            out.clear();
+            renderer.paint(&line, &mut out, 0, 1).unwrap();
+            assert!(String::from_utf8_lossy(&out).contains("1337;File=inline=1;"));
+            out.clear();
+
+            assert!(renderer.set_protocol(None, fullscreen, &mut out).unwrap());
+            let erase = String::from_utf8_lossy(&out);
+            assert!(erase.contains("\x1b[2J"));
+            assert_eq!(erase.contains("\x1b[3J"), !fullscreen);
+            out.clear();
+            renderer.paint(&line, &mut out, 0, 1).unwrap();
+            assert!(out.is_empty());
+            let automatic = renderer.resolve_protocol(ProtocolOverride::Auto);
+            assert!(
+                renderer
+                    .set_protocol(automatic, fullscreen, &mut out)
+                    .unwrap()
+            );
+            renderer.paint(&line, &mut out, 0, 1).unwrap();
+            assert!(String::from_utf8_lossy(&out).contains("a=t,f=100"));
         }
     }
 

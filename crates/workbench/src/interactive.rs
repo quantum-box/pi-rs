@@ -8,7 +8,7 @@ use crate::config::NoticeKind;
 use crate::ui::{
     color::ColorMode,
     editor::Editor,
-    images::{self, Cleanup, InlineImage, Renderer},
+    images::{self, Cleanup, InlineAttachment, Renderer},
     keys::Keys,
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
@@ -323,7 +323,16 @@ impl Terminal {
                 DisableMouseCapture,
                 LeaveAlternateScreen
             )?;
-            view.regular.layout = None;
+            // The restored screen may still contain images from the old protocol.
+            let needs_image_redraw = view.regular.layout.as_ref().is_some_and(|layout| {
+                layout
+                    .output
+                    .inline_images
+                    .is_some_and(|(protocol, _)| Some(protocol) != view.graphics.protocol())
+            });
+            if !needs_image_redraw {
+                view.regular.layout = None;
+            }
             view.regular.max_rows = 0;
             view.regular.committed_rows = 0;
         }
@@ -2552,7 +2561,7 @@ impl View {
             return true;
         };
         *output = crate::ui::render::strip_shell_ansi(&display_tool_blocks(blocks));
-        *parts = tool_result_parts(&update["content"], self.graphics.enabled());
+        *parts = tool_result_parts(&update["content"]);
         records.progress = records.progress.wrapping_add(1);
         self.partial_tool_results.insert(
             id.clone(),
@@ -3407,14 +3416,13 @@ impl View {
         Ok(())
     }
     fn add_images(&mut self, images: &[pi_rs::ImageContent]) {
-        if self.graphics.enabled() {
-            self.lines.extend(
-                images
-                    .iter()
-                    .filter_map(InlineImage::decode)
-                    .map(Entry::Image),
-            );
-        }
+        self.lines.extend(
+            images
+                .iter()
+                .cloned()
+                .map(InlineAttachment::new)
+                .map(Entry::Image),
+        );
     }
     fn add_tool(&mut self, invocation: &pi_rs::Invocation, record: Option<u64>) {
         if invocation.call.name == super::operation_models::TOOL {
@@ -3457,7 +3465,7 @@ impl View {
         let mut rendered_parts = match outcome {
             pi_rs::Outcome::Structured { data, .. }
             | pi_rs::Outcome::StructuredWithDetails { data, .. } => {
-                tool_result_parts(&data["content"], self.graphics.enabled())
+                tool_result_parts(&data["content"])
             }
             _ => Vec::new(),
         };
@@ -4423,8 +4431,11 @@ render_call_id: None,
             hidden_thinking_label: None,
             code_block_indent: None,
             notices: args.settings.notices(),
-            image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
-                .then(|| args.settings.terminal_image_width()),
+            inline_images: self
+                .graphics
+                .protocol()
+                .filter(|_| args.settings.show_terminal_images())
+                .map(|protocol| (protocol, args.settings.terminal_image_width())),
             padding: args.settings.output_padding(),
             expand_key: self.expand_key,
             mermaid: match (args.settings.mermaid_mode(), streaming) {
@@ -4433,6 +4444,28 @@ render_call_id: None,
                 (_, false) => Mermaid::Final,
             },
         }
+    }
+
+    fn update_image_protocol(&mut self, args: &Cli, fullscreen: bool) -> Result<bool> {
+        let previous = self.graphics.protocol();
+        let protocol = self
+            .graphics
+            .resolve_protocol(args.settings.terminal_image_override());
+        if protocol == previous {
+            return Ok(false);
+        }
+        let cleared_regular = !fullscreen && previous == Some(images::Protocol::Iterm2);
+        self.graphics
+            .set_protocol(protocol, fullscreen, &mut std::io::stdout().lock())?;
+        if cleared_regular {
+            self.regular = RegularState::default();
+        } else {
+            self.regular.redraw = true;
+        }
+        if previous.is_none() && protocol.is_some() {
+            images::query_cell_size()?;
+        }
+        Ok(true)
     }
 
     fn debug_log(&self, args: &Cli, theme: &Theme, width: usize, height: usize) -> Result<String> {
@@ -4833,10 +4866,10 @@ render_call_id: None,
     }
 }
 
-fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
+fn tool_result_parts(content: &Value) -> Vec<ToolPart> {
     content
         .as_array()
-        .filter(|blocks| images && blocks.iter().any(|block| block["type"] == "image"))
+        .filter(|blocks| blocks.iter().any(|block| block["type"] == "image"))
         .into_iter()
         .flatten()
         .filter_map(|value| match value["type"].as_str() {
@@ -4846,7 +4879,7 @@ fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
             Some("image") => {
                 let image = serde_json::from_value::<pi_rs::ImageContent>(value.clone())
                     .ok()
-                    .and_then(|content| InlineImage::decode(&content));
+                    .map(InlineAttachment::new);
                 Some(match image {
                     Some(image) => ToolPart::Image(image),
                     None => ToolPart::Text("[image unavailable]".into()),
@@ -6011,6 +6044,7 @@ pub(super) async fn run(
         async_transitions: true,
         expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
+        graphics: Renderer::new(args.settings.terminal_image_override()),
         ..View::default()
     };
     let changelog_path = super::config::agent_dir().join("pi-rs-changelog.json");
@@ -6159,6 +6193,12 @@ pub(super) async fn run(
                 dirty = true;
             }
         }
+        let fullscreen = _terminal
+            .as_ref()
+            .map_or(args.tui_mode != Some(TuiMode::Regular), |terminal| {
+                terminal.alternate
+            });
+        dirty |= view.update_image_protocol(&args, fullscreen)?;
         if let Some(terminal) = &mut _terminal {
             let alternate = args.tui_mode != Some(TuiMode::Regular);
             if terminal.alternate != alternate {
@@ -12441,14 +12481,27 @@ mod tests {
                 unreachable!()
             };
             assert!(*finished);
-            if enabled {
-                assert!(
-                    matches!(parts.as_slice(), [ToolPart::Text(a), ToolPart::Image(_), ToolPart::Text(b)] if a == "before" && b == "after")
-                );
-            } else {
-                assert!(parts.is_empty());
-                assert!(output.contains("[image · image/png]"));
-            }
+            assert!(
+                matches!(parts.as_slice(), [ToolPart::Text(a), ToolPart::Image(_), ToolPart::Text(b)] if a == "before" && b == "after")
+            );
+            assert!(output.contains("[image · image/png]"));
+            let render = |view: &View| {
+                entry
+                    .render(
+                        &Theme::system(),
+                        96,
+                        true,
+                        true,
+                        view.transcript_options(&args, false),
+                    )
+                    .iter()
+                    .any(|line| line.image.is_some())
+            };
+            assert_eq!(render(&view), enabled);
+            view.graphics
+                .set_protocol(Some(images::Protocol::Kitty), true, &mut Vec::new())
+                .unwrap();
+            assert!(render(&view));
         }
     }
 

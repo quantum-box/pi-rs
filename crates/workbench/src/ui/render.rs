@@ -255,7 +255,7 @@ pub enum ToolPart {
     Text(String),
     Warning(String),
     TruncationNotice(String),
-    Image(std::sync::Arc<super::images::InlineImage>),
+    Image(std::sync::Arc<super::images::InlineAttachment>),
 }
 
 #[derive(Clone)]
@@ -355,7 +355,7 @@ pub enum Entry {
         text: String,
         expanded: Option<bool>,
     },
-    Image(std::sync::Arc<super::images::InlineImage>),
+    Image(std::sync::Arc<super::images::InlineAttachment>),
     Tool {
         id: String,
         call_id: Option<String>,
@@ -374,7 +374,7 @@ pub enum Entry {
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranscriptOptions<'a> {
     pub notices: crate::config::NoticeSettings,
-    pub image_width: Option<usize>,
+    pub inline_images: Option<(super::images::Protocol, usize)>,
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
     pub code_block_indent: Option<&'a str>,
@@ -653,8 +653,9 @@ impl Entry {
             }
             Self::Image(image) => {
                 return options
-                    .image_width
-                    .map_or_else(Vec::new, |limit| image.lines(width, limit, padding));
+                    .inline_images
+                    .and_then(|(protocol, limit)| image.lines(width, limit, padding, protocol))
+                    .unwrap_or_default();
             }
             Self::Thinking { text, expanded } => {
                 if text
@@ -772,10 +773,12 @@ impl Entry {
                     .and_then(|rendered| rendered.result.as_ref())
                 {
                     lines.extend(extension_rows(result, theme, inner));
-                    if let Some(limit) = options.image_width {
+                    if let Some((protocol, limit)) = options.inline_images {
                         for part in parts {
-                            if let ToolPart::Image(image) = part {
-                                lines.extend(image.lines(width, limit, padding));
+                            if let ToolPart::Image(image) = part
+                                && let Some(rows) = image.lines(width, limit, padding, protocol)
+                            {
+                                lines.extend(rows);
                             }
                         }
                     }
@@ -810,14 +813,19 @@ impl Entry {
                         && parts
                             .iter()
                             .any(|part| matches!(part, ToolPart::Text(_) | ToolPart::Image(_)))
-                        && let Some(limit) = options.image_width
+                        && let Some((protocol, limit)) = options.inline_images
                     {
                         for part in parts {
                             match part {
                                 ToolPart::Text(text) => render_text(text, &mut lines),
                                 ToolPart::Warning(_) | ToolPart::TruncationNotice(_) => {}
                                 ToolPart::Image(image) => {
-                                    lines.extend(image.lines(width, limit, padding))
+                                    if let Some(rows) = image.lines(width, limit, padding, protocol)
+                                    {
+                                        lines.extend(rows);
+                                    } else {
+                                        render_text("[image unavailable]", &mut lines);
+                                    }
                                 }
                             }
                         }
@@ -5739,11 +5747,10 @@ mod tests {
         image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
-        let image = super::super::images::InlineImage::decode(&pi_rs::ImageContent {
+        let image = super::super::images::InlineAttachment::new(pi_rs::ImageContent {
             data: base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()),
             mime_type: "image/png".into(),
-        })
-        .unwrap();
+        });
         let entry = Entry::Tool {
             id: "test".into(),
             call_id: None,
@@ -5768,7 +5775,7 @@ mod tests {
             true,
             true,
             TranscriptOptions {
-                image_width: Some(60),
+                inline_images: Some((super::super::images::Protocol::Kitty, 60)),
                 padding: 1,
                 ..Default::default()
             },
@@ -5791,7 +5798,7 @@ mod tests {
                     false,
                     true,
                     TranscriptOptions {
-                        image_width: Some(60),
+                        inline_images: Some((super::super::images::Protocol::Kitty, 60)),
                         padding: 1,
                         ..Default::default()
                     }
