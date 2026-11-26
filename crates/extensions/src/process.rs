@@ -1088,8 +1088,7 @@ impl Extension for ExecutableExtension {
         let request = ProtocolRequest::BeforeAgentStart {
             event: BeforeAgentStartWireEvent {
                 event: event.clone(),
-                system_prompt_options: (supports_options && !options.sections.is_empty())
-                    .then(|| options.clone()),
+                system_prompt_options: supports_options.then(|| options.clone()),
             },
             state: state.cloned(),
         };
@@ -6524,7 +6523,7 @@ if request["type"] == "describe":
         "before_agent_start_hook": True,
     }
     if name != "legacy":
-        response["before_agent_start_prompt_options_v1"] = name == "sections"
+        response["before_agent_start_prompt_options_v1"] = name in ("sections", "empty-sections")
 else:
     expected = {
         "type": "before_agent_start",
@@ -6532,8 +6531,9 @@ else:
         "state": {"version": 1, "data": {"saved": True}},
     }
     response = {"systemPrompt": "legacy override"}
-    if name == "sections":
-        expected["event"]["systemPromptOptions"] = {"sections": {"rules": "host rules"}}
+    if name in ("sections", "empty-sections"):
+        sections = {"rules": "host rules"} if name == "sections" else {}
+        expected["event"]["systemPromptOptions"] = {"sections": sections}
         response = {"systemPromptOptions": {"sections": {"rules": "new rules", "cwd": None}}}
     assert request == expected, request
 print(json.dumps({"version": 1, "response": {"Ok": response}}))
@@ -6551,11 +6551,17 @@ print(json.dumps({"version": 1, "response": {"Ok": response}}))
                 .into_iter()
                 .collect(),
         };
+        let empty_options = BeforeAgentStartPromptOptions::default();
         let state = ExtensionState {
             version: 1,
             data: serde_json::json!({"saved": true}),
         };
-        for (name, opted_in) in [("legacy", false), ("disabled", false), ("sections", true)] {
+        for (name, opted_in, options) in [
+            ("legacy", false, &options),
+            ("disabled", false, &options),
+            ("sections", true, &options),
+            ("empty-sections", true, &empty_options),
+        ] {
             let path = dir.path().join(name);
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -6566,7 +6572,7 @@ print(json.dumps({"version": 1, "response": {"Ok": response}}))
                 opted_in
             );
             let result = extension
-                .before_agent_start_with_prompt_options(&event, &options, Some(&state))
+                .before_agent_start_with_prompt_options(&event, options, Some(&state))
                 .await
                 .unwrap();
             if opted_in {

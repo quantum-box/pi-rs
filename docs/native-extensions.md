@@ -352,7 +352,8 @@ also advertise `"before_agent_start_prompt_options_v1": true` in the v1
 existing handler opt-in. A missing or false executable capability uses the
 original request and result fields. With the capability enabled, the host sends
 available section bodies in `event.systemPromptOptions.sections` and accepts
-edits in the response's `systemPromptOptions.sections`.
+edits in the response's `systemPromptOptions.sections`. When there are no
+editable sections, the request's `sections` is an empty object.
 The response `{"systemPromptOptions":{"sections":{"rules":"New guidance","skills":null}}}`
 replaces the rules text and removes the skills section. Names must begin with
 a lowercase ASCII letter and may contain lowercase ASCII letters, digits,
