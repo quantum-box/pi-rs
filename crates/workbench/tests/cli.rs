@@ -6484,6 +6484,104 @@ fn native_notes_extension_is_saved_and_restored() {
 }
 
 #[test]
+fn cli_prompt_template_preserves_argument_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    let template = root.path().join("audit.md");
+    std::fs::write(&template, "$1|$2|$3|$4|$5|${6:-fallback}").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        loop {
+            let (mut socket, mut reader, first) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            let mut size = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    size = Some(value.trim().parse().unwrap());
+                }
+            }
+            if first.starts_with("GET /api/ps ") {
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut body = vec![0; size.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            return request;
+        }
+    });
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command.env_clear();
+    for name in ["PATH", "SystemRoot", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let output = command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--offline",
+            "--no-session",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--endpoint",
+            &endpoint,
+            "--prompt-template",
+        ])
+        .arg(&template)
+        .args([
+            "--print",
+            "/audit doesn't  \"say \\\"hi\\\"\"\u{a0}日本語 \"open tail",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "fixture answer\n"
+    );
+    let request = server.join().unwrap();
+    let message = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap();
+    assert_eq!(
+        message["content"],
+        "doesn't|say \"hi\"|日本語|\"open|tail|fallback"
+    );
+}
+
+#[test]
 fn print_and_json_modes_accept_positional_prompts() {
     let (endpoint, server) = model_fixture();
     for mode in ["--print", "--mode"] {

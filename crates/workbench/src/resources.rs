@@ -1971,7 +1971,7 @@ mod tests {
                 "$1|$2|$3|$4|$5",
                 r#"C:\work\file "" "two words" 'unfinished quote"#,
             ),
-            r"C:\work\file||two words|unfinished quote|"
+            r"C:\work\file||two words|'unfinished|quote"
         );
         assert_eq!(
             expand_arguments(
