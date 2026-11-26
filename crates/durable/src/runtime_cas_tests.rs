@@ -3223,7 +3223,7 @@ fn aged_fork_snapshot_packing_preserves_saved_forks_and_history_across_reopen() 
     for fork in [first_fork, replayed_fork] {
         let branch = harness.conversation(fork).unwrap();
         assert_eq!(branch.config.system_prompt, system_prompt);
-        assert_eq!(branch.messages, [message.clone()]);
+        assert_eq!(branch.messages.as_slice(), std::slice::from_ref(&message));
     }
 }
 
