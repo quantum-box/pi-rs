@@ -27,6 +27,36 @@ pub struct PackageResourcePaths {
     pub themes: Vec<PathBuf>,
 }
 
+/// The host grant that contributed a selected file path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourcePathOrigin {
+    /// The host supplied the file path directly.
+    DirectFile,
+    /// Package traversal selected the path from this host-granted directory.
+    Package {
+        /// The original grant spelling, even when a symlink is followed.
+        grant_root: PathBuf,
+    },
+}
+
+/// A selected path and the grant that contributed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourcePathSelection {
+    pub path: PathBuf,
+    pub origin: ResourcePathOrigin,
+}
+
+/// Selected paths in discovery or combined file-grant order, before the
+/// resource loaders read their content. Extension candidates require separate
+/// execution authorization.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackageResourceProvenance {
+    pub extension_candidates: Vec<ResourcePathSelection>,
+    pub skills: Vec<ResourcePathSelection>,
+    pub prompts: Vec<ResourcePathSelection>,
+    pub themes: Vec<ResourcePathSelection>,
+}
+
 impl PackageResourcePaths {
     /// Inspect local package directories in grant order, using the native
     /// manifest precedence. Reads are synchronous. Grants follow symlinks in
@@ -36,6 +66,23 @@ impl PackageResourcePaths {
     /// File reads through the resulting paths follow those links.
     /// This operation performs filesystem discovery only.
     pub fn discover(directories: &[PathBuf]) -> Result<Self> {
+        let provenance = Self::discover_with_provenance(directories)?;
+        let paths = |selected: Vec<ResourcePathSelection>| {
+            selected.into_iter().map(|entry| entry.path).collect()
+        };
+        Ok(Self {
+            extension_candidates: paths(provenance.extension_candidates),
+            skills: paths(provenance.skills),
+            prompts: paths(provenance.prompts),
+            themes: paths(provenance.themes),
+        })
+    }
+
+    /// Discover the same paths as [`Self::discover`] with their originating host
+    /// grants. Within each kind, paths are sorted per root and the first grant
+    /// that selects an equal path supplies its provenance. Path equality does
+    /// not resolve symlinks.
+    pub fn discover_with_provenance(directories: &[PathBuf]) -> Result<PackageResourceProvenance> {
         if directories.len() > MAX_PATHS {
             return Err(Error::Config("too many package directories".into()));
         }
@@ -51,7 +98,7 @@ impl PackageResourcePaths {
                 )));
             }
         }
-        let mut paths = Self::default();
+        let mut paths = PackageResourceProvenance::default();
         let mut examined = 0;
         for root in directories {
             if !fs::metadata(root)?.is_dir() {
@@ -77,11 +124,16 @@ impl PackageResourcePaths {
                 };
                 let candidates = discover_kind(root, kind, &patterns, explicit, &mut examined)?;
                 for path in candidates {
-                    if !output.contains(&path) {
+                    if !output.iter().any(|entry| entry.path == path) {
                         if output.len() == MAX_PATHS {
                             return Err(Error::Config(format!("too many package {name}")));
                         }
-                        output.push(path);
+                        output.push(ResourcePathSelection {
+                            path,
+                            origin: ResourcePathOrigin::Package {
+                                grant_root: root.clone(),
+                            },
+                        });
                     }
                 }
             }

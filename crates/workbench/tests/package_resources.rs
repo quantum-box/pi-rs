@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use pi_rs_workbench::package_resources::PackageResourcePaths;
+use pi_rs_workbench::package_resources::{
+    PackageResourcePaths, ResourcePathOrigin, ResourcePathSelection,
+};
 use pi_rs_workbench::resource_factory::{ResourceFactory, ResourceReadGrants};
 use serde_json::json;
 
@@ -13,6 +15,22 @@ fn write(root: &Path, path: &str, content: &str) -> PathBuf {
 }
 
 const THEME: &str = include_str!("../assets/themes/dark.json");
+
+fn package_selection(path: &Path, root: &Path) -> ResourcePathSelection {
+    ResourcePathSelection {
+        path: path.to_owned(),
+        origin: ResourcePathOrigin::Package {
+            grant_root: root.to_owned(),
+        },
+    }
+}
+
+fn direct_selection(path: &Path) -> ResourcePathSelection {
+    ResourcePathSelection {
+        path: path.to_owned(),
+        origin: ResourcePathOrigin::DirectFile,
+    }
+}
 
 #[test]
 fn snapshots_merge_grants_and_honor_native_manifest_filters() {
@@ -35,7 +53,7 @@ fn snapshots_merge_grants_and_honor_native_manifest_filters() {
     );
     let theme = write(&package, "custom/dark.json", THEME);
     write(&package, "themes/ignored.json", "malformed");
-    write(&package, "snippets/deep/excluded.md", "excluded");
+    let excluded = write(&package, "snippets/deep/excluded.md", "excluded");
     write(&package, "snippets/deleted.md", "deleted");
     write(&package, "snippets/.hidden.md", "hidden");
     let kept = write(&package, "snippets/deep/kept.md", "kept");
@@ -44,10 +62,29 @@ fn snapshots_merge_grants_and_honor_native_manifest_filters() {
     let fallback = write(temp.path(), "other/prompts/other.md", "another package");
     let roots = [package, temp.path().join("other")];
     let mut grants = ResourceReadGrants::default();
-    grants.templates.files = vec![host.clone(), kept.clone()];
+    grants.templates.files = vec![host.clone(), kept.clone(), excluded.clone()];
 
     let factory = ResourceFactory::default();
-    let snapshot = factory.load_with_packages(&grants, &[], &roots).unwrap();
+    let (snapshot, provenance) = factory
+        .load_with_package_provenance(&grants, &[], &roots)
+        .unwrap();
+    assert_eq!(
+        snapshot,
+        factory.load_with_packages(&grants, &[], &roots).unwrap()
+    );
+    assert_eq!(
+        provenance.prompts,
+        [
+            direct_selection(&host),
+            direct_selection(&kept),
+            direct_selection(&excluded),
+            package_selection(&rescued, &roots[0]),
+            package_selection(&fallback, &roots[1]),
+        ]
+    );
+    assert_eq!(provenance.skills, [package_selection(&skill, &roots[0])]);
+    assert_eq!(provenance.themes, [package_selection(&theme, &roots[0])]);
+    assert!(provenance.extension_candidates.is_empty());
     assert_eq!(
         snapshot
             .resources
@@ -55,7 +92,7 @@ fn snapshots_merge_grants_and_honor_native_manifest_filters() {
             .iter()
             .map(|t| &t.path)
             .collect::<Vec<_>>(),
-        [&host, &kept, &rescued, &fallback]
+        [&host, &kept, &excluded, &rescued, &fallback]
     );
     assert_eq!(snapshot.resources.skills.skills[0].path, skill);
     assert_eq!(snapshot.resources.themes.themes()[0].path(), theme);
@@ -63,12 +100,66 @@ fn snapshots_merge_grants_and_honor_native_manifest_filters() {
 
     fs::write(&manifest, r#"{"pi":{"prompts":[]}}"#).unwrap();
     let reload = factory.load_with_packages(&grants, &[], &roots).unwrap();
-    assert_eq!(reload.resources.templates.len(), 3);
+    assert_eq!(reload.resources.templates.len(), 4);
     assert!(reload.resources.themes.themes().is_empty());
     fs::write(manifest, "{").unwrap();
     assert!(factory.load_with_packages(&grants, &[], &roots).is_err());
-    assert_eq!(snapshot.resources.templates.len(), 4);
+    assert_eq!(snapshot.resources.templates.len(), 5);
     assert_eq!(snapshot.resources.themes.themes().len(), 1);
+}
+
+#[test]
+fn package_provenance_uses_first_selecting_grant_and_preserves_discovery_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let outer = temp.path();
+    let inner = outer.join("nested");
+    write(
+        outer,
+        "pi-package.json",
+        r#"{"pi":{"prompts":["nested/prompts","prompts","!inner-only.md","!never.md"]}}"#,
+    );
+    write(
+        &inner,
+        "pi-package.json",
+        r#"{"pi":{"prompts":["prompts","!never.md"]}}"#,
+    );
+    let z = write(&inner, "prompts/z.md", "z");
+    let a = write(&inner, "prompts/a.md", "a");
+    let inner_only = write(&inner, "prompts/inner-only.md", "inner only");
+    write(&inner, "prompts/never.md", "excluded by both manifests");
+    let outer_only = write(outer, "prompts/outer.md", "outer only");
+
+    let roots = [outer.to_owned(), inner.clone(), outer.to_owned()];
+    let provenance = PackageResourcePaths::discover_with_provenance(&roots).unwrap();
+    assert_eq!(
+        provenance.prompts,
+        [
+            package_selection(&a, outer),
+            package_selection(&z, outer),
+            package_selection(&outer_only, outer),
+            package_selection(&inner_only, &inner),
+        ]
+    );
+    assert_eq!(
+        PackageResourcePaths::discover(&roots).unwrap().prompts,
+        [
+            a.as_path(),
+            z.as_path(),
+            outer_only.as_path(),
+            inner_only.as_path()
+        ]
+    );
+    let reversed =
+        PackageResourcePaths::discover_with_provenance(&[inner.clone(), outer.into()]).unwrap();
+    assert_eq!(
+        reversed.prompts,
+        [
+            package_selection(&a, &inner),
+            package_selection(&inner_only, &inner),
+            package_selection(&z, &inner),
+            package_selection(&outer_only, outer),
+        ]
+    );
 }
 
 #[test]
@@ -343,9 +434,27 @@ printf '%s\n' '{{"version":1,"response":{{"Ok":{{"id":"fixture","dependencies":[
     )
     .unwrap();
 
-    let snapshot = ResourceFactory::default()
-        .load_with_packages(&ResourceReadGrants::default(), &[], &[package])
+    let granted_root = temp.path().join("package-alias");
+    symlink(&package, &granted_root).unwrap();
+    let executable = granted_root.join("extensions/fixture");
+    let (snapshot, provenance) = ResourceFactory::default()
+        .load_with_package_provenance(
+            &ResourceReadGrants::default(),
+            &[],
+            std::slice::from_ref(&granted_root),
+        )
         .unwrap();
+    assert_eq!(
+        provenance.extension_candidates,
+        [package_selection(&executable, &granted_root)]
+    );
+    assert_eq!(
+        provenance.prompts,
+        [package_selection(
+            &granted_root.join("prompts/linked.md"),
+            &granted_root
+        )]
+    );
     assert_eq!(snapshot.extension_candidates, [executable]);
     assert_eq!(snapshot.resources.templates.len(), 1);
     assert_eq!(snapshot.resources.templates[0].body, "linked template");
