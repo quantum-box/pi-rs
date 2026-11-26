@@ -6120,6 +6120,26 @@ into their logical blocks, and encrypted blocks stay separate. Replay is
 bound to the original endpoint and model. A loopback RPC check exercised
 restart, encrypted-only thinking and a switch to a different model endpoint.
 
+### Terminal color capability
+
+In regular and fullscreen mode, a boolean `terminal.trueColor` takes precedence
+over `PI_TRUE_COLOR` (`1` or `0`), followed by Pi's automatic detection from
+terminal environment hints and the platform. As in Pi, other setting values
+leave detection in charge. The startup session picker uses the same precedence.
+`/reload` reads the setting again, so removing an override restores the
+environment-derived mode. Regular mode redraws its committed
+transcript when the mode changes.
+
+In 256-color mode, foregrounds and backgrounds use Pi's RGB-to-ANSI conversion
+at the point of drawing. Theme contrast and syntax highlighting are computed
+using the original colors, and palette indices stay the same in both modes.
+Native output still follows Crossterm’s `NO_COLOR` handling. Session exports
+retain their original color behavior.
+
+See the pinned Pi [settings override](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/settings-manager.ts#L1204-L1211),
+[capability detection](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/tui/src/terminal-image.ts#L71-L194),
+and [ANSI conversion](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/tui/src/colors.ts#L279-L307).
+
 ### Terminal progress indicator
 
 The `terminal.showTerminalProgress` setting and the `/settings` toggle

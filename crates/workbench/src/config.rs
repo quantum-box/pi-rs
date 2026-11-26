@@ -510,6 +510,10 @@ impl Settings {
     pub fn enable_skill_commands(&self) -> bool {
         self.boolean("enableSkillCommands").unwrap_or(true)
     }
+    pub fn terminal_true_color(&self) -> Option<bool> {
+        // Like Pi, other JSON values leave capability detection in charge.
+        self.value["terminal"]["trueColor"].as_bool()
+    }
     pub fn terminal_progress(&self) -> bool {
         self.value["terminal"]["showTerminalProgress"]
             .as_bool()
@@ -1356,6 +1360,22 @@ mod tests {
         }
         std::fs::write(&user, r#"{"cacheWarming":"unknown"}"#).unwrap();
         assert!(super::Settings::load_from_paths(root.path(), true, &user).is_err());
+    }
+
+    #[test]
+    fn true_color_setting_only_accepts_booleans_in_effective_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("settings.json");
+        let workspace = directory.path().join("project");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        let project = workspace.join(".pi/settings.json");
+        std::fs::write(&user, br#"{"terminal":{"trueColor":true}}"#).unwrap();
+        std::fs::write(&project, br#"{"terminal":{"trueColor":false}}"#).unwrap();
+        let load = |trusted| super::Settings::load_from_paths(&workspace, trusted, &user).unwrap();
+        assert_eq!(load(false).terminal_true_color(), Some(true));
+        assert_eq!(load(true).terminal_true_color(), Some(false));
+        std::fs::write(project, br#"{"terminal":{"trueColor":"auto"}}"#).unwrap();
+        assert_eq!(load(true).terminal_true_color(), None);
     }
 
     #[test]
