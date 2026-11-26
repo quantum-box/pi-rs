@@ -950,8 +950,11 @@ and session transitions reset the overrides. Native extensions can also
 mount a bounded header renderer from terminal session and selection callbacks.
 It receives the terminal's header width and effective theme palette. A change
 to either, or explicit invalidation by the owning extension, requests a new
-render. Static and dynamic header setters share one slot. Pi's arbitrary live
-components and read-only footer data provider remain TypeScript features.
+render. The terminal uses the normal banner fallback while a render for the
+current mount, width and palette is pending. Each worker admits one render at a time
+and waits for executable cleanup before releasing that slot. Static and
+dynamic header setters share one slot. Pi's arbitrary live components and
+read-only footer data provider remain TypeScript features.
 The native footer still accepts static styled rows.
 
 ### Native extension theme discovery

@@ -58,8 +58,20 @@ impl Endpoint {
         &self,
         request: ProtocolRequest,
     ) -> ExtensionResult<T> {
+        self.request_with_cancellation(request, CancellationToken::new())
+            .await
+    }
+
+    async fn request_with_cancellation<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        request: ProtocolRequest,
+        cancellation: CancellationToken,
+    ) -> ExtensionResult<T> {
+        if cancellation.is_cancelled() {
+            return Err("native extension operation cancelled".into());
+        }
         let path = self.clone();
-        let guard = CancelOnDrop(CancellationToken::new());
+        let guard = CancelOnDrop(cancellation);
         let cancelled = guard.0.clone();
         tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
             .await
@@ -2526,6 +2538,21 @@ impl pi_rs_core::HeaderRenderer for ExecutableHeaderRenderer {
             .request_async(ProtocolRequest::RenderHeader {
                 context: context.clone(),
             })
+            .await
+    }
+
+    async fn render_with_cancellation(
+        &self,
+        context: &pi_rs_core::HeaderRenderContext,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        self.0
+            .request_with_cancellation(
+                ProtocolRequest::RenderHeader {
+                    context: context.clone(),
+                },
+                cancellation.child_token(),
+            )
             .await
     }
 }

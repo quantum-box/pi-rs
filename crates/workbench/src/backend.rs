@@ -2331,12 +2331,16 @@ fn read_requests(
                     renderer,
                     context,
                 } => {
-                    if terminal_managed {
-                        let ui = ui.clone();
+                    if !terminal_managed {
+                        continue;
+                    }
+                    if let Some(render) = ui.admit_header_render(renderer, context) {
                         runtime.spawn(async move {
-                            let rendered = ui.render_header(renderer, &context).await;
+                            let rendered = render.await;
                             output(json!({"type":"header_rendered","id":id,"rendered":rendered}));
                         });
+                    } else {
+                        output(json!({"type":"header_rendered","id":id,"rendered":null}));
                     }
                 }
                 Request::RenderTool {

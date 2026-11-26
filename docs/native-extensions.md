@@ -196,8 +196,10 @@ The executable protocol uses the same UI requests as `setHeaderRenderer` and
 `context` in the existing v1 render protocol. Executable callbacks can read
 their own state on each request. Return styled rows, an empty row list to
 hide the header, or null for the built-in banner. Renders have a 500 ms
-deadline and the same row limits as static headers. Pi's arbitrary
-components and live footer data provider remain specific to its TypeScript UI.
+deadline from worker admission and the same row limits as static headers.
+The worker waits for a cancelled executable to exit before admitting another
+render or shutting down the extension. Pi's arbitrary components and live
+footer data provider remain specific to its TypeScript UI.
 
 ## Customize the working indicator
 

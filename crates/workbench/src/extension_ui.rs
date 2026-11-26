@@ -5,6 +5,7 @@ use pi_rs::{
 };
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -15,7 +16,7 @@ pub struct Broker {
     pending: Arc<Mutex<BTreeMap<Uuid, oneshot::Sender<UiResponse>>>>,
     themes: Option<Mutex<ExtensionResult<Vec<UiThemeInfo>>>>,
     header: Mutex<Option<MountedHeader>>,
-    header_render: tokio::sync::Mutex<()>,
+    header_render: Arc<tokio::sync::Mutex<()>>,
 }
 struct MountedHeader {
     id: Uuid,
@@ -62,24 +63,52 @@ impl Broker {
         }
     }
 
-    pub async fn render_header(
+    pub fn admit_header_render(
         &self,
         id: Uuid,
-        context: &HeaderRenderContext,
-    ) -> Option<RenderedExtensionRows> {
-        let _slot = self.header_render.lock().await;
+        context: HeaderRenderContext,
+    ) -> Option<impl Future<Output = Option<RenderedExtensionRows>> + Send + use<>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let slot = self.header_render.clone().try_lock_owned().ok()?;
         let (renderer, cancellation) = {
             let header = self.header.lock().expect("extension header");
             let header = header.as_ref().filter(|header| header.id == id)?;
-            (header.renderer.clone(), header.cancellation.clone())
+            (header.renderer.clone(), header.cancellation.child_token())
         };
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => None,
-            rows = tokio::time::timeout(Duration::from_millis(500), renderer.render(context)) => {
-                rows.ok()?.ok()?.filter(RenderedExtensionRows::within_header_limits)
-            }
-        }
+        Some(async move {
+            let _slot = slot;
+            let rows = {
+                let render = async {
+                    if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    renderer
+                        .render_with_cancellation(&context, &cancellation)
+                        .await
+                };
+                tokio::pin!(render);
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => None,
+                    _ = tokio::time::sleep_until(deadline) => None,
+                    rows = &mut render => Some(rows),
+                };
+                if let Some(rows) = result {
+                    rows.ok().flatten().filter(|rows| {
+                        !cancellation.is_cancelled()
+                            && tokio::time::Instant::now() < deadline
+                            && rows.within_header_limits()
+                    })
+                } else {
+                    cancellation.cancel();
+                    // Keep the slot until any background work has been reaped.
+                    let _ = render.await;
+                    None
+                }
+            };
+            drop(renderer);
+            rows
+        })
     }
 
     pub async fn clear_header_renderer(&self) {
@@ -89,7 +118,7 @@ impl Broker {
                 super::output(json!({"type":"header_renderer_changed","renderer":null}));
             }
         }
-        // Finish dropping the in-flight callback before extension shutdown.
+        // Finish render cleanup before extension shutdown.
         let _slot = self.header_render.lock().await;
     }
 
@@ -314,15 +343,21 @@ mod tests {
             width: 72,
             theme: crate::ui::theme::Theme::system().extension_render_theme(),
         };
-        let (rendered, ()) = tokio::join!(ui.render_header(first, &context), async {
+        let render = ui.admit_header_render(first, context.clone()).unwrap();
+        let (rendered, ()) = tokio::join!(render, async {
             entered.notified().await;
             mount().await;
+            let (replacement, _) = header();
+            assert!(
+                ui.admit_header_render(replacement, context.clone())
+                    .is_none()
+            );
         });
         assert!(rendered.is_none());
         assert!(renderer.upgrade().is_none());
         let (second, renderer) = header();
         assert_ne!(first, second);
-        assert!(ui.render_header(first, &context).await.is_none());
+        assert!(ui.admit_header_render(first, context).is_none());
 
         ui.request(
             UiRequest::SetHeader {
@@ -338,6 +373,75 @@ mod tests {
         let (_, renderer) = header();
         ui.clear_header_renderer().await;
         assert!(renderer.upgrade().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_header_deadline_includes_scheduling_and_clear_waits_for_cleanup() {
+        #[derive(Default)]
+        struct Renderer {
+            entered: tokio::sync::Notify,
+            cancelled: tokio::sync::Notify,
+            finish_cleanup: tokio::sync::Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl HeaderRenderer for Renderer {
+            async fn render(
+                &self,
+                _: &HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                panic!("the broker must pass a cancellation token");
+            }
+
+            async fn render_with_cancellation(
+                &self,
+                _: &HeaderRenderContext,
+                cancellation: &CancellationToken,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                self.entered.notify_one();
+                cancellation.cancelled().await;
+                self.cancelled.notify_one();
+                self.finish_cleanup.notified().await;
+                Ok(Some(RenderedExtensionRows::default()))
+            }
+        }
+
+        let ui = Broker::new(true);
+        let renderer = Arc::new(Renderer::default());
+        let context = HeaderRenderContext {
+            width: 72,
+            theme: crate::ui::theme::Theme::system().extension_render_theme(),
+        };
+        let mount = || {
+            ui.set_header_renderer("test", Some(renderer.clone()), &CancellationToken::new())
+                .unwrap();
+            ui.header.lock().unwrap().as_ref().unwrap().id
+        };
+
+        let id = mount();
+        let delayed = ui.admit_header_render(id, context.clone()).unwrap();
+        assert!(ui.admit_header_render(id, context.clone()).is_none());
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(delayed.await.is_none());
+        assert!(futures_util::poll!(std::pin::pin!(renderer.entered.notified())).is_pending());
+
+        for expires in [true, false] {
+            let id = mount();
+            let running = tokio::spawn(ui.admit_header_render(id, context.clone()).unwrap());
+            renderer.entered.notified().await;
+            let mut clear = std::pin::pin!(ui.clear_header_renderer());
+            if expires {
+                tokio::time::advance(Duration::from_millis(500)).await;
+            } else {
+                assert!(futures_util::poll!(&mut clear).is_pending());
+            }
+            renderer.cancelled.notified().await;
+            assert!(futures_util::poll!(&mut clear).is_pending());
+            assert!(!running.is_finished());
+            renderer.finish_cleanup.notify_one();
+            clear.await;
+            assert!(running.await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]

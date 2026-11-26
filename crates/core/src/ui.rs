@@ -54,6 +54,20 @@ pub trait HeaderRenderer: Send + Sync {
         &self,
         context: &HeaderRenderContext,
     ) -> ExtensionResult<Option<RenderedExtensionRows>>;
+
+    /// Render until completion or cancellation. Implementations that start
+    /// background work must finish its cleanup before returning.
+    async fn render_with_cancellation(
+        &self,
+        context: &HeaderRenderContext,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Ok(None),
+            rows = self.render(context) => rows,
+        }
+    }
 }
 
 /// Layout options for an extension's custom transcript message.
