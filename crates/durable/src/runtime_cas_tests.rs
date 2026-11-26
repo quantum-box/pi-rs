@@ -949,6 +949,54 @@ fn session_tree_keeps_archived_roots_and_tracks_an_empty_reset() {
 }
 
 #[test]
+fn session_tree_keeps_writes_from_coalesced_text_resets() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    h.reset(id, Some("first reset".into())).unwrap();
+    let first = h.submit_write(id, None, "app.first".into(), None).unwrap();
+    h.reset(id, Some("last reset".into())).unwrap();
+    let second = h.submit_write(id, None, "app.second".into(), None).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    for reset in take_reset_batch(&mut state) {
+        place_reset(&mut state, reset);
+    }
+    h.save(&state, Expected::Version(version)).unwrap();
+
+    let tree = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap();
+    let last_reset = tree
+        .entries
+        .iter()
+        .find(|node| {
+            matches!(&node.entry, SessionEntry::Message(entry)
+            if matches!(&entry.message, Message::User { content } if content == "last reset"))
+        })
+        .unwrap();
+    let first_write = tree
+        .entries
+        .iter()
+        .find(|node| node.entry.id() == first)
+        .unwrap();
+    let second_write = tree
+        .entries
+        .iter()
+        .find(|node| node.entry.id() == second)
+        .unwrap();
+    assert_eq!(first_write.parent_id, Some(last_reset.entry.id()));
+    assert_eq!(second_write.parent_id, Some(first));
+    assert_eq!(tree.leaf_id, Some(second));
+}
+
+#[test]
 fn interrupted_recovery_retries_racing_stream_append() {
     for initial in [None, Some("first")] {
         let dir = tempfile::tempdir().unwrap();

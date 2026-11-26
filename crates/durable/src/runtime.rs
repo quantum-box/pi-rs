@@ -11211,24 +11211,33 @@ impl Harness {
             .iter()
             .filter(|(starts_context, _)| *starts_context)
             .count();
-        let mut resets = if replacement_count > 0
+        let resets = if replacement_count > 0
             && metadata
                 .iter()
                 .any(|entry| matches!(entry, SessionEntry::Custom { .. }))
         {
-            self.session_placed_resets(source, &record)?.into_iter()
+            self.session_placed_resets(source, &record)?
         } else {
-            Vec::new().into_iter()
+            Vec::new()
         };
-        let placed_resets: HashSet<_> = resets.as_slice().iter().copied().collect();
-        let mut writes_by_reset = HashMap::<_, Vec<_>>::new();
+        // Text-only resets can coalesce into one replacement. Block-bearing
+        // resets with retained cuts have one replacement per reset.
+        if replacement_count > 1 && !resets.is_empty() && resets.len() != replacement_count {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let reset_positions: HashMap<_, _> = resets
+            .into_iter()
+            .enumerate()
+            .map(|(index, reset)| (reset, if replacement_count == 1 { 0 } else { index }))
+            .collect();
+        let mut writes_by_replacement = HashMap::<_, Vec<_>>::new();
         let mut tail = Vec::new();
         for entry in metadata {
             if let SessionEntry::Custom { entry: write, .. } = &entry
                 && let Some(reset) = write.after_reset
-                && placed_resets.contains(&reset)
+                && let Some(index) = reset_positions.get(&reset)
             {
-                writes_by_reset.entry(reset).or_default().push(entry);
+                writes_by_replacement.entry(*index).or_default().push(entry);
             } else {
                 tail.push(entry);
             }
@@ -11236,6 +11245,7 @@ impl Harness {
         let message_cutoff = cutoff.is_some_and(|id| messages.iter().any(|entry| entry.id() == id));
         let mut messages = messages.into_iter();
         let mut events = Vec::new();
+        let mut replacement_index = 0;
         for (starts_context, len) in layout {
             if starts_context {
                 events.push(SessionTreeEvent::ContextStart);
@@ -11243,17 +11253,17 @@ impl Harness {
             for entry in messages.by_ref().take(len) {
                 events.push(SessionTreeEvent::Entry(entry));
             }
-            if starts_context
-                && let Some(reset) = resets.next()
-                && let Some(writes) = writes_by_reset.remove(&reset)
-            {
-                events.extend(writes.into_iter().map(SessionTreeEvent::Entry));
+            if starts_context {
+                if let Some(writes) = writes_by_replacement.remove(&replacement_index) {
+                    events.extend(writes.into_iter().map(SessionTreeEvent::Entry));
+                }
+                replacement_index += 1;
             }
             if message_cutoff && messages.len() == 0 {
                 break;
             }
         }
-        if messages.len() > 0 || !writes_by_reset.is_empty() {
+        if messages.len() > 0 || !writes_by_replacement.is_empty() {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
         events.extend(tail.into_iter().map(SessionTreeEvent::Entry));
