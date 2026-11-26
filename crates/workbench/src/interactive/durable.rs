@@ -485,6 +485,11 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                     }
                 }
             }
+            Some(InputEvent::Event(Event::Mouse(mouse)))
+                if args.tui_mode != Some(TuiMode::Regular) =>
+            {
+                dirty = view.fullscreen_mouse(mouse, &args);
+            }
             Some(InputEvent::Event(Event::Paste(text))) => view.paste_editor_text(&text),
             Some(InputEvent::Event(Event::Resize(_, _))) => (),
             #[cfg(any(unix, windows))]
