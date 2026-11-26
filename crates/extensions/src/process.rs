@@ -1096,13 +1096,25 @@ impl Extension for ExecutableExtension {
         state: Option<&ExtensionState>,
         host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<Option<pi_rs_core::UserBashResult>> {
-        if !self.description.user_bash_hook_host_calls {
-            return self.user_bash(event, state).await;
-        }
+        Ok(self
+            .user_bash_with_output_error(event, state, host)
+            .await?
+            .map(|result| result.result))
+    }
+
+    async fn user_bash_with_output_error(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&pi_rs_core::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<pi_rs_core::UserBashResultWithOutputError>> {
         let request = ProtocolRequest::UserBash {
             event: event.clone(),
             state: state.cloned(),
         };
+        if !self.description.user_bash_hook_host_calls {
+            return self.request_async(request).await;
+        }
         let path = self.endpoint.clone();
         let guard = CancelOnDrop(CancellationToken::new());
         let cancelled = guard.0.clone();

@@ -72,6 +72,29 @@ pub enum AttachmentContent {
     },
 }
 
+/// Internal worker result. Its serialized execution fields retain the public
+/// shell result shape, with an optional presentation detail for a failed spill.
+#[doc(hidden)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserShellExecution {
+    #[serde(flatten)]
+    pub execution: pi_rs::BashExecution,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_output_error: Option<String>,
+}
+
+impl UserShellExecution {
+    #[doc(hidden)]
+    pub fn new(execution: pi_rs::BashExecution, error: Option<&str>) -> Self {
+        let full_output_error = execution.output_save_error(error).map(str::to_owned);
+        Self {
+            execution,
+            full_output_error,
+        }
+    }
+}
+
 pub struct CodingTools {
     root: PathBuf,
     unrestricted: bool,
@@ -260,6 +283,19 @@ impl CodingTools {
         cancellation: &pi_rs::CancellationToken,
         progress: &mut (dyn FnMut(&str) + Send),
     ) -> Result<pi_rs::BashExecution> {
+        self.execute_shell_with_output_error(command, timeout, cancellation, progress)
+            .await
+            .map(|result| result.execution)
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_shell_with_output_error(
+        &self,
+        command: &str,
+        timeout: Option<Duration>,
+        cancellation: &pi_rs::CancellationToken,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<UserShellExecution> {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -283,6 +319,7 @@ impl CodingTools {
         let result = tool
             .shell_stream(&arguments, cancellation, progress, true, None)
             .await?;
+        let full_output_error = result.output.file_error.as_deref();
         let output = if result.timed_out {
             format!(
                 "{}\nCommand timed out after {} seconds",
@@ -292,18 +329,21 @@ impl CodingTools {
         } else {
             result.output.display_without_notice
         };
-        Ok(pi_rs::BashExecution {
-            command: command.into(),
-            output,
-            exit_code: result.status.code(),
-            cancelled: result.cancelled,
-            truncated: result.output.details.is_some(),
-            full_output_path: result
-                .output
-                .path
-                .map(|path| path.to_string_lossy().into_owned()),
-            exclude_from_context: false,
-        })
+        Ok(UserShellExecution::new(
+            pi_rs::BashExecution {
+                command: command.into(),
+                output,
+                exit_code: result.status.code(),
+                cancelled: result.cancelled,
+                truncated: result.output.details.is_some(),
+                full_output_path: result
+                    .output
+                    .path
+                    .map(|path| path.to_string_lossy().into_owned()),
+                exclude_from_context: false,
+            },
+            full_output_error,
+        ))
     }
 
     /// Run extension-supplied shell operations through the usual user output limits.
@@ -326,6 +366,7 @@ impl CodingTools {
             None,
         )
         .await
+        .map(|result| result.execution)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -339,6 +380,31 @@ impl CodingTools {
         progress: &mut (dyn FnMut(&str) + Send),
         host: Arc<dyn pi_rs::ToolHost>,
     ) -> Result<pi_rs::BashExecution> {
+        self.execute_shell_operations_with_output_error(
+            event,
+            extension,
+            state,
+            timeout,
+            cancellation,
+            progress,
+            host,
+        )
+        .await
+        .map(|result| result.execution)
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_shell_operations_with_output_error(
+        &self,
+        event: &pi_rs::UserBashEvent,
+        extension: &dyn pi_rs::Extension,
+        state: Option<&pi_rs::ExtensionState>,
+        timeout: Option<Duration>,
+        cancellation: &pi_rs::CancellationToken,
+        progress: &mut (dyn FnMut(&str) + Send),
+        host: Arc<dyn pi_rs::ToolHost>,
+    ) -> Result<UserShellExecution> {
         self.execute_shell_operations_inner(
             event,
             extension,
@@ -361,7 +427,7 @@ impl CodingTools {
         cancellation: &pi_rs::CancellationToken,
         progress: &mut (dyn FnMut(&str) + Send),
         host: Option<Arc<dyn pi_rs::ToolHost>>,
-    ) -> Result<pi_rs::BashExecution> {
+    ) -> Result<UserShellExecution> {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -443,6 +509,7 @@ impl CodingTools {
             output.append(remaining.as_bytes());
         }
         let result = output.finish();
+        let full_output_error = result.file_error.as_deref();
         let output = if timed_out {
             format!(
                 "{}\nCommand timed out after {} seconds",
@@ -452,15 +519,18 @@ impl CodingTools {
         } else {
             result.display_without_notice
         };
-        Ok(pi_rs::BashExecution {
-            command: event.command.clone(),
-            output,
-            exit_code,
-            cancelled,
-            truncated: result.details.is_some(),
-            full_output_path: result.path.map(|path| path.to_string_lossy().into_owned()),
-            exclude_from_context: event.exclude_from_context,
-        })
+        Ok(UserShellExecution::new(
+            pi_rs::BashExecution {
+                command: event.command.clone(),
+                output,
+                exit_code,
+                cancelled,
+                truncated: result.details.is_some(),
+                full_output_path: result.path.map(|path| path.to_string_lossy().into_owned()),
+                exclude_from_context: event.exclude_from_context,
+            },
+            full_output_error,
+        ))
     }
 
     /// Resolve a reader path, including Pi's filename fallbacks and this profile's scope.
