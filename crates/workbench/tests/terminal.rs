@@ -445,6 +445,116 @@ fn reload_applies_saved_theme_changes_without_overriding_cli_selection() {
 }
 
 #[test]
+fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
+    const RGB: &str = "\x1b[38;2;255;0;0m";
+    const INDEXED: &str = "\x1b[38;5;196m";
+    const RGB_BG: &str = "\x1b[48;2;128;128;128m";
+    const INDEXED_BG: &str = "\x1b[48;5;244m";
+    const TRANSCRIPT: &str = "committed color fixture";
+    for mode in ["regular", "fullscreen"] {
+        for (configured, env, before, after) in
+            [(false, "1", INDEXED, RGB), (true, "0", RGB, INDEXED)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            std::fs::create_dir_all(home.join("themes")).unwrap();
+            let session_path = root.path().join("session.jsonl");
+            pi_rs::Session::open(&session_path)
+                .unwrap()
+                .append_user_with_images(TRANSCRIPT.into(), vec![], None)
+                .unwrap();
+            let settings = home.join("settings.json");
+            std::fs::write(
+                &settings,
+                serde_json::json!({"theme":"color-fixture","terminal":{"trueColor":configured}})
+                    .to_string(),
+            )
+            .unwrap();
+            let mut theme: serde_json::Value =
+                serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+            theme["name"] = serde_json::json!("color-fixture");
+            theme["colors"]["border"] = serde_json::json!("#ff0000");
+            theme["colors"]["userMessageBg"] = serde_json::json!("#808080");
+            std::fs::write(home.join("themes/color-fixture.json"), theme.to_string()).unwrap();
+
+            let mut master_fd = -1;
+            let mut slave_fd = -1;
+            let mut size = libc::winsize {
+                ws_row: 32,
+                ws_col: 110,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master_fd,
+                        &mut slave_fd,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::addr_of_mut!(size),
+                    )
+                },
+                0
+            );
+            let mut master = unsafe { File::from_raw_fd(master_fd) };
+            let slave = unsafe { File::from_raw_fd(slave_fd) };
+            let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+            assert_eq!(
+                unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+            let _process = Process(
+                Command::new(env!("CARGO_BIN_EXE_pi"))
+                    .current_dir(root.path())
+                    .env("PI_RS_HOME", &home)
+                    .env("TERM", "xterm-256color")
+                    .env("PI_TRUE_COLOR", env)
+                    .env_remove("NO_COLOR")
+                    .args([
+                        "--offline",
+                        "--no-trust",
+                        "--no-mcp",
+                        "--no-extensions",
+                        "--tui-mode",
+                        mode,
+                        "--session",
+                    ])
+                    .arg(&session_path)
+                    .stdin(Stdio::from(slave.try_clone().unwrap()))
+                    .stdout(Stdio::from(slave.try_clone().unwrap()))
+                    .stderr(Stdio::from(slave))
+                    .spawn()
+                    .unwrap(),
+            );
+            output_until(&mut master, |text| {
+                assert!(
+                    !text.contains(after),
+                    "unexpected color mode before reload in {mode}"
+                );
+                if before == INDEXED {
+                    assert!(!text.contains("\x1b[38;2;") && !text.contains("\x1b[48;2;"));
+                }
+                let background = if configured { RGB_BG } else { INDEXED_BG };
+                text.contains("Enter to send")
+                    && text.contains(TRANSCRIPT)
+                    && text.contains(before)
+                    && text.contains(background)
+            });
+            std::fs::write(&settings, br#"{"theme":"color-fixture"}"#).unwrap();
+            master.write_all(b"/reload\r").unwrap();
+            output_until(&mut master, |text| {
+                let background = if configured { INDEXED_BG } else { RGB_BG };
+                text.contains("Reloaded settings")
+                    && text.contains(TRANSCRIPT)
+                    && text.contains(after)
+                    && text.contains(background)
+            });
+        }
+    }
+}
+
+#[test]
 fn initial_appearance_report_keeps_late_color_replies() {
     let root = tempfile::tempdir().unwrap();
     let mut master_fd = -1;
@@ -488,6 +598,7 @@ fn initial_appearance_report_keeps_late_color_replies() {
         .env("PI_RS_HOME", root.path().join("home"))
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
+        .env_remove("PI_TRUE_COLOR")
         .env_remove("NO_COLOR")
         .args([
             "--no-trust",
@@ -946,6 +1057,93 @@ fn debug_command_and_global_shortcut_write_session_snapshots() {
     });
     master.write_all(b"\x1b").unwrap();
     output_until(&mut master, |text| text.contains("Enter to send"));
+}
+
+#[test]
+fn startup_extension_lists_an_explicit_theme_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let theme_path = root.path().join("explicit-theme.json");
+    let mut theme: serde_json::Value =
+        serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+    theme["name"] = serde_json::json!("startup-fixture-theme");
+    std::fs::write(&theme_path, format!("\u{feff}{theme}")).unwrap();
+    let extension = root.path().join("theme-catalog");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request = json.load(sys.stdin)
+    result = {'id':'theme-catalog','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True} if request['type'] == 'describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame = json.loads(sys.stdin.readline())
+    if frame['request']['event']['type'] == 'session_start':
+        print(json.dumps({'type':'ui','request':{'method':'getAllThemes'}}), flush=True)
+        response = json.loads(sys.stdin.readline())['Ok']
+        assert response[0] == {'name':'system'}, response
+        expected = os.path.realpath(os.environ['PI_TEST_THEME_PATH'])
+        assert {'name':'startup-fixture-theme','path':expected} in response, response
+        print(json.dumps({'type':'ui','request':{'method':'notify','message':'Startup theme catalog verified'}}), flush=True)
+        assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .arg("--theme")
+            .arg(&theme_path)
+            .args(["--use-theme", "startup-fixture-theme"])
+            .arg("--extension")
+            .arg(&extension)
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("PI_TEST_THEME_PATH", &theme_path)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| {
+        text.contains("Startup theme catalog verified")
+    });
 }
 
 #[test]
