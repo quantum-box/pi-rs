@@ -2106,7 +2106,7 @@ impl Agent<'_> {
                         session,
                         &states,
                         SummaryScope {
-                            history_before: None,
+                            prestart: None,
                             retention,
                             instructions: None,
                             output_limit: summary_limit,
@@ -2466,7 +2466,7 @@ impl Agent<'_> {
                         session,
                         &states,
                         SummaryScope {
-                            history_before: None,
+                            prestart: None,
                             retention,
                             instructions: None,
                             output_limit: summary_limit,
@@ -2782,6 +2782,12 @@ impl Agent<'_> {
         run_id: Uuid,
     ) -> Result<()> {
         let branch = session.branch();
+        // A checkout can rewind context, but it cannot undo a summary dispatch.
+        if crate::before_agent_start::compaction_on_another_branch(session, &branch, run_id) {
+            return Err(Error::Session(
+                "resume pre-start compaction from the branch that recorded its attempt".into(),
+            ));
+        }
         if let Some(started_at) = crate::before_agent_start::interrupted_compaction(&branch, run_id)
         {
             let following = &branch[branch.partition_point(|record| record.id <= started_at)..];
@@ -2876,10 +2882,8 @@ impl Agent<'_> {
         let Some(window) = window.filter(|window| *window > 0) else {
             return Ok(false);
         };
-        if session.context_usage_estimate_for_branch(history).tokens
-            <= u64::from(window).saturating_sub(reserve)
-            || !control.enabled()
-        {
+        let tokens_before = session.context_usage_estimate_for_branch(history).tokens;
+        if tokens_before <= u64::from(window).saturating_sub(reserve) || !control.enabled() {
             return Ok(false);
         }
         let mut retention =
@@ -2917,27 +2921,35 @@ impl Agent<'_> {
             },
             observer,
         )?;
-        self.summarize_prefix(
-            session,
-            &states,
-            SummaryScope {
-                history_before,
-                retention,
-                instructions: None,
-                output_limit: if model_summary_available {
-                    summary_budget
-                } else {
-                    0
+        let summary = self
+            .summarize_prefix(
+                session,
+                &states,
+                SummaryScope {
+                    prestart: Some(PrestartSummary {
+                        history_before,
+                        tokens_before,
+                    }),
+                    retention,
+                    instructions: None,
+                    output_limit: if model_summary_available {
+                        summary_budget
+                    } else {
+                        0
+                    },
+                    cancellation: cancel,
+                    reason: crate::CompactionTrigger::Threshold,
+                    will_retry: false,
+                    skip_without_model: !model_summary_available,
                 },
-                cancellation: cancel,
-                reason: crate::CompactionTrigger::Threshold,
-                will_retry: false,
-                skip_without_model: !model_summary_available,
-            },
-            observer,
-            Some(followups),
-        )
-        .await?;
+                observer,
+                Some(followups),
+            )
+            .await;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        summary?;
         Ok(true)
     }
 
@@ -3175,7 +3187,7 @@ impl Agent<'_> {
                 session,
                 states,
                 SummaryScope {
-                    history_before: None,
+                    prestart: None,
                     retention,
                     instructions: None,
                     output_limit,
@@ -3239,6 +3251,7 @@ impl Agent<'_> {
                 states,
                 billing,
                 Some(retention),
+                None,
                 None,
                 cancel,
                 observer,
@@ -4945,7 +4958,7 @@ impl Agent<'_> {
         ensure_settled(session.operations())?;
         let states = self.migrate(session, observer)?;
         self.commit_compaction_with_host::<AgentInput>(
-            session, compaction, &states, None, None, None, cancel, observer, None,
+            session, compaction, &states, None, None, None, None, cancel, observer, None,
         )
         .await
         .map(|_| ())
@@ -4966,6 +4979,7 @@ impl Agent<'_> {
             session,
             compaction,
             &states,
+            None,
             None,
             None,
             None,
@@ -5029,6 +5043,7 @@ impl Agent<'_> {
             &states,
             None,
             Some(retention),
+            None,
             None,
             cancel,
             observer,
@@ -5690,7 +5705,7 @@ impl Agent<'_> {
             session,
             &states,
             SummaryScope {
-                history_before: None,
+                prestart: None,
                 retention,
                 instructions,
                 output_limit: limit,
@@ -5717,6 +5732,7 @@ impl Agent<'_> {
         let reason = scope.reason;
         let will_retry = scope.will_retry;
         let cancellation = scope.cancellation;
+        let prestart = scope.prestart.is_some();
         let mut progress = SummaryProgress::default();
         let result = self
             .summarize_prefix_inner(session, states, scope, observer, inputs, &mut progress)
@@ -5788,6 +5804,23 @@ impl Agent<'_> {
                 message: &message,
             });
         }
+        // A summary is optional before the prompt. Keep journal and settlement
+        // failures visible so they cannot be mistaken for a completed preflight.
+        if prestart
+            && !progress.request_checkpoint_failed
+            && matches!(
+                result,
+                Err(Error::Model(_)
+                    | Error::RetryableModel(_)
+                    | Error::Extension { .. }
+                    | Error::Config(_)
+                    | Error::AuthorizationRequired { .. }
+                    | Error::Cancelled
+                    | Error::Budget)
+            )
+        {
+            return Ok(None);
+        }
         result.map(|value| value.map(|(spent, _)| (spent, progress.supplied_without_model)))
     }
 
@@ -5801,7 +5834,7 @@ impl Agent<'_> {
         progress: &mut SummaryProgress,
     ) -> Result<Option<(u32, bool)>> {
         let SummaryScope {
-            history_before,
+            prestart,
             retention,
             instructions,
             output_limit: limit,
@@ -5832,13 +5865,16 @@ impl Agent<'_> {
         }
         let (branch_entries, tokens_before) = if has_pre_summary_hook {
             let branch = session.branch();
-            let history = match history_before {
+            let history = match prestart.and_then(|prior| prior.history_before) {
                 Some(id) => &branch[..branch.partition_point(|record| record.id < id)],
                 None => &branch,
             };
             (
                 history.iter().map(|entry| (*entry).clone()).collect(),
-                session.context_usage_estimate_for_branch(history).tokens,
+                prestart.map_or_else(
+                    || session.context_usage_estimate_for_branch(history).tokens,
+                    |prior| prior.tokens_before,
+                ),
             )
         } else {
             (Vec::new(), 0)
@@ -5919,6 +5955,7 @@ impl Agent<'_> {
                 result.usage.map(|usage| (usage, None)),
                 Some(retained),
                 Some(&result),
+                prestart.map(|prior| prior.tokens_before),
                 cancel,
                 observer,
                 inputs,
@@ -6011,7 +6048,8 @@ impl Agent<'_> {
                 observer,
                 inputs.as_deref_mut(),
             )
-            .await?
+            .await
+            .inspect_err(|_| progress.request_checkpoint_failed = true)?
             .outcome?;
         if reply.truncated {
             return Err(Error::Model(
@@ -6046,6 +6084,7 @@ impl Agent<'_> {
                 billing,
                 Some(retention),
                 None,
+                prestart.map(|prior| prior.tokens_before),
                 cancel,
                 observer,
                 inputs,
@@ -6094,6 +6133,7 @@ impl Agent<'_> {
         billing: Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
         minimum_retention: Option<RetentionPlan>,
         extension_result: Option<&crate::ExtensionCompaction>,
+        prior_tokens: Option<u64>,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
@@ -6197,7 +6237,7 @@ impl Agent<'_> {
         let (usage, usage_metadata) =
             billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
         let tokens_before = extension_result.map_or_else(
-            || session.context_usage_estimate().tokens,
+            || prior_tokens.unwrap_or_else(|| session.context_usage_estimate().tokens),
             |result| result.tokens_before,
         );
         let persist_metadata = (from_extension && extension_result.is_some())
@@ -6910,8 +6950,14 @@ fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {
     Some(start)
 }
 
-struct SummaryScope<'a> {
+#[derive(Clone, Copy)]
+struct PrestartSummary {
     history_before: Option<u64>,
+    tokens_before: u64,
+}
+
+struct SummaryScope<'a> {
+    prestart: Option<PrestartSummary>,
     retention: RetentionPlan,
     instructions: Option<&'a str>,
     output_limit: u32,
@@ -6925,6 +6971,7 @@ struct SummaryScope<'a> {
 struct SummaryProgress {
     reported: bool,
     supplied_without_model: bool,
+    request_checkpoint_failed: bool,
 }
 
 impl SummaryProgress {
@@ -9076,7 +9123,7 @@ mod tree_tests {
                             &mut session,
                             &ExtensionStates::new(),
                             SummaryScope {
-                                history_before: None,
+                                prestart: None,
                                 retention,
                                 instructions: None,
                                 output_limit: 0,
@@ -11870,7 +11917,7 @@ mod tree_tests {
                     &mut session,
                     &ExtensionStates::new(),
                     SummaryScope {
-                        history_before: None,
+                        prestart: None,
                         retention,
                         instructions: None,
                         output_limit: 16,
@@ -12620,7 +12667,7 @@ mod tree_tests {
                     &mut session,
                     &ExtensionStates::new(),
                     SummaryScope {
-                        history_before: None,
+                        prestart: None,
                         retention,
                         instructions: None,
                         output_limit: 0,

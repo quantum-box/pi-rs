@@ -339,10 +339,12 @@ trigger, opt into `handles_before_agent_start` and implement
 `before_agent_start`. Executable extensions advertise `before_agent_start_hook`
 and receive the `before_agent_start` protocol request. The event identifies
 the starting message and carries the resolved system prompt. Automatic
-threshold compaction of the prior conversation runs before these handlers.
-Each handler sees the latest prompt override in extension load order, and can return an
-exact prompt for the current run and a custom message. The final override is
-applied after request context hooks. An empty override clears the prompt text.
+threshold compaction of the prior conversation runs before these handlers. A
+summary failure or a compaction veto still allows the handlers to run. Cancelling
+the run stops preflight. Each handler sees the latest prompt override in
+extension load order and can return an exact prompt for the current run and a
+custom message. The final override is applied after request context hooks. An
+empty override clears the prompt text.
 Returned messages follow the starting input and the next-turn messages queued
 by the end of preflight. Cancellation interrupts delivery while a returned
 message's lifecycle hook is running. Handler failures are reported while

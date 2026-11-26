@@ -5613,12 +5613,15 @@ Native checks the prior conversation for automatic threshold compaction before
 invoking the hook for a new user or custom trigger. This follows the order in
 [Pi's pinned `_prepareRun`](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L2005-L2020).
 The new starting message and the hook's prompt override are excluded from the
-summary. A prior assistant older than the latest compaction cannot trigger this
-check. Native reports the threshold reason and leaves continuation to the
-starting message. If a run is interrupted during pre-start compaction, recovery
-settles the original summary request when one was recorded, skips the
-interrupted attempt, and resumes preflight on the same run. A committed
-compaction is retained on resume.
+summary. The saved prior-history token estimate also excludes the incoming
+image prompt when the SDK has already journaled it. A prior assistant older than the latest
+compaction cannot trigger this check. A summary failure or extension veto
+leaves preflight runnable. Cancelling the run stops preflight. If a run is
+interrupted during pre-start compaction, recovery settles the original summary
+request when one was recorded, skips the interrupted attempt, and resumes
+preflight on the same run. A committed compaction is retained on resume. An
+explicit resume with the same run ID requires the branch that recorded its
+compaction attempt.
 
 The native pre-start check covers configured threshold compaction. Explicit
 overflow and length-stop recovery use the existing turn recovery paths, and
