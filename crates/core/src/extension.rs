@@ -2562,11 +2562,13 @@ impl Registry {
 
     /// Reserve the entire session while startup commits and installs its
     /// complete staged model set. A concurrent revocation wins as a unit.
+    /// A supplied cycle list replaces this session's cache, including when empty.
     pub(crate) fn commit_session_model_bindings<T>(
         &self,
         session_id: Uuid,
         bindings: Vec<(Option<String>, String, Arc<dyn crate::Model>)>,
         guarded: Option<(&str, &str, &Arc<dyn crate::Model>)>,
+        refreshed_cycles: Option<&[(crate::journal::CycledModelSelection, Arc<dyn crate::Model>)]>,
         commit: impl FnOnce() -> Result<T>,
     ) -> Result<(T, bool)> {
         if bindings.iter().any(|(provider, name, _)| {
@@ -2595,6 +2597,14 @@ impl Registry {
             commit,
             || {
                 let mut models = self.branch_models.write().expect("branch models");
+                if let Some(refreshed) = refreshed_cycles {
+                    models.cycled.retain(|(owner, _), _| *owner != session_id);
+                    models
+                        .cycled
+                        .extend(refreshed.iter().map(|(selection, client)| {
+                            ((session_id, selection.clone()), client.clone())
+                        }));
+                }
                 for (provider, name, client) in bindings {
                     let guarded_binding = guarded
                         .is_some_and(|(p, n, _)| provider.as_deref() == Some(p) && name == n);

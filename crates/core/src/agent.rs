@@ -454,25 +454,42 @@ pub(crate) struct TreeModelResolution {
     pub revoked: Arc<std::sync::atomic::AtomicBool>,
 }
 
-fn tree_handoff_model(
-    registry: &Registry,
-    session: &Session,
-    name: &str,
-) -> Option<(Arc<dyn Model>, Option<Limits>)> {
-    if let Some(selection) = session.cycled_model_at(session.head()) {
-        return registry
-            .cycled_model(session.session_id(), &selection)
-            .map(|model| (model, None));
-    }
-    match session.model_provider() {
-        Some(provider) => registry.provider_branch_config(session.session_id(), provider, name),
-        None => registry
-            .branch_model(session.session_id(), name)
-            .map(|model| (model, None)),
-    }
-}
-
 impl Agent<'_> {
+    fn tree_handoff_model(
+        &self,
+        session: &Session,
+        name: Option<&str>,
+        previous_provider: Option<&str>,
+        previous_cycle: Option<&crate::journal::CycledModelSelection>,
+    ) -> Result<Option<(Arc<dyn Model>, Option<Limits>)>> {
+        let cycle = session.cycled_model_at(session.head())?;
+        let provider = session.model_provider();
+        let Some(name) = name.filter(|name| {
+            *name != self.model_name
+                || provider != previous_provider
+                || cycle.as_ref() != previous_cycle
+        }) else {
+            return Ok(None);
+        };
+        let model = if let Some(selection) = cycle {
+            self.registry
+                .cycled_model(session.session_id(), &selection)
+                .map(|model| (model, None))
+        } else if let Some(provider) = provider {
+            self.registry
+                .provider_branch_config(session.session_id(), provider, name)
+        } else {
+            self.registry
+                .branch_model(session.session_id(), name)
+                .map(|model| (model, None))
+        };
+        model.map(Some).ok_or_else(|| {
+            Error::Config(format!(
+                "tree trigger recovery requires registered model {name}"
+            ))
+        })
+    }
+
     pub(crate) async fn settle_recovery_before_hooks(
         &self,
         session: &Session,
@@ -734,7 +751,7 @@ impl Agent<'_> {
             return Err(Error::Cancelled);
         }
         let selected_provider = session.model_provider().map(str::to_owned);
-        let selected_cycle = session.cycled_model_at(session.head());
+        let selected_cycle = session.cycled_model_at(session.head())?;
         let handoff = if input.is_none() {
             match session.begin_tree_trigger_handoff(run_id) {
                 Ok(handoff) => handoff,
@@ -782,40 +799,32 @@ impl Agent<'_> {
         let branch_model = handoff
             .as_ref()
             .and_then(|_| session.model_selection().map(|selection| selection.0));
-        let provider_changed = handoff.is_some()
-            && (session.model_provider() != selected_provider.as_deref()
-                || session.cycled_model_at(session.head()) != selected_cycle);
-        let model = match branch_model
-            .as_deref()
-            .filter(|name| *name != self.model_name || provider_changed)
-        {
-            Some(name) => match tree_handoff_model(self.registry, session, name) {
-                Some(model) => Some(model),
-                None => {
-                    let error = if let Some((return_to, _)) = handoff {
-                        finish_tree_handoff(session, return_to, observer)
-                            .err()
-                            .unwrap_or_else(|| {
-                                Error::Config(format!(
-                                    "tree trigger recovery requires registered model {name}"
-                                ))
-                            })
-                    } else {
-                        Error::Config(format!(
-                            "tree trigger recovery requires registered model {name}"
-                        ))
-                    };
-                    observer(Notification::RunStarted { run_id });
-                    let message = error.to_string();
-                    observer(Notification::RunEnded {
-                        run_id,
-                        succeeded: false,
-                        error: Some(&message),
-                    });
-                    return Err(error);
-                }
-            },
-            None => None,
+        let model = match handoff.as_ref().map_or(Ok(None), |_| {
+            self.tree_handoff_model(
+                session,
+                branch_model.as_deref(),
+                selected_provider.as_deref(),
+                selected_cycle.as_ref(),
+            )
+        }) {
+            Ok(model) => model,
+            Err(error) => {
+                let error = if let Some((return_to, _)) = handoff {
+                    finish_tree_handoff(session, return_to, observer)
+                        .err()
+                        .unwrap_or(error)
+                } else {
+                    error
+                };
+                observer(Notification::RunStarted { run_id });
+                let message = error.to_string();
+                observer(Notification::RunEnded {
+                    run_id,
+                    succeeded: false,
+                    error: Some(&message),
+                });
+                return Err(error);
+            }
         };
         session.set_run_id(Some(run_id));
         observer(Notification::RunStarted { run_id });
@@ -855,7 +864,7 @@ impl Agent<'_> {
                 break;
             };
             let selected_provider = session.model_provider().map(str::to_owned);
-            let selected_cycle = session.cycled_model_at(session.head());
+            let selected_cycle = session.cycled_model_at(session.head())?;
             let handoff = match session.begin_tree_trigger_handoff(trigger_id) {
                 Ok(Some((return_to, records))) => {
                     for record in &records {
@@ -881,36 +890,32 @@ impl Agent<'_> {
             observer(Notification::RunStarted { run_id: trigger_id });
             let branch_model =
                 handoff.and_then(|_| session.model_selection().map(|selection| selection.0));
-            let provider_changed = handoff.is_some()
-                && (session.model_provider() != selected_provider.as_deref()
-                    || session.cycled_model_at(session.head()) != selected_cycle);
-            let model = match branch_model
-                .as_deref()
-                .filter(|name| *name != self.model_name || provider_changed)
-            {
-                Some(name) => match tree_handoff_model(self.registry, session, name) {
-                    Some(model) => Some(model),
-                    None => {
-                        session.set_run_id(None);
-                        let message =
-                            format!("tree trigger recovery requires registered model {name}");
-                        let error = if let Some(return_to) = handoff {
-                            finish_tree_handoff(session, return_to, observer)
-                                .err()
-                                .map(|error| error.to_string())
-                                .unwrap_or(message)
-                        } else {
-                            message
-                        };
-                        observer(Notification::RunEnded {
-                            run_id: trigger_id,
-                            succeeded: false,
-                            error: Some(&error),
-                        });
-                        break;
-                    }
-                },
-                None => None,
+            let model = match handoff.map_or(Ok(None), |_| {
+                self.tree_handoff_model(
+                    session,
+                    branch_model.as_deref(),
+                    selected_provider.as_deref(),
+                    selected_cycle.as_ref(),
+                )
+            }) {
+                Ok(model) => model,
+                Err(error) => {
+                    session.set_run_id(None);
+                    let error = if let Some(return_to) = handoff {
+                        finish_tree_handoff(session, return_to, observer)
+                            .err()
+                            .unwrap_or(error)
+                    } else {
+                        error
+                    };
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id: trigger_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    break;
+                }
             };
             let branch_agent = Agent {
                 model: model

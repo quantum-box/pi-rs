@@ -993,7 +993,10 @@ fn wire_id(id: Option<u64>) -> Option<String> {
 
 pub(super) fn sdk_branch_thinking(metadata: Option<&Value>) -> Option<&str> {
     let metadata = metadata?;
-    uuid::Uuid::parse_str(metadata.get("sdkCycleBinding")?.as_str()?).ok()?;
+    let binding = uuid::Uuid::parse_str(metadata.get("sdkCycleBinding")?.as_str()?).ok()?;
+    if binding.is_nil() {
+        return None;
+    }
     metadata
         .get("sdkCycleThinking")?
         .as_str()
@@ -1718,6 +1721,7 @@ mod tests {
             for malformed in [
                 json!({"sdkCycleThinking":"high"}),
                 json!({"sdkCycleBinding":"invalid","sdkCycleThinking":"high"}),
+                json!({"sdkCycleBinding":uuid::Uuid::nil(),"sdkCycleThinking":"high"}),
                 json!({"sdkCycleBinding":binding}),
                 json!({"sdkCycleBinding":binding,"sdkCycleThinking":42}),
                 json!({"sdkCycleBinding":binding,"sdkCycleThinking":" "}),

@@ -1953,59 +1953,82 @@ impl Session {
             .map(|(_, model, thinking)| (model, thinking))
     }
 
-    fn model_selection_record_at(&self, target: u64) -> Option<&Record> {
+    fn selection_history(&self, target: u64) -> impl Iterator<Item = &Record> {
         std::iter::successors(
-            self.records.get(target.checked_sub(1)? as usize),
+            target
+                .checked_sub(1)
+                .and_then(|id| self.records.get(id as usize)),
             |record| self.records.get(record.parent?.checked_sub(1)? as usize),
         )
-        .find(|record| {
-            matches!(
-                record.event,
-                Event::ModelSelected { .. }
-                    | Event::BranchModelSelected { .. }
-                    | Event::BranchSummary {
-                        fallback_model: Some(_),
-                        ..
-                    }
-            )
-        })
     }
 
-    pub(crate) fn cycled_model_at(&self, target: u64) -> Option<CycledModelSelection> {
-        let record = self.model_selection_record_at(target)?;
-        let marker = self.record_metadata(record.id)?.get("sdkCycleBinding")?;
-        let (provider, model, thinking) = match &record.event {
+    fn is_model_selection(record: &Record) -> bool {
+        matches!(
+            record.event,
+            Event::ModelSelected { .. }
+                | Event::BranchModelSelected { .. }
+                | Event::BranchSummary {
+                    fallback_model: Some(_),
+                    ..
+                }
+        )
+    }
+
+    pub(crate) fn cycled_model_at(&self, target: u64) -> Result<Option<CycledModelSelection>> {
+        for record in self.selection_history(target) {
+            let metadata = self.record_metadata(record.id).filter(|metadata| {
+                ["sdkCycleBinding", "sdkCycleThinking", "sdkThinkingOnly"]
+                    .iter()
+                    .any(|key| metadata.get(key).is_some())
+            });
+            if let Some(metadata) = metadata {
+                return Self::parse_sdk_model_binding(record, metadata)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        Error::Session(format!("invalid SDK cycle binding at record {}", record.id))
+                    });
+            }
+            if Self::is_model_selection(record) {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    fn parse_sdk_model_binding(
+        record: &Record,
+        metadata: &serde_json::Value,
+    ) -> Option<CycledModelSelection> {
+        let id = Uuid::parse_str(metadata.get("sdkCycleBinding")?.as_str()?).ok()?;
+        let thinking = metadata.get("sdkCycleThinking")?.as_str()?;
+        if id.is_nil()
+            || thinking.trim().is_empty()
+            || metadata
+                .get("sdkThinkingOnly")
+                .is_some_and(|flag| flag.as_bool() != Some(true))
+        {
+            return None;
+        }
+        let (provider, model) = match &record.event {
             Event::ModelSelected {
                 provider: Some(provider),
                 model,
-                thinking: Some(thinking),
-            } => (provider, model, thinking.as_str()),
+                thinking: Some(selected),
+            } if selected == thinking => (provider, model),
             Event::BranchModelSelected {
                 provider, model, ..
-            } => (
-                provider,
-                model,
-                self.record_metadata(record.id)?
-                    .get("sdkCycleThinking")?
-                    .as_str()?,
-            ),
+            } => (provider, model),
             Event::BranchSummary {
                 fallback_model: Some(selection),
                 ..
-            } => (
-                &selection.provider,
-                &selection.model,
-                self.record_metadata(record.id)?
-                    .get("sdkCycleThinking")?
-                    .as_str()?,
-            ),
+            } => (&selection.provider, &selection.model),
             _ => return None,
         };
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return None;
+        }
         Some(CycledModelSelection {
-            id: marker
-                .as_str()
-                .and_then(|id| Uuid::parse_str(id).ok())
-                .unwrap_or_else(Uuid::nil),
+            id,
             provider: provider.clone(),
             model: model.clone(),
             thinking: thinking.to_owned(),
@@ -2043,7 +2066,8 @@ impl Session {
         &self,
         target: u64,
     ) -> Option<(Option<String>, String, Option<String>)> {
-        self.model_selection_record_at(target)
+        self.selection_history(target)
+            .find(|record| Self::is_model_selection(record))
             .and_then(|record| match &record.event {
                 Event::ModelSelected {
                     model,

@@ -869,7 +869,7 @@ impl SessionControl {
                 journal.head(),
                 provider.as_deref(),
                 &name,
-            )
+            )?
             .ok_or_else(|| {
                 Error::Config(format!("session branch requires registered model {name}"))
             })?;
@@ -1256,11 +1256,11 @@ fn selected_branch_client(
     target: u64,
     provider: Option<&str>,
     name: &str,
-) -> Option<Arc<dyn Model>> {
-    match journal.cycled_model_at(target) {
+) -> Result<Option<Arc<dyn Model>>> {
+    Ok(match journal.cycled_model_at(target)? {
         Some(selection) => registry.cycled_model(journal.session_id(), &selection),
         None => branch_client(registry, journal.session_id(), provider, name),
-    }
+    })
 }
 
 type CycledModelResolver = dyn Fn(&str, &str, &str) -> Result<Option<Arc<dyn Model>>> + Send + Sync;
@@ -1269,9 +1269,6 @@ fn resolve_cycled_client(
     resolver: Option<&CycledModelResolver>,
     selection: &CycledModelSelection,
 ) -> Result<Option<Arc<dyn Model>>> {
-    if selection.id.is_nil() {
-        return Err(Error::Session("invalid SDK cycle binding".into()));
-    }
     resolver.map_or(Ok(None), |resolve| {
         resolve(&selection.provider, &selection.model, &selection.thinking)
     })
@@ -1468,7 +1465,16 @@ impl SessionBuilder {
         // registrations, so resolver or journal failures cannot replace them.
         let mut resolved = None;
         let mut model_fallback = None;
-        let cycled = session.cycled_model_at(session.head());
+        let cycled = session.cycled_model_at(session.head())?;
+        // A new owner with an explicit policy reauthorizes the selected binding.
+        // Historical bindings will be resolved on demand during branch transitions.
+        let refreshed_cycle = match &cycled {
+            Some(selection) => {
+                resolve_cycled_client(self.cycled_model_resolver.as_deref(), selection)?
+                    .map(|client| (selection.clone(), client))
+            }
+            None => None,
+        };
         if cycled.is_none()
             && let Some(resolver) = &self.historical_model_resolver
             && let Some((Some(provider), name, _)) = session.model_identity_at(session.head())
@@ -1541,10 +1547,13 @@ impl SessionBuilder {
         // qualified choice before its first request, while leaving existing
         // historical selections (including unqualified ones) untouched.
         let initial_selection = session.model_identity_at(session.head()).is_none();
-        let (_, _revoked) = self.registry.commit_session_model_bindings(
+        let (_, revoked) = self.registry.commit_session_model_bindings(
             session.session_id(),
             bindings,
             guarded,
+            self.cycled_model_resolver
+                .is_some()
+                .then_some(refreshed_cycle.as_slice()),
             || {
                 if let (Some((provider, name, _)), Some(_)) = (&resolved, &model_fallback) {
                     session.select_provider_model_atomic(provider, name)?;
@@ -1559,26 +1568,10 @@ impl SessionBuilder {
             self.model_name = name;
             self.model_provider = Some(provider);
         }
-        if let Some(selection) = &cycled
-            && self
-                .registry
-                .cycled_model(session.session_id(), selection)
-                .is_none()
-            && let Some(client) =
-                resolve_cycled_client(self.cycled_model_resolver.as_deref(), selection)?
-        {
-            let (_, revoked) = self.registry.commit_cycled_model(
-                session.session_id(),
-                selection,
-                client,
-                false,
-                || Ok(()),
-            )?;
-            if revoked {
-                return Err(Error::Config(
-                    "cycled model client was revoked during open".into(),
-                ));
-            }
+        if revoked && refreshed_cycle.is_some() {
+            return Err(Error::Config(
+                "cycled model client was revoked during open".into(),
+            ));
         }
         // Registered historical models must be active even before startup
         // hooks run: synchronous checkout and fork can be called immediately.
@@ -1589,7 +1582,7 @@ impl SessionBuilder {
                 session.head(),
                 provider.as_deref(),
                 &name,
-            ) {
+            )? {
                 Some(client) => {
                     self.model = client;
                     self.model_name = name;
@@ -1756,15 +1749,15 @@ impl AgentSession {
     }
 
     fn resolve_branch_model(&self, journal: &Session, target: u64) -> Result<BranchResolution> {
-        if let Some(selection) = journal.cycled_model_at(target) {
+        if let Some(selection) = journal.cycled_model_at(target)? {
             return self.resolve_cycled_branch(selection, false);
         }
         let Some((provider, name, _)) = journal.model_identity_at(target) else {
             let selection = if journal.session_id() == self.session_id {
-                journal.cycled_model_at(journal.head())
+                journal.cycled_model_at(journal.head())?
             } else {
                 let source = self.journal()?;
-                source.cycled_model_at(source.head())
+                source.cycled_model_at(source.head())?
             };
             if let Some(selection) = selection {
                 return self.resolve_cycled_branch(selection, true);
@@ -1894,7 +1887,7 @@ impl AgentSession {
         name: String,
     ) -> Result<()> {
         let model =
-            selected_branch_client(&self.registry, journal, journal.head(), provider, &name)
+            selected_branch_client(&self.registry, journal, journal.head(), provider, &name)?
                 .ok_or_else(|| {
                     Error::Config(format!("session branch requires registered model {name}"))
                 })?;
@@ -1973,7 +1966,7 @@ impl AgentSession {
                     journal.head(),
                     provider.as_deref(),
                     &name,
-                )
+                )?
                 .ok_or_else(|| {
                     Error::Config(format!("session branch requires registered model {name}"))
                 })?;
@@ -2163,7 +2156,7 @@ impl AgentSession {
             journal.head(),
             self.model_provider.as_deref(),
             &self.model_name,
-        )
+        )?
         .is_some_and(|client| Arc::ptr_eq(&client, &self.model));
         if !self.model_identity_resolved || !matches_selection || !registered {
             return Err(Error::Config(
@@ -2783,7 +2776,7 @@ impl AgentSession {
                 revoked,
                 journal
                     .model_identity_at(journal.head())
-                    .and_then(|(provider, model, _)| {
+                    .map(|(provider, model, _)| {
                         let client = selected_branch_client(
                             &self.registry,
                             &journal,
@@ -2791,8 +2784,10 @@ impl AgentSession {
                             provider.as_deref(),
                             &model,
                         )?;
-                        Some((provider, model, client))
-                    }),
+                        Ok::<_, Error>(client.map(|client| (provider, model, client)))
+                    })
+                    .transpose()?
+                    .flatten(),
                 journal.records().last().cloned().expect("checkout record"),
                 InputHooks::new(&self.registry, &journal),
             )
@@ -3170,7 +3165,7 @@ impl AgentSession {
                     journal.head(),
                     provider.as_deref(),
                     &name,
-                )
+                )?
                 .is_some()
             {
                 self.restore_branch_model(&journal, provider.as_deref(), name)?;
@@ -3237,7 +3232,7 @@ impl AgentSession {
             self.control.observe(&event);
             emit(&events, &event);
         };
-        let cycled = journal.cycled_model_at(journal.head());
+        let cycled = journal.cycled_model_at(journal.head())?;
         let model = match &cycled {
             Some(selection) => self
                 .registry
@@ -5438,6 +5433,178 @@ mod tests {
         assert_eq!(
             session.prompt("inherited selection").await.unwrap(),
             "a-high"
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_reopen_reauthorizes_bindings_in_a_reused_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let registry = Registry::default();
+        let builder = || {
+            SessionBuilder::new(Arc::new(ProviderBranchModel("generic")), "shared")
+                .provider("a")
+                .unwrap()
+                .registry(registry.clone())
+        };
+        let mut original = builder().open(&path).unwrap();
+        let available = [
+            cycle_entry("b", "shared", Some("high")),
+            cycle_entry("a", "shared", Some("low")),
+        ];
+        for _ in 0..2 {
+            original
+                .cycle_model(
+                    ModelCycleDirection::Forward,
+                    &available,
+                    &[],
+                    None,
+                    |_, _, level| Ok((Arc::new(ProviderBranchModel("stale")), level.into())),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let (session_id, current, historical, historical_target) = {
+            let journal = original.journal().unwrap();
+            let target = journal
+                .records()
+                .iter()
+                .find(|record| {
+                    journal
+                        .record_metadata(record.id)
+                        .is_some_and(|metadata| metadata["sdkCycleThinking"] == "high")
+                })
+                .unwrap()
+                .id;
+            (
+                journal.session_id(),
+                journal.cycled_model_at(journal.head()).unwrap().unwrap(),
+                journal.cycled_model_at(target).unwrap().unwrap(),
+                target,
+            )
+        };
+        original.close().await.unwrap();
+        drop(original);
+        assert!(registry.cycled_model(session_id, &current).is_some());
+        assert!(registry.cycled_model(session_id, &historical).is_some());
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let mut authorized = builder()
+            .cycled_model_resolver(move |provider, model, level| {
+                seen.lock().unwrap().push((
+                    provider.to_owned(),
+                    model.to_owned(),
+                    level.to_owned(),
+                ));
+                Ok(Some(Arc::new(ProviderBranchModel("authorized"))))
+            })
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [("a".into(), "shared".into(), "low".into())]
+        );
+        assert_eq!(authorized.prompt("current").await.unwrap(), "authorized");
+        let head = authorized.journal().unwrap().head();
+        let mut fork = authorized
+            .fork_to(head, directory.path().join("fork.jsonl"))
+            .unwrap();
+        assert_eq!(fork.prompt("fork").await.unwrap(), "authorized");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(registry.cycled_model(session_id, &historical).is_none());
+        authorized.checkout(historical_target).unwrap();
+        assert_eq!(
+            calls.lock().unwrap()[1],
+            ("b".into(), "shared".into(), "high".into())
+        );
+        assert_eq!(authorized.prompt("historical").await.unwrap(), "authorized");
+        authorized.close().await.unwrap();
+        drop(authorized);
+        assert!(registry.cycled_model(session_id, &historical).is_some());
+
+        let denied = Arc::new(AtomicUsize::new(0));
+        let observed = denied.clone();
+        let mut refused = builder()
+            .cycled_model_resolver(move |provider, model, level| {
+                assert_eq!((provider, model, level), ("b", "shared", "high"));
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            })
+            .open(&path)
+            .unwrap();
+        assert_eq!(denied.load(Ordering::SeqCst), 1);
+        assert!(registry.cycled_model(session_id, &historical).is_none());
+        assert!(refused.model_provider().is_err());
+        let before = refused.journal().unwrap().head();
+        assert!(refused.prompt("denied").await.is_err());
+        assert_eq!(refused.journal().unwrap().head(), before);
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_reopen_rejects_invalid_markers_and_preserves_ordinary_history() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let binding = Uuid::new_v4();
+        for (index, metadata) in [
+            json!({"sdkCycleBinding": binding}),
+            json!({"sdkCycleThinking": "high"}),
+            json!({"sdkThinkingOnly": true}),
+            json!({"sdkCycleBinding": "broken", "sdkCycleThinking": "high"}),
+            json!({"sdkCycleBinding": Uuid::nil(), "sdkCycleThinking": "high"}),
+            json!({"sdkCycleBinding": binding, "sdkCycleThinking": null}),
+            json!({"sdkCycleBinding": binding, "sdkCycleThinking": " "}),
+            json!({"sdkCycleBinding": binding, "sdkCycleThinking": "low"}),
+            json!({"sdkCycleBinding": binding, "sdkCycleThinking": "high", "sdkThinkingOnly": "true"}),
+        ].into_iter().enumerate() {
+            let path = directory.path().join(format!("corrupt-{index}.jsonl"));
+            let mut journal = Session::open(&path).unwrap();
+            let invalid = journal.append_with_record_metadata(crate::Event::ModelSelected {
+                provider: Some("historical".into()),
+                model: "shared".into(),
+                thinking: Some("high".into()),
+            }, metadata).unwrap().id;
+            drop(journal);
+            let builder = || SessionBuilder::new(Arc::new(ProviderBranchModel("legacy")), "shared")
+                .historical_model_resolver(Arc::new(|_: &str, _: &str| panic!("legacy fallback")))
+                .cycled_model_resolver(|_, _, _| panic!("malformed binding reached resolver"));
+            let original = std::fs::read(&path).unwrap();
+            assert!(matches!(builder().open(&path), Err(Error::Session(message)) if message.contains("invalid SDK cycle binding")));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+
+            let mut journal = Session::open(&path).unwrap();
+            journal.append_with_record_metadata(crate::Event::ModelSelected {
+                provider: None,
+                model: "shared".into(),
+                thinking: Some("low".into()),
+            }, json!({"unrelatedHistory": true})).unwrap();
+            drop(journal);
+            let mut legacy = builder().open(&path).unwrap();
+            assert!(matches!(legacy.checkout(invalid), Err(Error::Session(message)) if message.contains("invalid SDK cycle binding")));
+            assert_eq!(legacy.model_provider().unwrap(), None);
+            assert_eq!(legacy.prompt("ordinary history").await.unwrap(), "legacy");
+        }
+
+        let path = directory.path().join("thinking-only.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        journal.append_with_record_metadata(crate::Event::ModelSelected {
+            provider: Some("historical".into()),
+            model: "shared".into(),
+            thinking: Some("high".into()),
+        }, json!({"sdkCycleBinding": binding, "sdkCycleThinking": "high", "sdkThinkingOnly": true})).unwrap();
+        drop(journal);
+        let mut reopened = SessionBuilder::new(Arc::new(ProviderBranchModel("generic")), "shared")
+            .cycled_model_resolver(|provider, model, level| {
+                assert_eq!((provider, model, level), ("historical", "shared", "high"));
+                Ok(Some(Arc::new(ProviderBranchModel("thinking-only"))))
+            })
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            reopened.prompt("thinking-only marker").await.unwrap(),
+            "thinking-only"
         );
     }
 
@@ -8687,7 +8854,7 @@ mod tests {
             .registry(registry.clone())
             .historical_model_resolver(resolver);
         registry
-            .commit_session_model_bindings(id, vec![], None, || {
+            .commit_session_model_bindings(id, vec![], None, None, || {
                 assert!(builder.build(journal).is_err());
                 Ok(())
             })
