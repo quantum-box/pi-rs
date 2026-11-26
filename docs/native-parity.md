@@ -5497,7 +5497,9 @@ Reentrant sends are serviced by the journal owner while the callback waits.
 Pi awaits each `agent_start` handler in extension order before proceeding.
 In pi-rs, each active `agent_start` handler can use its host for plain and keyed
 messages while the callback is live. Return, timeout, or cancellation expires
-that host and discards its queued requests that have yet to reach the journal.
+that host and rejects requests the journal owner has yet to admit. Once admitted,
+a send receives the journal write's outcome. MCP change callbacks delivered
+after `agent_start` continue to use their shared message host.
 [Pi agent event dispatch](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L1371-L1376)
 [Pi extension runner](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/extensions/runner.ts#L1108-L1136)
 
