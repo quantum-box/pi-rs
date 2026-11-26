@@ -1736,7 +1736,9 @@ impl Store {
              WHERE key >= ?1 AND key < ?2 AND sequence > ?3 AND sequence <= ?4
              ORDER BY sequence LIMIT ?5",
         )?;
-        let rows = stmt.query_map(params![prefix, end, after, through, limit], |row| row.get(0))?;
+        let rows = stmt.query_map(params![prefix, end, after, through, limit], |row| {
+            row.get(0)
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
