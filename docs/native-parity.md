@@ -2120,9 +2120,13 @@ bounded argument and error previews, and durations on completion. Parallel
 calls update their original positions. The first 64 calls are tracked, and
 further calls are counted without changing dispatch. Script return, timeout,
 and caller abort mark still-running calls cancelled in the settlement snapshot.
-The terminal shows recent call states and RPC and JSON attach the live snapshot
-to the parent tool result event. These details are transient and do not change
-the journal, model-facing output, or store transaction. The snapshot covers
+The terminal shows recent call states. RPC and JSON attach the snapshot as
+`codemodeProgress` on the parent's `tool_execution_end` event. The snapshot
+is transient and leaves tool-result messages, journal records, model output,
+and the store transaction intact. The scheduler bounds complete progress
+events, omits large parent arguments, and gives extension observers a single
+250 ms maximum budget per tool. Observer callbacks stop when the tool settles
+while the remaining events still reach presentation consumers. The snapshot covers
 `tools.*` calls. `models.*` calls remain outside it.
 [Pinned Codemode nested tool lifecycle](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/extensions/codemode/execute.ts#L514-L550)
 

@@ -7144,26 +7144,78 @@ struct ProgressReporter {
 #[derive(Default)]
 struct ProgressSettlement {
     closed: bool,
-    pending: Option<serde_json::Value>,
+    pending: Option<TurnProgress>,
 }
 
 impl ProgressReporter {
     fn close(&self) -> Option<TurnProgress> {
         let mut settlement = self.settlement.lock().expect("tool progress settlement");
         settlement.closed = true;
-        settlement.pending.take().map(|value| self.event(value))
+        settlement.pending.take()
     }
 
-    fn event(&self, partial_result: serde_json::Value) -> TurnProgress {
-        TurnProgress::Event(Box::new(crate::LifecycleEvent::ToolExecutionUpdate {
+    fn event(&self, partial_result: serde_json::Value) -> crate::ExtensionResult<TurnProgress> {
+        let event = crate::LifecycleEvent::ToolExecutionUpdate {
             tool_call_id: self.tool_call_id.clone(),
             tool_name: self.tool_name.clone(),
             args: self.args.clone(),
             partial_result,
             parent_tool_call_id: self.parent_tool_call_id.clone(),
-        }))
+        };
+        // Count the entire event, including escaped arguments and identifiers,
+        // without allocating a second copy of its serialized representation.
+        serde_json::to_writer(ProgressSizeLimit(1024 * 1024), &event)
+            .map_err(|_| "tool progress event exceeds size limit".to_owned())?;
+        Ok(TurnProgress::Event(Box::new(event)))
+    }
+
+    fn report(
+        &self,
+        partial_result: serde_json::Value,
+        settlement: Option<serde_json::Value>,
+        retain_if_full: bool,
+        cancellation: &CancellationToken,
+    ) -> crate::ExtensionResult<()> {
+        let live = self.event(partial_result)?;
+        let settlement = settlement.map(|value| self.event(value)).transpose()?;
+        let mut pending = self.settlement.lock().expect("tool progress settlement");
+        if pending.closed || cancellation.is_cancelled() {
+            return Err("tool progress cancelled".into());
+        }
+        match &self.sender {
+            ProgressSink::Turn(sender) => match sender.try_reserve() {
+                Ok(permit) => {
+                    permit.send(live);
+                    pending.pending = settlement;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if retain_if_full {
+                        pending.pending = settlement.or(Some(live));
+                    }
+                    return Err("tool progress queue is full".into());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err("tool has finished".into()),
+            },
+        }
+        Ok(())
     }
 }
+
+struct ProgressSizeLimit(usize);
+impl std::io::Write for ProgressSizeLimit {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or(std::io::ErrorKind::WriteZero)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 enum ProgressSink {
     Turn(mpsc::Sender<TurnProgress>),
@@ -7188,49 +7240,18 @@ impl ToolHost for NestedHost {
         &self,
         partial_result: serde_json::Value,
     ) -> crate::ExtensionResult<()> {
-        self.report_progress_with_settlement(partial_result, None)
-            .await
+        self.progress.as_ref().map_or(Ok(()), |progress| {
+            progress.report(partial_result, None, false, &self.cancellation)
+        })
     }
     async fn report_progress_with_settlement(
         &self,
         partial_result: serde_json::Value,
         settlement: Option<serde_json::Value>,
     ) -> crate::ExtensionResult<()> {
-        let Some(progress) = &self.progress else {
-            return Ok(());
-        };
-        for value in std::iter::once(&partial_result).chain(settlement.as_ref()) {
-            if serde_json::to_vec(value)
-                .map_err(|error| error.to_string())?
-                .len()
-                > 1024 * 1024
-            {
-                return Err("tool progress exceeds size limit".into());
-            }
-        }
-        let mut pending = progress
-            .settlement
-            .lock()
-            .expect("tool progress settlement");
-        if pending.closed || self.cancellation.is_cancelled() {
-            return Err("tool progress cancelled".into());
-        }
-        match &progress.sender {
-            ProgressSink::Turn(sender) => match sender.try_reserve() {
-                Ok(permit) => {
-                    permit.send(progress.event(partial_result));
-                    pending.pending = settlement;
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    if settlement.is_some() || pending.pending.is_some() {
-                        pending.pending = settlement.or(Some(partial_result));
-                    }
-                    return Err("tool progress queue is full".into());
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => return Err("tool has finished".into()),
-            },
-        }
-        Ok(())
+        self.progress.as_ref().map_or(Ok(()), |progress| {
+            progress.report(partial_result, settlement, true, &self.cancellation)
+        })
     }
 
     fn has_ui(&self) -> bool {

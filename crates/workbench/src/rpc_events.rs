@@ -533,9 +533,6 @@ impl Stream {
                         Some(&outcome),
                         Some(outcome.is_structured()),
                     );
-                    if let Some(details) = self.codemode_progress.remove(&operation_id) {
-                        result["details"] = details;
-                    }
                     if let Some(content) = &metadata.structured_content {
                         result["structuredContent"] = content.clone();
                     }
@@ -543,6 +540,9 @@ impl Stream {
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
                     });
+                    if let Some(progress) = self.codemode_progress.remove(&operation_id) {
+                        event["codemodeProgress"] = progress;
+                    }
                     if let Some(duration_ms) = metadata.duration_ms {
                         event["durationMs"] = json!(duration_ms);
                     }
@@ -2133,7 +2133,7 @@ mod streaming_tool_tests {
     }
 
     #[test]
-    fn codemode_projects_the_settled_snapshot_without_changing_result_content() {
+    fn codemode_progress_is_only_attached_to_the_lifecycle_event() {
         let args = Cli::parse_from(["pi"]);
         let operation_id = Uuid::new_v4();
         for from_worker in [false, true] {
@@ -2175,7 +2175,12 @@ mod streaming_tool_tests {
                 }
             }
             let mut events = Vec::new();
-            let outcome = Outcome::Failed("fixture".into());
+            let original = json!({"calls":"existing result metadata","custom":"kept"});
+            let outcome = Outcome::TextResult {
+                output: "fixture".into(),
+                details: Some(original.clone()),
+                is_error: true,
+            };
             stream.record(
                 Event::ToolReconciled {
                     operation_id,
@@ -2184,12 +2189,21 @@ mod streaming_tool_tests {
                 &args,
                 &mut events,
             );
-            let result = &events
+            let end = events
                 .iter()
                 .find(|event| event["type"] == "tool_execution_end")
-                .unwrap()["result"];
-            assert_eq!(result["details"], terminal);
-            assert_eq!(result["content"][0]["text"], outcome.tool_content());
+                .unwrap();
+            assert_eq!(end["codemodeProgress"], terminal);
+            assert_eq!(end["result"]["details"], original);
+            assert_eq!(end["result"]["content"][0]["text"], outcome.tool_content());
+            assert_eq!(stream.tool_results[0]["details"], original);
+            assert!(stream.tool_results[0].get("codemodeProgress").is_none());
+            for event in events
+                .iter()
+                .filter(|event| event["type"] != "tool_execution_end")
+            {
+                assert!(!event.to_string().contains("omittedCalls"));
+            }
             assert!(stream.codemode_progress.is_empty());
         }
     }
