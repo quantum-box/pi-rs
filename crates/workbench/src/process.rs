@@ -1,6 +1,6 @@
 //! Shared subprocess transport for terminal and RPC frontends.
 use super::Cli;
-use pi_rs::{Error, Result, SessionShutdownReason, SessionStartReason};
+use pi_rs::{Error, Result, Session, SessionShutdownReason, SessionStartReason};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
