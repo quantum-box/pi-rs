@@ -1264,6 +1264,9 @@ mod tests {
                 entry: json!({"requestId":request_id}),
             },
         });
+        let mut other_run = records.last().unwrap().clone();
+        other_run.run_id = Some(Uuid::nil());
+        assert_eq!(pi_rs::superseded_turn_partial(&records, &other_run), None);
         let scheduled = Session::from_records(records).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let round_trip = |session: &Session, superseded: bool| {
@@ -1348,6 +1351,87 @@ mod tests {
             imported.last_assistant_text().as_deref(),
             Some("partial answer")
         );
+    }
+
+    #[test]
+    fn superseded_partial_import_requires_nearest_completion_on_its_branch() {
+        let reply = |id, parent, stop, text| {
+            json!({"type":"message","id":id,"parentId":parent,"message":{
+                "role":"assistant","stopReason":stop,"content":[{"type":"text","text":text}]
+            }})
+        };
+        let mut measured = reply("measured", "early", "stop", "measured answer");
+        measured["message"]["usage"] = json!({"input":83,"output":7});
+        let history = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"prompt","parentId":null,"message":{
+                "role":"user","content":"question"
+            }}),
+            reply("early", "prompt", "error", "older partial"),
+            measured,
+            reply("retry", "measured", "error", "retry partial"),
+            json!({"type":"label","id":"label","parentId":"retry","targetId":"retry","label":"note"}),
+            reply("sibling", "measured", "error", "sibling partial"),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.jsonl");
+        for (parent, target, replacement, expected_usage, expected_assistants) in [
+            (
+                "label",
+                "retry",
+                Some(Value::Null),
+                90,
+                &["older partial", "measured answer"][..],
+            ),
+            (
+                "measured",
+                "early",
+                Some(Value::Null),
+                0,
+                &["measured answer"],
+            ),
+            (
+                "label",
+                "sibling",
+                Some(Value::Null),
+                0,
+                &["older partial", "measured answer", "retry partial"],
+            ),
+            (
+                "label",
+                "retry",
+                None,
+                0,
+                &["older partial", "measured answer"],
+            ),
+        ] {
+            let mut edit = json!({"type":"context_edit","id":"edit","parentId":parent,"targetId":target,
+                (pi_rs::pi_import::SUPERSEDED_PARTIAL_FIELD):true});
+            if let Some(replacement) = replacement {
+                edit["replacement"] = replacement;
+            }
+            let mut file = std::fs::File::create(&path).unwrap();
+            for entry in history.iter().chain(std::iter::once(&edit)) {
+                writeln!(file, "{entry}").unwrap();
+            }
+            let imported = super::super::session_import::read(&path).unwrap();
+            let estimate = imported.context_usage_estimate();
+            assert_eq!(estimate.usage_tokens, expected_usage, "{edit}");
+            assert_eq!(
+                estimate.last_usage_record.is_some(),
+                expected_usage > 0,
+                "{edit}"
+            );
+            let assistants: Vec<_> = imported
+                .current_messages()
+                .into_iter()
+                .filter_map(|message| match message {
+                    Message::Assistant { content, .. } => Some(content),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(assistants, expected_assistants, "{edit}");
+        }
     }
 
     fn assert_turn_partial(failure: pi_rs::ModelFailure, marker: &str, stop: &str) {

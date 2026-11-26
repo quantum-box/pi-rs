@@ -7399,8 +7399,9 @@ The raw attempt and its usage remain in the journal. Earlier native journals
 that recorded the omission as a context edit still hide that partial. Edits
 to display-only completions leave measured usage and model projection intact.
 Pi-compatible export includes an advisory flag on generated omission edits.
-On import, the flag keeps the edit display-only when it targets the matching
-failed reply on that branch. Untagged edits retain their ordinary semantics.
+On import, the flag keeps the edit display-only when its target matches the
+nearest failed completion on that branch. Other edits retain their ordinary
+semantics.
 Older readers can open journals containing the retry marker and may display
 the superseded partial.
 Older unmarked failures and summary partials remain excluded. RPC keeps

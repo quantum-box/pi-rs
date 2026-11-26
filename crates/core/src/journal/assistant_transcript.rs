@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    Event, ModelFailure, Session, context_edits, is_ecmascript_whitespace, retained_message_floor,
-    turn_partial_failure,
+    Event, ModelFailure, Session, context_edits, is_ecmascript_whitespace,
+    nearest_model_completion, retained_message_floor, turn_partial_failure,
 };
 use crate::{ContentBlock, ContextContent};
 
@@ -20,18 +20,11 @@ pub fn superseded_turn_partial(records: &[super::Record], marker: &super::Record
         return None;
     }
     let request = uuid::Uuid::parse_str(entry["requestId"].as_str()?).ok()?;
-    let mut parent = marker.parent;
-    while let Some(record) = parent.and_then(|id| records.get(id.checked_sub(1)? as usize)) {
-        if record.run_id != marker.run_id {
-            return None;
-        }
-        if let Event::ModelFinished { request_id, .. } = &record.event {
-            return (*request_id == request && turn_partial_failure(records, record).is_some())
-                .then_some(record.id);
-        }
-        parent = record.parent;
-    }
-    None
+    let completion =
+        nearest_model_completion(marker, |id| records.get(id.checked_sub(1)? as usize))?;
+    (matches!(completion.event, Event::ModelFinished { request_id, .. } if request_id == request)
+        && turn_partial_failure(records, completion).is_some())
+    .then_some(completion.id)
 }
 
 /// Normalize native stops from the original reply. An edit can change its text

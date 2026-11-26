@@ -4834,10 +4834,28 @@ fn context_edits<'a>(path: &[&'a Record]) -> BTreeMap<u64, &'a Option<crate::Con
         .collect()
 }
 
+/// Find the nearest completion on the marker's branch without crossing a run boundary.
+fn nearest_model_completion<'a>(
+    marker: &Record,
+    lookup: impl Fn(u64) -> Option<&'a Record>,
+) -> Option<&'a Record> {
+    let mut parent = marker.parent;
+    while let Some(record) = parent.and_then(&lookup) {
+        if record.run_id != marker.run_id {
+            return None;
+        }
+        if matches!(record.event, Event::ModelFinished { .. }) {
+            return Some(record);
+        }
+        parent = record.parent;
+    }
+    None
+}
+
 fn imported_assistant_source<'a>(
     assistant: &Record,
     lookup: impl Fn(u64) -> Option<&'a Record>,
-) -> Option<(&'a serde_json::Value, Option<ModelFailure>)> {
+) -> Option<(&'a serde_json::Value, &'a Record)> {
     let Event::Assistant {
         request_id: Some(request),
         ..
@@ -4846,12 +4864,7 @@ fn imported_assistant_source<'a>(
         return None;
     };
     let completion = lookup(assistant.parent?)?;
-    let Event::ModelFinished {
-        request_id,
-        failure,
-        ..
-    } = &completion.event
-    else {
+    let Event::ModelFinished { request_id, .. } = &completion.event else {
         return None;
     };
     if request_id != request {
@@ -4861,7 +4874,7 @@ fn imported_assistant_source<'a>(
         return None;
     };
     (format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant")
-        .then_some((entry, *failure))
+        .then_some((entry, completion))
 }
 
 fn is_model_context_edit(branch: &[&Record], record: &Record) -> bool {
@@ -4893,20 +4906,29 @@ fn is_model_context_edit(branch: &[&Record], record: &Record) -> bool {
     let Event::SourceEntry { format, entry } = &source.event else {
         return true;
     };
-    // The flag is advisory. Only the imported conversion of a null edit
-    // targeting its original failed reply can omit display without editing context.
+    // The flag is advisory. The original failed reply must correspond to the
+    // nearest completion, as it would for a native retry or overflow marker.
     !(record.run_id.is_none()
         && source.id + 1 == record.id
         && source.timestamp == record.timestamp
         && format == "pi"
         && entry["type"] == "context_edit"
-        && entry["replacement"].is_null()
+        && entry
+            .get("replacement")
+            .is_some_and(serde_json::Value::is_null)
         && entry[crate::pi_import::SUPERSEDED_PARTIAL_FIELD] == true
-        && imported_assistant_source(target, lookup).is_some_and(|(message, failure)| {
-            failure == Some(ModelFailure::Failed)
-                && entry["targetId"]
-                    .as_str()
-                    .is_some_and(|id| message["id"] == id)
+        && imported_assistant_source(target, lookup).is_some_and(|(message, completion)| {
+            matches!(
+                completion.event,
+                Event::ModelFinished {
+                    failure: Some(ModelFailure::Failed),
+                    ..
+                }
+            ) && entry["targetId"]
+                .as_str()
+                .is_some_and(|id| message["id"] == id)
+                && nearest_model_completion(record, lookup)
+                    .is_some_and(|nearest| nearest.id == completion.id)
         }))
 }
 
