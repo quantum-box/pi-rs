@@ -291,6 +291,8 @@ struct Cli {
     /// Theme name, or a light/dark theme pair for automatic appearance.
     #[arg(long, global = true)]
     use_theme: Option<String>,
+    #[arg(skip)]
+    extension_theme: Option<String>,
     /// Additional theme file or directory. Repeatable.
     #[arg(long = "theme", global = true)]
     themes: Vec<PathBuf>,
@@ -353,8 +355,9 @@ struct InitialSelection {
 
 impl Cli {
     fn theme_setting(&self) -> Option<&str> {
-        self.use_theme
+        self.extension_theme
             .as_deref()
+            .or(self.use_theme.as_deref())
             .or_else(|| self.settings.string("theme"))
     }
 
