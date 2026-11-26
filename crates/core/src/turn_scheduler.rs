@@ -2988,12 +2988,34 @@ impl Agent<'_> {
                                 let progress_worker = tokio::spawn(progress_worker);
                                 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
                                 let progress_worker = async move { progress_worker.await.unwrap_or_else(|error| vec![("tool-progress".into(), "tool_execution_update", error.to_string())]) };
-                                let host = Arc::new(NestedHost { ui: ui.clone(), requests: requests.clone(), specs: specs.clone(), parent_operation: calls[index].invocation.operation_id, cancellation, depth: calls[index].depth, call_count: calls[index].call_count.clone(), progress: Some(ProgressReporter { sender: ProgressSink::Turn(updates.clone()), tool_call_id: calls[index].invocation.call.id.clone(), tool_name: calls[index].invocation.call.name.clone(), args: crate::parse_tool_arguments(&calls[index].invocation.call.arguments).unwrap_or(serde_json::Value::Null), parent_tool_call_id: calls[index].parent.clone() }) });
+                                let reporter = ProgressReporter {
+                                    sender: ProgressSink::Turn(updates.clone()),
+                                    tool_call_id: calls[index].invocation.call.id.clone(),
+                                    tool_name: calls[index].invocation.call.name.clone(),
+                                    args: crate::parse_tool_arguments(&calls[index].invocation.call.arguments).unwrap_or(serde_json::Value::Null),
+                                    parent_tool_call_id: calls[index].parent.clone(),
+                                    settlement: Arc::default(),
+                                };
+                                let host = Arc::new(NestedHost { ui: ui.clone(), requests: requests.clone(), specs: specs.clone(), parent_operation: calls[index].invocation.operation_id, cancellation, depth: calls[index].depth, call_count: calls[index].call_count.clone(), progress: Some(reporter.clone()) });
                                 let cancel = calls[index].cancellation.clone(); let programmatic = calls[index].depth > 0;
                                 let omit = self.registry.omit_default_tool_timeout; let timeout = self.limits.tool_timeout;
                                 calls[index].phase = TurnPhase::Running;
-                                let flush = updates.clone();
-                                futures.push(async move { let invoke = async move { let start = crate::runtime::Monotonic::now(); let reply = Self::turn_invoke(prepared, &cancel, host, programmatic, omit, timeout).await; let duration = ran.then(|| start.elapsed().as_millis().min(u64::MAX as u128) as u64); let (send, receive) = oneshot::channel(); if flush.send(TurnProgress::Flush(send)).await.is_ok() { let _ = receive.await; } let _ = finish_progress.send(()); (reply, duration) }; let ((reply, duration), errors) = futures_util::future::join(invoke, progress_worker).await; TurnEvent::Ran(index, reply, duration, errors) }.boxed());
+                                futures.push(async move {
+                                    let invoke = async move {
+                                        let start = crate::runtime::Monotonic::now();
+                                        let reply = Self::turn_invoke(prepared, &cancel, host, programmatic, omit, timeout).await;
+                                        let duration = ran.then(|| start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                                        if let Some(settlement) = reporter.close() {
+                                            let _ = updates.send(settlement).await;
+                                        }
+                                        let (send, receive) = oneshot::channel();
+                                        if updates.send(TurnProgress::Flush(send)).await.is_ok() { let _ = receive.await; }
+                                        let _ = finish_progress.send(());
+                                        (reply, duration)
+                                    };
+                                    let ((reply, duration), errors) = futures_util::future::join(invoke, progress_worker).await;
+                                    TurnEvent::Ran(index, reply, duration, errors)
+                                }.boxed());
                     }
                     TurnEvent::Ran(index, mut reply, duration, errors) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }

@@ -5,7 +5,7 @@ mod turn_scheduler;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -7138,6 +7138,31 @@ struct ProgressReporter {
     tool_name: String,
     args: serde_json::Value,
     parent_tool_call_id: Option<String>,
+    settlement: Arc<Mutex<ProgressSettlement>>,
+}
+
+#[derive(Default)]
+struct ProgressSettlement {
+    closed: bool,
+    pending: Option<serde_json::Value>,
+}
+
+impl ProgressReporter {
+    fn close(&self) -> Option<TurnProgress> {
+        let mut settlement = self.settlement.lock().expect("tool progress settlement");
+        settlement.closed = true;
+        settlement.pending.take().map(|value| self.event(value))
+    }
+
+    fn event(&self, partial_result: serde_json::Value) -> TurnProgress {
+        TurnProgress::Event(Box::new(crate::LifecycleEvent::ToolExecutionUpdate {
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+            args: self.args.clone(),
+            partial_result,
+            parent_tool_call_id: self.parent_tool_call_id.clone(),
+        }))
+    }
 }
 #[derive(Clone)]
 enum ProgressSink {
@@ -7163,35 +7188,51 @@ impl ToolHost for NestedHost {
         &self,
         partial_result: serde_json::Value,
     ) -> crate::ExtensionResult<()> {
+        self.report_progress_with_settlement(partial_result, None)
+            .await
+    }
+    async fn report_progress_with_settlement(
+        &self,
+        partial_result: serde_json::Value,
+        settlement: Option<serde_json::Value>,
+    ) -> crate::ExtensionResult<()> {
         let Some(progress) = &self.progress else {
             return Ok(());
         };
-        if serde_json::to_vec(&partial_result)
-            .map_err(|error| error.to_string())?
-            .len()
-            > 1024 * 1024
-        {
-            return Err("tool progress exceeds size limit".into());
+        for value in std::iter::once(&partial_result).chain(settlement.as_ref()) {
+            if serde_json::to_vec(value)
+                .map_err(|error| error.to_string())?
+                .len()
+                > 1024 * 1024
+            {
+                return Err("tool progress exceeds size limit".into());
+            }
         }
-        let event = crate::LifecycleEvent::ToolExecutionUpdate {
-            tool_call_id: progress.tool_call_id.clone(),
-            tool_name: progress.tool_name.clone(),
-            args: progress.args.clone(),
-            partial_result,
-            parent_tool_call_id: progress.parent_tool_call_id.clone(),
-        };
-        if self.cancellation.is_cancelled() {
+        let mut pending = progress
+            .settlement
+            .lock()
+            .expect("tool progress settlement");
+        if pending.closed || self.cancellation.is_cancelled() {
             return Err("tool progress cancelled".into());
         }
         match &progress.sender {
-            ProgressSink::Turn(sender) => sender
-                .try_send(TurnProgress::Event(Box::new(event)))
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => "tool progress queue is full".into(),
-                    mpsc::error::TrySendError::Closed(_) => "tool has finished".into(),
-                }),
+            ProgressSink::Turn(sender) => match sender.try_reserve() {
+                Ok(permit) => {
+                    permit.send(progress.event(partial_result));
+                    pending.pending = settlement;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if settlement.is_some() || pending.pending.is_some() {
+                        pending.pending = settlement.or(Some(partial_result));
+                    }
+                    return Err("tool progress queue is full".into());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err("tool has finished".into()),
+            },
         }
+        Ok(())
     }
+
     fn has_ui(&self) -> bool {
         self.ui.is_some()
     }

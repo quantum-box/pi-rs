@@ -2114,6 +2114,18 @@ their existing scheduler deadlines.
 [Pinned Codemode worker deadline](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/codemode/src/runtime/execution.ts)
 [Pinned coding-agent result formatting](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/extensions/codemode/execute.ts)
 
+Native Codemode publishes an empty parent progress snapshot at startup, then
+reports nested tool calls in dispatch order with stable script-local IDs,
+bounded argument and error previews, and durations on completion. Parallel
+calls update their original positions. The first 64 calls are tracked, and
+further calls are counted without changing dispatch. Script return, timeout,
+and caller abort mark still-running calls cancelled in the settlement snapshot.
+The terminal shows recent call states and RPC and JSON attach the live snapshot
+to the parent tool result event. These details are transient and do not change
+the journal, model-facing output, or store transaction. The snapshot covers
+`tools.*` calls. `models.*` calls remain outside it.
+[Pinned Codemode nested tool lifecycle](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/extensions/codemode/execute.ts#L514-L550)
+
 `PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
 running. Positive integer values accept Pi's numeric forms, including

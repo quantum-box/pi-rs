@@ -41,6 +41,147 @@ const MAX_INLINE_BYTES: usize = 7 * 1024 * 1024;
 // the preview and its warning before adding image metadata.
 const MAX_INLINE_IMAGE_LABEL_BYTES: usize = MAX_INLINE_BYTES - 6 * MAX_PREVIEW_UNITS - 4096;
 const WORKER_WAIT_LIMIT: Duration = Duration::from_secs(60);
+const MAX_PROGRESS_CALLS: usize = 64;
+const ARGS_PREVIEW_UNITS: usize = 200;
+const ERROR_PREVIEW_UNITS: usize = 500;
+const PROGRESS_WAIT: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CallStatus {
+    Running,
+    Ok,
+    Error,
+    Cancelled,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CallProgress {
+    id: String,
+    name: String,
+    args: String,
+    status: CallStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+struct NestedProgress {
+    operation: String,
+    calls: Vec<CallProgress>,
+    omitted: usize,
+}
+
+impl NestedProgress {
+    fn snapshot(&self, settle: bool) -> Value {
+        let calls: Vec<_> = self
+            .calls
+            .iter()
+            .map(|call| {
+                let mut value = json!(call);
+                if settle && call.status == CallStatus::Running {
+                    value["status"] = json!(CallStatus::Cancelled);
+                }
+                value
+            })
+            .collect();
+        json!({"content":[],"details":{"calls":calls,"omittedCalls":self.omitted}})
+    }
+
+    async fn publish(&self, host: &dyn ToolHost, settle: bool) {
+        let fallback = (!settle
+            && self
+                .calls
+                .iter()
+                .any(|call| call.status == CallStatus::Running))
+        .then(|| self.snapshot(true));
+        // Reporting is best effort. A slow embedder must not hold the script
+        // or its shutdown window open.
+        let _ = tokio::time::timeout(
+            PROGRESS_WAIT,
+            host.report_progress_with_settlement(self.snapshot(settle), fallback),
+        )
+        .await;
+    }
+
+    async fn start(&mut self, host: &dyn ToolHost, name: &str, arguments: &str) -> Option<usize> {
+        if self.calls.len() == MAX_PROGRESS_CALLS {
+            self.omitted = self.omitted.saturating_add(1);
+            if self.omitted == 1 {
+                self.publish(host, false).await;
+            }
+            return None;
+        }
+        let index = self.calls.len();
+        self.calls.push(CallProgress {
+            id: format!("{}/{}", self.operation, index + 1),
+            name: progress_preview(name, ARGS_PREVIEW_UNITS),
+            args: progress_preview(arguments, ARGS_PREVIEW_UNITS),
+            status: CallStatus::Running,
+            duration_ms: None,
+            error: None,
+        });
+        self.publish(host, false).await;
+        Some(index)
+    }
+
+    async fn complete(
+        &mut self,
+        host: &dyn ToolHost,
+        index: usize,
+        started: Instant,
+        outcome: &Outcome,
+        cancelled: bool,
+    ) {
+        if matches!(outcome, Outcome::Pending { .. }) {
+            return;
+        }
+        let call = &mut self.calls[index];
+        call.duration_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        call.status = if !outcome.is_error() {
+            CallStatus::Ok
+        } else if cancelled {
+            CallStatus::Cancelled
+        } else {
+            CallStatus::Error
+        };
+        if outcome.is_error() {
+            call.error = Some(nested_error_preview(outcome));
+        }
+        self.publish(host, false).await;
+    }
+}
+
+fn progress_preview(text: &str, limit: usize) -> String {
+    if utf16_prefix_bytes(text.chars(), limit) == text.len() {
+        return text.to_owned();
+    }
+    let end = utf16_prefix_bytes(text.chars(), limit - 3);
+    format!("{}...", &text[..end])
+}
+
+fn nested_error_preview(outcome: &Outcome) -> String {
+    let text = match outcome {
+        Outcome::Failed(text)
+        | Outcome::Skipped(text)
+        | Outcome::Unknown(text)
+        | Outcome::TextResult { output: text, .. }
+        | Outcome::TextResultWithStructuredContent { output: text, .. } => text,
+        Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } => {
+            data["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|block| block["type"] == "text")
+                .and_then(|block| block["text"].as_str())
+                .unwrap_or("Nested tool failed")
+        }
+        _ => "Nested tool failed",
+    };
+    progress_preview(text, ERROR_PREVIEW_UNITS)
+}
 
 // Resizing never revokes a running worker. Excess permits are retired when
 // they become available, including when a running worker releases its slot.
@@ -421,14 +562,34 @@ impl Tool for ScriptTool {
             // Stop nested calls when execution settles, before any output
             // formatting, and also if the worker unwinds.
             let _cancel_nested_calls = worker_context.cancellation.clone().drop_guard();
-            let result = handle.block_on(evaluate(
-                &source,
-                store,
-                host,
-                worker_context,
-                deadline,
-                worker_sink,
-            ));
+            let result = handle.block_on(async {
+                let progress = host.supports_progress().then(|| {
+                    Arc::new(tokio::sync::Mutex::new(NestedProgress {
+                        operation: worker_context.operation_id.to_string(),
+                        calls: Vec::new(),
+                        omitted: 0,
+                    }))
+                });
+                let cancellation = worker_context.cancellation.clone();
+                let result = evaluate(
+                    &source,
+                    store,
+                    host.clone(),
+                    worker_context,
+                    deadline,
+                    worker_sink,
+                    progress.clone(),
+                )
+                .await;
+                cancellation.cancel();
+                if let Some(progress) = progress {
+                    let progress = progress.lock().await;
+                    if !progress.calls.is_empty() {
+                        progress.publish(host.as_ref(), true).await;
+                    }
+                }
+                result
+            });
             Ok::<_, &str>((result, permit))
         });
         let startup = tokio::select! {
@@ -676,6 +837,7 @@ async fn evaluate(
     context: ToolContext,
     deadline: Option<ScriptDeadline>,
     sink: Arc<Mutex<Output>>,
+    progress: Option<Arc<tokio::sync::Mutex<NestedProgress>>>,
 ) -> Result<Completion, String> {
     if context.cancellation.is_cancelled() {
         return Err("Script cancelled".into());
@@ -714,7 +876,18 @@ async fn evaluate(
     let output_cancellation = context.cancellation.clone();
     let operation = javascript.async_with(async move |ctx| {
         let result: rquickjs::Result<String> = async {
-            install_globals(&ctx, documents, host, store, sink, output_cancellation)?;
+            if let Some(progress) = &progress {
+                progress.lock().await.publish(host.as_ref(), false).await;
+            }
+            install_globals(
+                &ctx,
+                documents,
+                host,
+                store,
+                sink,
+                output_cancellation,
+                progress,
+            )?;
             match ctx.eval::<Promise, _>(code) {
                 Ok(promise) => promise.into_future::<String>().await,
                 Err(error) => Err(error),
@@ -787,6 +960,7 @@ fn install_globals(
     store: Value,
     sink: Arc<Mutex<Output>>,
     cancellation: pi_rs_core::CancellationToken,
+    progress: Option<Arc<tokio::sync::Mutex<NestedProgress>>>,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
     let catalogue: Vec<_> = documents
@@ -886,6 +1060,7 @@ fn install_globals(
             let host = host.clone();
             let output = tool_output.clone();
             let cancellation = cancellation.clone();
+            let progress = progress.clone();
             async move {
                 if output.lock().expect("codemode output").limit_exceeded {
                     return Ok::<_, rquickjs::Error>(
@@ -901,11 +1076,35 @@ fn install_globals(
                     {
                         json!({"ok":false,"error":"This tool is not callable from a script"})
                     }
-                    Ok(arguments) => nested_tool_value(
-                        &name,
-                        host.call_with_cancellation(&name, arguments, cancellation)
-                            .await,
-                    ),
+                    Ok(parsed) => {
+                        let index = if let Some(progress) = &progress {
+                            progress
+                                .lock()
+                                .await
+                                .start(host.as_ref(), &name, &arguments)
+                                .await
+                        } else {
+                            None
+                        };
+                        let started = Instant::now();
+                        let outcome = host
+                            .call_with_cancellation(&name, parsed, cancellation.clone())
+                            .await;
+                        if let Some((progress, index)) = progress.as_ref().zip(index) {
+                            progress
+                                .lock()
+                                .await
+                                .complete(
+                                    host.as_ref(),
+                                    index,
+                                    started,
+                                    &outcome,
+                                    cancellation.is_cancelled(),
+                                )
+                                .await;
+                        }
+                        nested_tool_value(&name, outcome)
+                    }
                     Err(error) => json!({"ok":false,"error":error.to_string()}),
                 };
                 Ok::<_, rquickjs::Error>(result.to_string())
@@ -3300,6 +3499,7 @@ mod tests {
                     },
                     None,
                     sink.clone(),
+                    None,
                 ),
             )
             .await
@@ -3865,6 +4065,7 @@ mod tests {
                 },
                 Some(ScriptDeadline::new(Instant::now(), Duration::from_secs(10)).unwrap()),
                 sink.clone(),
+                None,
             )
             .await;
             assert_eq!(result.is_ok(), expected_success);
@@ -3891,6 +4092,7 @@ mod tests {
             },
             Some(ScriptDeadline::new(Instant::now(), Duration::from_secs(10)).unwrap()),
             sink.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -3915,6 +4117,7 @@ mod tests {
             },
             Some(ScriptDeadline::new(Instant::now(), Duration::from_secs(30)).unwrap()),
             sink.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -4339,14 +4542,14 @@ mod tests {
             Outcome::Succeeded("read".into())
         }
     }
-    struct ParallelExtension;
+    struct ParallelExtension(usize);
     impl Extension for ParallelExtension {
         fn id(&self) -> &str {
             "parallel-test"
         }
         fn tools(&self) -> Vec<Arc<dyn Tool>> {
             vec![Arc::new(ParallelTool(Arc::new(tokio::sync::Barrier::new(
-                2,
+                self.0,
             ))))]
         }
     }
@@ -4378,7 +4581,7 @@ mod tests {
                 vec![Ok(ModelEvent::Complete {
                     calls: vec![ToolCall {
                         id: "script".into(), name: "codemode".into(),
-                        arguments: json!({"code":"text((await Promise.all([tools.barrier({}), tools.barrier({})])).join(','));"}).to_string(),
+                        arguments: json!({"code":"text((await Promise.all([tools.barrier({call:1}), tools.barrier({call:2})])).join(','));"}).to_string(),
                     }], usage: None,
                 })]
             };
@@ -4390,18 +4593,220 @@ mod tests {
         let mut session = pi_rs_core::SessionBuilder::new(Arc::new(ParallelModel), "fixture")
             .extension(Arc::new(Codemode::default()))
             .unwrap()
-            .extension(Arc::new(ParallelExtension))
+            .extension(Arc::new(ParallelExtension(2)))
             .unwrap()
             .in_memory()
             .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(2), session.prompt("parallel"))
-            .await
-            .unwrap()
-            .unwrap();
+        let mut updates = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.prompt_with_observer("parallel", &mut |event| {
+                if let Some(details) = codemode_update(event) {
+                    updates.push(details);
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(result, "done");
+        assert_eq!(updates[0]["calls"], json!([]));
+        assert_eq!(updates[1]["calls"][0]["status"], "running");
+        assert_eq!(updates[2]["calls"][0]["status"], "running");
+        assert_eq!(updates[2]["calls"][1]["status"], "running");
+        let calls = updates.last().unwrap()["calls"].as_array().unwrap();
+        for (index, call) in calls.iter().enumerate() {
+            assert_eq!(call["status"], "ok");
+            assert_eq!(call["args"], format!("{{\"call\":{}}}", index + 1));
+            assert_eq!(call["id"], updates[2]["calls"][index]["id"]);
+            assert!(call["durationMs"].is_u64());
+        }
+        assert_ne!(calls[0]["id"], calls[1]["id"]);
         assert_eq!(session.journal().unwrap().operations().len(), 3);
         session.close().await.unwrap();
     }
+
+    fn codemode_update(event: pi_rs_core::Notification<'_>) -> Option<Value> {
+        if let pi_rs_core::Notification::ToolProgress(
+            pi_rs_core::LifecycleEvent::ToolExecutionUpdate {
+                tool_name,
+                partial_result,
+                ..
+            },
+        ) = event
+            && tool_name == ID
+        {
+            return Some(partial_result["details"].clone());
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn codemode_settles_running_progress_on_sdk_abort_and_script_timeout() {
+        use pi_rs_core::{Error, Event, Notification};
+        for abort in [true, false] {
+            let mut session = pi_rs_core::SessionBuilder::new(Arc::new(ParallelModel), "fixture")
+                .extension(Arc::new(Codemode {
+                    timeout: if abort {
+                        Duration::MAX
+                    } else {
+                        Duration::from_millis(500)
+                    },
+                    ..Default::default()
+                }))
+                .unwrap()
+                .extension(Arc::new(ParallelExtension(3)))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+            let control = session.controls();
+            let mut running = false;
+            let mut settled = false;
+            let mut root_operation = None;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                session.prompt_with_observer("cancel", &mut |event| {
+                    if let Notification::Committed(record) = &event {
+                        match &record.event {
+                            Event::Assistant { invocations, .. } => {
+                                if let Some(root) =
+                                    invocations.iter().find(|tool| tool.call.name == ID)
+                                {
+                                    root_operation = Some(root.operation_id);
+                                }
+                            }
+                            Event::ToolFinished { operation_id, .. }
+                                if Some(*operation_id) == root_operation =>
+                            {
+                                assert!(
+                                    settled,
+                                    "the settlement snapshot must precede the parent result"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(details) = codemode_update(event) {
+                        let calls = details["calls"].as_array().unwrap();
+                        if calls.len() == 2 && calls.iter().all(|call| call["status"] == "running")
+                        {
+                            running = true;
+                            if abort {
+                                control.abort();
+                            }
+                        }
+                        if calls.len() == 2
+                            && calls.iter().all(|call| call["status"] == "cancelled")
+                        {
+                            settled = true;
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(running && settled);
+            if abort {
+                assert!(
+                    matches!(result, Err(Error::Cancelled | Error::Reconciliation(_))),
+                    "{result:?}"
+                );
+                assert!(session.journal().unwrap().operations().iter().any(
+                    |(invocation, state)| {
+                        invocation.call.name == ID
+                            && matches!(
+                                state,
+                                pi_rs_core::OperationState::Finished(Outcome::Unknown(_))
+                            )
+                    }
+                ));
+            } else {
+                let operations = session.journal().unwrap().operations();
+                assert!(
+                    matches!(result, Err(Error::Reconciliation(id)) if
+                        operations.iter().any(|(call, _)| call.operation_id == id && call.call.name == "barrier")
+                    ),
+                    "{result:?}"
+                );
+                assert!(operations.iter().any(|(invocation, state)| {
+                    invocation.call.name == ID
+                        && matches!(state, pi_rs_core::OperationState::Finished(Outcome::Failed(message))
+                            if message.contains("Script timed out: Execution timed out after 500 ms"))
+                }));
+            }
+            session.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn codemode_caps_previews_and_settles_unawaited_calls_on_success() {
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<Value>>);
+        #[async_trait::async_trait]
+        impl ToolHost for Recorder {
+            fn tools(&self) -> Vec<ToolSpec> {
+                Host.tools()
+            }
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn supports_progress(&self) -> bool {
+                true
+            }
+            async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
+                assert!(value.to_string().len() <= 1024 * 1024);
+                self.0.lock().unwrap().push(value);
+                Ok(())
+            }
+            async fn call(&self, _: &str, arguments: Value) -> Outcome {
+                if arguments["hold"] == true {
+                    return std::future::pending().await;
+                }
+                if arguments["fail"] == true {
+                    return Outcome::Failed("😀".repeat(300));
+                }
+                Outcome::Succeeded("done".into())
+            }
+        }
+        let host = Arc::new(Recorder::default());
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(5)),
+        }
+        .invoke_transaction(
+            json!({"code":r#"
+                    void tools.echo({hold:true});
+                    for (let i = 0; i < 65; i++) {
+                        try { await tools.echo({fail:true, text:'😀'.repeat(110)}); } catch (_) {}
+                    }
+                    store('settled', true);
+                    text('result kept');
+                "#}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            host.clone(),
+        )
+        .await;
+        assert!(matches!(reply.outcome, Outcome::Structured { .. }));
+        assert!(reply.outcome.tool_content().contains("result kept"));
+        assert_eq!(reply.state.unwrap().data["settled"], true);
+        let updates = host.0.lock().unwrap();
+        let details = &updates.last().unwrap()["details"];
+        let calls = details["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), MAX_PROGRESS_CALLS);
+        assert_eq!(details["omittedCalls"], 2);
+        assert_eq!(calls[0]["status"], "cancelled");
+        assert!(calls[0].get("durationMs").is_none());
+        assert_eq!(calls[1]["status"], "error");
+        for (field, limit) in [("args", ARGS_PREVIEW_UNITS), ("error", ERROR_PREVIEW_UNITS)] {
+            let text = calls[1][field].as_str().unwrap();
+            assert!(text.ends_with("..."));
+            assert!(text.encode_utf16().count() <= limit);
+        }
+    }
+
     #[tokio::test]
     async fn output_breach_skips_queued_write_and_returns_tool_failure_to_model() {
         use std::sync::atomic::{AtomicUsize, Ordering};

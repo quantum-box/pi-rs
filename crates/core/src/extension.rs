@@ -545,6 +545,16 @@ pub trait ToolHost: Send + Sync {
     async fn report_progress(&self, _partial_result: Value) -> ExtensionResult<()> {
         Ok(())
     }
+    /// Publish progress with a fallback to emit if the tool stops before
+    /// reporting settlement. A later update replaces or clears the fallback.
+    #[doc(hidden)]
+    async fn report_progress_with_settlement(
+        &self,
+        partial_result: Value,
+        _settlement: Option<Value>,
+    ) -> ExtensionResult<()> {
+        self.report_progress(partial_result).await
+    }
     fn has_ui(&self) -> bool {
         false
     }
