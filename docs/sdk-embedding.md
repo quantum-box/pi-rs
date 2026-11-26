@@ -14,6 +14,15 @@ resolves provider-qualified historical selections when sessions reopen or
 navigate branches. This is useful when two providers use the same model name:
 the SDK never guesses a provider or silently replaces an existing binding.
 
+Use `catalog.models()` to list descriptors and `catalog.find(provider, model)`
+to look up one exact pair. A registered model can have a descriptor with
+`info: None`. Use `catalog.providers()` to list provider identities that have
+registered models, or `catalog.find_provider(provider)` to inspect a single
+provider and iterate its models. These reads expose only identities and
+host-supplied metadata. They do not load config, access credentials, probe
+providers, or infer a default route. Listings are ordered by the registered
+identities, and lookup is case-sensitive.
+
 For older journals that recorded a model name without its provider, the host
 may explicitly authorize that name with `session_builder_with_legacy_model`.
 Use this only when the host knows which provider the old name represents; the
@@ -21,22 +30,35 @@ ordinary `session_builder` deliberately leaves such histories unbound.
 
 ```rust,no_run
 use std::sync::Arc;
-use pi_rs::{Model, ModelCatalogBuilder};
+use pi_rs::{CatalogModelInfo, Model, ModelCatalogBuilder};
 
 fn session_builder(client: Arc<dyn Model>) -> pi_rs::Result<pi_rs::SessionBuilder> {
     let mut models = ModelCatalogBuilder::new();
-    models.register("my-provider", "my-model", client)?;
-    models.build().session_builder("my-provider", "my-model")
+    models.register_with_info(
+        "my-provider",
+        "my-model",
+        client,
+        CatalogModelInfo {
+            display_name: Some("My model".into()),
+            ..Default::default()
+        },
+    )?;
+    let catalog = models.build();
+    let model = catalog
+        .find("my-provider", "my-model")
+        .expect("registered above");
+    catalog.session_builder(model.provider, model.model)
 }
 ```
 
 Clients, endpoints and credentials remain the host's responsibility. Journal
 identities are used only for exact lookups in this trusted snapshot; unknown
 identities do not cause a network request or automatic fallback. Build a new
-catalog and new sessions after changing credentials or endpoint policy. Existing
-sessions retain their original clients. Hosts needing automatic fallback can
-provide their own `HistoricalModelResolver` instead. This provider-neutral API
-does not depend on Tauri or a desktop runtime.
+catalog after changing provider or model definitions, credentials, or endpoint
+policy. Share the replacement snapshot for new lookups and sessions. Previously
+cloned catalogs and existing sessions retain their original bindings. Hosts
+needing automatic fallback can provide their own `HistoricalModelResolver`.
+This provider-neutral API does not depend on Tauri or a desktop runtime.
 
 ## Native quickstart
 
