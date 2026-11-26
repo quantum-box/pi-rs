@@ -584,6 +584,38 @@ impl<'a> Transcript<'a> {
         if child == self.id {
             return Err(Error::SelfFork);
         }
+        self.prepare_projection(cursor, child, Expected::Missing, value, blocks)
+    }
+
+    /// Move an existing head to a projection of an authenticated source batch.
+    pub(crate) fn prepare_checkout_projection(
+        &self,
+        previous: &Cursor,
+        source: &Cursor,
+        value: &Value,
+        blocks: Vec<MessageContentBlocks>,
+    ) -> Result<(Batch, Cursor), Error> {
+        if previous.transcript != self.id {
+            return Err(Error::WrongTranscript);
+        }
+        let (head, version) = self.load_head()?;
+        if head.tip != previous.next {
+            return Err(durable_store::Error::Conflict {
+                key: head_key(self.id),
+            }
+            .into());
+        }
+        self.prepare_projection(source, self.id, Expected::Version(version), value, blocks)
+    }
+
+    fn prepare_projection(
+        &self,
+        cursor: &Cursor,
+        target: Uuid,
+        expected: Expected,
+        value: &Value,
+        blocks: Vec<MessageContentBlocks>,
+    ) -> Result<(Batch, Cursor), Error> {
         if value.get("ForkCut").is_none()
             || (!blocks.is_empty() && !valid_block_bindings(value, &blocks))
         {
@@ -610,14 +642,14 @@ impl<'a> Transcript<'a> {
                 Some(blocks)
             },
         };
-        let head_key = head_key(child);
+        let head_key = head_key(target);
         let entry_key = entry_key(tip.id);
         Ok((
             Batch {
                 checks: vec![
                     Check {
                         key: head_key.clone(),
-                        expected: Expected::Missing,
+                        expected,
                     },
                     Check {
                         key: entry_key.clone(),
@@ -639,7 +671,7 @@ impl<'a> Transcript<'a> {
                 ],
             },
             Cursor {
-                transcript: child,
+                transcript: target,
                 next: Some(tip),
             },
         ))
