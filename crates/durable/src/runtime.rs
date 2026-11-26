@@ -25852,7 +25852,7 @@ impl Scheduler {
     }
 
     /// Losslessly pack aged fork evidence in bounded background passes.
-    /// Reattach after reopening to continue the persisted aging window.
+    /// Reattach after reopening to resume from the last completed page.
     pub fn start_fork_snapshot_packing(
         &mut self,
         retain_for: Duration,
@@ -25870,24 +25870,12 @@ impl Scheduler {
         let owner = self.harness.owner.clone();
         let cancel = self.reporter_cancel.clone();
         self.fork_snapshot_packing = Some(tokio::spawn(async move {
-            let mut cursor = None;
-            let mut last_start = None;
             while !cancel.is_cancelled() {
                 let owner = owner.clone();
-                (cursor, last_start) = tokio::task::spawn_blocking(move || {
-                    if cursor.is_none() {
-                        let due = owner
-                            .store()
-                            .fork_snapshot_packing_due(unix_ms(), retain_ms)?;
-                        if due != last_start {
-                            last_start = due.clone();
-                            cursor = due;
-                        }
-                    }
-                    if let Some(current) = &cursor {
-                        cursor = owner.store().pack_fork_snapshot_history(current, 4)?.next;
-                    }
-                    Ok::<_, Error>((cursor, last_start))
+                tokio::task::spawn_blocking(move || {
+                    owner
+                        .store()
+                        .sweep_fork_snapshot_history(unix_ms(), retain_ms, 4)
                 })
                 .await
                 .map_err(|error| {

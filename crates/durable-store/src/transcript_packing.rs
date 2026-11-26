@@ -128,7 +128,7 @@ impl Store {
             return Err(Error::InvalidSnapshot);
         }
         let after = cursor.after.map_or_else(|| PREFIX.to_vec(), key_for);
-        let page = self.packing_candidates(PREFIX, &after, None, limit)?;
+        let page = self.packing_candidates(PREFIX, &after, None, None, limit)?;
         let next = page
             .last()
             .filter(|_| page.len() == limit)
@@ -163,18 +163,22 @@ impl Store {
         &self,
         prefix: &[u8],
         after: &[u8],
-        through_version: Option<u64>,
+        versions: Option<(u64, u64)>,
+        exact_key_bytes: Option<usize>,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, u64)>, Error> {
         let end = prefix_end(prefix).ok_or(Error::InvalidSnapshot)?;
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         let mut stmt = conn.prepare(
             "SELECT key, version FROM durable_store_entries
-             WHERE key>?1 AND key<?2 AND (?3 IS NULL OR version<=?3) ORDER BY key LIMIT ?4",
+             WHERE key>?1 AND key<?2 AND (?3 IS NULL OR (version>?3 AND version<=?4))
+               AND (?5 IS NULL OR length(key)=?5) ORDER BY key LIMIT ?6",
         )?;
-        let rows = stmt.query_map(params![after, end, through_version, limit], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?))
-        })?;
+        let (since, through) = versions.unzip();
+        let rows = stmt.query_map(
+            params![after, end, since, through, exact_key_bytes, limit],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?)),
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 

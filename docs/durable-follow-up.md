@@ -35,7 +35,7 @@ SDK の `transcript_packing_start` と `pack_transcript_history` で、確定済
 
 SDK の `Scheduler::start_published_checkpointable_progress_retention` は、以後の公開済みチェックポイント途中出力を別レコードに保存する形式をデータベースに記録する。同じ終了タスクと本文を指定期間観測した後に本文を回収し、履歴には期限切れの記録を残す。形式の有効化後は対応するバイナリを使用する。再起動後にスケジューラーの回収処理を再設定すると、保存済みの期限判定を引き継ぐ。
 
-SDK の `Scheduler::start_fork_snapshot_packing` は、記録したバージョン境界から指定期間を経たフォーク用スナップショットを、ページ単位で可逆圧縮する。期限判定の境界は再起動後も残る。SDK の `fork_snapshot_packing_due` と `pack_fork_snapshot_history` で手動実行もできる。スナップショットの元の内容、コミット順、文書リビジョンを維持する。圧縮済みの保存領域は SQLite が再利用でき、データベースのファイルサイズは別途の保守操作で縮小できる。
+SDK の `Scheduler::start_fork_snapshot_packing` は、記録したバージョン境界から指定期間を経たフォーク用スナップショットを、ページ単位で可逆圧縮する。期限判定の境界と最後に完了したページを保存し、再起動後にそこから続ける。次の期間は前回の完了境界より新しいバージョンを対象にする。SDK の `fork_snapshot_packing_due` と `pack_fork_snapshot_history` で手動実行もできる。スナップショットの元の内容、コミット順、文書リビジョンを維持する。圧縮済みの保存領域は SQLite が再利用でき、データベースのファイルサイズは別途の保守操作で縮小できる。
 
 ### マージ後のCI確認
 

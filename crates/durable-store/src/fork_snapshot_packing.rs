@@ -7,10 +7,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const PREFIX: &[u8] = b"runtime/fork/";
+const FORK_KEY_BYTES: usize = PREFIX.len() + 36 + 1 + 20;
 const WINDOW: &[u8] = b"runtime/fork-snapshot-packing/window/v1";
+const SWEEP: &[u8] = b"runtime/fork-snapshot-packing/sweep/v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkSnapshotPackingCursor {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    since_version: u64,
     through_version: u64,
     after: Option<Vec<u8>>,
 }
@@ -29,6 +33,17 @@ struct Window {
     eligible: u64,
     pending: u64,
     observed_ms: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Sweep {
+    completed: u64,
+    cursor: Option<ForkSnapshotPackingCursor>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn canonical_key(key: &[u8]) -> bool {
@@ -149,20 +164,21 @@ impl Store {
         let window: Window =
             serde_json::from_slice(&window.value).map_err(|_| Error::InvalidSnapshot)?;
         if !(1..=MAX_LIMIT).contains(&limit)
-            || cursor.through_version == 0
+            || cursor.since_version >= cursor.through_version
             || cursor.through_version > window.eligible
             || cursor.through_version > self.put_version()?
             || cursor
                 .after
                 .as_ref()
-                .is_some_and(|key| !key.starts_with(PREFIX))
+                .is_some_and(|key| key.len() != FORK_KEY_BYTES || !key.starts_with(PREFIX))
         {
             return Err(Error::InvalidSnapshot);
         }
         let page = self.packing_candidates(
             PREFIX,
             cursor.after.as_deref().unwrap_or(PREFIX),
-            Some(cursor.through_version),
+            Some((cursor.since_version, cursor.through_version)),
+            Some(FORK_KEY_BYTES),
             limit,
         )?;
         let mut packed = 0;
@@ -180,6 +196,7 @@ impl Store {
             page.last()
                 .filter(|_| page.len() == limit)
                 .map(|(key, _)| ForkSnapshotPackingCursor {
+                    since_version: cursor.since_version,
                     through_version: cursor.through_version,
                     after: Some(key.clone()),
                 });
@@ -190,10 +207,68 @@ impl Store {
             next,
         })
     }
+
+    /// Run one page of the background sweep and persist its continuation.
+    /// Packing the same page again after an interruption is safe.
+    pub fn sweep_fork_snapshot_history(
+        &self,
+        now_ms: u64,
+        retain_ms: u64,
+        limit: usize,
+    ) -> Result<(), Error> {
+        if retain_ms == 0 || !(1..=MAX_LIMIT).contains(&limit) {
+            return Err(Error::InvalidSnapshot);
+        }
+        let checkpoint = self.get_bounded(SWEEP, 1024)?;
+        let mut sweep: Sweep = checkpoint
+            .as_ref()
+            .map(|entry| serde_json::from_slice(&entry.value))
+            .transpose()
+            .map_err(|_| Error::InvalidSnapshot)?
+            .unwrap_or_default();
+        if sweep.completed > self.put_version()? {
+            return Err(Error::InvalidSnapshot);
+        }
+        let cursor = match sweep.cursor.take() {
+            Some(cursor) if cursor.since_version == sweep.completed => cursor,
+            Some(_) => return Err(Error::InvalidSnapshot),
+            None => {
+                let Some(mut cursor) = self.fork_snapshot_packing_due(now_ms, retain_ms)? else {
+                    return Ok(());
+                };
+                if cursor.through_version <= sweep.completed {
+                    return Ok(());
+                }
+                cursor.since_version = sweep.completed;
+                cursor
+            }
+        };
+        let page = self.pack_fork_snapshot_history(&cursor, limit)?;
+        sweep.cursor = page.next;
+        if sweep.cursor.is_none() {
+            sweep.completed = cursor.through_version;
+        }
+        let value = serde_json::to_vec(&sweep).map_err(|_| Error::InvalidSnapshot)?;
+        match self.commit(
+            &[Check {
+                key: SWEEP.to_vec(),
+                expected: checkpoint
+                    .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+            }],
+            &[Mutation::Put {
+                key: SWEEP.to_vec(),
+                value,
+            }],
+        ) {
+            Ok(()) | Err(Error::Conflict { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn packing_cursor(through_version: u64) -> Option<ForkSnapshotPackingCursor> {
     (through_version != 0).then_some(ForkSnapshotPackingCursor {
+        since_version: 0,
         through_version,
         after: None,
     })
@@ -202,6 +277,115 @@ fn packing_cursor(through_version: u64) -> Option<ForkSnapshotPackingCursor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_sweep_resumes_after_reopen_and_skips_completed_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forks.sqlite");
+        let key = |position: usize| {
+            format!("runtime/fork/{}/{position:020}", Uuid::from_u128(1)).into_bytes()
+        };
+        let bytes = vec![b'x'; 4096];
+        let put = |store: &Store, position| {
+            store
+                .commit(
+                    &[],
+                    &[Mutation::Put {
+                        key: key(position),
+                        value: bytes.clone(),
+                    }],
+                )
+                .unwrap();
+        };
+        let checkpoint = |store: &Store| -> Sweep {
+            serde_json::from_slice(&store.get(SWEEP).unwrap().unwrap().value).unwrap()
+        };
+        let is_packed = |store: &Store, position| {
+            let value: Vec<u8> = store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT value FROM durable_store_entries WHERE key=?1",
+                    [key(position)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            value.starts_with(MAGIC)
+        };
+
+        let store = Store::open(&path).unwrap();
+        put(&store, 2);
+        put(&store, 3);
+        // Invalid keys cannot inflate the persisted cursor beyond its read bound.
+        let malformed = [PREFIX, &[b'!'; 2048]].concat();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: malformed,
+                    value: bytes.clone(),
+                }],
+            )
+            .unwrap();
+        let through = store.put_version().unwrap();
+        let evidence = store.get(&key(3)).unwrap().unwrap();
+        let cut = store
+            .document_cut_for_version(&key(3), evidence.version)
+            .unwrap();
+        store.sweep_fork_snapshot_history(100, 20, 1).unwrap();
+        // This key sorts before the progress cursor but belongs to the next window.
+        put(&store, 1);
+        store.sweep_fork_snapshot_history(120, 20, 1).unwrap();
+        assert_eq!(checkpoint(&store).cursor.unwrap().after, Some(key(2)));
+        assert!(is_packed(&store, 2));
+        assert!(!is_packed(&store, 1));
+        assert!(!is_packed(&store, 3));
+        // Simulate interruption after the payload update and before its checkpoint.
+        let pending = checkpoint(&store).cursor.unwrap();
+        assert_eq!(
+            store
+                .pack_fork_snapshot_history(&pending, 1)
+                .unwrap()
+                .packed,
+            1
+        );
+        assert_eq!(checkpoint(&store).cursor, Some(pending));
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        store.sweep_fork_snapshot_history(121, 20, 1).unwrap();
+        assert_eq!(checkpoint(&store).cursor.unwrap().after, Some(key(3)));
+        assert!(is_packed(&store, 3));
+        assert!(!is_packed(&store, 1));
+        let entry = store.get(&key(3)).unwrap().unwrap();
+        assert_eq!(entry.version, evidence.version);
+        assert_eq!(entry.value, evidence.value);
+        assert_eq!(
+            store
+                .document_cut_for_version(&key(3), entry.version)
+                .unwrap(),
+            cut
+        );
+
+        store.sweep_fork_snapshot_history(122, 20, 1).unwrap();
+        assert_eq!(checkpoint(&store).completed, through);
+        assert!(checkpoint(&store).cursor.is_none());
+        let checkpoint_version = store.get(SWEEP).unwrap().unwrap().version;
+        store.sweep_fork_snapshot_history(123, 20, 1).unwrap();
+        assert_eq!(
+            store.get(SWEEP).unwrap().unwrap().version,
+            checkpoint_version
+        );
+
+        store.sweep_fork_snapshot_history(140, 20, 1).unwrap();
+        let cursor = checkpoint(&store).cursor.unwrap();
+        assert_eq!(cursor.since_version, through);
+        assert_eq!(cursor.after, Some(key(1)));
+        assert!(is_packed(&store, 1));
+        store.sweep_fork_snapshot_history(141, 20, 1).unwrap();
+        assert!(checkpoint(&store).cursor.is_none());
+    }
 
     #[test]
     fn newer_fork_snapshots_do_not_extend_an_aging_pass() {
