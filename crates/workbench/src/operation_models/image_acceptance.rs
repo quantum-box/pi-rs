@@ -219,10 +219,11 @@ async fn codemode_openrouter_image_loopback_acceptance() {
             if abort {
                 cancel.cancel();
             }
-            assert_eq!(
-                timeout(WAIT, socket.read(&mut [0])).await.unwrap().unwrap(),
-                0
-            );
+            match timeout(WAIT, socket.read(&mut [0])).await.unwrap() {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                result => panic!("expected the cancelled response to disconnect: {result:?}"),
+            }
         });
         let options = if abort {
             ""
