@@ -1561,7 +1561,7 @@ impl SessionBuilder {
         // qualified choice before its first request, while leaving existing
         // historical selections (including unqualified ones) untouched.
         let initial_selection = session.model_identity_at(session.head()).is_none();
-        let (_, revoked) = self.registry.commit_session_model_bindings(
+        self.registry.commit_session_model_bindings(
             &reservation,
             bindings,
             guarded,
@@ -1582,11 +1582,6 @@ impl SessionBuilder {
             self.model = client;
             self.model_name = name;
             self.model_provider = Some(provider);
-        }
-        if revoked && !refreshed_cycles.is_empty() {
-            return Err(Error::Config(
-                "cycled model client was revoked during open".into(),
-            ));
         }
         // Registered historical models must be active even before startup
         // hooks run: synchronous checkout and fork can be called immediately.
@@ -9011,43 +9006,90 @@ mod tests {
                     client: Arc::new(ProviderBranchModel("fallback")),
                 })
             });
-            let mut session =
-                SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
-                    .provider("current")
-                    .unwrap()
-                    .registry(registry)
-                    .historical_model_resolver(resolver)
-                    .build(journal)
-                    .unwrap();
-            assert_eq!(
-                session.journal().unwrap().model_provider(),
-                Some("fallback")
-            );
+            let id = journal.session_id();
+            let result = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+                .provider("current")
+                .unwrap()
+                .registry(registry.clone())
+                .historical_model_resolver(resolver)
+                .build(journal);
             if revoke {
                 assert!(
-                    branch_client(
-                        &session.registry,
-                        session.session_id,
-                        Some("current"),
-                        "shared"
-                    )
-                    .is_none()
+                    matches!(result, Err(Error::Config(message)) if message.contains("revoked during open"))
                 );
-                assert!(
-                    branch_client(
-                        &session.registry,
-                        session.session_id,
-                        Some("fallback"),
-                        "shared"
-                    )
-                    .is_none()
-                );
-                assert!(session.prompt("no dispatch").await.is_err());
+                for provider in ["current", "fallback"] {
+                    assert!(branch_client(&registry, id, Some(provider), "shared").is_none());
+                }
             } else {
+                let mut session = result.unwrap();
+                assert_eq!(
+                    session.journal().unwrap().model_provider(),
+                    Some("fallback")
+                );
                 assert_eq!(session.prompt("test").await.unwrap(), "fallback");
+                session.close().await.unwrap();
             }
-            session.close().await.unwrap();
         }
+    }
+
+    #[test]
+    fn startup_fallback_revoked_by_resolver_leaves_journal_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        journal
+            .select_provider_model(Some("old"), "shared", Some("high"))
+            .unwrap();
+        let id = journal.session_id();
+        drop(journal);
+        let before = std::fs::read(&path).unwrap();
+
+        let registry = Registry::default();
+        let client: Arc<dyn Model> = Arc::new(ProviderBranchModel("cached"));
+        let other_id = Uuid::new_v4();
+        let cycle = CycledModelSelection {
+            id: Uuid::new_v4(),
+            provider: "cached".into(),
+            model: "shared".into(),
+            thinking: "high".into(),
+        };
+        for session_id in [id, other_id] {
+            registry
+                .register_session_provider_model(session_id, "cached", "shared", client.clone())
+                .unwrap();
+            registry
+                .commit_cycled_model(session_id, &cycle, client.clone(), false, || Ok(()))
+                .unwrap();
+        }
+        let resolver_registry = registry.clone();
+        let result = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(Arc::new(move |provider: &str, model: &str| {
+                assert_eq!((provider, model), ("old", "shared"));
+                resolver_registry.remove_session_branch_models(id);
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "fallback".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("fallback")),
+                })
+            }))
+            .open(&path);
+
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("revoked during open"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        for provider in ["cached", "current", "fallback"] {
+            assert!(branch_client(&registry, id, Some(provider), "shared").is_none());
+        }
+        assert!(registry.cycled_model(id, &cycle).is_none());
+
+        let other_named = branch_client(&registry, other_id, Some("cached"), "shared").unwrap();
+        let other_cycle = registry.cycled_model(other_id, &cycle).unwrap();
+        assert!(Arc::ptr_eq(&other_named, &client));
+        assert!(Arc::ptr_eq(&other_cycle, &client));
     }
 
     #[test]

@@ -2578,7 +2578,7 @@ impl Registry {
         guarded: Option<(&str, &str, &Arc<dyn crate::Model>)>,
         refreshed_cycles: Option<&[(crate::journal::CycledModelSelection, Arc<dyn crate::Model>)]>,
         commit: impl FnOnce() -> Result<T>,
-    ) -> Result<(T, bool)> {
+    ) -> Result<T> {
         if bindings.iter().any(|(provider, name, _)| {
             name.trim().is_empty() || provider.as_ref().is_some_and(|p| p.trim().is_empty())
         }) {
@@ -2598,7 +2598,20 @@ impl Registry {
                 "model client changed while resolving {provider}/{name}"
             )));
         }
-        self.commit_model_reservation(reservation, commit, || {
+        let revoked_error =
+            || Error::Config("session model bindings were revoked during open".into());
+        if self
+            .branch_reservations
+            .read()
+            .expect("branch reservations")
+            .get(&reservation.key)
+            == Some(&true)
+        {
+            return Err(revoked_error());
+        }
+        // The store may call back into the registry during append. Release the
+        // read lock before writing, then check revocation again at publication.
+        let (result, revoked) = self.commit_model_reservation(reservation, commit, || {
             let mut models = self.branch_models.write().expect("branch models");
             if let Some(refreshed) = refreshed_cycles {
                 models.cycled.retain(|(owner, _), _| *owner != session_id);
@@ -2618,7 +2631,11 @@ impl Registry {
                     models.named.insert(key, (client, None));
                 }
             }
-        })
+        })?;
+        if revoked {
+            return Err(revoked_error());
+        }
+        Ok(result)
     }
 
     fn commit_reserved_session_models<T>(

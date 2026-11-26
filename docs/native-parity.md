@@ -1773,12 +1773,13 @@ returns an exact client, a different provider/model client, or unavailable.
 For a fallback the SDK commits the chosen identity, clears the thinking level,
 and exposes both identities through `AgentSession::model_fallback`. The SDK
 rejects a fallback before committing if that provider/model already has a
-different client; an existing matching client must be the same `Arc`. A host
-revocation during the write prevents the entire staged client set from being
-installed, and conflicting in-flight registrations are rejected before the
-journal write.
-The durable selection can then exist without a client and requires a new
-authorized registration before dispatch. The SDK cannot verify an opaque
+different client. An existing matching client must be the same `Arc`. A
+revocation during startup resolution aborts construction before the journal
+records a replacement selection. A revocation during the write fails
+construction and blocks publication of the entire staged client set. A
+selection already written to disk requires a new authorized registration
+before dispatch. Conflicting in-flight registrations are rejected before the
+journal write. The SDK cannot verify an opaque
 client's endpoint; the host must enforce endpoint-bound
 credentials. Unqualified legacy selections never invoke the resolver, and
 existing exact registrations take precedence. The resolver runs on session
