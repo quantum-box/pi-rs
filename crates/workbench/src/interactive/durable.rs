@@ -110,7 +110,7 @@ const FOREGROUND_REFRESH: Duration = Duration::from_millis(250);
 struct ForegroundViewer {
     child: Uuid,
     dialog: Uuid,
-    request: Option<Uuid>,
+    request: Option<(Uuid, bool)>,
     last_refresh: Option<Instant>,
     stopped: bool,
 }
@@ -335,18 +335,19 @@ impl Conversation {
         let Some(viewer) = self.foreground_viewer.as_mut() else {
             return Ok(());
         };
+        let final_refresh = !self.foreground_children.contains(&viewer.child);
         if viewer.stopped
             || viewer.request.is_some()
-            || !self.foreground_children.contains(&viewer.child)
-            || viewer
-                .last_refresh
-                .is_some_and(|at| at.elapsed() < FOREGROUND_REFRESH)
+            || (!final_refresh
+                && viewer
+                    .last_refresh
+                    .is_some_and(|at| at.elapsed() < FOREGROUND_REFRESH))
         {
             return Ok(());
         }
         let id = Uuid::new_v4();
         send(json!({"type": "get_foreground_subagent", "conversationId": viewer.child, "id": id}))?;
-        viewer.request = Some(id);
+        viewer.request = Some((id, final_refresh));
         viewer.last_refresh = Some(Instant::now());
         Ok(())
     }
@@ -355,10 +356,14 @@ impl Conversation {
         let Some(viewer) = self.foreground_viewer.as_mut() else {
             return;
         };
-        if id.is_none() || id != viewer.request {
+        let Some((request, final_refresh)) = viewer.request else {
+            return;
+        };
+        if id != Some(request) {
             return;
         }
         viewer.request = None;
+        viewer.stopped = final_refresh;
         let Some(dialog) = view
             .dialog_mut()
             .filter(|dialog| dialog.id == viewer.dialog)
@@ -983,6 +988,11 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                     picker.clear_mouse_press();
                 }
             }
+            Some(InputEvent::Event(Event::Mouse(mouse)))
+                if args.tui_mode != Some(TuiMode::Regular) =>
+            {
+                dirty = view.fullscreen_mouse(mouse, &args);
+            }
             Some(InputEvent::Event(Event::Paste(text))) => {
                 if conversation.foreground_viewer.is_some() {
                     continue;
@@ -1107,8 +1117,30 @@ mod tests {
             "type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"parent answer"}]}
         }));
         conversation.event(&mut view, &mut args, json!({"type":"agent_end"}));
+        let mut last = None;
         conversation
-            .refresh_foreground_view(|_| panic!("parent tool has finished"))
+            .refresh_foreground_view(|frame| {
+                last = Some(frame);
+                Ok(())
+            })
+            .unwrap();
+        let last = last.unwrap();
+        conversation.event(
+            &mut view,
+            &mut args,
+            response(last["id"].clone(), "final answer"),
+        );
+        let drawn = view
+            .dialog()
+            .unwrap()
+            .render(&Theme::system(), 100, 16, &keys)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| span.text)
+            .collect::<String>();
+        assert!(drawn.contains("final answer"));
+        conversation
+            .refresh_foreground_view(|_| panic!("final snapshot was already received"))
             .unwrap();
         assert!(conversation.foreground_input(&mut view, key(KeyCode::Esc), &keys));
         assert!(view.dialog().is_none());
