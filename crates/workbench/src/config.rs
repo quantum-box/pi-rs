@@ -999,7 +999,7 @@ const NATIVE_TRUST_FILE: &str = "native-project-trust.json";
 fn stored_project_trust(workspace: &Path, decisions: &Value, native_votes: &Value) -> Option<bool> {
     workspace.ancestors().find_map(|directory| {
         let key = directory.to_string_lossy();
-        if let Some(value) = decisions.get(key.as_ref()).and_then(Value::as_bool) {
+        if let Some(value) = legacy_project_trust(directory, decisions) {
             return Some(value);
         }
         let vote: SavedVote =
@@ -1007,6 +1007,12 @@ fn stored_project_trust(workspace: &Path, decisions: &Value, native_votes: &Valu
         vote.workspace.verify(directory).ok()?;
         Some(vote.trusted)
     })
+}
+
+fn legacy_project_trust(directory: &Path, decisions: &Value) -> Option<bool> {
+    decisions
+        .get(directory.to_string_lossy().as_ref())
+        .and_then(Value::as_bool)
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -1017,6 +1023,9 @@ struct SavedVote {
 
 fn existing_project_trust(workspace: &Path, agent: &Path) -> Result<Option<bool>> {
     let decisions = read_object(&agent.join("trust.json"))?;
+    if let Some(decision) = legacy_project_trust(workspace, &decisions) {
+        return Ok(Some(decision));
+    }
     let native_votes = read_object(&agent.join(NATIVE_TRUST_FILE))?;
     if let Some(decision) = stored_project_trust(workspace, &decisions, &native_votes) {
         return Ok(Some(decision));
@@ -1129,6 +1138,9 @@ fn record_canonical_trust(
     }
     check()?;
     let mut decisions = read_object(&path)?;
+    if preserve_saved && let Some(saved) = legacy_project_trust(workspace, &decisions) {
+        return Ok(saved);
+    }
     let native_path = agent.join(NATIVE_TRUST_FILE);
     let mut native_votes = if preserve_saved || identity.is_some() {
         read_object(&native_path)?
@@ -1834,6 +1846,60 @@ mod tests {
             resolve(&workspace.join("missing"), Some(false)),
             Some(false)
         );
+    }
+
+    #[test]
+    fn project_trust_exact_legacy_decision_survives_invalid_native_store() {
+        use serde_json::json;
+
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("project");
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let native_path = agent.join(super::NATIVE_TRUST_FILE);
+        let resolve = |workspace: &std::path::Path| {
+            super::resolve_project_trust(
+                workspace,
+                None,
+                &agent,
+                |_| -> [std::result::Result<Option<super::ProjectTrustVote>, String>; 0] {
+                    panic!("preflight must not run")
+                },
+                |_| unreachable!(),
+            )
+        };
+
+        for contents in [b"{".as_slice(), b"[]"] {
+            std::fs::write(&native_path, contents).unwrap();
+            for decision in [true, false] {
+                std::fs::write(
+                    agent.join("trust.json"),
+                    json!({(workspace.to_str().unwrap()): decision}).to_string(),
+                )
+                .unwrap();
+                assert_eq!(resolve(&workspace).unwrap(), Some(decision));
+                // The locked publish path must also preserve a newly saved decision.
+                assert_eq!(
+                    super::record_canonical_trust(
+                        &agent,
+                        &workspace,
+                        !decision,
+                        true,
+                        None,
+                        &|| Ok(()),
+                    )
+                    .unwrap(),
+                    decision
+                );
+                assert_eq!(std::fs::read(&native_path).unwrap(), contents);
+            }
+        }
+        let child = workspace.join("child");
+        std::fs::create_dir(&child).unwrap();
+        // The native store could contain a closer decision than the legacy ancestor.
+        assert!(resolve(&child).is_err());
     }
 
     #[test]

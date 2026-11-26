@@ -1202,10 +1202,11 @@ or fail, the existing trust selector appears. The first yes or no wins, and
 only a decisive vote with `remember: true` is saved. Native remembered votes
 are stored with the directory identity in `native-project-trust.json`. The
 shared `trust.json` keeps its path-based boolean format and takes precedence on
-an identical path. A stale native vote is ignored after directory
-replacement. A host decision recorded while a voter is running takes
-precedence. The terminal uses the canonical workspace and carries its identity
-into settings, package and resource resolution, and worker bootstrap.
+an identical path, even if the native vote file cannot be read. A stale native
+vote is ignored after directory replacement. A host decision recorded during
+preflight takes precedence. The terminal uses the canonical workspace and
+carries its identity into settings, package and resource resolution, and worker
+bootstrap.
 
 The macOS host invokes a verified copy inside the system sandbox with owner-only
 scratch and a cleared environment. The child receives the canonical workspace
@@ -1228,6 +1229,8 @@ Its ordinary `Describe` result may include
 `"project_trust_error":"…"` reports a hook error alongside a valid registration.
 A process or protocol failure preserves the trust fallback and skips the failed
 registration for that terminal launch. No second `Describe` is sent. The host
+defers preparation of an explicit local package that includes a failed voter
+for that launch, so the terminal can still offer the trust selector. The host
 reuses valid registrations during package validation and forwards them to the
 terminal worker with the existing settings snapshot and resolved trust flag.
 The worker rechecks the pin on the opened source file and retains those verified

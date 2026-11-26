@@ -269,8 +269,15 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
             )
             .await
             {
-                Ok(package) => {
+                Ok(Some(package)) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
+                }
+                Ok(None) => {
+                    let error = deferred_preflight_package();
+                    if cleanup.is_some() {
+                        return Err(error);
+                    }
+                    eprintln!("Package {}: {error}", display_source(&declaration.source));
                 }
                 // Standalone share requires a complete runtime. Keep strict
                 // validation for explicitly requested native files and directories.
@@ -1872,14 +1879,22 @@ fn remote(source: &str) -> bool {
 }
 
 async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Result<Installed> {
-    install_with_registrations(source, offline, cleanup, None, false).await
+    install_with_registrations(source, offline, cleanup, None, false)
+        .await?
+        .ok_or_else(deferred_preflight_package)
+}
+
+fn deferred_preflight_package() -> Error {
+    Error::Config(
+        "native package deferred for this launch after project_trust preflight failed".into(),
+    )
 }
 
 async fn validate_package_executable(
     executable: &Path,
     activation: Option<&Cli>,
     restricted: bool,
-) -> Result<()> {
+) -> Result<bool> {
     if let Some(args) = activation {
         args.verify_project_workspace()?;
         if restricted && !super::project_trust::outside_untrusted_workspace(args, executable)? {
@@ -1892,15 +1907,11 @@ async fn validate_package_executable(
         args.trust_registrations
             .load(executable, args.trusted.then_some(args.workspace.as_path()))
     }) {
-        if registration?.is_none() {
-            return Err(Error::Config(
-                "native package preflight registration failed".into(),
-            ));
-        }
+        Ok(registration?.is_some())
     } else {
         pi_rs_extensions::ExecutableExtension::load_async(executable).await?;
+        Ok(true)
     }
-    Ok(())
 }
 
 fn admit_user_package_preparation(args: &Cli, source: &str) -> Result<()> {
@@ -1930,7 +1941,7 @@ async fn install_with_registrations(
     cleanup: Option<&Children>,
     activation: Option<&Cli>,
     restricted: bool,
-) -> Result<Installed> {
+) -> Result<Option<Installed>> {
     let check_workspace = || activation.map_or(Ok(()), Cli::verify_project_workspace);
     check_workspace()?;
     if restricted {
@@ -1968,7 +1979,9 @@ async fn install_with_registrations(
     check_workspace()?;
     if !remote(source) && Path::new(source).is_file() {
         let executable = PathBuf::from(source);
-        validate_package_executable(&executable, activation, restricted).await?;
+        if !validate_package_executable(&executable, activation, restricted).await? {
+            return Ok(None);
+        }
         let root = executable.parent().unwrap_or(Path::new(".")).to_path_buf();
         let package = Installed {
             source: source.into(),
@@ -1983,7 +1996,7 @@ async fn install_with_registrations(
             index.insert(key(source), serde_json::to_value(&package)?);
             Ok(())
         })?;
-        return Ok(package);
+        return Ok(Some(package));
     }
     let generation = tempfile::Builder::new()
         .prefix("install-")
@@ -2193,7 +2206,10 @@ async fn install_with_registrations(
     let pi = manifest_pi(&manifest)?;
     let resources = collect_package_resources(&root, pi, installed_binaries)?;
     for executable in &resources.extensions {
-        validate_package_executable(executable, activation, restricted).await?;
+        if !validate_package_executable(executable, activation, restricted).await? {
+            // Every executable must pass validation before this package is cached.
+            return Ok(None);
+        }
     }
     check_workspace()?;
     let retain_generation = root.starts_with(generation.path())
@@ -2214,7 +2230,7 @@ async fn install_with_registrations(
         index.insert(key(source), serde_json::to_value(&package)?);
         Ok(())
     })?;
-    Ok(package)
+    Ok(Some(package))
 }
 
 fn collect_package_resources(
@@ -3550,6 +3566,86 @@ mod tests {
         std::fs::remove_dir(&file).unwrap();
         std::fs::write(&file, "fixture").unwrap();
         assert!(!local_source_matches_cache(&package));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn project_trust_failed_voter_defers_explicit_local_package() {
+        const CHILD: &str = "PI_RS_TEST_DEFERRED_PREFLIGHT_PACKAGE";
+        let Some(directory) = std::env::var_os(CHILD) else {
+            let temporary = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "packages::tests::project_trust_failed_voter_defers_explicit_local_package",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, temporary.path())
+                .env("HOME", temporary.path())
+                .env("PI_RS_HOME", temporary.path().join("agent"))
+                .env("TMPDIR", temporary.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("native package deferred for this launch")
+            );
+            return;
+        };
+
+        use clap::Parser;
+        let directory = PathBuf::from(directory).canonicalize().unwrap();
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let package = config::agent_dir();
+        let voter = package.join("extensions/voter");
+        std::fs::create_dir_all(voter.parent().unwrap()).unwrap();
+        // A manifest can select a regular file. This fixture has no executable code.
+        std::fs::write(&voter, "inert fixture").unwrap();
+        std::fs::write(
+            package.join("pi-package.json"),
+            json!({"pi":{"extensions":["extensions/voter"]}}).to_string(),
+        )
+        .unwrap();
+
+        let mut args = Cli::parse_from([
+            "pi",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--extension",
+            package.to_str().unwrap(),
+            "--offline",
+        ]);
+        args.trust_pending = config::project_trust(&workspace, None).unwrap().is_none();
+        assert!(args.trust_pending);
+        args.trust_registrations = serde_json::from_value(json!({
+            (voter.to_str().unwrap()): {
+                "sha256": "0".repeat(64),
+                "identity": null,
+                "description": null
+            }
+        }))
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(prepare(&args)).unwrap();
+        assert!(args.trust_pending);
+        assert!(matches!(
+            args.trust_registrations.load(&voter, None),
+            Some(Ok(None))
+        ));
+        assert!(index().unwrap().is_empty());
+        assert!(transient_resources(&args).unwrap().extensions.is_empty());
     }
 
     #[cfg(unix)]
