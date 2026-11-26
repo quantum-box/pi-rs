@@ -759,6 +759,91 @@ esac
 }
 
 #[test]
+fn terminal_project_trust_routes_around_a_malformed_native_store() {
+    for default in [None, Some("never")] {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("workspace");
+        let native = agent.join("native-project-trust.json");
+        let legacy = agent.join("trust.json");
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        std::fs::write(workspace.join(".pi/settings.json"), b"{}").unwrap();
+        std::fs::write(&native, b"{").unwrap();
+        if let Some(default) = default {
+            std::fs::write(
+                agent.join("settings.json"),
+                serde_json::json!({"defaultProjectTrust":default}).to_string(),
+            )
+            .unwrap();
+        }
+
+        let (mut master_fd, mut slave_fd) = (-1, -1);
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 110,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size,
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let _process = Process(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(&workspace)
+                .env("PI_RS_HOME", &agent)
+                .env("TERM", "xterm-256color")
+                .args(["--offline", "--tui-mode", "fullscreen", "--session"])
+                .arg(root.path().join("session.jsonl"))
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+        if default.is_none() {
+            output_until(&mut master, |text| {
+                text.contains("Load project configuration?")
+            });
+            assert!(!legacy.exists());
+            master.write_all(b"\x1b[B\r").unwrap();
+            output_until(&mut master, |text| {
+                text.contains("Project configuration skipped")
+            });
+            let decisions: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&legacy).unwrap()).unwrap();
+            assert_eq!(
+                decisions[workspace.canonicalize().unwrap().to_str().unwrap()],
+                false
+            );
+        } else {
+            output_until(&mut master, |text| {
+                assert!(!text.contains("Load project configuration?"), "{text}");
+                text.contains("Enter to send")
+            });
+            assert!(!legacy.exists());
+        }
+        assert_eq!(std::fs::read(&native).unwrap(), b"{");
+    }
+}
+
+#[test]
 fn terminal_appearance_notifications_follow_the_saved_theme_selection() {
     let root = tempfile::tempdir().unwrap();
     let mut master_fd = -1;

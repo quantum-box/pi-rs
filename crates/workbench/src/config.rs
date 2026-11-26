@@ -1004,14 +1004,18 @@ where
 
 const NATIVE_TRUST_FILE: &str = "native-project-trust.json";
 
-fn stored_project_trust(workspace: &Path, decisions: &Value, native_votes: &Value) -> Option<bool> {
+fn stored_project_trust(
+    workspace: &Path,
+    decisions: &Value,
+    native_votes: Option<&Value>,
+) -> Option<bool> {
     workspace.ancestors().find_map(|directory| {
         let key = directory.to_string_lossy();
         if let Some(value) = legacy_project_trust(directory, decisions) {
             return Some(value);
         }
         let vote: SavedVote =
-            serde_json::from_value(native_votes.get(key.as_ref())?.clone()).ok()?;
+            serde_json::from_value(native_votes?.get(key.as_ref())?.clone()).ok()?;
         vote.workspace.verify(directory).ok()?;
         Some(vote.trusted)
     })
@@ -1034,11 +1038,17 @@ fn existing_project_trust(workspace: &Path, agent: &Path) -> Result<Option<bool>
     if let Some(decision) = legacy_project_trust(workspace, &decisions) {
         return Ok(Some(decision));
     }
-    let native_votes = read_object(&agent.join(NATIVE_TRUST_FILE))?;
-    if let Some(decision) = stored_project_trust(workspace, &decisions, &native_votes) {
-        return Ok(Some(decision));
-    }
-    Ok(default_project_trust(agent))
+    let native_votes = match read_object(&agent.join(NATIVE_TRUST_FILE)) {
+        Ok(votes) => Some(votes),
+        // A malformed native store supplies no votes. Legacy ancestor
+        // decisions and host policy still resolve trust normally.
+        Err(Error::Config(_)) => None,
+        Err(error) => return Err(error),
+    };
+    Ok(
+        stored_project_trust(workspace, &decisions, native_votes.as_ref())
+            .or_else(|| default_project_trust(agent)),
+    )
 }
 
 fn default_project_trust(agent: &Path) -> Option<bool> {
@@ -1150,17 +1160,20 @@ fn record_canonical_trust(
         return Ok(saved);
     }
     let native_path = agent.join(NATIVE_TRUST_FILE);
-    let mut native_votes = if preserve_saved || identity.is_some() {
-        read_object(&native_path)?
+    let native_votes = if preserve_saved || identity.is_some() {
+        read_object(&native_path)
     } else {
-        Value::Null
+        Ok(Value::Null)
     };
     if preserve_saved
-        && let Some(saved) = stored_project_trust(workspace, &decisions, &native_votes)
+        && matches!(&native_votes, Ok(_) | Err(Error::Config(_)))
+        && let Some(saved) = stored_project_trust(workspace, &decisions, native_votes.as_ref().ok())
             .or_else(|| default_project_trust(agent))
     {
         return Ok(saved);
     }
+    // The read fallback must never turn a malformed store into a writable one.
+    let mut native_votes = native_votes?;
     let key = workspace.to_string_lossy().into_owned();
     if let Some(identity) = identity {
         identity.verify(workspace)?;
@@ -1857,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn project_trust_exact_legacy_decision_survives_invalid_native_store() {
+    fn project_trust_exact_and_inherited_legacy_decisions_survive_invalid_native_store() {
         use serde_json::json;
 
         let root = tempfile::tempdir().unwrap();
@@ -1866,6 +1879,8 @@ mod tests {
         std::fs::create_dir(&agent).unwrap();
         std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
         let workspace = workspace.canonicalize().unwrap();
+        let child = workspace.join("child");
+        std::fs::create_dir(&child).unwrap();
         let native_path = agent.join(super::NATIVE_TRUST_FILE);
         let resolve = |workspace: &std::path::Path| {
             super::resolve_project_trust(
@@ -1887,27 +1902,80 @@ mod tests {
                     json!({(workspace.to_str().unwrap()): decision}).to_string(),
                 )
                 .unwrap();
-                assert_eq!(resolve(&workspace).unwrap(), Some(decision));
-                // The locked publish path must also preserve a newly saved decision.
-                assert_eq!(
-                    super::record_canonical_trust(
-                        &agent,
-                        &workspace,
-                        !decision,
-                        true,
-                        None,
-                        &|| Ok(()),
-                    )
-                    .unwrap(),
-                    decision
-                );
+                for target in [&workspace, &child] {
+                    assert_eq!(resolve(target).unwrap(), Some(decision));
+                    // The locked publish path must also preserve a newly saved decision.
+                    assert_eq!(
+                        super::record_canonical_trust(
+                            &agent,
+                            target,
+                            !decision,
+                            true,
+                            None,
+                            &|| Ok(()),
+                        )
+                        .unwrap(),
+                        decision
+                    );
+                }
                 assert_eq!(std::fs::read(&native_path).unwrap(), contents);
             }
         }
-        let child = workspace.join("child");
-        std::fs::create_dir(&child).unwrap();
-        // The native store could contain a closer decision than the legacy ancestor.
-        assert!(resolve(&child).is_err());
+    }
+
+    #[test]
+    fn project_trust_malformed_native_store_uses_host_policy_without_repairing_stores() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let legacy_path = agent.join("trust.json");
+        let native_path = agent.join(super::NATIVE_TRUST_FILE);
+        let settings_path = agent.join("settings.json");
+        let resolve =
+            || super::resolve_project_trust(&workspace, None, &agent, |_| [], |_| unreachable!());
+        std::fs::write(&native_path, b"{").unwrap();
+        for (policy, decision) in [
+            ("ask", None),
+            ("always", Some(true)),
+            ("never", Some(false)),
+        ] {
+            std::fs::write(
+                &settings_path,
+                serde_json::json!({"defaultProjectTrust":policy}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(resolve().unwrap(), decision);
+        }
+        std::fs::remove_file(settings_path).unwrap();
+        #[cfg(unix)]
+        {
+            let identity = crate::project_trust::WorkspaceIdentity::capture(&workspace).unwrap();
+            assert!(matches!(
+                super::record_canonical_trust(
+                    &agent,
+                    &workspace,
+                    true,
+                    true,
+                    Some(&identity),
+                    &|| Ok(()),
+                ),
+                Err(super::Error::Config(_))
+            ));
+        }
+        assert!(!legacy_path.exists());
+        assert_eq!(std::fs::read(&native_path).unwrap(), b"{");
+
+        super::save_canonical_trust(&agent, &workspace, false).unwrap();
+        assert_eq!(resolve().unwrap(), Some(false));
+        assert_eq!(std::fs::read(&native_path).unwrap(), b"{");
+        std::fs::write(&legacy_path, b"[]").unwrap();
+        assert!(resolve().is_err());
+        assert!(super::save_canonical_trust(&agent, &workspace, true).is_err());
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), b"[]");
+        assert_eq!(std::fs::read(&native_path).unwrap(), b"{");
     }
 
     #[test]
@@ -2072,6 +2140,19 @@ mod tests {
             super::existing_project_trust(current.path(), &agent).unwrap(),
             Some(true)
         );
+        super::save_canonical_trust(&agent, current.path().parent().unwrap(), false).unwrap();
+        let child = current.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        assert_eq!(
+            super::existing_project_trust(&child, &agent).unwrap(),
+            Some(true)
+        );
+        super::save_canonical_trust(&agent, current.path(), false).unwrap();
+        assert_eq!(
+            super::existing_project_trust(&child, &agent).unwrap(),
+            Some(false)
+        );
+        std::fs::remove_file(agent.join("trust.json")).unwrap();
         std::fs::rename(&workspace, root.path().join("remembered")).unwrap();
         std::fs::create_dir(&workspace).unwrap();
         assert_eq!(
