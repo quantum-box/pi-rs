@@ -6106,7 +6106,7 @@ impl Agent<'_> {
             result = platform_time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
                 result.map_err(|_| Error::Config("model preparation timed out".into()))?,
         }
-        .inspect_err(|_| progress.failure = SummaryFailure::Optional)?;
+        .inspect_err(|error| progress.failure = SummaryFailure::from_model_error(error))?;
         let active = Agent {
             model: prepared.as_deref().unwrap_or(self.model),
             limits: self.limits.clone(),
@@ -6154,13 +6154,7 @@ impl Agent<'_> {
             .await
             .inspect_err(|_| progress.failure = SummaryFailure::Fatal)?
             .outcome
-            .inspect_err(|error| {
-                progress.failure = if matches!(error, Error::Budget) {
-                    SummaryFailure::Fatal
-                } else {
-                    SummaryFailure::Optional
-                };
-            })?;
+            .inspect_err(|error| progress.failure = SummaryFailure::from_model_error(error))?;
         let output = reply
             .usage
             .map_or(u64::from(allowance), |usage| usage.output_tokens);
@@ -7090,6 +7084,18 @@ enum SummaryFailure {
     ByError,
     Optional,
     Fatal,
+}
+
+impl SummaryFailure {
+    fn from_model_error(error: &Error) -> Self {
+        // A model's explicit budget error applies to the run. Local summary
+        // allowance checks decide separately whether to skip compaction.
+        if matches!(error, Error::Budget) {
+            Self::Fatal
+        } else {
+            Self::Optional
+        }
+    }
 }
 
 impl SummaryProgress {

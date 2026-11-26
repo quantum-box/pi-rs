@@ -459,6 +459,8 @@ mod tests {
     enum SummaryOutcome {
         #[default]
         Success,
+        PreparationBudget,
+        PreparationUnavailable,
         ProviderFailure,
         ProviderIo,
         ProviderJson,
@@ -475,6 +477,11 @@ mod tests {
     #[derive(Default)]
     struct CompactionTrace(Mutex<Vec<&'static str>>, SummaryOutcome);
 
+    fn is_summary_request(request: &ModelRequest) -> bool {
+        matches!(request.messages.last(), Some(Message::User { content })
+            if content.starts_with("Summarize only this older conversation."))
+    }
+
     #[async_trait::async_trait]
     impl Model for CompactionTrace {
         fn minimum_output_tokens(&self) -> u32 {
@@ -485,9 +492,26 @@ mod tests {
             }
         }
 
+        async fn prepare_context<'a>(
+            &'a self,
+            request: &ModelRequest,
+        ) -> Result<Option<Arc<dyn Model + 'a>>> {
+            if is_summary_request(request) {
+                let error = match self.1 {
+                    SummaryOutcome::PreparationBudget => Error::Budget,
+                    SummaryOutcome::PreparationUnavailable => {
+                        std::io::Error::other("summary adapter unavailable").into()
+                    }
+                    _ => return Ok(None),
+                };
+                self.0.lock().unwrap().push("prepare summary");
+                return Err(error);
+            }
+            Ok(None)
+        }
+
         async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
-            let summary = matches!(request.messages.last(), Some(Message::User { content })
-                if content.starts_with("Summarize only this older conversation."));
+            let summary = is_summary_request(&request);
             let text = if summary {
                 assert_eq!(user_texts(&request.messages)[0], "oldest question");
                 assert!(!user_texts(&request.messages).contains(&"new question"));
@@ -819,6 +843,54 @@ mod tests {
                     .iter()
                     .any(|record| matches!(record.event, Event::Compacted { .. }))
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_preserves_model_budget_errors_during_summary_preparation() {
+        for summary in [
+            SummaryOutcome::PreparationBudget,
+            SummaryOutcome::PreparationUnavailable,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+            let trace = Arc::new(CompactionTrace(Mutex::default(), summary));
+            let mut sdk = compaction_builder(&trace)
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+
+            let result = sdk.prompt("new question").await;
+            let seen = trace.0.lock().unwrap();
+            if matches!(summary, SummaryOutcome::PreparationBudget) {
+                assert!(matches!(result, Err(Error::Budget)), "{result:?}");
+                assert_eq!(*seen, ["before compaction", "prepare summary"]);
+                let journal = sdk.journal().unwrap();
+                assert!(!journal.records().iter().any(|record| matches!(
+                    record.event,
+                    Event::ModelRequested { .. } | Event::Compacted { .. }
+                )));
+                assert!(matches!(
+                    journal.records().last().unwrap().event,
+                    Event::Run {
+                        state: RunState::Failed,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(result.unwrap(), "answer");
+                assert_eq!(
+                    *seen,
+                    [
+                        "before compaction",
+                        "prepare summary",
+                        "before_agent_start",
+                        "turn request"
+                    ]
+                );
+            }
         }
     }
 
