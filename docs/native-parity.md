@@ -2299,10 +2299,21 @@ A source entry with a missing parent is recovered as a separate native branch;
 its original parent ID remains in the retained source entry, while RPC presents
 it as a root. Missing ancestors may contain unrecoverable state or tool calls;
 orphan tool results and compactions involving orphaned branches are still rejected.
-Forward parent references and compaction boundaries on a different branch are
-also rejected. Pi instead drops a retained boundary that is not on the current
-path; native import rejects it rather than silently retaining unrelated history.
+Forward parent references and missing or forward compaction boundary IDs are
+also rejected. Pi v1 keeps its positional boundary migration, and RPC exposes
+the verified boundary as a projected entry ID. When a compaction names an
+earlier boundary on a complete sibling branch, Pi restores its system
+checkpoint, summary and descendants with no pre-compaction messages. Native
+import does the same and retains the original
+boundary and usage in a full export. A fork or Pi RPC projection uses the
+compaction's own ID as the boundary, so the result is independent of the
+sibling branch.
 
+Pi labels and context edits whose target IDs are absent from the whole source
+remain inert. The original source nodes are preserved in the native journal,
+and the RPC projection keeps their target IDs unbound. Branch forks retain
+these context edits and rebuild labels only for retained targets. Forward
+references and context edits that target another branch are rejected.
 Context edits are projected onto future model context while the imported raw
 entries remain available. Imported system messages appear as `[system]` in the
 default session tree, where their text can be searched and copied.
