@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use crate::{
     Agent, AgentInput, AgentStartTrigger, BeforeAgentStartEvent, BeforeAgentStartPromptOptions,
-    CancellationToken, CustomMessage, CustomMessageDelivery, Error, Event, Notification, Observer,
-    Record, Result, RunState, Session,
+    BeforeAgentStartPromptResult, CancellationToken, CustomMessage, CustomMessageDelivery, Error,
+    Event, Notification, Observer, Record, Result, RunState, Session,
 };
 
 const PLAN_FORMAT: &str = "pi-rs:before-agent-start-v1";
@@ -217,8 +217,8 @@ pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
     let mut event = BeforeAgentStartEvent {
         trigger,
         system_prompt: base_prompt.render(),
-        system_prompt_options: prompt_options(&base_prompt),
     };
+    let mut options = prompt_options(&base_prompt);
     let states = session.extension_states();
     let mut edits = indexmap::IndexMap::new();
     let mut plan = Plan {
@@ -234,7 +234,11 @@ pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
         let result = {
             let callback = std::panic::AssertUnwindSafe(async {
                 extension
-                    .before_agent_start(&event, states.get(extension.id()))
+                    .before_agent_start_with_prompt_options(
+                        &event,
+                        &options,
+                        states.get(extension.id()),
+                    )
                     .await
             })
             .catch_unwind();
@@ -259,7 +263,10 @@ pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
             }
         };
         match result {
-            Ok(result) => {
+            Ok(BeforeAgentStartPromptResult {
+                result,
+                system_prompt_options,
+            }) => {
                 if let Some(message) = result.message {
                     match crate::journal::validate_custom_message(&message) {
                         Ok(()) => plan.messages.push((Uuid::new_v4(), message)),
@@ -270,7 +277,7 @@ pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
                     event.system_prompt.clone_from(&prompt);
                     plan.system_prompt = Some(prompt);
                 }
-                let changes = result.system_prompt_options.sections;
+                let changes = system_prompt_options.sections;
                 if !changes.is_empty() {
                     if let Some(name) = changes.keys().find(|name| !valid_section_name(name)) {
                         report(
@@ -303,7 +310,7 @@ pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect::<Vec<_>>();
                     prompt.apply_sections(&applied);
-                    event.system_prompt_options = prompt_options(&prompt);
+                    options = prompt_options(&prompt);
                     if plan.system_prompt.is_none() {
                         event.system_prompt = prompt.render();
                     }
@@ -422,17 +429,9 @@ mod tests {
             if matches!(event.trigger, AgentStartTrigger::Custom { .. }) {
                 return Ok(Default::default());
             }
-            if self.id == "section-after-force" {
-                assert!(event.system_prompt.is_empty());
-                return Ok(serde_json::from_value(serde_json::json!({
-                    "systemPromptOptions": {"sections": {"rules": "section after force"}},
-                }))
-                .unwrap());
-            }
             Ok(crate::BeforeAgentStartResult {
                 message: Some(message(self.id)),
                 system_prompt: Some(if self.id == "clear" { "" } else { self.id }.into()),
-                ..Default::default()
             })
         }
     }
@@ -498,7 +497,7 @@ mod tests {
     async fn before_agent_start_edits_named_sections_in_order_and_only_for_the_run() {
         struct EditSections {
             id: &'static str,
-            observations: Arc<Mutex<Vec<BeforeAgentStartEvent>>>,
+            observations: Arc<Mutex<Vec<(String, BeforeAgentStartPromptOptions)>>>,
         }
 
         #[async_trait::async_trait]
@@ -511,17 +510,21 @@ mod tests {
                 true
             }
 
-            async fn before_agent_start(
+            async fn before_agent_start_with_prompt_options(
                 &self,
                 event: &BeforeAgentStartEvent,
+                options: &BeforeAgentStartPromptOptions,
                 _: Option<&ExtensionState>,
-            ) -> ExtensionResult<crate::BeforeAgentStartResult> {
+            ) -> ExtensionResult<BeforeAgentStartPromptResult> {
                 if !matches!(&event.trigger, AgentStartTrigger::User { prompt, .. } if prompt == "edit")
                 {
                     return Ok(Default::default());
                 }
-                self.observations.lock().unwrap().push(event.clone());
-                let changes = match self.id {
+                self.observations
+                    .lock()
+                    .unwrap()
+                    .push((event.system_prompt.clone(), options.clone()));
+                let sections = match self.id {
                     "first" => {
                         serde_json::json!({"rules":"first rules","retired":null,"cwd":"first cwd","z-added":"Z"})
                     }
@@ -529,10 +532,12 @@ mod tests {
                     "last" => serde_json::json!({"rules":"final rules","cwd":"","a_added":"A"}),
                     _ => unreachable!(),
                 };
-                Ok(serde_json::from_value(serde_json::json!({
-                    "systemPromptOptions": {"sections": changes},
-                }))
-                .unwrap())
+                Ok(BeforeAgentStartPromptResult {
+                    system_prompt_options: crate::BeforeAgentStartPromptChanges {
+                        sections: serde_json::from_value(sections).unwrap(),
+                    },
+                    ..Default::default()
+                })
             }
         }
 
@@ -590,16 +595,16 @@ mod tests {
         assert!(errors[0].1.contains("preamble"));
         let observations = observations.lock().unwrap();
         assert_eq!(observations.len(), 3);
-        assert_eq!(observations[0].system_prompt, prompt);
-        let last = &observations[2];
-        let sections = &last.system_prompt_options.sections;
+        assert_eq!(observations[0].0, prompt);
+        let (last_prompt, options) = &observations[2];
+        let sections = &options.sections;
         assert_eq!(
             sections.keys().map(String::as_str).collect::<Vec<_>>(),
             ["rules", "cwd", "z-added"]
         );
         assert_eq!(sections["rules"], "first rules");
         assert_eq!(sections["cwd"], "first cwd");
-        assert!(last.system_prompt.contains("<z-added>\nZ\n</z-added>"));
+        assert!(last_prompt.contains("<z-added>\nZ\n</z-added>"));
         let requests = requests.lock().unwrap();
         assert_eq!(
             requests[0][0],
@@ -924,6 +929,35 @@ mod tests {
 
     #[tokio::test]
     async fn before_agent_start_forces_final_prompt_after_context_transforms() {
+        struct EditAfterForce;
+        #[async_trait::async_trait]
+        impl Extension for EditAfterForce {
+            fn id(&self) -> &str {
+                "section-after-force"
+            }
+
+            fn handles_before_agent_start(&self) -> bool {
+                true
+            }
+
+            async fn before_agent_start_with_prompt_options(
+                &self,
+                event: &BeforeAgentStartEvent,
+                _: &BeforeAgentStartPromptOptions,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<BeforeAgentStartPromptResult> {
+                assert!(event.system_prompt.is_empty());
+                Ok(BeforeAgentStartPromptResult {
+                    system_prompt_options: crate::BeforeAgentStartPromptChanges {
+                        sections: [("rules".into(), Some("section after force".into()))]
+                            .into_iter()
+                            .collect(),
+                    },
+                    ..Default::default()
+                })
+            }
+        }
+
         struct Rewrite;
         #[async_trait::async_trait]
         impl Extension for Rewrite {
@@ -961,10 +995,7 @@ mod tests {
                 observations: observations.clone(),
             }))
             .unwrap()
-            .extension(Arc::new(Hook {
-                id: "section-after-force",
-                observations: observations.clone(),
-            }))
+            .extension(Arc::new(EditAfterForce))
             .unwrap()
             .extension(Arc::new(Rewrite))
             .unwrap()

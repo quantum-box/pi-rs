@@ -7,13 +7,15 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use pi_rs_core::{
-    CacheWarmingAction, CacheWarmingDecision, CancellationToken, Compaction, CustomMessage,
-    Decision, Error, Extension, ExtensionFlag, ExtensionFlagValue, ExtensionResult, ExtensionState,
-    InputAction, InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RenderedExtensionRows,
-    RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolRenderContext,
-    ToolRenderShell, ToolRendererMatch, ToolRendererOverride, ToolRendererOverrideCallback,
-    ToolRendererOverrideMode, ToolRendererOverrideSection, ToolRenderers, ToolReply,
-    ToolSectionRenderer, ToolSpec, TreeDecision, TreePreparation,
+    BeforeAgentStartEvent, BeforeAgentStartPromptChanges, BeforeAgentStartPromptOptions,
+    BeforeAgentStartPromptResult, BeforeAgentStartResult, CacheWarmingAction, CacheWarmingDecision,
+    CancellationToken, Compaction, CustomMessage, Decision, Error, Extension, ExtensionFlag,
+    ExtensionFlagValue, ExtensionResult, ExtensionState, InputAction, InputEvent, LifecycleEvent,
+    Message, ModelRequest, Outcome, RenderedExtensionRows, RequestPurpose, Result, Tool,
+    ToolContext, ToolExecution, ToolHost, ToolRenderContext, ToolRenderShell, ToolRendererMatch,
+    ToolRendererOverride, ToolRendererOverrideCallback, ToolRendererOverrideMode,
+    ToolRendererOverrideSection, ToolRenderers, ToolReply, ToolSectionRenderer, ToolSpec,
+    TreeDecision, TreePreparation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -157,6 +159,34 @@ fn restore_legacy_tool_metadata(
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeforeAgentStartWireEvent {
+    #[serde(flatten)]
+    event: BeforeAgentStartEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_prompt_options: Option<BeforeAgentStartPromptOptions>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeforeAgentStartWireResult {
+    #[serde(flatten)]
+    result: BeforeAgentStartResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_prompt_options: Option<BeforeAgentStartPromptChanges>,
+}
+
+impl From<BeforeAgentStartPromptResult> for BeforeAgentStartWireResult {
+    fn from(value: BeforeAgentStartPromptResult) -> Self {
+        Self {
+            result: value.result,
+            system_prompt_options: (!value.system_prompt_options.sections.is_empty())
+                .then_some(value.system_prompt_options),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ProtocolRequest {
     Describe,
@@ -186,7 +216,7 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
     },
     BeforeAgentStart {
-        event: pi_rs_core::BeforeAgentStartEvent,
+        event: BeforeAgentStartWireEvent,
         state: Option<ExtensionState>,
     },
     Input {
@@ -1030,14 +1060,37 @@ impl Extension for ExecutableExtension {
 
     async fn before_agent_start(
         &self,
-        event: &pi_rs_core::BeforeAgentStartEvent,
+        event: &BeforeAgentStartEvent,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<pi_rs_core::BeforeAgentStartResult> {
-        self.request_async(ProtocolRequest::BeforeAgentStart {
-            event: event.clone(),
-            state: state.cloned(),
-        })
+    ) -> ExtensionResult<BeforeAgentStartResult> {
+        self.before_agent_start_with_prompt_options(
+            event,
+            &BeforeAgentStartPromptOptions::default(),
+            state,
+        )
         .await
+        .map(|value| value.result)
+    }
+
+    async fn before_agent_start_with_prompt_options(
+        &self,
+        event: &BeforeAgentStartEvent,
+        options: &BeforeAgentStartPromptOptions,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<BeforeAgentStartPromptResult> {
+        let response: BeforeAgentStartWireResult = self
+            .request_async(ProtocolRequest::BeforeAgentStart {
+                event: BeforeAgentStartWireEvent {
+                    event: event.clone(),
+                    system_prompt_options: (!options.sections.is_empty()).then(|| options.clone()),
+                },
+                state: state.cloned(),
+            })
+            .await?;
+        Ok(BeforeAgentStartPromptResult {
+            result: response.result,
+            system_prompt_options: response.system_prompt_options.unwrap_or_default(),
+        })
     }
 
     fn handles_input(&self) -> bool {
@@ -4308,9 +4361,16 @@ async fn dispatch_inner(
                 ContextResponse::Changed { value: request }
             }))
         }
-        ProtocolRequest::BeforeAgentStart { event, state } => {
-            encode(extension.before_agent_start(&event, state.as_ref()).await)
-        }
+        ProtocolRequest::BeforeAgentStart { event, state } => encode(
+            extension
+                .before_agent_start_with_prompt_options(
+                    &event.event,
+                    &event.system_prompt_options.unwrap_or_default(),
+                    state.as_ref(),
+                )
+                .await
+                .map(BeforeAgentStartWireResult::from),
+        ),
         ProtocolRequest::Input { event, state } => {
             if host.supports_custom_messages() {
                 encode(
@@ -6252,11 +6312,11 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
 
     #[tokio::test]
     async fn before_agent_start_negotiates_and_transports_prompt_edits() {
-        struct Hook;
+        struct LegacyHook;
         #[async_trait::async_trait]
-        impl Extension for Hook {
+        impl Extension for LegacyHook {
             fn id(&self) -> &str {
-                "run-preflight"
+                "legacy-preflight"
             }
 
             fn handles_before_agent_start(&self) -> bool {
@@ -6265,39 +6325,61 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
 
             async fn before_agent_start(
                 &self,
-                event: &pi_rs_core::BeforeAgentStartEvent,
+                event: &BeforeAgentStartEvent,
                 _: Option<&ExtensionState>,
-            ) -> ExtensionResult<pi_rs_core::BeforeAgentStartResult> {
+            ) -> ExtensionResult<BeforeAgentStartResult> {
                 let pi_rs_core::AgentStartTrigger::User { prompt, images } = &event.trigger else {
                     panic!("expected a user prompt");
                 };
                 assert_eq!(prompt, "question");
                 assert!(images.is_empty());
                 assert_eq!(event.system_prompt, "host prompt");
-                if !event.system_prompt_options.sections.is_empty() {
-                    assert_eq!(event.system_prompt_options.sections["rules"], "host rules");
-                    assert_eq!(event.system_prompt_options.sections["cwd"], "workspace");
-                    return Ok(pi_rs_core::BeforeAgentStartResult {
-                        system_prompt_options: pi_rs_core::BeforeAgentStartPromptChanges {
-                            sections: [
-                                ("z-first".into(), Some("new section".into())),
-                                ("cwd".into(), None),
-                                ("rules".into(), Some("new rules".into())),
-                            ]
-                            .into_iter()
-                            .collect(),
-                        },
-                        ..Default::default()
-                    });
-                }
-                Ok(pi_rs_core::BeforeAgentStartResult {
+                Ok(BeforeAgentStartResult {
+                    message: None,
                     system_prompt: Some(String::new()),
+                })
+            }
+        }
+
+        struct SectionHook;
+        #[async_trait::async_trait]
+        impl Extension for SectionHook {
+            fn id(&self) -> &str {
+                "section-preflight"
+            }
+
+            fn handles_before_agent_start(&self) -> bool {
+                true
+            }
+
+            async fn before_agent_start_with_prompt_options(
+                &self,
+                event: &BeforeAgentStartEvent,
+                options: &BeforeAgentStartPromptOptions,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<BeforeAgentStartPromptResult> {
+                assert_eq!(event.system_prompt, "host prompt");
+                if options.sections.is_empty() {
+                    return Ok(Default::default());
+                }
+                assert_eq!(options.sections["rules"], "host rules");
+                assert_eq!(options.sections["cwd"], "workspace");
+                Ok(BeforeAgentStartPromptResult {
+                    system_prompt_options: BeforeAgentStartPromptChanges {
+                        sections: [
+                            ("z-first".into(), Some("new section".into())),
+                            ("cwd".into(), None),
+                            ("rules".into(), Some("new rules".into())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
                     ..Default::default()
                 })
             }
         }
 
-        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let extension: Arc<dyn Extension> = Arc::new(SectionHook);
         let mut description = dispatch(extension.clone(), ProtocolRequest::Describe)
             .await
             .unwrap();
@@ -6312,35 +6394,40 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
                 .before_agent_start_hook
         );
 
-        let request = serde_json::from_value(serde_json::json!({
+        let legacy_request = serde_json::json!({
             "type": "before_agent_start",
             "event": {
                 "messageType": "user",
                 "prompt": "question",
                 "systemPrompt": "host prompt"
-            }
-        }))
-        .unwrap();
+            },
+            "state": null
+        });
+        let request = serde_json::from_value::<ProtocolRequest>(legacy_request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), legacy_request);
         let response = dispatch(extension.clone(), request).await.unwrap();
-        assert_eq!(response, serde_json::json!({"systemPrompt": ""}));
+        assert_eq!(response, serde_json::json!({}));
 
-        let request = serde_json::from_value::<ProtocolRequest>(serde_json::json!({
-            "type": "before_agent_start",
-            "event": {
-                "messageType": "user",
-                "prompt": "question",
-                "systemPrompt": "host prompt",
-                "systemPromptOptions": {"sections": {"rules": "host rules", "cwd": "workspace"}}
-            }
-        }))
-        .unwrap();
-        let request = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let mut structured_request = legacy_request;
+        structured_request["event"]["systemPromptOptions"] =
+            serde_json::json!({"sections": {"rules": "host rules", "cwd": "workspace"}});
+        let request =
+            serde_json::from_value::<ProtocolRequest>(structured_request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), structured_request);
+        let response = dispatch(Arc::new(LegacyHook), request).await.unwrap();
+        assert_eq!(response, serde_json::json!({"systemPrompt": ""}));
+        let legacy_result: BeforeAgentStartWireResult = serde_json::from_value(response).unwrap();
+        assert_eq!(legacy_result.result.system_prompt.as_deref(), Some(""));
+        assert!(legacy_result.system_prompt_options.is_none());
+
+        let request = serde_json::from_value::<ProtocolRequest>(structured_request).unwrap();
         let response = dispatch(extension, request).await.unwrap();
-        let result: pi_rs_core::BeforeAgentStartResult = serde_json::from_value(response).unwrap();
-        assert!(result.system_prompt.is_none());
+        let result: BeforeAgentStartWireResult = serde_json::from_value(response).unwrap();
+        assert!(result.result.system_prompt.is_none());
         assert_eq!(
             result
                 .system_prompt_options
+                .unwrap()
                 .sections
                 .into_iter()
                 .collect::<Vec<_>>(),

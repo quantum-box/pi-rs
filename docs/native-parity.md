@@ -5612,9 +5612,11 @@ The final prompt override applies after request context transforms. A recorded
 preparation plan retains the run-local prompt edits and deduplicates its appended
 messages when the run resumes before its first model request is journaled.
 
-Native exposes section bodies through a returned patch. Upstream exposes the
-full mutable prompt builder, including tool selection, and compacts incoming
-prompt context before invoking the hook. The native hook runs before the agent
+Rust extensions can opt into the additive `before_agent_start_with_prompt_options`
+callback to read section bodies and return a patch. Executable extensions use
+`systemPromptOptions.sections` in the existing request and response. Upstream
+exposes the full mutable prompt builder, including tool selection, and compacts
+incoming prompt context before invoking the hook. The native hook runs before the agent
 loop's automatic compaction checks.
 
 ### Rust extension lifecycle observation

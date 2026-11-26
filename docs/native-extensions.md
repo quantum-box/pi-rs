@@ -335,14 +335,18 @@ Pi v1.5.0 declares a `restore` source but its session restoration path does not
 emit a model selection event.
 
 To run an extension callback for a submitted user prompt or an idle custom
-trigger, opt into `handles_before_agent_start` and implement
-`before_agent_start`. Executable extensions advertise `before_agent_start_hook`
-and receive the `before_agent_start` protocol request. The event identifies
-the starting message and carries the resolved system prompt and ordered
-`system_prompt_options.sections` bodies. Each handler sees the previous
-handlers' edits in extension load order. Return section edits using
-`system_prompt_options.sections` (wire format `systemPromptOptions.sections`).
-For example, `{"systemPromptOptions":{"sections":{"rules":"New guidance","skills":null}}}`
+trigger, opt into `handles_before_agent_start`. In Rust, implement
+`before_agent_start` for a custom message or an exact prompt replacement.
+Implement `before_agent_start_with_prompt_options` to also receive the ordered
+section bodies and return edits in `BeforeAgentStartPromptResult::system_prompt_options`.
+The default implementation calls `before_agent_start`. Each handler sees
+earlier handlers' edits in extension load order.
+
+Executable extensions advertise `before_agent_start_hook` and receive the
+`before_agent_start` protocol request. The event identifies the starting
+message and carries the resolved system prompt. Read the current section bodies
+and return section edits through `systemPromptOptions.sections`.
+The response `{"systemPromptOptions":{"sections":{"rules":"New guidance","skills":null}}}`
 replaces the rules text and removes the skills section. Names must begin with
 a lowercase ASCII letter and may contain lowercase ASCII letters, digits,
 underscores and hyphens. The preamble is reserved. Replacements keep their

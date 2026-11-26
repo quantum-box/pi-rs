@@ -1142,14 +1142,9 @@ pub struct BeforeAgentStartEvent {
     pub trigger: AgentStartTrigger,
     /// The current prompt, including edits from earlier extensions.
     pub system_prompt: String,
-    /// The editable portion of the current structured prompt.
-    #[serde(
-        default,
-        skip_serializing_if = "BeforeAgentStartPromptOptions::is_empty"
-    )]
-    pub system_prompt_options: BeforeAgentStartPromptOptions,
 }
 
+/// The editable portion of the current structured prompt.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BeforeAgentStartPromptOptions {
@@ -1157,24 +1152,13 @@ pub struct BeforeAgentStartPromptOptions {
     pub sections: indexmap::IndexMap<String, String>,
 }
 
-impl BeforeAgentStartPromptOptions {
-    fn is_empty(&self) -> bool {
-        self.sections.is_empty()
-    }
-}
-
+/// Run-local changes to the structured prompt.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BeforeAgentStartPromptChanges {
     /// A nonempty string sets the body, an empty string resets it to the base,
-    /// and null removes the section.
+    /// and `None` removes the section.
     pub sections: indexmap::IndexMap<String, Option<String>>,
-}
-
-impl BeforeAgentStartPromptChanges {
-    fn is_empty(&self) -> bool {
-        self.sections.is_empty()
-    }
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -1185,9 +1169,23 @@ pub struct BeforeAgentStartResult {
     /// An exact prompt replacement for this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+}
+
+/// Result of preflight with editable prompt sections.
+#[derive(Clone, Debug, Default)]
+pub struct BeforeAgentStartPromptResult {
+    pub result: BeforeAgentStartResult,
     /// Run-local section edits. An exact replacement takes precedence.
-    #[serde(skip_serializing_if = "BeforeAgentStartPromptChanges::is_empty")]
     pub system_prompt_options: BeforeAgentStartPromptChanges,
+}
+
+impl From<BeforeAgentStartResult> for BeforeAgentStartPromptResult {
+    fn from(result: BeforeAgentStartResult) -> Self {
+        Self {
+            result,
+            system_prompt_options: BeforeAgentStartPromptChanges::default(),
+        }
+    }
 }
 
 /// A shell command entered by the user, before the host executes it.
@@ -1433,6 +1431,17 @@ pub trait Extension: Send + Sync {
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<BeforeAgentStartResult> {
         Ok(BeforeAgentStartResult::default())
+    }
+
+    /// Run preflight with ordered prompt sections using the existing handler opt-in.
+    /// By default, delegates to the original preflight callback.
+    async fn before_agent_start_with_prompt_options(
+        &self,
+        event: &BeforeAgentStartEvent,
+        _options: &BeforeAgentStartPromptOptions,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<BeforeAgentStartPromptResult> {
+        self.before_agent_start(event, state).await.map(Into::into)
     }
 
     fn handles_user_bash(&self) -> bool {
