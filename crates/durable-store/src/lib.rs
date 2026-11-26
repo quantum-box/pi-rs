@@ -10,6 +10,7 @@ pub mod controls;
 #[cfg(feature = "experimental-graph-revision")]
 pub mod graph_revision;
 pub mod owner;
+pub mod transcript_packing;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::{

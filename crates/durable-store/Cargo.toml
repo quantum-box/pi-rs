@@ -9,6 +9,8 @@ experimental-graph-scope = []
 experimental-graph-revision = []
 
 [dependencies]
+flate2 = "1"
+sha2 = "0.10"
 durable-task-schema = { path = "../durable-task-schema" }
 uuid = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

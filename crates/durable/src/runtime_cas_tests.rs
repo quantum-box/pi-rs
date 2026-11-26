@@ -3050,6 +3050,57 @@ fn position_fork_uses_the_occurrence_commit_not_an_earlier_reference() {
 }
 
 #[test]
+fn packing_keeps_a_runtime_message_cut_forkable_across_reset_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history.sqlite");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let id = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let text = "original content ".repeat(500);
+    let (mut state, version) = harness.load(id).unwrap();
+    state.messages.push(Message::User {
+        content: text.clone(),
+    });
+    harness.save(&state, Expected::Version(version)).unwrap();
+    let message = harness
+        .view_positioned(id, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries
+        .remove(0);
+    let history = message.history.unwrap();
+    let position = message.position;
+    let existing_fork = harness.fork_by_entry_id(id, history.id).unwrap();
+    harness.reset(id, Some("new context".into())).unwrap();
+
+    let capture = harness.transcript_packing_start().unwrap();
+    let packed = harness
+        .pack_transcript_history(&capture, std::num::NonZeroUsize::new(16).unwrap())
+        .unwrap();
+    assert!(packed.packed > 0 && packed.reclaimed_bytes > 4_000);
+    drop(harness);
+
+    let mut harness = Harness::open_paused(path, options()).unwrap();
+    let from_saved = harness
+        .view_positioned_page(id, position, std::num::NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(from_saved.entries[0].history.as_ref(), Some(&history));
+    let new_fork = harness.fork_by_entry_id(id, history.id).unwrap();
+    for branch in [existing_fork, new_fork] {
+        assert_eq!(
+            harness.conversation(branch).unwrap().messages,
+            vec![Message::User {
+                content: text.clone()
+            }]
+        );
+    }
+}
+
+#[test]
 fn message_history_tracks_commit_state_across_batches_reset_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

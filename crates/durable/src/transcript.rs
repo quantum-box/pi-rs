@@ -8,8 +8,9 @@
 //! contract. Storage and payload sizes are otherwise unbounded.
 //!
 //! The public fork operation captures the current head; the runtime also forks
-//! trusted historical cursors. Forward pagination, deletion, garbage collection, cross-database references, and
-//! concurrent writers bypassing this API are not supported. Corruption checks
+//! trusted historical cursors. Optional lossless packing reclaims storage for
+//! immutable entries. Deleting referenced entries, cross-database references,
+//! and concurrent writers bypassing this API are unsupported. Corruption checks
 //! validate the portions visited, not the entire database; they cannot detect a
 //! valid-looking replacement by an external writer. Store operations are blocking.
 //! A storage error during commit can have an unknown outcome: inspect the head
@@ -171,7 +172,7 @@ impl<'a> Transcript<'a> {
         let key = entry_key(link.id);
         let stored = self
             .store
-            .get_bounded(&key, DISPLAY_FORK_RECORD_LIMIT)?
+            .get_transcript_entry(&key, Some(DISPLAY_FORK_RECORD_LIMIT))?
             .ok_or(Error::Corrupt)?;
         decode_entry(link, &stored.value)?;
         Ok((key, stored.version))
@@ -189,7 +190,7 @@ impl<'a> Transcript<'a> {
             let key = entry_key(link.id);
             let stored = self
                 .store
-                .get_bounded(&key, DISPLAY_FORK_RECORD_LIMIT)?
+                .get_transcript_entry(&key, Some(DISPLAY_FORK_RECORD_LIMIT))?
                 .ok_or(Error::Corrupt)?;
             let entry = decode_entry(link, &stored.value)?;
             checks.push(Check {
@@ -683,9 +684,10 @@ impl<'a> Transcript<'a> {
             TEST_UNBOUNDED_ENTRY_READS.with(|count| count.set(count.get() + 1));
         }
         let stored = if bounded {
-            self.store.get_bounded(&key, DISPLAY_FORK_RECORD_LIMIT)?
+            self.store
+                .get_transcript_entry(&key, Some(DISPLAY_FORK_RECORD_LIMIT))?
         } else {
-            self.store.get(&key)?
+            self.store.get_transcript_entry(&key, None)?
         }
         .ok_or(Error::Corrupt)?;
         #[cfg(test)]
@@ -815,6 +817,69 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn packing_keeps_forks_saved_positions_and_original_commit_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sqlite");
+        let db = Store::open(&path).unwrap();
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let first = json!({"body":"verified history ".repeat(400)});
+        let second = json!({"body":"shared history ".repeat(400)});
+        create(&db, parent);
+        append(&db, parent, first.clone());
+        append(&db, parent, second.clone());
+        let source = Transcript::new(&db, parent);
+        let saved = source.snapshot().unwrap();
+        let (key, version) = source.entry_evidence(&saved).unwrap();
+        let original_commit = db.commit_for_version(&key, version).unwrap();
+        let raw_bytes = db.get(&key).unwrap().unwrap().value.len();
+
+        commit(&db, source.prepare_fork(child).unwrap());
+        let child_cursor = Transcript::new(&db, child).snapshot().unwrap();
+        let start = db.transcript_packing_start().unwrap();
+        let late = json!({"body":"written after the pass started ".repeat(400)});
+        append(&db, child, late.clone());
+        let late_head = Transcript::new(&db, child).snapshot().unwrap();
+        let (late_key, _) = Transcript::new(&db, child)
+            .entry_evidence(&late_head)
+            .unwrap();
+        let late_raw = db.get(&late_key).unwrap().unwrap();
+
+        let mut cursor = Some(start);
+        let mut packed = 0;
+        let mut saved_bytes = 0;
+        while let Some(position) = cursor {
+            let page = db.pack_transcript_history(&position, 1).unwrap();
+            packed += page.packed;
+            saved_bytes += page.reclaimed_bytes;
+            cursor = page.next;
+        }
+        assert_eq!(packed, 2);
+        assert!(saved_bytes > 8_000);
+        assert!(db.get(&key).unwrap().unwrap().value.len() < raw_bytes);
+        assert!(db.get_transcript_entry(&key, Some(raw_bytes - 1)).is_err());
+        assert_eq!(db.get(&late_key).unwrap().unwrap(), late_raw);
+        assert_eq!(
+            source.entry_evidence(&saved).unwrap(),
+            (key.clone(), version)
+        );
+        assert_eq!(
+            db.commit_for_version(&key, version).unwrap(),
+            original_commit
+        );
+
+        drop(db);
+        let db = Store::open(path).unwrap();
+        assert_eq!(
+            read_all(&Transcript::new(&db, parent), saved, 1),
+            vec![second.clone(), first.clone()]
+        );
+        let child = Transcript::new(&db, child);
+        assert_eq!(read_all(&child, child_cursor, 1), vec![second, first]);
+        assert_eq!(read_all(&child, late_head, 1)[0], late);
+    }
 
     fn commit(db: &Store, batch: Batch) {
         db.commit(&batch.checks, &batch.mutations).unwrap();

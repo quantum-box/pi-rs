@@ -13,6 +13,9 @@ use crate::{
     recovery::{ReplayPolicy, ToolRecovery, UncertainPolicy, recover_tool},
     retry_policy::{Decision, Failure, RetryPolicy, RetryState, StopReason, is_context_overflow},
 };
+pub use durable_store::transcript_packing::{
+    PackingCursor as TranscriptPackingCursor, PackingPage as TranscriptPackingPage,
+};
 use durable_store::{
     Check, Expected, Mutation,
     owner::{OwnedStore, OwnerError},
@@ -14380,6 +14383,22 @@ impl Harness {
         }
     }
 
+    /// Capture the upper version of an explicit history-packing pass.
+    pub fn transcript_packing_start(&self) -> Result<TranscriptPackingCursor, Error> {
+        Ok(self.subagent_store()?.transcript_packing_start()?)
+    }
+
+    /// Pack one bounded page of immutable transcript entries.
+    pub fn pack_transcript_history(
+        &self,
+        cursor: &TranscriptPackingCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<TranscriptPackingPage, Error> {
+        Ok(self
+            .subagent_store()?
+            .pack_transcript_history(cursor, limit.get())?)
+    }
+
     /// Reclaim at most `limit` attempt-local progress snapshots for a settled
     /// task. The caller chooses which terminal tasks to retain for inspection.
     /// Repeat while a full batch is returned. Published transcript, results,
@@ -24391,6 +24410,18 @@ impl Scheduler {
         self.harness
             .prune_finished_checkpointable_progress(task, limit)
     }
+    pub fn transcript_packing_start(&self) -> Result<TranscriptPackingCursor, Error> {
+        self.harness.transcript_packing_start()
+    }
+
+    pub fn pack_transcript_history(
+        &self,
+        cursor: &TranscriptPackingCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<TranscriptPackingPage, Error> {
+        self.harness.pack_transcript_history(cursor, limit)
+    }
+
     pub fn progress_history_from_now(
         &self,
         conversation: Uuid,
