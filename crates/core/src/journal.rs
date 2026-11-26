@@ -2612,7 +2612,7 @@ impl Session {
 
     pub fn append_bash_execution(&mut self, execution: crate::BashExecution) -> Result<()> {
         self.ensure_settled()?;
-        self.record_bash_result(execution)
+        self.record_bash_result(execution, None)
     }
 
     /// Append extension data without adding a message to the model context.
@@ -2635,12 +2635,21 @@ impl Session {
     /// An interrupted tool can still await reconciliation. Its eventual result
     /// is projected beside its tool call, before this shell output.
     pub fn append_local_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {
+        self.append_local_bash_result_with_output_error(execution, None)
+    }
+
+    #[doc(hidden)]
+    pub fn append_local_bash_result_with_output_error(
+        &mut self,
+        execution: crate::BashExecution,
+        full_output_error: Option<&str>,
+    ) -> Result<()> {
         if self.host_binding().is_some() {
             return Err(Error::Session(
                 "a managed session must record shell output through its host".into(),
             ));
         }
-        self.record_bash_result(execution)
+        self.record_bash_result(execution, full_output_error)
     }
 
     /// Record background cache usage only on the session and branch that sent it.
@@ -2711,12 +2720,19 @@ impl Session {
         })
     }
 
-    fn record_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {
+    fn record_bash_result(
+        &mut self,
+        execution: crate::BashExecution,
+        full_output_error: Option<&str>,
+    ) -> Result<()> {
+        let metadata = execution
+            .output_save_error(full_output_error)
+            .map(|error| serde_json::json!({"fullOutputError":error}));
         let event = Event::BashExecution { execution };
         if serde_json::to_vec(&event)?.len() > 8 * 1024 * 1024 {
             return Err(Error::Config("shell execution exceeds size limit".into()));
         }
-        self.append(event)?;
+        self.append_with_advisory_metadata(event, metadata)?;
         Ok(())
     }
 
@@ -3077,6 +3093,9 @@ impl Session {
                 continue;
             }
             if entry["type"] == "label" {
+                if verified_conversions.get(&record.id) == Some(&0) {
+                    continue;
+                }
                 let paired = branch.get(index + 1).is_some_and(|next| {
                     next.parent == Some(record.id) && next.timestamp == record.timestamp
                         && next.run_id.is_none()
@@ -3247,6 +3266,22 @@ impl Session {
                         }
                     }
                     if entry["type"] == "compaction"
+                        && let Some(source) = source_ids.get(&original_id)
+                        && let Some(count) = verified_conversions
+                            .get(&original_id)
+                            .filter(|&&count| count > 0)
+                        && matches!(
+                            &self.records[(original_id + count - 1) as usize].event,
+                            Event::Compacted {
+                                retain_from: None,
+                                ..
+                            }
+                        )
+                    {
+                        // A verified no-retention compaction is self-contained
+                        // in the fork even when its raw boundary was a sibling.
+                        entry["firstKeptEntryId"] = serde_json::json!(source);
+                    } else if entry["type"] == "compaction"
                         && let Some(old) = entry["firstKeptEntryId"].as_str()
                         && let Some(label_id) = source_labels.get(old)
                     {
@@ -3907,6 +3942,19 @@ fn publish_snapshot(
     Ok(())
 }
 
+/// Request ID of a journal marker for a display-only cancelled turn partial.
+#[doc(hidden)]
+pub fn aborted_turn_partial_request(event: &Event) -> Option<Uuid> {
+    match event {
+        Event::SourceEntry { format, entry } if format == "pi-rs:aborted-turn-partial" => {
+            entry["requestId"]
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+        }
+        _ => None,
+    }
+}
+
 /// Whether a completion is a marked, display-only cancelled turn partial.
 #[doc(hidden)]
 pub fn is_aborted_turn_partial(records: &[Record], record: &Record) -> bool {
@@ -3926,10 +3974,7 @@ pub fn is_aborted_turn_partial(records: &[Record], record: &Record) -> bool {
     else {
         return false;
     };
-    matches!(&parent.event, Event::SourceEntry { format, entry }
-        if format == "pi-rs:aborted-turn-partial"
-            && entry["requestId"].as_str().and_then(|id| Uuid::parse_str(id).ok()) == Some(*request_id)
-            && !partial.is_empty())
+    aborted_turn_partial_request(&parent.event) == Some(*request_id) && !partial.is_empty()
 }
 
 fn validate_context_edit(
@@ -5590,6 +5635,60 @@ mod record_metadata_tests {
         drop(share);
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.record_metadata(id), Some(&metadata));
+    }
+
+    #[test]
+    fn user_shell_save_error_is_advisory_for_legacy_stores() {
+        struct LegacyStore(MemoryStore);
+
+        impl SessionStore for LegacyStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.0.load()
+            }
+
+            fn append(&mut self, record: &Record) -> Result<()> {
+                self.0.append(record)
+            }
+        }
+
+        let execution = crate::BashExecution {
+            command: "fixture".into(),
+            output: "bounded tail".into(),
+            exit_code: Some(19),
+            cancelled: false,
+            truncated: true,
+            full_output_path: None,
+            exclude_from_context: false,
+        };
+        let mut legacy = Session::with_store(LegacyStore(MemoryStore::default())).unwrap();
+        legacy
+            .append_local_bash_result_with_output_error(execution.clone(), Some("disk full"))
+            .unwrap();
+        let record = legacy.records().last().unwrap();
+        assert!(matches!(&record.event, Event::BashExecution { execution }
+            if execution.exit_code == Some(19) && execution.output == "bounded tail"));
+        assert!(legacy.record_metadata(record.id).is_none());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append_local_bash_result_with_output_error(execution, Some("disk full"))
+            .unwrap();
+        let id = session.head();
+        drop(session);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(
+            reopened.record_metadata(id),
+            Some(&serde_json::json!({"fullOutputError":"disk full"}))
+        );
+        assert_eq!(
+            {
+                let fork = reopened.fork_session(id).unwrap();
+                fork.record_metadata(fork.head()).cloned()
+            },
+            reopened.record_metadata(id).cloned()
+        );
     }
 
     #[test]

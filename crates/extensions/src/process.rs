@@ -1162,13 +1162,25 @@ impl Extension for ExecutableExtension {
         state: Option<&ExtensionState>,
         host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<Option<pi_rs_core::UserBashResult>> {
-        if !self.description.user_bash_hook_host_calls {
-            return self.user_bash(event, state).await;
-        }
+        Ok(self
+            .user_bash_with_output_error(event, state, host)
+            .await?
+            .map(|result| result.result))
+    }
+
+    async fn user_bash_with_output_error(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&pi_rs_core::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<pi_rs_core::UserBashResultWithOutputError>> {
         let request = ProtocolRequest::UserBash {
             event: event.clone(),
             state: state.cloned(),
         };
+        if !self.description.user_bash_hook_host_calls {
+            return self.request_async(request).await;
+        }
         let path = self.endpoint.clone();
         let guard = CancelOnDrop(CancellationToken::new());
         let cancelled = guard.0.clone();
@@ -3296,6 +3308,8 @@ fn call_duplex_inner<T: serde::de::DeserializeOwned>(
         }
     });
     let (sender, frames) = std::sync::mpsc::sync_channel(1);
+    let ui_requester = cancellation.child_token();
+    let reader_requester = ui_requester.clone();
     std::thread::spawn(move || {
         let mut output = std::io::BufReader::new(output);
         loop {
@@ -3313,6 +3327,11 @@ fn call_duplex_inner<T: serde::de::DeserializeOwned>(
                     | DuplexFrame::Ui { .. }
                     | DuplexFrame::Progress { .. })
             );
+            // A host UI request may be waiting before the frame receiver can
+            // consume EOF or a completion. Publish closure before queuing it.
+            if terminal {
+                reader_requester.cancel();
+            }
             if sender.send(frame).is_err() || terminal {
                 break;
             }
@@ -3442,13 +3461,15 @@ fn call_duplex_inner<T: serde::de::DeserializeOwned>(
             }
             Ok(Ok(DuplexFrame::Call { .. })) => unreachable!("call frames are prevalidated"),
             Ok(Ok(DuplexFrame::Ui { request })) => {
+                let needs_response = request.needs_response();
                 let response = runtime.block_on(async {
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => Err("native extension cancelled during UI request".to_owned()),
-                        result = host.ui(request) => result,
+                        _ = ui_requester.cancelled(), if needs_response => Err("native extension disconnected during UI request".to_owned()),
+                        result = pi_rs_core::with_ui_requester_cancellation(ui_requester.clone(), host.ui(request)) => Ok(result),
                     }
-                });
+                })?;
                 send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
             }
             Ok(Ok(DuplexFrame::Complete { response })) => {
