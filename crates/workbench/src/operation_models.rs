@@ -2125,12 +2125,15 @@ mod tests {
                     assert_eq!(data["stopReason"], "error", "{data}");
                     assert_eq!(data["answers"], json!({}));
                     let error = data["errorMessage"].as_str().unwrap();
-                    assert!(error.contains(&format!("HTTP {status}")), "{data}");
-                    if status == 503 {
-                        assert!(error.contains("gateway_unavailable"), "{data}");
-                        assert!(error.contains("[redacted]"), "{data}");
-                        assert!(!error.contains("radius-fixture-key"), "{data}");
-                    }
+                    let code = if status == 503 {
+                        " (service_unavailable)"
+                    } else {
+                        ""
+                    };
+                    assert_eq!(
+                        error,
+                        format!("model: Pi Decision returned HTTP {status}{code}")
+                    );
                 }
                 let gateway = super::super::radius_auth::Gateway::configured().unwrap();
                 let auth_path = super::super::config::agent_dir().join("auth.json");
@@ -2291,7 +2294,11 @@ mod tests {
                             "responseId":"fixture-decision","usage":{"input":3,"output":1}})
                         .to_string(),
                         503 => json!({"error":{
-                            "code":"gateway_unavailable","message":format!("rejected token {key}")
+                            "code":"service_unavailable","message":format!("rejected token {key}")
+                        }})
+                        .to_string(),
+                        404 => json!({"error":{
+                            "code":"gateway_unavailable","message":"unrecognized diagnostic"
                         }})
                         .to_string(),
                         _ => String::new(),
