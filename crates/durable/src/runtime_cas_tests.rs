@@ -3050,6 +3050,133 @@ fn position_fork_uses_the_occurrence_commit_not_an_earlier_reference() {
 }
 
 #[test]
+fn session_labels_follow_visible_entries_and_current_bookmarks_at_a_historical_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let id = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let append_message = |harness: &mut Harness, content: &str| {
+        let (mut state, version) = harness.load(id).unwrap();
+        state.messages.push(Message::User {
+            content: content.into(),
+        });
+        harness.save(&state, Expected::Version(version)).unwrap();
+        harness
+            .session_entries(
+                &harness.session_entries_start(id).unwrap(),
+                std::num::NonZeroUsize::MIN,
+            )
+            .unwrap()
+            .entries[0]
+            .id()
+    };
+    let retained = append_message(&mut harness, "retained");
+    let deleted = append_message(&mut harness, "label will clear");
+    let first_change = harness
+        .set_session_label(id, deleted, Some("temporary"))
+        .unwrap();
+    let historical = harness.set_session_name(id, "cut here").unwrap();
+    let original_capture = harness.session_entries_start(id).unwrap();
+    let outside = append_message(&mut harness, "after cut");
+    harness.set_session_label(id, deleted, Some("")).unwrap();
+    harness
+        .set_session_label(id, retained, Some("keep me"))
+        .unwrap();
+    harness
+        .set_session_label(id, outside, Some("outside"))
+        .unwrap();
+    assert!(
+        harness
+            .set_session_label(id, Uuid::new_v4(), Some("unknown"))
+            .is_err()
+    );
+
+    let child = harness.fork_by_entry_id(id, historical).unwrap();
+    let copied = harness
+        .session_labels(&harness.session_entries_start(child).unwrap())
+        .unwrap();
+    assert_eq!(copied.len(), 1);
+    assert_eq!(copied[0].target_id, retained);
+    assert_eq!(copied[0].label.as_deref(), Some("keep me"));
+    assert!(
+        harness
+            .set_session_label(child, outside, Some("hidden"))
+            .is_err()
+    );
+    let via_label = harness.fork_by_entry_id(child, copied[0].id).unwrap();
+
+    drop(harness);
+    let harness = Harness::open_paused(&path, options()).unwrap();
+    for branch in [child, via_label] {
+        let state = harness.conversation(branch).unwrap();
+        assert_eq!(state.session_name(), Some("cut here"));
+        assert_eq!(state.messages.len(), 2);
+        let labels = harness
+            .session_labels(&harness.session_entries_start(branch).unwrap())
+            .unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].target_id, retained);
+    }
+    let previous = harness.session_labels(&original_capture).unwrap();
+    assert_eq!(previous.len(), 1);
+    assert_eq!(previous[0].id, first_change);
+    assert_eq!(previous[0].label.as_deref(), Some("temporary"));
+}
+
+#[test]
+fn session_label_commits_merge_with_an_inflight_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    harness.submit(id, None, "question".into()).unwrap();
+    let target = harness
+        .session_entries(
+            &harness.session_entries_start(id).unwrap(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .unwrap()
+        .entries[0]
+        .id();
+
+    let mut worker = harness.worker();
+    let (mut candidate, baseline) = worker.load(id).unwrap();
+    candidate.messages.push(Message::Assistant {
+        content: "answer".into(),
+        calls: Vec::new(),
+        replay: None,
+    });
+    let change = harness
+        .set_session_label(id, target, Some("bookmark"))
+        .unwrap();
+    worker
+        .save(&candidate, Expected::Version(baseline))
+        .unwrap();
+
+    let cursor = harness.session_entries_start(id).unwrap();
+    let labels = harness.session_labels(&cursor).unwrap();
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].id, change);
+    let entries = harness
+        .session_entries(&cursor, std::num::NonZeroUsize::new(4).unwrap())
+        .unwrap();
+    assert_eq!(entries.entries.len(), 3);
+    assert_eq!(entries.entries[1].id(), change);
+    assert_eq!(harness.conversation(id).unwrap().messages.len(), 2);
+}
+
+#[test]
 fn session_info_is_append_only_and_forks_at_its_original_revision() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

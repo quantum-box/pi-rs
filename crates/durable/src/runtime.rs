@@ -1368,6 +1368,12 @@ pub struct Conversation {
     pub config: Config,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_info: Option<SessionInfoEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_session_label: Option<SessionLabelEntry>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    has_session_labels: bool,
+    #[serde(skip)]
+    forked_session_labels: Vec<SessionLabelEntry>,
     #[serde(default)]
     pub queue_modes: QueueModes,
     #[serde(default)]
@@ -2803,12 +2809,26 @@ pub struct SessionInfoEntry {
     pub name: Option<String>,
 }
 
+/// An append-only bookmark change. An empty label removes the bookmark.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLabelEntry {
+    pub id: Uuid,
+    pub target_id: Uuid,
+    pub label: Option<String>,
+    pub timestamp_ms: i64,
+}
+
 /// An original entry in the committed session history.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionEntry {
     Message(SessionMessageEntry),
     SessionInfo {
         entry: SessionInfoEntry,
+        origin: Uuid,
+        observation: crate::observer::Cursor,
+    },
+    Label {
+        entry: SessionLabelEntry,
         origin: Uuid,
         observation: crate::observer::Cursor,
     },
@@ -2819,6 +2839,7 @@ impl SessionEntry {
         match self {
             Self::Message(entry) => entry.history.id,
             Self::SessionInfo { entry, .. } => entry.id,
+            Self::Label { entry, .. } => entry.id,
         }
     }
 }
@@ -2829,6 +2850,12 @@ pub struct SessionEntryCursor(SessionMessageCursor);
 pub struct SessionEntryPage {
     pub entries: Vec<SessionEntry>,
     pub older: Option<SessionEntryCursor>,
+}
+
+#[derive(Default)]
+struct SessionLabelProjection {
+    targets: HashSet<Uuid>,
+    latest: std::collections::BTreeMap<Uuid, SessionLabelEntry>,
 }
 
 pub struct PositionedViewPage {
@@ -3855,6 +3882,7 @@ pub enum ForkBoundary {
     Observation,
     Message { entry_id: Uuid },
     SessionInfo { entry_id: Uuid },
+    Label { entry_id: Uuid },
     Application { entry_id: Uuid },
     Display { entry_id: Uuid },
 }
@@ -7215,6 +7243,8 @@ impl Harness {
                     // Settings changes can race external model/tool calls. Preserve the
                     // newest values; boundary commits retry selection separately.
                     state.session_info = latest.session_info.clone();
+                    state.last_session_label = latest.last_session_label.clone();
+                    state.has_session_labels = latest.has_session_labels;
                     state.queue_modes = latest.queue_modes;
                     state.after_failed_run = latest.after_failed_run;
                     for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
@@ -8339,6 +8369,13 @@ impl Harness {
         {
             event["session_info"] = serde_json::to_value(info)?;
         }
+        if expected == Expected::Missing && !state.forked_session_labels.is_empty() {
+            event["session_labels"] = serde_json::to_value(&state.forked_session_labels)?;
+        } else if let Some(label) = state.last_session_label.as_ref()
+            && old.is_some_and(|old| old.last_session_label.as_ref() != Some(label))
+        {
+            event["session_labels"] = serde_json::to_value([label])?;
+        }
         append.set_value(&event)?;
         let fork_key = format!("runtime/fork/{}/{:020}", state.id, append.cursor.0).into_bytes();
         let fork_snapshot = crate::fork::Snapshot {
@@ -8920,6 +8957,48 @@ impl Harness {
         }
     }
 
+    /// Append a bookmark change to a visible session entry. An empty label clears it.
+    pub fn set_session_label(
+        &mut self,
+        id: Uuid,
+        target: Uuid,
+        label: Option<&str>,
+    ) -> Result<Uuid, Error> {
+        let entry = SessionLabelEntry {
+            id: Uuid::new_v4(),
+            target_id: target,
+            label: label.filter(|value| !value.is_empty()).map(str::to_owned),
+            timestamp_ms: (self.clock)(),
+        };
+        loop {
+            let (mut state, version) = self.load(id)?;
+            let mut cursor = Some(self.session_entries_start(id)?);
+            let mut found = false;
+            while let Some(position) = cursor {
+                let page =
+                    self.session_entries(&position, std::num::NonZeroUsize::new(64).unwrap())?;
+                if page.entries.iter().any(|item| item.id() == target) {
+                    found = true;
+                    break;
+                }
+                cursor = page.older;
+            }
+            if !found {
+                return Err(crate::fork::Error::InvalidCursor.into());
+            }
+            state.last_session_label = Some(entry.clone());
+            state.has_session_labels = true;
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&state, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                other => return other.map(|()| entry.id),
+            }
+        }
+    }
+
     /// Persist delivery modes, including while a run is active. Each boundary reads the latest values.
     pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
         loop {
@@ -8968,6 +9047,9 @@ impl Harness {
             id,
             config,
             session_info: None,
+            last_session_label: None,
+            has_session_labels: false,
+            forked_session_labels: Vec::new(),
             queue_modes: QueueModes::default(),
             after_failed_run: AfterFailedRun::default(),
             extensions: vec![],
@@ -9046,6 +9128,8 @@ impl Harness {
         state.id = child;
         // This is a new task-owned session, not a user-visible history fork.
         state.session_info = None;
+        state.last_session_label = None;
+        state.has_session_labels = false;
         state.context_generation = Some(Uuid::new_v4());
         state.extensions.retain(|name| {
             !name.starts_with(crate::subagent_management::EXTENSION_PREFIX)
@@ -9170,8 +9254,13 @@ impl Harness {
         if !state.content_blocks.is_empty() {
             crate::fork::validate_context(&state.messages)?;
         }
+        if state.has_session_labels {
+            state.forked_session_labels =
+                self.fork_session_labels(id, id, observation, &ForkBoundary::Observation)?;
+        }
         state.tool_attempt = None;
         state.id = Uuid::new_v4();
+        state.last_session_label = None;
         state.context_generation = Some(Uuid::new_v4());
         state.active = None;
         state.abort_requested = false;
@@ -9289,7 +9378,13 @@ impl Harness {
         evidence: &[Check],
         membership: &crate::session_membership::ForkMembershipProof,
     ) -> Result<Uuid, Error> {
-        self.load(id)?;
+        let (source, _) = self.load(id)?;
+        let has_session_labels = if membership.parent() == id {
+            source.has_session_labels
+        } else {
+            self.load(membership.parent())?.0.has_session_labels
+        };
+        drop(source);
         if cursor.0 == 0 {
             return Err(crate::fork::Error::InvalidCursor.into());
         }
@@ -9514,6 +9609,11 @@ impl Harness {
         }
         let record = crate::observer::Record { cursor, value };
         let point = crate::fork::extract_cut(id, &record)?;
+        let forked_session_labels = if has_session_labels {
+            self.fork_session_labels(membership.parent(), id, cursor, &boundary)?
+        } else {
+            Vec::new()
+        };
         let state = Conversation {
             id: Uuid::new_v4(),
             session_info: point
@@ -9522,6 +9622,9 @@ impl Harness {
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()?
                 .flatten(),
+            last_session_label: None,
+            has_session_labels,
+            forked_session_labels,
             config: point.config,
             queue_modes: point
                 .documents
@@ -10564,7 +10667,14 @@ impl Harness {
         let (entries, older) = self.session_history_page(
             cursor,
             limit,
-            |source, observation| self.session_messages_in_observation(source, observation),
+            false,
+            |source, observation, skip_messages| {
+                if skip_messages {
+                    Ok(Vec::new())
+                } else {
+                    self.session_messages_in_observation(source, observation)
+                }
+            },
             |entry| entry.history.id,
         )?;
         Ok(SessionMessagePage { entries, older })
@@ -10584,7 +10694,10 @@ impl Harness {
         let (entries, older) = self.session_history_page(
             &cursor.0,
             limit,
-            |source, observation| self.session_entries_in_observation(source, observation),
+            true,
+            |source, observation, skip_messages| {
+                self.session_entries_in_observation(source, observation, skip_messages)
+            },
             SessionEntry::id,
         )?;
         Ok(SessionEntryPage {
@@ -10593,11 +10706,116 @@ impl Harness {
         })
     }
 
+    /// Resolve the active bookmarks in this captured session history.
+    pub fn session_labels(
+        &self,
+        cursor: &SessionEntryCursor,
+    ) -> Result<Vec<SessionLabelEntry>, Error> {
+        if cursor.0.consumed != 0
+            || cursor.0.source != cursor.0.conversation
+            || cursor.0.cutoff.is_some()
+        {
+            return Err(crate::fork::Error::InvalidCursor.into());
+        }
+        let view = self.session_label_projection(cursor.clone(), &HashSet::new())?;
+        Ok(view
+            .latest
+            .into_values()
+            .filter(|change| change.label.is_some())
+            .collect())
+    }
+
+    fn session_label_projection(
+        &self,
+        cursor: SessionEntryCursor,
+        targets: &HashSet<Uuid>,
+    ) -> Result<SessionLabelProjection, Error> {
+        let mut view = SessionLabelProjection::default();
+        let mut cursor = Some(cursor);
+        while let Some(position) = cursor {
+            let page = self.session_entries(&position, std::num::NonZeroUsize::new(64).unwrap())?;
+            for item in page.entries {
+                match item {
+                    SessionEntry::Label { entry, .. } => {
+                        view.latest.entry(entry.target_id).or_insert(entry);
+                    }
+                    _ if targets.contains(&item.id()) => {
+                        view.targets.insert(item.id());
+                    }
+                    _ => {}
+                }
+            }
+            cursor = page.older;
+        }
+        Ok(view)
+    }
+
+    // Upstream copies the latest labels of entries retained by a fork. History
+    // before the cut is already inherited, so only append changed labels here,
+    // including clears. Commit them with the new conversation's first record.
+    fn fork_session_labels(
+        &self,
+        parent: Uuid,
+        origin: Uuid,
+        observation: crate::observer::Cursor,
+        boundary: &ForkBoundary,
+    ) -> Result<Vec<SessionLabelEntry>, Error> {
+        let cut = self.original_session_cut(ForkParent {
+            conversation: parent,
+            source: origin,
+            source_observation: observation.0,
+            boundary: boundary.clone(),
+        })?;
+        let current =
+            self.session_label_projection(self.session_entries_start(parent)?, &HashSet::new())?;
+        let targets = current.latest.keys().copied().collect();
+        let older = self.session_label_projection(
+            SessionEntryCursor(SessionMessageCursor {
+                conversation: parent,
+                source: cut.source,
+                observation: cut.source_observation,
+                consumed: 0,
+                cutoff: match cut.boundary {
+                    ForkBoundary::Message { entry_id } | ForkBoundary::Label { entry_id } => {
+                        Some(entry_id)
+                    }
+                    _ => None,
+                },
+            }),
+            &targets,
+        )?;
+        let mut changes = Vec::new();
+        for (target, mut change) in current.latest {
+            let previous = older.latest.get(&target);
+            if !older.targets.contains(&target) {
+                // The raw prefix remains visible to history readers, but the
+                // fork's bookmarks only refer to retained non-label entries.
+                if previous.is_some_and(|previous| previous.label.is_some()) {
+                    change.label = None;
+                } else {
+                    continue;
+                }
+            }
+            let same = match previous {
+                Some(previous) => {
+                    previous.label == change.label && previous.timestamp_ms == change.timestamp_ms
+                }
+                None => change.label.is_none(),
+            };
+            if !same {
+                change.id = Uuid::new_v4();
+                changes.push(change);
+            }
+        }
+        Ok(changes)
+    }
+
     fn session_history_page<E>(
         &self,
         cursor: &SessionMessageCursor,
         limit: std::num::NonZeroUsize,
-        read_entries: impl Fn(Uuid, u64) -> Result<Vec<E>, Error>,
+        include_labels: bool,
+        read_entries: impl Fn(Uuid, u64, bool) -> Result<Vec<E>, Error>,
         entry_id: impl Fn(&E) -> Uuid,
     ) -> Result<(Vec<E>, Option<SessionMessageCursor>), Error> {
         if limit.get() > 256 {
@@ -10624,17 +10842,16 @@ impl Harness {
                 position.observation = parent.source_observation;
                 position.cutoff = match parent.boundary {
                     ForkBoundary::Message { entry_id } => Some(entry_id),
+                    ForkBoundary::Label { entry_id } if include_labels => Some(entry_id),
                     _ => None,
                 };
             }
             // A fork's initial record can be a copied context with new
             // local IDs. Its source supplies the original occurrences.
+            let skip_seed_messages =
+                position.observation == 1 && self.fork_parent(position.source)?.is_some();
             let mut messages =
-                if position.observation == 1 && self.fork_parent(position.source)?.is_some() {
-                    Vec::new()
-                } else {
-                    read_entries(position.source, position.observation)?
-                };
+                read_entries(position.source, position.observation, skip_seed_messages)?;
             if let Some(cutoff) = position.cutoff {
                 let index = messages
                     .iter()
@@ -10752,13 +10969,17 @@ impl Harness {
         &self,
         source: Uuid,
         observation: u64,
+        skip_seed_messages: bool,
     ) -> Result<Vec<SessionEntry>, Error> {
         let record = self.session_observation(source, observation)?;
-        let mut entries: Vec<_> = self
-            .session_messages_from_record(source, &record)?
-            .into_iter()
-            .map(SessionEntry::Message)
-            .collect();
+        let mut entries = Vec::new();
+        if !skip_seed_messages {
+            entries.extend(
+                self.session_messages_from_record(source, &record)?
+                    .into_iter()
+                    .map(SessionEntry::Message),
+            );
+        }
         if let Some(info) = record.value.get("session_info") {
             self.authenticate_fork_anchor(source, observation)?;
             entries.push(SessionEntry::SessionInfo {
@@ -10766,6 +10987,15 @@ impl Harness {
                 origin: source,
                 observation: record.cursor,
             });
+        }
+        if let Some(labels) = record.value.get("session_labels") {
+            self.authenticate_fork_anchor(source, observation)?;
+            let labels: Vec<SessionLabelEntry> = serde_json::from_value(labels.clone())?;
+            entries.extend(labels.into_iter().map(|entry| SessionEntry::Label {
+                entry,
+                origin: source,
+                observation: record.cursor,
+            }));
         }
         Ok(entries)
     }
@@ -10869,7 +11099,7 @@ impl Harness {
         Ok(batches.into_iter().rev().flatten().collect())
     }
 
-    /// Fork at a session-info entry or original message occurrence.
+    /// Fork at a bookmark change, session-info entry or original message occurrence.
     /// Interior messages require a proven safe append. Inherited entries must
     /// be visible in the shared chain or recorded session ancestry and have a
     /// verified origin snapshot. Local observations are scanned across resets.
@@ -11148,6 +11378,21 @@ impl Harness {
                         origin,
                         observation,
                         ForkBoundary::SessionInfo { entry_id },
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                        &membership,
+                    ),
+                    SessionEntry::Label {
+                        origin,
+                        observation,
+                        ..
+                    } => self.fork_at_selected(
+                        origin,
+                        observation,
+                        ForkBoundary::Label { entry_id },
                         None,
                         None,
                         None,
@@ -24720,6 +24965,22 @@ impl Scheduler {
         self.harness.set_session_name(id, name)
     }
 
+    pub fn set_session_label(
+        &mut self,
+        id: Uuid,
+        target: Uuid,
+        label: Option<&str>,
+    ) -> Result<Uuid, Error> {
+        self.harness.set_session_label(id, target, label)
+    }
+
+    pub fn session_labels(
+        &self,
+        cursor: &SessionEntryCursor,
+    ) -> Result<Vec<SessionLabelEntry>, Error> {
+        self.harness.session_labels(cursor)
+    }
+
     pub fn session_entries_start(&self, id: Uuid) -> Result<SessionEntryCursor, Error> {
         self.harness.session_entries_start(id)
     }
@@ -27934,8 +28195,10 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         .and_then(|v| v.remove("after_failed_run"));
     new.as_object_mut()
         .and_then(|v| v.remove("after_failed_run"));
-    old.as_object_mut().and_then(|v| v.remove("session_info"));
-    new.as_object_mut().and_then(|v| v.remove("session_info"));
+    for key in ["session_info", "last_session_label", "has_session_labels"] {
+        old.as_object_mut().and_then(|v| v.remove(key));
+        new.as_object_mut().and_then(|v| v.remove(key));
+    }
     old.as_object_mut().and_then(|v| v.remove("queue_modes"));
     new.as_object_mut().and_then(|v| v.remove("queue_modes"));
     let old_submissions = old
@@ -35712,6 +35975,9 @@ mod scheduler_tests {
             id: Uuid::new_v4(),
             config: config(),
             session_info: None,
+            last_session_label: None,
+            has_session_labels: false,
+            forked_session_labels: Vec::new(),
             queue_modes: QueueModes::default(),
             after_failed_run: AfterFailedRun::default(),
             extensions: vec![],
