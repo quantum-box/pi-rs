@@ -874,6 +874,14 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
     assert_eq!(nodes.last().unwrap()["fromId"], *original_leaf);
     assert_eq!(nodes.last().unwrap()["parentId"], Value::Null);
     assert_eq!(nodes.len(), entries.len() + 1);
+    let fork = frames(rpc(
+        dir.path(),
+        &["--conversation", id],
+        &[json!({"type":"fork_at_entry","entryId":nodes.last().unwrap()["id"]})],
+    ));
+    assert_eq!(fork[0]["success"], true, "{fork:#?}");
+    assert_ne!(fork[0]["data"]["sessionId"], id);
+    assert_eq!(fork[0]["data"]["messages"][0], *summary);
 
     let mut cancelled = spawn_rpc(dir.path(), &["--conversation", id]);
     let mut stdin = cancelled.stdin.take().unwrap();

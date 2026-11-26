@@ -1367,6 +1367,11 @@ fn session_branch_summary_reopens_at_proven_interior_cut_and_fences_stale_plan()
     );
     h.checkout_session_entry(id, original).unwrap();
     assert_eq!(h.conversation(id).unwrap().messages.len(), 3);
+    let fork = h.fork_by_entry_id(id, summary_id).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().messages.last(),
+        Some(&summary.message())
+    );
     assert!(h.navigate_session_entry(id, summary_id).unwrap().is_none());
     assert_eq!(h.conversation(id).unwrap().messages.len(), 2);
 }

@@ -12108,7 +12108,15 @@ impl Harness {
                 }
                 last_reference = Some(reference.clone());
                 if record.value.get("session_checkout").is_some() {
-                    continue;
+                    // A normal checkout reuses another observation's transcript.
+                    // A summary checkout publishes one new, addressable occurrence.
+                    let Some(summary) = record.value.get("session_branch_summary") else {
+                        continue;
+                    };
+                    let summary: SessionBranchSummary = serde_json::from_value(summary.clone())?;
+                    if summary.id != entry_id {
+                        continue;
+                    }
                 }
                 let batch = transcript.read_with_blocks(&reference, std::num::NonZeroUsize::MIN)?;
                 let Some(batch) = batch.records.first() else {
