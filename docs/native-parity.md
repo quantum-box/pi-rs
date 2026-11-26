@@ -7451,8 +7451,11 @@ precedence of `pi-package.json`, Cargo metadata and Pi `package.json`. Explicit
 Pi `package.json` resource lists contribute themes only, as in the native CLI.
 Without an explicit resource list, discovery uses the conventional resource
 directories. The SDK supports package-relative paths and globs. `!` exclusions
-can match a basename or a literal directory subtree. Skill patterns can match
-the directory containing `SKILL.md`, including exact `+` and `-` overrides.
+can match a basename or a literal directory subtree. The SDK shares the
+native CLI's path, basename, glob and supported extglob matcher. Skill
+patterns can match the directory containing `SKILL.md`, including exact
+`+` and `-` overrides. Wildcards match the file or its containing directory.
+A literal directory path can select its subtree.
 Native skill discovery looks for `SKILL.md` and can include nested skill
 directories.
 For extensions, discovery starts with executable files directly inside

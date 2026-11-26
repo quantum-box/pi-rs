@@ -50,6 +50,8 @@ pub mod native_pi_messages;
 pub mod oauth_callback;
 #[doc(hidden)]
 pub mod package_manifest;
+#[doc(hidden)]
+pub mod package_pattern;
 pub mod package_resources;
 #[doc(hidden)]
 pub mod process_cleanup;

@@ -148,9 +148,28 @@ fn extension_discovery_uses_native_candidates_and_stem_overrides() {
             "extensions/nested/tool.exe",
             "tools/worker.exe"
         ]),
-        [nested, runner, elsewhere]
+        [nested, runner.clone(), elsewhere]
     );
-    assert_eq!(discover(&["helper"]), [helper]);
+    assert_eq!(
+        discover(&["extensions/@(helper|runner).exe"]),
+        [helper.clone(), runner]
+    );
+    #[cfg(unix)]
+    {
+        let helper = executable("extensions/helper");
+        let runner = executable("extensions/runner");
+        assert_eq!(discover(&["extensions/@(helper|runner)"]), [helper, runner]);
+    }
+    assert_eq!(discover(&["helper"]), {
+        #[cfg(unix)]
+        {
+            [root.join("extensions/helper"), helper].to_vec()
+        }
+        #[cfg(windows)]
+        {
+            vec![helper]
+        }
+    });
     assert!(discover(&[]).is_empty());
 }
 
@@ -162,6 +181,7 @@ fn skill_patterns_match_containing_directories_and_exact_overrides() {
     let public = write(root, "skills/public/SKILL.md", "");
     let internal = write(root, "skills/internal-guide/SKILL.md", "");
     let outside = write(root, "docs/additional/SKILL.md", "");
+    fs::create_dir(root.join("public")).unwrap();
     let discover = |patterns: &[&str]| {
         fs::write(&manifest, json!({"pi":{"skills":patterns}}).to_string()).unwrap();
         PackageResourcePaths::discover(&[root.to_owned()])
@@ -175,6 +195,10 @@ fn skill_patterns_match_containing_directories_and_exact_overrides() {
     );
     assert_eq!(discover(&["skills/*", "!internal-*"]), [public.clone()]);
     assert_eq!(discover(&["public"]), [public.clone()]);
+    let nested = write(root, "skills/public-guide/internal/SKILL.md", "");
+    assert!(discover(&["skills/public-*"]).is_empty());
+    assert_eq!(discover(&["skills/public-guide"]), [nested.clone()]);
+    fs::remove_file(nested).unwrap();
     assert_eq!(
         discover(&["!internal-*"]),
         [outside.clone(), public.clone()]
@@ -192,6 +216,29 @@ fn skill_patterns_match_containing_directories_and_exact_overrides() {
             "+docs/additional"
         ]),
         [outside, public]
+    );
+}
+
+#[test]
+fn package_wide_matching_preserves_the_sdk_depth_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let depth = std::iter::repeat_n("d", 65).collect::<Vec<_>>().join("/");
+    write(root, &format!("other/{depth}/SKILL.md"), "");
+    let skill = write(root, "skills/chosen/SKILL.md", "");
+    let manifest = write(
+        root,
+        "pi-package.json",
+        r#"{"pi":{"skills":["skills/chosen"]}}"#,
+    );
+    let discover = || PackageResourcePaths::discover(&[root.to_owned()]);
+    assert_eq!(discover().unwrap().skills, [skill]);
+    fs::write(manifest, r#"{"pi":{"skills":["**/SKILL.md"]}}"#).unwrap();
+    assert!(
+        discover()
+            .unwrap_err()
+            .to_string()
+            .contains("package directory scan limit exceeded")
     );
 }
 
