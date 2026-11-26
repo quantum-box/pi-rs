@@ -6125,6 +6125,17 @@ into their logical blocks, and encrypted blocks stay separate. Replay is
 bound to the original endpoint and model. A loopback RPC check exercised
 restart, encrypted-only thinking and a switch to a different model endpoint.
 
+### Terminal session restoration
+
+An interactive native session reports an OSC 7577 resume command when
+launched with `OSC7577_TOKEN` by a supporting terminal. The report contains
+the native executable, the absolute session journal path, and the working
+directory. Native journals are resumable as soon as their file exists.
+Session switches replace the report and returning from suspend refreshes it.
+A normal quit clears it so the session is not reopened on terminal restart.
+The token is removed before starting the runtime or child processes and is
+never written into the journal. Ephemeral sessions do not report a command.
+
 ### Terminal color capability
 
 In regular and fullscreen mode, a boolean `terminal.trueColor` takes precedence

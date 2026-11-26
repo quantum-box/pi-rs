@@ -49,6 +49,7 @@ mod operation_models;
 mod packages;
 mod pi_messages;
 mod process;
+mod program_resume;
 mod providers;
 mod vertex_auth;
 mod xai_auth;
@@ -1435,6 +1436,13 @@ fn run_durable_cli() -> Option<i32> {
 }
 
 fn main() {
+    let resume_token = std::env::var_os(program_resume::TOKEN_ENV);
+    if resume_token.is_some() {
+        // This is the binary entry point, before the runtime, other threads,
+        // or any child process starts. The token must never reach a child.
+        unsafe { std::env::remove_var(program_resume::TOKEN_ENV) };
+    }
+    let resume_token = resume_token.and_then(|token| token.into_string().ok());
     if let Some(code) = run_durable_cli() {
         std::process::exit(code);
     }
@@ -1444,13 +1452,13 @@ fn main() {
         std::thread::Builder::new()
             .name("pi".into())
             .stack_size(4 * 1024 * 1024)
-            .spawn(run_cli)
+            .spawn(move || run_cli(resume_token))
             .expect("start Pi runtime thread")
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     };
     #[cfg(not(windows))]
-    let code = run_cli();
+    let code = run_cli(resume_token);
     // Detached discovery threads may still be finishing. Wait for any token
     // rotation and prevent another one from starting before process exit.
     let _refreshes = process::stop_new_refreshes();
@@ -1464,7 +1472,7 @@ fn main() {
 const RPC_FILE_ARGUMENT_ERROR: &str = "Error: @file arguments are not supported in RPC mode";
 
 #[tokio::main(flavor = "current_thread")]
-async fn run_cli() -> i32 {
+async fn run_cli(resume_token: Option<String>) -> i32 {
     // Terminal-owned workers receive the same foreground-group SIGINT as the
     // frontend and editor. Their parent handles terminal interrupts and sends
     // explicit cancel/shutdown commands; do not independently stop the worker.
@@ -1769,7 +1777,7 @@ async fn run_cli() -> i32 {
         let mcp_login = args.list_models.is_none() && matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }));
         let standalone_share = args.list_models.is_none() && matches!(&args.command, Some(Command::Share));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx)));
+        let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx), resume_token));
         if managed {
             tokio::select! {
                 biased;
@@ -1912,6 +1920,7 @@ async fn execute(
     mut args: Cli,
     output_truncated: &mut bool,
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+    resume_token: Option<String>,
 ) -> Result<()> {
     let pi_style_invocation = args.command.is_none();
     let patterns: Vec<_> = if let Some(patterns) = &args.models {
@@ -2270,7 +2279,7 @@ async fn execute(
     );
     let mut command = args.command.take().unwrap_or(Command::Interactive);
     if matches!(command, Command::Interactive) {
-        return interactive::run(args, follow_up_prompts, ready).await;
+        return interactive::run(args, follow_up_prompts, ready, resume_token).await;
     }
     if !matches!(&command, Command::Share)
         && let Some(parent) = args

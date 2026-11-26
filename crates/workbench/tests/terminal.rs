@@ -555,6 +555,121 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
 }
 
 #[test]
+fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use sha2::{Digest, Sha256};
+
+    const TOKEN: &str = "terminal-test-token";
+    const PREFIX: &str = "\x1b]7577;";
+    const END: &str = "\x1b\\";
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().canonicalize().unwrap();
+    let session_path = workspace.join("session with spaces.jsonl");
+    let session_dir = workspace.join("new journals");
+    pi_rs::Session::open(&session_path)
+        .unwrap()
+        .append_user_with_images("resume test transcript".into(), vec![], None)
+        .unwrap();
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&workspace)
+            .env("PI_RS_HOME", workspace.join("home"))
+            .env("TERM", "xterm-256color")
+            .env("OSC7577_TOKEN", TOKEN)
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--session",
+            ])
+            .arg(&session_path)
+            .arg("--session-dir")
+            .arg(&session_dir)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+
+    let verify = |text: &str, expected: &str| {
+        text.split(PREFIX).skip(1).any(|report| {
+            let Some((report, _)) = report.split_once(END) else {
+                return false;
+            };
+            let Some((body, mac)) = report.rsplit_once(":mac=") else {
+                return false;
+            };
+            if !body.ends_with(expected) {
+                return false;
+            }
+            assert_eq!(
+                mac,
+                format!("{:x}", Sha256::digest(format!("{body}:{TOKEN}")))
+            );
+            assert!(!report.contains(TOKEN));
+            true
+        })
+    };
+    let session = STANDARD.encode(session_path.to_str().unwrap());
+    let cwd = STANDARD.encode(workspace.to_str().unwrap());
+    let expected = format!(",LS1zZXNzaW9u,{session}:cwd={cwd}");
+    output_until(&mut master, |text| {
+        text.contains("Enter to send") && verify(text, &expected)
+    });
+
+    master
+        .write_all(b"!test -z \"${OSC7577_TOKEN+x}\" && touch child-token-absent\r")
+        .unwrap();
+    output_until(&mut master, |text| {
+        workspace.join("child-token-absent").is_file() && text.contains("Enter to send")
+    });
+    master.write_all(b"/new\r").unwrap();
+    output_until(&mut master, |text| {
+        let Some(new_path) = std::fs::read_dir(&session_dir)
+            .ok()
+            .and_then(|mut dir| dir.find_map(|entry| entry.ok().map(|entry| entry.path())))
+        else {
+            return false;
+        };
+        assert_ne!(new_path, session_path);
+        let new_session = STANDARD.encode(new_path.to_str().unwrap());
+        verify(text, &format!(",LS1zZXNzaW9u,{new_session}:cwd={cwd}"))
+    });
+    master.write_all(b"/quit\r").unwrap();
+    output_until(&mut master, |text| verify(text, ":clear=1"));
+}
+
+#[test]
 fn initial_appearance_report_keeps_late_color_replies() {
     let root = tempfile::tempdir().unwrap();
     let mut master_fd = -1;

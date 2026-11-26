@@ -5930,6 +5930,7 @@ pub(super) async fn run(
     mut args: Cli,
     follow_up_prompts: Vec<String>,
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+    resume_token: Option<String>,
 ) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(Error::Config(
@@ -6038,6 +6039,8 @@ pub(super) async fn run(
                 .map(|prompt| (prompt, Vec::new())),
         )
         .collect();
+    let mut resume = resume_token.and_then(super::program_resume::Reporter::new);
+    let mut resume_after_suspend = false;
     let mut dirty = true;
     let frame_interval = Duration::from_millis(16);
     let mut last_frame = Instant::now() - frame_interval;
@@ -6061,6 +6064,7 @@ pub(super) async fn run(
             && _terminal.is_some()
         {
             view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+            resume_after_suspend = true;
             dirty = true;
         }
         #[cfg(any(unix, windows))]
@@ -6818,6 +6822,14 @@ pub(super) async fn run(
                     )?;
                     dirty = true;
                 }
+            }
+        }
+        if let Some(reporter) = &mut resume {
+            let force = std::mem::take(&mut resume_after_suspend);
+            if args.no_session {
+                reporter.clear()?;
+            } else {
+                reporter.report(&args.session, &args.workspace, force)?;
             }
         }
         if let Some(title) = view.pending_terminal_title.take() {
@@ -7823,7 +7835,10 @@ pub(super) async fn run(
                 match action {
                     "app.suspend" => {
                         #[cfg(unix)]
-                        view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+                        {
+                            view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+                            resume_after_suspend = true;
+                        }
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
                     }
@@ -8124,6 +8139,7 @@ pub(super) async fn run(
                                             #[cfg(unix)]
                                             if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
                                                 view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+                                                resume_after_suspend = true;
                                             }
                                         },
                                     }
@@ -8235,6 +8251,12 @@ pub(super) async fn run(
     #[cfg(all(unix, debug_assertions))]
     test_input_drain_barrier();
     let _ = input.drain(Duration::from_secs(1), Duration::from_millis(50));
+    if !interrupted
+        && !super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+        && let Some(reporter) = &mut resume
+    {
+        reporter.clear()?;
+    }
     let finish = if args.tui_mode == Some(TuiMode::Regular) {
         view.finish_regular()
     } else {
