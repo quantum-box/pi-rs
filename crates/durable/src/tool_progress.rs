@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 pub const MAX_PROGRESS_BYTES: usize = 1024 * 1024;
 // Leave room for the completed envelope around a legacy maximum-sized partial.
-const MAX_COMPLETED_BYTES: usize = MAX_PROGRESS_BYTES + 32;
+pub(crate) const MAX_COMPLETED_BYTES: usize = MAX_PROGRESS_BYTES + 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -173,7 +173,7 @@ impl Snapshot {
         })
     }
 }
-fn key(id: Uuid) -> Vec<u8> {
+pub(crate) fn key(id: Uuid) -> Vec<u8> {
     format!("durable/tool-progress/{id}").into_bytes()
 }
 fn retained_key(id: Uuid) -> Vec<u8> {
