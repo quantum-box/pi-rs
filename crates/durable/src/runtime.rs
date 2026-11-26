@@ -2816,7 +2816,7 @@ pub struct SessionMessageEntry {
     /// The summary and first retained identity for a recorded compaction.
     pub compaction: Option<SessionCompaction>,
     /// Present when this model-context message represents an archived branch.
-    pub branch_summary: Option<SessionBranchSummary>,
+    pub branch_summary: Option<Box<SessionBranchSummary>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -12049,7 +12049,7 @@ impl Harness {
                             blocks: blocks_for(id),
                             context_replacement: base,
                             compaction: None,
-                            branch_summary: branch_summary.cloned(),
+                            branch_summary: branch_summary.cloned().map(Box::new),
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?
