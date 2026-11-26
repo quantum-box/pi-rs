@@ -185,6 +185,10 @@ enum ProtocolRequest {
         request: ModelRequest,
         state: Option<ExtensionState>,
     },
+    BeforeAgentStart {
+        event: pi_rs_core::BeforeAgentStartEvent,
+        state: Option<ExtensionState>,
+    },
     Input {
         event: InputEvent,
         state: Option<ExtensionState>,
@@ -412,6 +416,8 @@ struct Description {
     command_effects: bool,
     #[serde(default)]
     command_failure_classification_v1: bool,
+    #[serde(default)]
+    before_agent_start_hook: bool,
     #[serde(default)]
     input_hook: bool,
     #[serde(default)]
@@ -1018,6 +1024,22 @@ impl Extension for ExecutableExtension {
             })
             .collect()
     }
+    fn handles_before_agent_start(&self) -> bool {
+        self.description.before_agent_start_hook
+    }
+
+    async fn before_agent_start(
+        &self,
+        event: &pi_rs_core::BeforeAgentStartEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::BeforeAgentStartResult> {
+        self.request_async(ProtocolRequest::BeforeAgentStart {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn handles_input(&self) -> bool {
         self.description.input_hook
     }
@@ -4176,6 +4198,7 @@ async fn dispatch_inner(
             command_entries: extension.supports_command_entries(),
             command_effects: extension.supports_command_effects(),
             command_failure_classification_v1: true,
+            before_agent_start_hook: extension.handles_before_agent_start(),
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
             result_presence_v1: true,
@@ -4284,6 +4307,9 @@ async fn dispatch_inner(
             } else {
                 ContextResponse::Changed { value: request }
             }))
+        }
+        ProtocolRequest::BeforeAgentStart { event, state } => {
+            encode(extension.before_agent_start(&event, state.as_ref()).await)
         }
         ProtocolRequest::Input { event, state } => {
             if host.supports_custom_messages() {
@@ -6222,6 +6248,65 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
         }))
         .unwrap();
         dispatch(extension, request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_negotiates_and_transports_prompt_replacement() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "run-preflight"
+            }
+
+            fn handles_before_agent_start(&self) -> bool {
+                true
+            }
+
+            async fn before_agent_start(
+                &self,
+                event: &pi_rs_core::BeforeAgentStartEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::BeforeAgentStartResult> {
+                let pi_rs_core::AgentStartTrigger::User { prompt, images } = &event.trigger else {
+                    panic!("expected a user prompt");
+                };
+                assert_eq!(prompt, "question");
+                assert!(images.is_empty());
+                assert_eq!(event.system_prompt, "host prompt");
+                Ok(pi_rs_core::BeforeAgentStartResult {
+                    system_prompt: Some(String::new()),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let mut description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["before_agent_start_hook"], true);
+        description
+            .as_object_mut()
+            .unwrap()
+            .remove("before_agent_start_hook");
+        assert!(
+            !serde_json::from_value::<Description>(description)
+                .unwrap()
+                .before_agent_start_hook
+        );
+
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "before_agent_start",
+            "event": {
+                "messageType": "user",
+                "prompt": "question",
+                "systemPrompt": "host prompt"
+            }
+        }))
+        .unwrap();
+        let response = dispatch(extension, request).await.unwrap();
+        assert_eq!(response, serde_json::json!({"systemPrompt": ""}));
     }
 
     #[tokio::test]

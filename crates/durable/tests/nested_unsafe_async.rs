@@ -80,6 +80,11 @@ impl DurableAsyncTool for UnsafeChild {
             .map_err(|e| e.to_string())?;
         writeln!(f, "{phase}").map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
+        if self.mode == "live" {
+            return Ok(DurableToolStep::Complete(Outcome::Succeeded(
+                "child".into(),
+            )));
+        }
         if phase == "initial" && self.mode == "interrupt" {
             std::fs::write(self.dir.join("running.tmp"), "running").map_err(|e| e.to_string())?;
             std::fs::rename(self.dir.join("running.tmp"), self.dir.join("running"))
@@ -577,6 +582,42 @@ impl DurableAsyncTool for AnyParent {
 fn build_any(dir: &Path, safe: bool) -> (StandaloneNoHooksHost, Arc<TaskTool>) {
     build_any_mode(dir, safe, "success")
 }
+struct LiveParent;
+
+#[async_trait]
+impl Tool for LiveParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+}
+
+#[async_trait]
+impl DurableAsyncTool for LiveParent {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: DurableToolResume,
+        host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        let child = host
+            .start_child_now("child", "unsafe-child", json!({}))
+            .await?;
+        assert_eq!(
+            host.wait_child_result(&child, Duration::from_secs(10))
+                .await?,
+            Some(AsyncTaskResult::Outcome(Outcome::Succeeded("child".into())))
+        );
+        Ok(DurableToolStep::Complete(Outcome::Succeeded(
+            "parent".into(),
+        )))
+    }
+}
+
 fn build_any_mode(dir: &Path, safe: bool, mode: &str) -> (StandaloneNoHooksHost, Arc<TaskTool>) {
     let gate: Arc<dyn Handler> = Arc::new(Gate);
     let mut registry = Registry::default();
@@ -600,7 +641,7 @@ fn build_any_mode(dir: &Path, safe: bool, mode: &str) -> (StandaloneNoHooksHost,
         .register_unsafe_durable_tool(
             Arc::new(UnsafeChild {
                 dir: dir.into(),
-                mode: if mode == "parent-interrupt" {
+                mode: if matches!(mode, "parent-interrupt" | "live-interrupt") {
                     "interrupt"
                 } else {
                     mode
@@ -615,6 +656,8 @@ fn build_any_mode(dir: &Path, safe: bool, mode: &str) -> (StandaloneNoHooksHost,
         .unwrap();
     let parent: Arc<dyn DurableAsyncTool> = if mode == "parent-interrupt" {
         Arc::new(BlockingAnyParent(dir.to_owned()))
+    } else if matches!(mode, "live" | "live-interrupt") {
+        Arc::new(LiveParent)
     } else {
         Arc::new(AnyParent)
     };
@@ -638,6 +681,86 @@ fn build_any_mode(dir: &Path, safe: bool, mode: &str) -> (StandaloneNoHooksHost,
         .unwrap()
     };
     (host, root)
+}
+
+#[test]
+fn standalone_unsafe_parent_waits_for_an_immediate_unsafe_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, tool) = build_any_mode(dir.path(), false, "live");
+    let root = host.start_unsafe_durable_root(&tool, json!({}), 3).unwrap();
+    let driver = host.into_driver();
+    let result = until(&driver, root, |state| {
+        matches!(state, TaskState::Succeeded(_) | TaskState::Failed(_))
+    });
+    assert_eq!(
+        result.state(),
+        &TaskState::Succeeded(serde_json::to_value(Outcome::Succeeded("parent".into())).unwrap())
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("child-effects")).unwrap(),
+        b"initial\n"
+    );
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn standalone_immediate_child_crash_fixture() {
+    let Some(dir) = std::env::var_os("PI_STANDALONE_IMMEDIATE_CHILD_CRASH_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let (host, tool) = build_any_mode(&dir, false, "live-interrupt");
+    let root = host.start_unsafe_durable_root(&tool, json!({}), 3).unwrap();
+    std::fs::write(dir.join("root"), root.to_string()).unwrap();
+    let _driver = host.into_driver();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+fn interrupted_standalone_parent_does_not_replay_immediate_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "standalone_immediate_child_crash_fixture"])
+        .env("PI_STANDALONE_IMMEDIATE_CHILD_CRASH_DIR", dir.path())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !dir.path().join("running").exists() {
+        if Instant::now() >= deadline || worker.try_wait().unwrap().is_some() {
+            let _ = worker.kill();
+            let _ = worker.wait();
+            panic!("immediate child did not enter the crash boundary");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    worker.kill().unwrap();
+    worker.wait().unwrap();
+    let root = std::fs::read_to_string(dir.path().join("root"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (host, _) = build_any_mode(dir.path(), false, "live");
+    let driver = host.into_driver();
+    let parent = until(&driver, root, |state| matches!(state, TaskState::Failed(_)));
+    assert!(
+        matches!(parent.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
+    );
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap();
+    assert_eq!(tasks.len(), 2);
+    assert!(tasks.iter().all(|record| matches!(
+        record.task.state(),
+        TaskState::Cancelled | TaskState::Failed(_)
+    )));
+    assert_eq!(
+        std::fs::read(dir.path().join("child-effects")).unwrap(),
+        b"initial\n"
+    );
+    driver.shutdown().unwrap();
 }
 
 #[test]
