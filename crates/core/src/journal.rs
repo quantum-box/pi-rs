@@ -1683,15 +1683,14 @@ impl Session {
         let token_index = crate::tokens::SourceTokenIndex::new(self, &branch);
         let entries = conversation_entries_unrepaired(&branch, self.operations());
         let system_invalidations = crate::tokens::non_additive_native_system_checkpoints(&branch);
-        let invalidated_at = branch
-            .iter()
-            .rev()
-            .find_map(|record| {
+        let invalidated_at = branch_with_context_edits(&branch)
+            .filter_map(|(record, context_edit)| {
                 (matches!(record.event, Event::Compacted { .. })
-                    || is_model_context_edit(&branch, record)
+                    || context_edit
                     || system_invalidations.contains(&record.id))
                 .then_some(record.id)
             })
+            .last()
             .unwrap_or(0);
         let completions: BTreeMap<_, _> = branch
             .iter()
@@ -1789,10 +1788,8 @@ impl Session {
     pub(crate) fn context_budget_estimate(&self) -> crate::ContextUsageEstimate {
         let branch = self.branch();
         let entries = conversation_entries(&branch, self.operations());
-        let invalidated_at = branch
-            .iter()
-            .rev()
-            .find_map(|record| {
+        let invalidated_at = branch_with_context_edits(&branch)
+            .filter_map(|(record, context_edit)| {
                 (matches!(
                     record.event,
                     Event::Compacted { .. }
@@ -1803,9 +1800,10 @@ impl Session {
                             fallback_model: Some(_),
                             ..
                         }
-                ) || is_model_context_edit(&branch, record))
-                .then_some(record.id)
+                ) || context_edit)
+                    .then_some(record.id)
             })
+            .last()
             .unwrap_or(0);
         let completions: BTreeMap<_, _> = branch
             .iter()
@@ -2658,22 +2656,25 @@ impl Session {
             return false;
         }
         let branch = self.branch();
-        branch.iter().rev().find_map(|record| match record.event {
-            Event::ModelRequested {
-                request_id: current,
-                ..
-            } => Some(current == Some(request_id)),
-            Event::Compacted { .. }
-            | Event::BranchSummary { .. }
-            | Event::BashExecution { .. }
-            | Event::CustomMessage { .. }
-            | Event::CustomMessageDelivered { .. }
-            | Event::User { .. }
-            | Event::UserWithImages { .. }
-            | Event::UserImages { .. } => Some(false),
-            _ if is_model_context_edit(&branch, record) => Some(false),
-            _ => None,
-        }) == Some(true)
+        branch_with_context_edits(&branch)
+            .filter_map(|(record, context_edit)| match record.event {
+                Event::ModelRequested {
+                    request_id: current,
+                    ..
+                } => Some(current == Some(request_id)),
+                Event::Compacted { .. }
+                | Event::BranchSummary { .. }
+                | Event::BashExecution { .. }
+                | Event::CustomMessage { .. }
+                | Event::CustomMessageDelivered { .. }
+                | Event::User { .. }
+                | Event::UserWithImages { .. }
+                | Event::UserImages { .. } => Some(false),
+                _ if context_edit => Some(false),
+                _ => None,
+            })
+            .last()
+            == Some(true)
     }
 
     pub(crate) fn append_cache_warm(
@@ -4877,19 +4878,45 @@ fn imported_assistant_source<'a>(
         .then_some((entry, completion))
 }
 
-fn is_model_context_edit(branch: &[&Record], record: &Record) -> bool {
+/// Classify edits in branch order so each one can check the preceding
+/// completion without walking the same ancestors again.
+fn branch_with_context_edits<'a, 'b>(
+    branch: &'b [&'a Record],
+) -> impl Iterator<Item = (&'a Record, bool)> + 'b {
+    let lookup = |id| {
+        branch
+            .binary_search_by_key(&id, |record| record.id)
+            .ok()
+            .map(|index| branch[index])
+    };
+    let mut previous: Option<&Record> = None;
+    let mut completion = None;
+    branch.iter().copied().map(move |record| {
+        if !previous.is_some_and(|parent| {
+            record.parent == Some(parent.id) && record.run_id == parent.run_id
+        }) {
+            completion = None;
+        }
+        let context_edit = is_model_context_edit(record, completion, lookup);
+        if matches!(record.event, Event::ModelFinished { .. }) {
+            completion = Some(record.id);
+        }
+        previous = Some(record);
+        (record, context_edit)
+    })
+}
+
+fn is_model_context_edit<'a>(
+    record: &Record,
+    nearest_completion: Option<u64>,
+    lookup: impl Fn(u64) -> Option<&'a Record>,
+) -> bool {
     let Event::ContextEdited {
         target,
         replacement,
     } = &record.event
     else {
         return false;
-    };
-    let lookup = |id| {
-        branch
-            .binary_search_by_key(&id, |record| record.id)
-            .ok()
-            .map(|index| branch[index])
     };
     let Some(target) = lookup(*target) else {
         return true;
@@ -4900,7 +4927,7 @@ fn is_model_context_edit(branch: &[&Record], record: &Record) -> bool {
     if replacement.is_some() {
         return true;
     }
-    let Some(source) = record.parent.and_then(lookup) else {
+    let Some(source) = record.parent.and_then(&lookup) else {
         return true;
     };
     let Event::SourceEntry { format, entry } = &source.event else {
@@ -4927,8 +4954,7 @@ fn is_model_context_edit(branch: &[&Record], record: &Record) -> bool {
             ) && entry["targetId"]
                 .as_str()
                 .is_some_and(|id| message["id"] == id)
-                && nearest_model_completion(record, lookup)
-                    .is_some_and(|nearest| nearest.id == completion.id)
+                && nearest_completion == Some(completion.id)
         }))
 }
 
@@ -5243,12 +5269,7 @@ fn conversation_entries_since_inner(
             (source, message)
         })
         .collect();
-    if repair
-        && !edits.is_empty()
-        && path
-            .iter()
-            .any(|record| is_model_context_edit(path, record))
-    {
+    if repair && !edits.is_empty() && branch_with_context_edits(path).any(|(_, edit)| edit) {
         let thinking_sources: BTreeSet<_> = messages
             .iter()
             .filter_map(|(source, message)| {

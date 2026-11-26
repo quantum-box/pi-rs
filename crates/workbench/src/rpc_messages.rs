@@ -1434,6 +1434,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repeated_superseded_partial_edits_preserve_the_measured_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("repeated-edits.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for entry in [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"prompt","parentId":null,
+                "message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"measured","parentId":"prompt","message":{
+                "role":"assistant","stopReason":"stop","usage":{"input":83,"output":7},
+                "content":[{"type":"text","text":"measured answer"}]
+            }}),
+            json!({"type":"message","id":"partial","parentId":"measured","message":{
+                "role":"assistant","stopReason":"error",
+                "content":[{"type":"text","text":"retry partial"}]
+            }}),
+        ] {
+            writeln!(file, "{entry}").unwrap();
+        }
+        let mut parent = "partial".to_owned();
+        for index in 0..4_000 {
+            let id = format!("edit{index}");
+            let edit = json!({"type":"context_edit","id":id,"parentId":parent,
+                "targetId":"partial","replacement":null,
+                (pi_rs::pi_import::SUPERSEDED_PARTIAL_FIELD):true});
+            writeln!(file, "{edit}").unwrap();
+            parent = id;
+        }
+        drop(file);
+        let imported = super::super::session_import::read(&path).unwrap();
+        let estimate = imported.context_usage_estimate();
+        assert_eq!(estimate.usage_tokens, 90);
+        assert!(estimate.last_usage_record.is_some());
+        assert_eq!(
+            imported.last_assistant_text().as_deref(),
+            Some("measured answer")
+        );
+        assert_eq!(imported.current_messages().len(), 2);
+    }
+
     fn assert_turn_partial(failure: pi_rs::ModelFailure, marker: &str, stop: &str) {
         let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
         initial
