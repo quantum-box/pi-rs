@@ -556,7 +556,9 @@ available to Codemode. Live Vercel authentication and inference were unverified.
 ### Mistral checkpoint
 
 Mistral exposes the 34 Pi 1.6.0 chat models using `MISTRAL_API_KEY` and the
-`mistral-conversations` transport. DeepSeek V4.1 Flash 1017 supports images
+`mistral-conversations` transport. The bundled default is
+`mistral-medium-latest`, matching the pinned Pi startup preference. An
+explicit or saved model still takes precedence. DeepSeek V4.1 Flash 1017 supports images
 with the catalog's resize limits. Ministral 3 3B has a 131,072-token output
 limit. Mistral Large (latest) uses the updated pricing and a 1,048,576-token
 context window with low, medium, and high reasoning effort. The transport
@@ -963,9 +965,55 @@ The list puts `system` first and sorts other names by the host locale. The first
 valid source wins for duplicate names. Embedded themes and paths that cannot be
 represented in UTF-8 omit their file path. The snapshot skips invalid files, includes explicit `--theme` paths and
 uses the native theme resource read limits. Theme selection and the catalog
-both accept a UTF-8 BOM. Native theme objects and switching
-through extension UI remain open.
+both accept a UTF-8 BOM.
 [Pi theme listing](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L403-L434)
+
+The read-only `getTheme` request accepts an exact name and returns
+`UiResponse::Theme` with its resolved colors, dim roles, and optional source
+path. Named file and embedded palettes use the same snapshot and precedence
+as the catalog. A refresh loads updated file palettes. Looking up a name
+does not scan directories or open paths supplied by the extension. Unknown
+names and headless RPC lookups return JSON null. Headless RPC handles the
+request locally.
+
+The terminal supplies the generated `system` palette from its current
+color reports, including the grayscale fallback while initial reports are
+pending. Colors preserve the native renderer's RGB, ANSI index, and
+terminal-default reset behavior. Faint styling is carried as dim roles,
+whereas Pi's JavaScript color accessor approximates the resulting colors.
+The request returns palette data and leaves the active theme selection intact.
+[Pi named theme lookup](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L557-L574)
+[Pi RPC extension UI](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/docs/rpc-extension-ui.md)
+
+The `setTheme` UI request accepts an exact, case-sensitive name from the scoped
+theme catalog or a resolved palette returned by `getTheme`. The worker resolves
+named selection and lookup against the same snapshot. Reload refreshes that
+snapshot from the resolved theme files, and the terminal supplies the live
+`system` palette.
+The terminal must claim the request from the worker before it can change the
+palette or settings. Callback cancellation or a disconnected executable before
+the claim prevents both changes. A granted claim authorizes the active terminal
+to finish even if the caller cancels while waiting for its response. The terminal
+answers theme requests during model and thinking-level selection callbacks.
+Final selection callbacks during exit can still read themes. Theme changes return
+`{success: false, error: "UI not available"}` once the terminal is restored.
+
+A successful named selection applies the theme and saves the name in user
+settings when it differs from the current setting. On `/reload`, the terminal
+reads the saved setting again and honors any explicit `--use-theme` override.
+A named load failure applies the live `system` fallback and returns
+`{success: false, error}`,
+as in Pi, without writing settings. A native settings write failure or an
+invalid supplied palette returns failure and preserves the active theme.
+A supplied palette ignores its path, survives passive terminal and resource
+refreshes even while a picker is open, and is discarded on session rebind or
+reload. If the configured theme fails to load during reload, a discarded
+palette is replaced with the live `system` theme. `getActiveTheme` exposes
+the current palette, corresponding to Pi’s extension UI `theme` property.
+Headless RPC returns
+`{success: false, error: "UI not available"}` locally.
+[Pi theme setting](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L2874-L2891)
+[Pi fallback](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/theme/theme.ts#L703-L722)
 
 ### Native extension working indicator
 
@@ -1064,6 +1112,10 @@ nonempty `ALACRITTY_WINDOW_ID` when it uses `TERM=xterm-256color`, matching Pi
 v1.6.0 even when `TERM_PROGRAM` is unset.
 Empty terminal-identification environment variables do not advertise OSC 8
 support or indicate a tmux session.
+On hyperlink-capable terminals, destinations beyond Pi's 8,192 UTF-16 unit
+limit retain their visible link text without OSC 8. Wrapping therefore cannot
+repeat a very long destination on every line.
+[Pinned Pi hyperlink limit](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/tui/src/terminal-image.ts#L795-L815)
 Bare HTTP, HTTPS and FTP URLs, `www.` links and email addresses receive link
 styling and the same terminal-dependent behavior. Bare URLs stop before CJK
 punctuation while explicit links retain it in their destination. Markdown
@@ -2124,6 +2176,24 @@ their existing scheduler deadlines.
 [Pinned Codemode worker deadline](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/codemode/src/runtime/execution.ts)
 [Pinned coding-agent result formatting](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/extensions/codemode/execute.ts)
 
+Native Codemode publishes an empty parent progress snapshot at startup, then
+reports nested tool calls in dispatch order with stable script-local IDs,
+bounded argument and error previews, and durations on completion. Parallel
+calls update their original positions. The first 64 calls are tracked, and
+further calls are counted without changing dispatch. Script return, timeout,
+and caller abort mark still-running calls cancelled in the settlement snapshot.
+The terminal shows recent call states. RPC and JSON attach the snapshot as
+`codemodeProgress` on the parent's `tool_execution_end` event. The snapshot
+is transient and leaves tool-result messages, journal records, model output,
+and the store transaction intact. The scheduler bounds complete progress
+events and omits large parent arguments. Codemode gives extension observers a
+single 250 ms maximum budget and stops those callbacks when the tool returns.
+Ordinary tools still drain accepted updates. Queued Codemode events reach
+presentation consumers, and caller abort preserves the latest omission count
+even if the script cannot publish its final snapshot. The snapshot covers
+`tools.*` calls. `models.*` calls remain outside it.
+[Pinned Codemode nested tool lifecycle](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/extensions/codemode/execute.ts#L514-L550)
+
 `PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
 running. Positive integer values accept Pi's numeric forms, including
@@ -2250,10 +2320,21 @@ A source entry with a missing parent is recovered as a separate native branch;
 its original parent ID remains in the retained source entry, while RPC presents
 it as a root. Missing ancestors may contain unrecoverable state or tool calls;
 orphan tool results and compactions involving orphaned branches are still rejected.
-Forward parent references and compaction boundaries on a different branch are
-also rejected. Pi instead drops a retained boundary that is not on the current
-path; native import rejects it rather than silently retaining unrelated history.
+Forward parent references and missing or forward compaction boundary IDs are
+also rejected. Pi v1 keeps its positional boundary migration, and RPC exposes
+the verified boundary as a projected entry ID. When a compaction names an
+earlier boundary on a complete sibling branch, Pi restores its system
+checkpoint, summary and descendants with no pre-compaction messages. Native
+import does the same and retains the original
+boundary and usage in a full export. A fork or Pi RPC projection uses the
+compaction's own ID as the boundary, so the result is independent of the
+sibling branch.
 
+Pi labels and context edits whose target IDs are absent from the whole source
+remain inert. The original source nodes are preserved in the native journal,
+and the RPC projection keeps their target IDs unbound. Branch forks retain
+these context edits and rebuild labels only for retained targets. Forward
+references and context edits that target another branch are rejected.
 Context edits are projected onto future model context while the imported raw
 entries remain available. Imported system messages appear as `[system]` in the
 default session tree, where their text can be searched and copied.
@@ -3913,9 +3994,21 @@ stream close event and reports errors from that event. Rust's standard file
 drop has no error result. A path in a live progress snapshot refers to a spill
 that is still being written.
 
-User-initiated shell execution also retains its bounded output and exit status.
-Its journal and RPC result do not yet expose the separate save error.
+User-initiated shell execution keeps its bounded output and exit status and exposes
+`fullOutputError` in the RPC completion and shell history when truncated
+output could not be saved. Native execution, extension streaming operations,
+and extension-supplied results use the same projection. Successful spills
+provide the file path. Small output has no save error, including when raw
+terminal control bytes triggered an unsuccessful spill attempt.
+
+Native journal metadata stores up to 4 KiB of save failure detail. Older
+stores without metadata support still record the original shell execution,
+and imported Pi history can read the detail from its source entry. The Rust
+`BashExecution` and `UserBashResult` fields retain their existing shape.
 [Pi shell output accumulator](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/tools/output-accumulator.ts)
+[Pi user shell executor](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/bash-executor.ts)
+[Pi session recording](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts)
+[Pi RPC shell completion](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/rpc/rpc-mode.ts)
 
 ### Grep context and line-limit checkpoint
 
@@ -4109,6 +4202,16 @@ standalone and summary usage. A loopback RPC test covers message and tool counts
 cache accounting, summary usage deduplication and unknown post-compaction context.
 The complete workspace tests and all-target Clippy pass.
 
+### Rust SDK session statistics
+
+`AgentSession::session_stats()` follows Pi's `getSessionStats()` by combining
+the external session ID, SDK-managed file path, durable totals across the
+session, and context usage for the current branch. The SDK uses the host's
+configured context window and reads the journal once without contacting a
+provider. Its totals retain the native UUID and journal accounting. Workbench
+RPC uses projected Pi message counts and adds usage from native model
+operations. [Pinned Pi implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4363-L4415)
+
 
 ### Imported extension entries
 
@@ -4151,6 +4254,22 @@ Session and owned SDK name reads trim ECMAScript whitespace from the latest
 stored name, as Pi does, including names imported from external JSONL. A
 whitespace-only name clears the title without falling back to an older name;
 reading preserves internal line breaks and does not rewrite the journal.
+
+### SDK model-facing tool selection
+
+An owned Rust session exposes `active_tool_names` and `set_active_tools` for
+the configured model-facing tool selection. Native branch checkpoints preserve
+their recorded loadout. The runtime intersects that loadout with the selected
+registry tools and uses current schemas. A selected tool can therefore be absent
+from a request on a restored branch. Request-time registry hooks can also
+change the advertised list.
+
+The setter requires mutable ownership and an available journal, so hosts apply
+it to future runs. Pi can apply a selection on the next turn of an active run.
+Native registry validation rejects unknown names without replacing the previous
+selection. Native nested orchestration can call registered tools regardless of
+selection. In Pi, inactive callable tools must have `codemode` or `deferred`
+exposure.
 
 ### SDK queued input inspection
 
@@ -6191,6 +6310,16 @@ continuations and session restarts. Text and summary fragments are combined
 into their logical blocks, and encrypted blocks stay separate. Replay is
 bound to the original endpoint and model. A loopback RPC check exercised
 restart, encrypted-only thinking and a switch to a different model endpoint.
+
+### Terminal hyperlink capability
+
+An explicit boolean in `terminal.hyperlinks` takes precedence over
+`PI_HYPERLINKS` and automatic terminal detection. Use `"auto"` for automatic
+detection. Existing non-boolean values in `terminal.hyperlinks` and
+`terminal.trueColor` are preserved and use automatic detection too.
+Both transcript modes redraw Markdown links after `/reload`. Returning from
+a boolean hyperlink override to automatic mode refreshes detection, including
+the tmux client capability probe. Subsequent draws reuse the detected result.
 
 ### Terminal color capability
 

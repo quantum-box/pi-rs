@@ -30,7 +30,7 @@ pub(super) struct Output {
     pub script: String,
     pub script_truncated: bool,
     pub path: Option<PathBuf>,
-    file_error: Option<String>,
+    pub file_error: Option<String>,
     pub details: Option<Value>,
 }
 

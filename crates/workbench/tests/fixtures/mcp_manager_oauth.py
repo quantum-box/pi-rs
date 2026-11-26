@@ -122,7 +122,10 @@ with (
     launcher = r"""#!/usr/bin/env python3
 import os, pathlib, socket, sys, urllib.parse
 capture = pathlib.Path(os.environ["PI_TEST_MCP_BROWSER_URL"])
-capture.write_text(sys.argv[-1])
+# The reader starts as soon as the capture appears.
+temporary = capture.with_name(f"{capture.name}.{os.getpid()}.tmp")
+temporary.write_text(sys.argv[-1])
+os.replace(temporary, capture)
 if capture.with_suffix(".manual").exists():
     sys.exit(1)
 args = urllib.parse.parse_qs(urllib.parse.urlsplit(sys.argv[-1]).query)
@@ -231,6 +234,7 @@ with socket.create_connection((parts.hostname, parts.port), timeout=5) as redire
         deadline = time.monotonic() + 5
         while not capture.exists() and time.monotonic() < deadline:
             time.sleep(.02)
+        assert capture.exists(), "browser launcher did not publish the authorization URL"
         authorization = urllib.parse.urlsplit(capture.read_text())
         parameters = urllib.parse.parse_qs(authorization.query)
         callback = parameters["redirect_uri"][0]

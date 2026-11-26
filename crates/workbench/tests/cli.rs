@@ -3834,6 +3834,239 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn rpc_user_shell_save_errors_keep_exit_tails_and_restored_history() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    async fn request(
+        input: &mut tokio::process::ChildStdin,
+        output: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+        request: Value,
+    ) -> (Value, Vec<Value>) {
+        input
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut entries = Vec::new();
+            while let Some(line) = output.next_line().await.unwrap() {
+                let event: Value = serde_json::from_str(&line).unwrap();
+                if event["type"] == "entry_appended"
+                    && event["entry"]["message"]["role"] == "bashExecution"
+                {
+                    entries.push(event["entry"]["message"].clone());
+                }
+                if event["type"] == "response" && event["id"] == request["id"] {
+                    assert_eq!(event["success"], true, "{event}");
+                    return (event["data"].clone(), entries);
+                }
+            }
+            panic!("RPC worker exited during {request}");
+        })
+        .await
+        .expect("RPC shell request timed out")
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let temp = root.path().join("spill");
+    let parked = root.path().join("spill-parked");
+    std::fs::create_dir(&temp).unwrap();
+    let session = root.path().join("session.jsonl");
+    let extension = root.path().join("shell-fixture");
+    std::fs::write(
+        &extension,
+        r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-bash-v1' in sys.argv:
+    request = json.loads(sys.stdin.readline())
+    assert request['event']['command'] == 'remote large'
+    data = b'START' + b'x' * 60000 + b'END'
+    print(json.dumps({'type':'output','data':list(data)}), flush=True)
+    print(json.dumps({'type':'complete','response':{'Ok':23}}), flush=True)
+else:
+    request = json.load(sys.stdin)
+    kind = request['type']
+    if kind == 'describe':
+        result = {'id':'shell-fixture','dependencies':[],'commands':[],'tools':[],
+                  'user_bash_hook':True,'user_bash_operations_hook':True}
+    elif kind == 'user_bash_operations':
+        result = request['event']['command'] == 'remote large'
+    elif kind == 'user_bash' and request['event']['command'] == 'replacement':
+        result = {'output':'replacement tail','exitCode':29,'truncated':True,
+                  'fullOutputError':'remote storage unavailable'}
+    else:
+        result = None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spawn = || {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("TMPDIR", &temp)
+            .args([
+                "--mode",
+                "rpc",
+                "--no-mcp",
+                "--no-skills",
+                "--no-trust",
+                "--offline",
+                "--session",
+            ])
+            .arg(&session)
+            .arg("--extension")
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+
+    let mut child = spawn();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let (saved, _) = request(
+        &mut input, &mut output,
+        json!({"type":"bash","id":"saved","command":"printf START; printf '%60000s' ''; printf END; exit 31"}),
+    ).await;
+    assert_eq!(saved["exitCode"], 31);
+    assert_eq!(saved["truncated"], true);
+    assert!(saved.get("fullOutputError").is_none());
+    let path = saved["fullOutputPath"].as_str().unwrap();
+    let complete = std::fs::read_to_string(path).unwrap();
+    assert!(complete.starts_with("START") && complete.ends_with("END"));
+    assert_eq!(complete.len(), 60_008);
+
+    // Leave the running worker and its existing temp files intact. New spill
+    // attempts now see a regular file where the temp directory should be.
+    std::fs::rename(&temp, &parked).unwrap();
+    std::fs::write(&temp, b"not a directory").unwrap();
+    let mut failures = Vec::new();
+    for (id, command, exit) in [
+        (
+            "native",
+            "printf START; printf '%60000s' ''; printf END; exit 19",
+            19,
+        ),
+        ("remote", "remote large", 23),
+        ("replacement", "replacement", 29),
+    ] {
+        let (data, entries) = request(
+            &mut input,
+            &mut output,
+            json!({"type":"bash","id":id,"command":command,"excludeFromContext":id=="remote"}),
+        )
+        .await;
+        assert_eq!(data["exitCode"], exit, "{id}");
+        assert_eq!(data["cancelled"], false);
+        assert_eq!(data["truncated"], true);
+        assert!(data.get("fullOutputPath").is_none());
+        let error = data["fullOutputError"].as_str().unwrap();
+        let tail = data["output"].as_str().unwrap();
+        if id == "replacement" {
+            assert_eq!(error, "remote storage unavailable");
+            assert_eq!(tail, "replacement tail");
+        } else {
+            assert!(tail.ends_with("END") && !tail.starts_with("START"));
+            assert!(tail.len() <= 50 * 1024);
+            assert!(!tail.contains("Could not save the full output"));
+        }
+        let [entry] = entries.as_slice() else {
+            panic!("missing live bash entry: {id}")
+        };
+        assert_eq!(entry["fullOutputError"], error);
+        assert_eq!(entry["output"], tail);
+        failures.push((command, data));
+    }
+    let (small, _) = request(
+        &mut input, &mut output,
+        json!({"type":"bash","id":"small","command":r"printf '\033[31m%.0s' {1..11000}; printf tiny"}),
+    ).await;
+    assert_eq!(small["output"], "tiny");
+    assert_eq!(small["exitCode"], 0);
+    assert_eq!(small["truncated"], false);
+    assert!(small.get("fullOutputError").is_none());
+    assert!(small.get("fullOutputPath").is_none());
+
+    std::fs::remove_file(&temp).unwrap();
+    std::fs::rename(&parked, &temp).unwrap();
+    request(
+        &mut input,
+        &mut output,
+        json!({"type":"shutdown","id":"stop"}),
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let mut reopened = spawn();
+    let mut input = reopened.stdin.take().unwrap();
+    let mut output = tokio::io::BufReader::new(reopened.stdout.take().unwrap()).lines();
+    let (history, _) = request(
+        &mut input,
+        &mut output,
+        json!({"type":"get_messages","id":"history"}),
+    )
+    .await;
+    let history = history["messages"].as_array().unwrap();
+    for (command, live) in failures {
+        let restored = history
+            .iter()
+            .find(|entry| entry["command"] == command)
+            .unwrap();
+        for field in [
+            "fullOutputError",
+            "output",
+            "exitCode",
+            "truncated",
+            "cancelled",
+        ] {
+            assert_eq!(restored[field], live[field], "{command} {field}");
+        }
+        assert!(restored["fullOutputPath"].is_null());
+    }
+    let restored_spill = history
+        .iter()
+        .find(|entry| entry["exitCode"] == 31)
+        .unwrap();
+    assert_eq!(restored_spill["fullOutputPath"], path);
+    assert!(restored_spill.get("fullOutputError").is_none());
+    let restored_small = history
+        .iter()
+        .find(|entry| entry["output"] == "tiny")
+        .unwrap();
+    assert!(restored_small.get("fullOutputError").is_none());
+    request(
+        &mut input,
+        &mut output,
+        json!({"type":"shutdown","id":"stop"}),
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(10), reopened.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn rpc_user_bash_extension_can_replace_execution_and_pass_through() {
     use std::os::unix::fs::PermissionsExt;
