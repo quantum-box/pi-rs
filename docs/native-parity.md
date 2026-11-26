@@ -556,7 +556,9 @@ available to Codemode. Live Vercel authentication and inference were unverified.
 ### Mistral checkpoint
 
 Mistral exposes the 34 Pi 1.6.0 chat models using `MISTRAL_API_KEY` and the
-`mistral-conversations` transport. DeepSeek V4.1 Flash 1017 supports images
+`mistral-conversations` transport. The bundled default is
+`mistral-medium-latest`, matching the pinned Pi startup preference. An
+explicit or saved model still takes precedence. DeepSeek V4.1 Flash 1017 supports images
 with the catalog's resize limits. Ministral 3 3B has a 131,072-token output
 limit. Mistral Large (latest) uses the updated pricing and a 1,048,576-token
 context window with low, medium, and high reasoning effort. The transport
