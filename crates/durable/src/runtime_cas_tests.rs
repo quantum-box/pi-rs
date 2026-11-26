@@ -889,6 +889,66 @@ fn custom_session_entries_survive_reopen_and_respect_display_fork_cuts() {
 }
 
 #[test]
+fn session_tree_keeps_archived_roots_and_tracks_an_empty_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let root = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let initial = harness.set_session_name(root, "first path").unwrap();
+    let custom = harness
+        .session_transaction(root, |tx| tx.append_entry("extension.bookmark", None))
+        .unwrap();
+    harness
+        .set_session_label(root, custom, Some("old"))
+        .unwrap();
+    let before_reset = harness.session_entries_start(root).unwrap();
+    harness.reset(root, None).unwrap();
+    let empty = harness.session_entries_start(root).unwrap();
+    assert_eq!(harness.session_tree(&empty).unwrap().leaf_id, None);
+    let new_root = harness.set_session_name(root, "next path").unwrap();
+    let branch = harness.fork_by_entry_id(root, initial).unwrap();
+    drop(harness);
+
+    let harness = Harness::open_paused(&path, options()).unwrap();
+    let tree = harness
+        .session_tree(&harness.session_entries_start(root).unwrap())
+        .unwrap();
+    assert_eq!(tree.leaf_id, Some(new_root));
+    assert_eq!(
+        tree.entries
+            .iter()
+            .map(|node| (node.entry.id(), node.parent_id))
+            .collect::<Vec<_>>(),
+        [
+            (initial, None),
+            (custom, Some(initial)),
+            (tree.entries[2].entry.id(), Some(custom)),
+            (new_root, None),
+        ]
+    );
+    assert_eq!(
+        tree.entries[1].label.as_ref().unwrap().label.as_deref(),
+        Some("old")
+    );
+    assert_eq!(
+        harness.session_tree(&before_reset).unwrap().entries.len(),
+        3
+    );
+    assert_eq!(harness.session_tree(&empty).unwrap().leaf_id, None);
+    let forked = harness
+        .session_tree(&harness.session_entries_start(branch).unwrap())
+        .unwrap();
+    assert_eq!(forked.leaf_id, Some(initial));
+    assert_eq!(forked.entries.len(), 1);
+}
+
+#[test]
 fn interrupted_recovery_retries_racing_stream_append() {
     for initial in [None, Some("first")] {
         let dir = tempfile::tempdir().unwrap();
@@ -4135,6 +4195,18 @@ async fn repeated_compaction_retains_original_provenance() {
         .history
         .unwrap();
     assert_eq!(retained, history);
+    let tree = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap();
+    assert_eq!(tree.entries.len(), 5);
+    assert_eq!(tree.entries[1].entry.id(), history.id);
+    for edges in tree.entries.windows(2) {
+        assert_eq!(edges[1].parent_id, Some(edges[0].entry.id()));
+    }
+    assert_eq!(
+        tree.leaf_id,
+        tree.entries.last().map(|node| node.entry.id())
+    );
     let fork = h.fork_by_entry_id(id, history.id).unwrap();
     assert!(
         h.conversation(fork)

@@ -2863,6 +2863,31 @@ pub struct SessionEntryPage {
     pub older: Option<SessionEntryCursor>,
 }
 
+/// One entry and its parent in chronological order. A context replacement
+/// starts a new root and retains earlier roots for navigation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionTreeEntry {
+    pub entry: SessionEntry,
+    pub parent_id: Option<Uuid>,
+    pub label: Option<SessionLabelEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionTree {
+    pub entries: Vec<SessionTreeEntry>,
+    pub leaf_id: Option<Uuid>,
+}
+
+enum SessionTreeEvent {
+    ContextStart,
+    Entry(SessionEntry),
+}
+
+struct SessionMessageBatch {
+    starts_context: bool,
+    entries: Vec<SessionMessageEntry>,
+}
+
 #[derive(Default)]
 struct SessionLabelProjection {
     targets: HashSet<Uuid>,
@@ -10732,6 +10757,63 @@ impl Harness {
         })
     }
 
+    /// Read the archived roots and active leaf at a captured session position.
+    /// Pass a fresh capture or a saved capture made by `session_entries_start`.
+    pub fn session_tree(&self, capture: &SessionEntryCursor) -> Result<SessionTree, Error> {
+        if capture.0.consumed != 0
+            || capture.0.source != capture.0.conversation
+            || capture.0.cutoff.is_some()
+        {
+            return Err(crate::fork::Error::InvalidCursor.into());
+        }
+        let mut cursor = Some(capture.0.clone());
+        let mut events = Vec::new();
+        while let Some(position) = cursor {
+            let (page, older) = self.session_history_page(
+                &position,
+                std::num::NonZeroUsize::new(128).unwrap(),
+                true,
+                |source, observation, skip_seed_entries, cutoff| {
+                    self.session_tree_events(
+                        source,
+                        observation,
+                        skip_seed_entries,
+                        capture.0.include_custom_entries,
+                        cutoff,
+                    )
+                },
+            )?;
+            events.extend(page);
+            cursor = older;
+        }
+        let mut tree = SessionTree {
+            entries: Vec::new(),
+            leaf_id: None,
+        };
+        let mut latest_labels = HashMap::new();
+        for event in events.into_iter().rev() {
+            let SessionTreeEvent::Entry(entry) = event else {
+                tree.leaf_id = None;
+                continue;
+            };
+            if let SessionEntry::Label { entry, .. } = &entry {
+                latest_labels.insert(entry.target_id, entry.clone());
+            }
+            let parent_id = tree.leaf_id.replace(entry.id());
+            tree.entries.push(SessionTreeEntry {
+                entry,
+                parent_id,
+                label: None,
+            });
+        }
+        for node in &mut tree.entries {
+            node.label = latest_labels
+                .remove(&node.entry.id())
+                .filter(|label| label.label.is_some());
+        }
+        Ok(tree)
+    }
+
     /// Resolve the active bookmarks in this captured session history.
     pub fn session_labels(
         &self,
@@ -11002,17 +11084,35 @@ impl Harness {
         cutoff: Option<Uuid>,
     ) -> Result<Vec<SessionEntry>, Error> {
         let record = self.session_observation(source, observation)?;
-        let mut entries = Vec::new();
-        if !skip_seed_entries {
-            entries.extend(
-                self.session_messages_from_record(source, &record)?
-                    .into_iter()
-                    .map(SessionEntry::Message),
-            );
-            if include_custom_entries {
-                entries.extend(self.session_custom_entries(source, &record)?);
-            }
+        let messages = if skip_seed_entries {
+            Vec::new()
+        } else {
+            self.session_messages_from_record(source, &record)?
+        };
+        self.session_entries_from_record(
+            source,
+            &record,
+            messages,
+            skip_seed_entries,
+            include_custom_entries,
+            cutoff,
+        )
+    }
+
+    fn session_entries_from_record(
+        &self,
+        source: Uuid,
+        record: &crate::observer::Record,
+        messages: Vec<SessionMessageEntry>,
+        skip_seed_entries: bool,
+        include_custom_entries: bool,
+        cutoff: Option<Uuid>,
+    ) -> Result<Vec<SessionEntry>, Error> {
+        let mut entries: Vec<_> = messages.into_iter().map(SessionEntry::Message).collect();
+        if !skip_seed_entries && include_custom_entries {
+            entries.extend(self.session_custom_entries(source, record)?);
         }
+        let observation = record.cursor.0;
         if let Some(info) = record.value.get("session_info") {
             self.authenticate_fork_anchor(source, observation)?;
             entries.push(SessionEntry::SessionInfo {
@@ -11038,7 +11138,7 @@ impl Harness {
             let mut tail = entries.split_off(index + 1);
             if let SessionEntry::Message(message) = &entries[index] {
                 tail.retain(|entry| matches!(entry, SessionEntry::Custom { .. }));
-                self.retain_message_cut_writes(source, &record, message, &mut tail)?;
+                self.retain_message_cut_writes(source, record, message, &mut tail)?;
                 entries.extend(tail);
             }
         }
@@ -11073,6 +11173,128 @@ impl Harness {
             writes.retain(|entry| retained.contains(&entry.id()));
         }
         Ok(())
+    }
+
+    fn session_tree_events(
+        &self,
+        source: Uuid,
+        observation: u64,
+        skip_seed_entries: bool,
+        include_custom_entries: bool,
+        cutoff: Option<Uuid>,
+    ) -> Result<Vec<SessionTreeEvent>, Error> {
+        let record = self.session_observation(source, observation)?;
+        let batches = if skip_seed_entries {
+            Vec::new()
+        } else {
+            self.session_message_batches(source, &record)?
+        };
+        let layout: Vec<_> = batches
+            .iter()
+            .map(|batch| (batch.starts_context, batch.entries.len()))
+            .collect();
+        let entries = self.session_entries_from_record(
+            source,
+            &record,
+            batches
+                .into_iter()
+                .flat_map(|batch| batch.entries)
+                .collect(),
+            skip_seed_entries,
+            include_custom_entries,
+            cutoff,
+        )?;
+        let (messages, metadata): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| matches!(entry, SessionEntry::Message(_)));
+        let replacement_count = layout
+            .iter()
+            .filter(|(starts_context, _)| *starts_context)
+            .count();
+        let mut resets = if replacement_count > 0
+            && metadata
+                .iter()
+                .any(|entry| matches!(entry, SessionEntry::Custom { .. }))
+        {
+            self.session_placed_resets(source, &record)?.into_iter()
+        } else {
+            Vec::new().into_iter()
+        };
+        let placed_resets: HashSet<_> = resets.as_slice().iter().copied().collect();
+        let mut writes_by_reset = HashMap::<_, Vec<_>>::new();
+        let mut tail = Vec::new();
+        for entry in metadata {
+            if let SessionEntry::Custom { entry: write, .. } = &entry
+                && let Some(reset) = write.after_reset
+                && placed_resets.contains(&reset)
+            {
+                writes_by_reset.entry(reset).or_default().push(entry);
+            } else {
+                tail.push(entry);
+            }
+        }
+        let message_cutoff = cutoff.is_some_and(|id| messages.iter().any(|entry| entry.id() == id));
+        let mut messages = messages.into_iter();
+        let mut events = Vec::new();
+        for (starts_context, len) in layout {
+            if starts_context {
+                events.push(SessionTreeEvent::ContextStart);
+            }
+            for entry in messages.by_ref().take(len) {
+                events.push(SessionTreeEvent::Entry(entry));
+            }
+            if starts_context
+                && let Some(reset) = resets.next()
+                && let Some(writes) = writes_by_reset.remove(&reset)
+            {
+                events.extend(writes.into_iter().map(SessionTreeEvent::Entry));
+            }
+            if message_cutoff && messages.len() == 0 {
+                break;
+            }
+        }
+        if messages.len() > 0 || !writes_by_reset.is_empty() {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        events.extend(tail.into_iter().map(SessionTreeEvent::Entry));
+        Ok(events)
+    }
+
+    fn session_placed_resets(
+        &self,
+        source: Uuid,
+        record: &crate::observer::Record,
+    ) -> Result<Vec<Uuid>, Error> {
+        let Some(resets) = record
+            .value
+            .get("resets")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Ok(Vec::new());
+        };
+        if resets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let previous_count = if record.cursor.0 > 1 {
+            let prior = self.session_observation(source, record.cursor.0 - 1)?;
+            prior
+                .value
+                .get("resets")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        } else {
+            0
+        };
+        resets
+            .get(previous_count..)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .iter()
+            .map(|reset| {
+                Ok(serde_json::from_value(
+                    reset.get("id").cloned().unwrap_or_default(),
+                )?)
+            })
+            .collect()
     }
 
     fn session_custom_entries(
@@ -11134,6 +11356,18 @@ impl Harness {
         source: Uuid,
         record: &crate::observer::Record,
     ) -> Result<Vec<SessionMessageEntry>, Error> {
+        Ok(self
+            .session_message_batches(source, record)?
+            .into_iter()
+            .flat_map(|batch| batch.entries)
+            .collect())
+    }
+
+    fn session_message_batches(
+        &self,
+        source: Uuid,
+        record: &crate::observer::Record,
+    ) -> Result<Vec<SessionMessageBatch>, Error> {
         let observation = record.cursor.0;
         let Some(mut position): Option<crate::transcript::Cursor> =
             serde_json::from_value(record.value.get("_transcript").cloned().unwrap_or_default())?
@@ -11150,6 +11384,7 @@ impl Harness {
                 .first()
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
             let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+            let starts_context = matches!(&change, TranscriptChange::ReplaceV2 { .. });
             let blocks_for = |id| {
                 record
                     .content_blocks
@@ -11207,7 +11442,10 @@ impl Harness {
                     })
                     .collect()
             };
-            batches.push(entries);
+            batches.push(SessionMessageBatch {
+                starts_context,
+                entries,
+            });
             if !page.has_more {
                 break;
             }
@@ -11216,7 +11454,8 @@ impl Harness {
         if !batches.is_empty() {
             self.authenticate_fork_anchor(source, observation)?;
         }
-        Ok(batches.into_iter().rev().flatten().collect())
+        batches.reverse();
+        Ok(batches)
     }
 
     /// Fork at a bookmark change, session-info entry, placed custom entry or original message.
@@ -25104,6 +25343,9 @@ impl Scheduler {
 
     pub fn session_entries_start(&self, id: Uuid) -> Result<SessionEntryCursor, Error> {
         self.harness.session_entries_start(id)
+    }
+    pub fn session_tree(&self, capture: &SessionEntryCursor) -> Result<SessionTree, Error> {
+        self.harness.session_tree(capture)
     }
 
     pub fn session_entries(

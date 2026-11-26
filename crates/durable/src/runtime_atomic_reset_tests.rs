@@ -2054,6 +2054,21 @@ fn atomic_failure_fork_preserves_writes_at_each_reset() {
     drop(h);
     let h = Harness::open_paused(&path, options()).unwrap();
     let history = h.session_entries_start(fork).unwrap();
+    let tree = h.session_tree(&history).unwrap();
+    let write = tree
+        .entries
+        .iter()
+        .find(|node| node.entry.id() == first_write)
+        .unwrap();
+    assert_eq!(write.parent_id, occurrences.last().copied());
+    let parent_history = h.session_entries_start(id).unwrap();
+    let parent_tree = h.session_tree(&parent_history).unwrap();
+    let former_write = parent_tree
+        .entries
+        .iter()
+        .find(|node| node.entry.id() == first_write)
+        .unwrap();
+    assert_eq!(former_write.parent_id, write.parent_id);
     let labels = h.session_labels(&history).unwrap();
     assert_eq!(labels.len(), 1);
     assert_eq!(labels[0].target_id, first_write);
