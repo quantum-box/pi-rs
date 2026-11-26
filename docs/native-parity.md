@@ -6144,14 +6144,16 @@ under protected directories on an allowlisted local filesystem. Linux accepts
 ext-family, XFS, Btrfs, and tmpfs. macOS accepts local APFS, HFS, and tmpfs
 with ownership enforced and without extended ACL grants. The checks reject
 unknown filesystem semantics, network filesystems, and mounts that ignore
-ownership. Workers keep the existing-only journal policy for the restored
-session, including later reopens. An explicit new session can create a journal.
+ownership. Workers and the session picker keep the existing-only journal
+policy for the restored session, including later reopens. An explicit new
+session can create a journal.
 
-If a trusted workspace was unprotected when Pi reported it, or cannot be
-verified as protected at restore time, the normal project trust prompt
-requires fresh approval before loading trusted project configuration. A
-previously denied workspace remains untrusted. These safeguards are native
-restrictions on unattended restore.
+If Pi cannot verify protection for the workspace or its project configuration
+and resource paths at report or restore time, the normal project trust prompt
+requires fresh approval before loading trusted project configuration. Project
+package declarations also require approval because preparation resolves their
+resource paths. A previously denied workspace remains untrusted. These
+safeguards are native restrictions on unattended restore.
 
 Session switches replace the report. Returning from suspend refreshes it
 immediately, including during package reload. A missing journal or a normal

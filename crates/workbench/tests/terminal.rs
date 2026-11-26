@@ -735,6 +735,20 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
 
 #[test]
 fn terminal_resume_prompts_again_for_a_shared_workspace() {
+    assert_terminal_resume_project_trust(false, false);
+}
+
+#[test]
+fn terminal_resume_prompts_again_for_shared_project_configuration() {
+    assert_terminal_resume_project_trust(true, false);
+}
+
+#[test]
+fn terminal_resume_preserves_saved_project_denial() {
+    assert_terminal_resume_project_trust(true, true);
+}
+
+fn assert_terminal_resume_project_trust(shared_configuration: bool, saved_denial: bool) {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
@@ -743,7 +757,15 @@ fn terminal_resume_prompts_again_for_a_shared_workspace() {
     }
     let workspace = root.join("shared workspace");
     std::fs::create_dir(&workspace).unwrap();
-    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let shared = if shared_configuration {
+        let project = workspace.join(".pi");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("settings.json"), "{}").unwrap();
+        project
+    } else {
+        workspace.clone()
+    };
+    std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
     let home = root.join("home");
     std::fs::create_dir(&home).unwrap();
     std::fs::write(
@@ -751,6 +773,13 @@ fn terminal_resume_prompts_again_for_a_shared_workspace() {
         r#"{"defaultProjectTrust":"always"}"#,
     )
     .unwrap();
+    if saved_denial {
+        std::fs::write(
+            home.join("trust.json"),
+            serde_json::json!({(workspace.to_str().unwrap()): false}).to_string(),
+        )
+        .unwrap();
+    }
     let journal = root.join("session.jsonl");
     pi_rs::Session::open(&journal)
         .unwrap()
@@ -773,6 +802,13 @@ fn terminal_resume_prompts_again_for_a_shared_workspace() {
         .arg("--session")
         .arg(&journal);
     let (mut master, _slave, _process) = spawn_child_pty(&mut command);
+    if saved_denial {
+        output_until(&mut master, |text| {
+            assert!(!text.contains("Load project configuration?"));
+            text.contains("Enter to send")
+        });
+        return;
+    }
     output_until(&mut master, |text| {
         text.contains("Load project configuration?")
     });

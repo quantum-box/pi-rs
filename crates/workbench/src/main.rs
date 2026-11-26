@@ -171,7 +171,7 @@ struct Cli {
     #[arg(long, hide = true, requires = "terminal_resume_worker")]
     terminal_resume_approved: bool,
     #[arg(skip)]
-    resume_existing_session: Option<PathBuf>,
+    resume_existing_session: Option<(PathBuf, PathBuf)>,
     #[arg(skip)]
     resume_limits: program_resume::ExplicitLimits,
     /// Open or create a named session in this workspace's session directory.
@@ -364,7 +364,16 @@ struct InitialSelection {
 
 impl Cli {
     fn resume_requires_existing(&self) -> bool {
-        self.resume_existing_session.as_ref() == Some(&self.session)
+        self.bound_resume_workspace(&self.session).is_some()
+    }
+
+    fn bound_resume_workspace(&self, path: &std::path::Path) -> Option<&std::path::Path> {
+        let (journal, workspace) = self.resume_existing_session.as_ref()?;
+        (journal == path).then_some(workspace)
+    }
+
+    fn bind_existing_session(&mut self) {
+        self.resume_existing_session = Some((self.session.clone(), self.workspace.clone()));
     }
 
     fn project_trust(&self) -> Result<Option<bool>> {

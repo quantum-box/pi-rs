@@ -3393,7 +3393,7 @@ mod share_context_tests {
         let root = tempfile::tempdir().unwrap();
         let mut args = <Cli as clap::Parser>::parse_from(["pi"]);
         args.session = root.path().join("restored.jsonl");
-        args.resume_existing_session = Some(args.session.clone());
+        args.bind_existing_session();
         drop(Session::open(&args.session).unwrap());
         std::fs::remove_file(&args.session).unwrap();
 

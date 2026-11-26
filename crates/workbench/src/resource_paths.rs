@@ -40,6 +40,43 @@ impl Kind {
         }
     }
 }
+#[cfg(unix)]
+pub(super) fn project_protection_roots(
+    settings: &serde_json::Value,
+    project: &Path,
+) -> Option<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for kind in [Kind::Extension, Kind::Skill, Kind::Prompt, Kind::Theme] {
+        let key = kind.key();
+        roots.push(project.join(key));
+        let Some(entries) = settings.get(key) else {
+            continue;
+        };
+        for entry in entries.as_array()? {
+            let entry = entry.as_str()?;
+            if entry.starts_with(['+', '-', '!'])
+                || (kind == Kind::Extension && named_extension(entry))
+            {
+                continue;
+            }
+            let path = absolute(project, entry);
+            let path = if kind == Kind::Skill {
+                normalize_resource_path(&path)
+            } else {
+                path
+            };
+            // A missing literal can become a glob at load time. Check the
+            // entire area the loader could search, including the literal.
+            let prefix = glob_root(&path);
+            if prefix != path {
+                roots.push(prefix);
+            }
+            roots.push(path);
+        }
+    }
+    Some(roots)
+}
+
 fn executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -254,18 +291,7 @@ pub fn resolve(
                     roots.push((agents.join("skills"), agents));
                 }
             } else if args.trusted {
-                let user_agents = std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .map(|home| PathBuf::from(home).join(".agents"));
-                for directory in workspace.ancestors() {
-                    let agents = directory.join(".agents");
-                    if user_agents.as_ref() != Some(&agents) {
-                        roots.push((agents.join("skills"), agents));
-                    }
-                    if directory.join(".git").exists() {
-                        break;
-                    }
-                }
+                roots.extend(project_agent_skills(&workspace));
             }
         }
         let mut overrides = vec!["**".to_owned()];
@@ -304,6 +330,23 @@ pub fn resolve(
     append(&mut paths, additional_prompts);
     Ok(paths)
 }
+pub(super) fn project_agent_skills(workspace: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let user_agents = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| PathBuf::from(home).join(".agents"));
+    let mut roots = Vec::new();
+    for directory in workspace.ancestors() {
+        let agents = directory.join(".agents");
+        if user_agents.as_ref() != Some(&agents) {
+            roots.push((agents.join("skills"), agents));
+        }
+        if directory.join(".git").exists() {
+            break;
+        }
+    }
+    roots
+}
+
 fn skill_file_is_markdown(kind: Kind, path: &Path, warnings: &mut Vec<String>) -> bool {
     if kind != Kind::Skill {
         return true;
@@ -433,14 +476,7 @@ fn expand(
         .build()
         .map_err(|error| Error::Config(format!("invalid resource pattern {pattern:?}: {error}")))?
         .compile_matcher();
-    let mut root = PathBuf::new();
-    for component in path.components() {
-        if matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
-        {
-            break;
-        }
-        root.push(component);
-    }
+    let root = glob_root(path);
     let found = collect_matching(&root, kind, false, warnings, Some(&matcher))?;
     if required && found.is_empty() {
         return Err(Error::Config(format!(
@@ -449,6 +485,14 @@ fn expand(
     }
     Ok(found)
 }
+fn glob_root(path: &Path) -> PathBuf {
+    path.components()
+        .take_while(|component| {
+            !matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        })
+        .collect()
+}
+
 fn collect(
     path: &Path,
     kind: Kind,

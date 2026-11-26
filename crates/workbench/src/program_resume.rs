@@ -85,7 +85,7 @@ pub(super) fn bind_startup(args: &mut Cli) -> Result<()> {
         .filter(|workspace| *workspace == args.workspace)
         .ok_or_else(|| Error::Config("terminal resume requires a canonical workspace".into()))?;
     snapshot_bound_session(args)?;
-    args.resume_existing_session = Some(args.session.clone());
+    args.bind_existing_session();
     args.command = Some(Command::Interactive);
     Ok(())
 }
@@ -100,14 +100,14 @@ pub(super) fn bind_worker(args: &mut Cli) -> Result<()> {
         ));
     }
     snapshot_bound_session(args)?;
-    args.resume_existing_session = Some(args.session.clone());
+    args.bind_existing_session();
     Ok(())
 }
 
 pub(super) fn needs_fresh_approval(args: &Cli) -> bool {
     args.resume_requires_existing()
         && !args.terminal_resume_approved
-        && (args.terminal_resume_confirm_project || !protected_workspace(&args.workspace))
+        && (args.terminal_resume_confirm_project || !protected_project(&args.workspace))
 }
 
 pub(super) fn snapshot_bound_session(args: &Cli) -> Result<Session> {
@@ -118,9 +118,16 @@ pub(super) fn snapshot_bound_session(args: &Cli) -> Result<Session> {
 }
 
 pub(super) fn open_bound_session(args: &Cli) -> Result<Session> {
-    require_journal_path(&args.session)?;
-    let session = Session::open_existing(&args.session)?;
-    check_workspace(&session, &args.workspace)?;
+    open_bound_session_at(args, &args.session)
+}
+
+pub(super) fn open_bound_session_at(args: &Cli, path: &Path) -> Result<Session> {
+    let workspace = args
+        .bound_resume_workspace(path)
+        .ok_or_else(|| Error::Config("terminal resume journal has no bound workspace".into()))?;
+    require_journal_path(path)?;
+    let session = Session::open_existing(path)?;
+    check_workspace(&session, workspace)?;
     Ok(session)
 }
 
@@ -188,6 +195,152 @@ fn protected_workspace(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
+fn protected_project(workspace: &Path) -> bool {
+    use super::resource_paths::{project_agent_skills, project_protection_roots};
+
+    if !protected_workspace(workspace) {
+        return false;
+    }
+    // SAFETY: geteuid has no arguments or memory-safety preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let project = workspace.join(".pi");
+    let Some(project_metadata) = protected_project_entry(&project, uid) else {
+        return false;
+    };
+    if project_metadata.is_some_and(|metadata| !metadata.is_dir()) {
+        return false;
+    }
+    let settings = project.join("settings.json");
+    for path in [
+        settings.clone(),
+        project.join("mcp.json"),
+        project.join("SYSTEM.md"),
+        project.join("APPEND_SYSTEM.md"),
+    ] {
+        match protected_project_entry(&path, uid) {
+            Some(metadata) if metadata.as_ref().is_none_or(|metadata| metadata.is_file()) => (),
+            _ => return false,
+        }
+    }
+    // Only read declarations after their path passes the filesystem checks.
+    let Ok(settings) = super::config::read_object(&settings) else {
+        return false;
+    };
+    // Project packages can resolve through local manifests or a package cache.
+    // Their complete resource scope is only known during package preparation.
+    if settings
+        .get("packages")
+        .is_some_and(|packages| !packages.as_array().is_some_and(Vec::is_empty))
+    {
+        return false;
+    }
+    let Some(mut roots) = project_protection_roots(&settings, &project) else {
+        return false;
+    };
+    roots.extend(
+        project_agent_skills(workspace)
+            .into_iter()
+            .map(|(root, _)| root),
+    );
+    // Bound the metadata work before interactive startup. Large or unreadable
+    // resource trees use the same approval prompt as other unverified paths.
+    let mut entries_left = 4096;
+    roots
+        .into_iter()
+        .all(|root| protected_resource_tree(&root, uid, &mut entries_left))
+}
+
+#[cfg(unix)]
+fn protected_project_entry(path: &Path, uid: u32) -> Option<Option<std::fs::Metadata>> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let ancestors: Vec<_> = path.ancestors().collect();
+    let mut parent_writable = false;
+    for (index, entry) in ancestors.iter().enumerate().rev() {
+        let metadata = match std::fs::symlink_metadata(entry) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !parent_writable => {
+                // A loader that normalizes dot segments could still reach an
+                // existing entry after a missing component followed by `..`.
+                let tail = path.strip_prefix(entry.parent()?).ok()?;
+                return (!tail
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir))
+                .then_some(None);
+            }
+            Err(_) => return None,
+        };
+        let directory = index != 0;
+        if !protected_project_metadata(entry, &metadata, uid, directory)
+            || (directory && !metadata.is_dir())
+        {
+            return None;
+        }
+        if !directory {
+            return Some(Some(metadata));
+        }
+        parent_writable = metadata.mode() & 0o022 != 0;
+    }
+    None
+}
+
+#[cfg(unix)]
+fn protected_project_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    uid: u32,
+    ancestor: bool,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let mode = metadata.mode();
+    (metadata.is_dir() || metadata.is_file())
+        && (metadata.uid() == 0 || metadata.uid() == uid)
+        && (mode & 0o022 == 0 || (ancestor && metadata.is_dir() && mode & 0o1000 != 0))
+        && enforces_posix_permissions(path)
+        && has_no_granting_acl(path)
+}
+
+#[cfg(unix)]
+fn protected_resource_tree(root: &Path, uid: u32, entries_left: &mut usize) -> bool {
+    let Some(metadata) = protected_project_entry(root, uid) else {
+        return false;
+    };
+    if !metadata.is_some_and(|metadata| metadata.is_dir()) {
+        return true;
+    }
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return false;
+        };
+        for entry in entries {
+            let Some(remaining) = entries_left.checked_sub(1) else {
+                return false;
+            };
+            *entries_left = remaining;
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                return false;
+            };
+            if !protected_project_metadata(&path, &metadata, uid, false) {
+                return false;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
 fn protected_directories(path: &Path, uid: u32, allow_sticky_leaf: bool) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -212,7 +365,7 @@ fn protected_journal_path(_: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn protected_workspace(_: &Path) -> bool {
+fn protected_project(_: &Path) -> bool {
     false
 }
 
@@ -327,7 +480,8 @@ fn has_no_granting_acl(path: &Path) -> bool {
 pub(super) struct Reporter {
     token: String,
     executable: PathBuf,
-    reported: Option<String>,
+    candidate: Option<String>,
+    reported: bool,
 }
 
 impl Reporter {
@@ -338,7 +492,8 @@ impl Reporter {
         Some(Self {
             token,
             executable: std::env::current_exe().ok()?,
-            reported: None,
+            candidate: None,
+            reported: false,
         })
     }
 
@@ -352,19 +507,33 @@ impl Reporter {
         force: bool,
         write: impl FnOnce(&str) -> io::Result<()>,
     ) -> io::Result<()> {
-        let body = report_body(&self.executable, args);
-        if !force && body == self.reported {
+        let candidate = report_body(&self.executable, args, false);
+        if !force && candidate == self.candidate {
             return Ok(());
         }
+        // Resource checks belong to report emission and restore, rather than
+        // every pass through the terminal input loop.
+        let body = if candidate.is_some()
+            && args.trusted
+            && canonical_workspace(&args.workspace)
+                .is_none_or(|workspace| !protected_project(&workspace))
+        {
+            report_body(&self.executable, args, true)
+        } else {
+            candidate.clone()
+        };
         if let Some(body) = body {
             let frame = self.frame(&body);
             if frame.len() <= MAX_FRAME_BYTES {
                 write(&frame)?;
-                self.reported = Some(body);
+                self.candidate = candidate;
+                self.reported = true;
                 return Ok(());
             }
         }
-        self.clear_with(write)
+        self.clear_with(write)?;
+        self.candidate = candidate;
+        Ok(())
     }
 
     pub fn clear(&mut self) -> io::Result<()> {
@@ -372,10 +541,11 @@ impl Reporter {
     }
 
     fn clear_with(&mut self, write: impl FnOnce(&str) -> io::Result<()>) -> io::Result<()> {
-        if self.reported.is_some() {
+        if self.reported {
             write(&self.frame("clear=1"))?;
-            self.reported = None;
+            self.reported = false;
         }
+        self.candidate = None;
         Ok(())
     }
 
@@ -388,7 +558,7 @@ impl Reporter {
     }
 }
 
-fn report_body(executable: &Path, args: &Cli) -> Option<String> {
+fn report_body(executable: &Path, args: &Cli, confirm_project: bool) -> Option<String> {
     if args.no_session
         || args.ephemeral_worker_session
         || args.trust_pending
@@ -409,7 +579,7 @@ fn report_body(executable: &Path, args: &Cli) -> Option<String> {
         "--workspace".into(),
         workspace.to_str()?.into(),
     ];
-    if args.trusted && !protected_workspace(&workspace) {
+    if confirm_project {
         argv.push("--terminal-resume-confirm-project".into());
     }
     for (restricted, flag) in [
@@ -493,6 +663,23 @@ fn write_frame(frame: &str) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn assert_report_requires_project_confirmation(args: &Cli, executable: PathBuf) {
+        let mut reporter = Reporter {
+            token: "fixture-token".into(),
+            executable,
+            candidate: None,
+            reported: false,
+        };
+        reporter
+            .report_with(args, false, |frame| {
+                assert!(frame.contains(&STANDARD.encode("--terminal-resume-confirm-project")));
+                Ok(())
+            })
+            .unwrap();
+        assert!(reporter.reported);
+    }
+
     #[test]
     fn program_resume_frames_sign_the_exact_report_and_clear() {
         assert_eq!(
@@ -530,7 +717,7 @@ mod tests {
             return;
         }
         let executable = root.join("pi");
-        let body = report_body(&executable, &args).unwrap();
+        let body = report_body(&executable, &args, false).unwrap();
         let argv = body
             .strip_prefix("argv=")
             .unwrap()
@@ -556,10 +743,10 @@ mod tests {
                 "--disable-extension=todo",
             ]
         );
-        assert!(report_body(Path::new("relative"), &args).is_none());
-        assert!(report_body(&root.join("separator\u{1b}"), &args).is_none());
+        assert!(report_body(Path::new("relative"), &args, false).is_none());
+        assert!(report_body(&root.join("separator\u{1b}"), &args, false).is_none());
         args.api_key = Some("fixture-credential".into());
-        assert!(report_body(&executable, &args).is_none());
+        assert!(report_body(&executable, &args, false).is_none());
     }
 
     #[test]
@@ -628,8 +815,9 @@ mod tests {
         let mut args = fixture_args(&root);
         let workspace = root.join("workspace");
         std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join(".git")).unwrap();
         args.workspace = workspace.clone();
-        args.resume_existing_session = Some(args.session.clone());
+        args.bind_existing_session();
         args.trusted = true;
         args.no_trust = false;
         args.trust = true;
@@ -638,8 +826,7 @@ mod tests {
         assert!(!protected_workspace(&workspace));
         assert_eq!(args.project_trust().unwrap(), None);
         if protected_journal_path(&args.session).is_some() {
-            let body = report_body(&root.join("pi"), &args).unwrap();
-            assert!(body.contains(&STANDARD.encode("--terminal-resume-confirm-project")));
+            assert_report_requires_project_confirmation(&args, root.join("pi"));
             std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(args.project_trust().unwrap(), Some(true));
             args.terminal_resume_confirm_project = true;
@@ -650,6 +837,60 @@ mod tests {
         assert_eq!(args.project_trust().unwrap(), Some(true));
         args.no_trust = true;
         assert_eq!(args.project_trust().unwrap(), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_resume_checks_trust_bearing_project_paths() {
+        use std::fs;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        if !root.ancestors().all(enforces_posix_permissions) {
+            return;
+        }
+        let mut args = fixture_args(&root);
+        let project = root.join(".pi");
+        let settings = project.join("settings.json");
+        let mcp = project.join("mcp.json");
+        let extension = project.join("extensions/bin/example");
+        let configured = root.join("extra/prompts/example.md");
+        let skill = root.join(".agents/skills/example/SKILL.md");
+        fs::create_dir(root.join(".git")).unwrap();
+        for path in [&extension, &configured, &skill] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "fixture").unwrap();
+        }
+        fs::write(&settings, r#"{"prompts":["../extra/prompts/*.md"]}"#).unwrap();
+        fs::write(&mcp, "{}").unwrap();
+        args.bind_existing_session();
+        args.trusted = true;
+        args.trust = true;
+        args.no_trust = false;
+        assert_eq!(args.project_trust().unwrap(), Some(true));
+
+        for path in [&project, &settings, &mcp, &extension, &configured, &skill] {
+            let permissions = fs::metadata(path).unwrap().permissions();
+            fs::set_permissions(path, fs::Permissions::from_mode(permissions.mode() | 0o020))
+                .unwrap();
+            assert_eq!(args.project_trust().unwrap(), None, "{}", path.display());
+            assert_report_requires_project_confirmation(&args, root.join("pi"));
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let shared = root.join("shared-config");
+        fs::rename(&project, &shared).unwrap();
+        symlink(&shared, &project).unwrap();
+        assert_eq!(args.project_trust().unwrap(), None);
+        args.no_trust = true;
+        assert_eq!(args.project_trust().unwrap(), Some(false));
+        args.no_trust = false;
+        args.terminal_resume_approved = true;
+        assert_eq!(args.project_trust().unwrap(), Some(true));
+        args.terminal_resume_approved = false;
+        args.resume_existing_session = None;
+        assert_eq!(args.project_trust().unwrap(), Some(true));
     }
 
     #[cfg(unix)]
@@ -698,7 +939,7 @@ mod tests {
         }
         let executable = root.join("pi");
         std::fs::set_permissions(&args.session, std::fs::Permissions::from_mode(0o620)).unwrap();
-        assert!(report_body(&executable, &args).is_none());
+        assert!(report_body(&executable, &args, false).is_none());
 
         let unsafe_directory = root.join("shared");
         std::fs::create_dir(&unsafe_directory).unwrap();
@@ -706,15 +947,15 @@ mod tests {
             .unwrap();
         args.session = unsafe_directory.join("session.jsonl");
         Session::open(&args.session).unwrap();
-        assert!(report_body(&executable, &args).is_none());
+        assert!(report_body(&executable, &args, false).is_none());
 
         let alias = root.join("alias.jsonl");
         symlink(&args.session, &alias).unwrap();
         args.session = alias;
-        assert!(report_body(&executable, &args).is_none());
+        assert!(report_body(&executable, &args, false).is_none());
 
         args.session = unsafe_directory;
-        assert!(report_body(&executable, &args).is_none());
+        assert!(report_body(&executable, &args, false).is_none());
     }
 
     #[cfg(unix)]
@@ -729,7 +970,8 @@ mod tests {
         let mut reporter = Reporter {
             token: "fixture-token".into(),
             executable: root.join("pi"),
-            reported: None,
+            candidate: None,
+            reported: false,
         };
         let mut frames = Vec::new();
         let mut write = |frame: &str| {

@@ -5455,7 +5455,7 @@ fn slash(
             let workspace = args.workspace.canonicalize()?;
             if let Some(parent) = args.session.parent() {
                 for path in sessions::stored_paths(parent)? {
-                    if let Ok(session) = Session::open(&path) {
+                    if let Ok(session) = open_picker_session(args, &path) {
                         if session.host_binding().is_some() {
                             continue;
                         }
@@ -8342,8 +8342,8 @@ fn is_busy(worker: &Option<Worker>) -> bool {
 }
 
 fn persist_pending_thinking(pending: &PendingThinking, args: &Cli) -> Result<()> {
-    let mut session = if args.resume_existing_session.as_ref() == Some(&pending.session) {
-        Session::open_existing(&pending.session)?
+    let mut session = if args.bound_resume_workspace(&pending.session).is_some() {
+        super::program_resume::open_bound_session_at(args, &pending.session)?
     } else {
         Session::open(&pending.session)?
     };
@@ -10063,6 +10063,14 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
     items
 }
 
+fn open_picker_session(args: &Cli, path: &Path) -> Result<Session> {
+    if args.bound_resume_workspace(path).is_some() {
+        super::program_resume::open_bound_session_at(args, path)
+    } else {
+        Session::open_existing(path)
+    }
+}
+
 fn select(
     selection: Selection,
     args: &mut Cli,
@@ -10072,7 +10080,7 @@ fn select(
 ) -> Result<()> {
     match selection {
         Selection::RenameSession(path, name) => {
-            let mut session = Session::open(&path)?;
+            let mut session = open_picker_session(args, &path)?;
             if session.host_binding().is_some() {
                 return Err(Error::Session(
                     "managed sessions must be renamed by their host".into(),
@@ -10096,7 +10104,7 @@ fn select(
             if path.canonicalize().ok() == args.session.canonicalize().ok() {
                 return Err(Error::Config("Cannot delete the active session".into()));
             }
-            let session = Session::open(&path)?;
+            let session = open_picker_session(args, &path)?;
             if session.host_binding().is_some() {
                 return Err(Error::Session(
                     "managed sessions must be deleted by their host".into(),
@@ -10590,9 +10598,9 @@ fn initialize_open_session(args: &mut Cli, session: &mut Session) -> Result<()> 
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     let session = args.open_session()?;
-    if !args.resume_requires_existing()
-        && let Some(cwd) = session.working_directory()
-    {
+    if let Some(workspace) = args.bound_resume_workspace(&args.session) {
+        args.workspace = workspace.to_owned();
+    } else if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);
         if !path.is_dir() {
             return Err(Error::Config(
@@ -15209,6 +15217,32 @@ exit {exit}
         assert!(
             matches!(&shown[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**live**")
         );
+    }
+
+    #[test]
+    fn program_resume_picker_cannot_recreate_a_removed_journal() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.workspace = directory.path().canonicalize().unwrap();
+        args.session = args.workspace.join("restored.jsonl");
+        args.bind_existing_session();
+        let path = args.session.clone();
+        drop(pi_rs::Session::open(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(super::open_picker_session(&args, &path).is_err());
+        let mut view = super::View::default();
+        let result = super::select(
+            super::Selection::RenameSession(path.clone(), "new label".into()),
+            &mut args,
+            &mut view,
+            &mut super::Theme::system(),
+            &mut None,
+        );
+        assert!(result.is_err());
+        assert!(!path.exists());
     }
 
     #[test]
