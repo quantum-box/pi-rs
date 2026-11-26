@@ -4281,11 +4281,16 @@ render_call_id: None,
                 .saturating_sub(prompt_height + 4 + footer.len())
                 .min(available.saturating_sub(min_body)),
         );
-        if self.dialog().is_some() {
+        let above = if self.dialog().is_some() {
             below.clear();
-        }
+            Vec::new()
+        } else {
+            let mut above = self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor);
+            above.truncate(available.saturating_sub(below.len() + min_body));
+            above
+        };
         let output = self.transcript_options(args, false);
-        let body_height = available.saturating_sub(below.len());
+        let body_height = available.saturating_sub(above.len() + below.len());
         let mut lines = Vec::new();
         let mut prompts = Vec::new();
         let mut panels = Vec::new();
@@ -4367,7 +4372,6 @@ render_call_id: None,
             lines = dialog.render(theme, width, body_height, keys);
             dialog.cursor(width, body_height)
         } else {
-            lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
             self.picker
                 .as_ref()
                 .and_then(|picker| picker.tree_input_cursor(width, body_height))
@@ -4483,6 +4487,11 @@ render_call_id: None,
                 queue!(out, MoveTo((width - 1) as u16, (row + header_rows) as u16))?;
                 Line::themed(glyph, theme, role).draw(&mut out, 1, color_mode)?;
             }
+        }
+        // Widget rows belong to the input dock, outside transcript navigation and clipping.
+        for (row, line) in above.iter().enumerate() {
+            queue!(out, MoveTo(0, (header_rows + body_height + row) as u16))?;
+            line.draw(&mut out, width, color_mode)?;
         }
         let border_row = height - prompt_height - 2 - footer.len() - below.len();
         queue!(out, MoveTo(0, border_row as u16))?;

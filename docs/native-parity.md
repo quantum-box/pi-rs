@@ -3003,8 +3003,12 @@ status entries, above/below-editor widgets, window titles and editor text.
 Widgets appear in registration order within each position; replacing or moving
 a widget places it last at its destination, as in Pi.
 String-array widgets show at most ten input lines and a truncation notice, as in
-Pi. Native widgets retain the existing 64-widget and 128-line request limits;
-their text styling and fixed fullscreen placement remain to be matched.
+Pi. Native widgets retain the existing 64-widget and 128-line request limits,
+and their text styling can still differ. In fullscreen, both placements stay
+beside the editor while the transcript scrolls. Transcript search, selection,
+scrollbar geometry, and image clipping use only transcript rows. On short
+terminals, widget rows are clipped to make room for the editor and transcript.
+[Pinned Pi fullscreen layout](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/modes/interactive/chat-viewport.ts#L21-L44)
 `interactive_review` is a runnable Rust example.
 
 The TUI renders dialogs in fullscreen and regular modes. Escape cancels a
