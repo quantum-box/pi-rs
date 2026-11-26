@@ -10003,13 +10003,14 @@ impl Harness {
             membership
                 .append_to(state.id, &mut batch)
                 .map_err(|error| Error::Invalid(format!("fork session membership: {error}")))?;
-            match &reset_cut {
-                Some(
-                    ResetForkCut::Replay { checks, .. } | ResetForkCut::Anchored { checks, .. },
-                ) => {
-                    batch.checks.extend_from_slice(checks);
-                }
-                None => self.record_display_fork_origin(&state, id, cursor, &mut batch)?,
+            if let Some(
+                ResetForkCut::Replay { checks, .. } | ResetForkCut::Anchored { checks, .. },
+            ) = &reset_cut
+            {
+                batch.checks.extend_from_slice(checks);
+            }
+            if !matches!(reset_cut, Some(ResetForkCut::Replay { .. })) {
+                self.record_display_fork_origin(&state, id, cursor, &mut batch)?;
             }
             if let Some((_, entries)) = &application_cut {
                 let target = crate::application_entry::key(state.id);
