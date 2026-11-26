@@ -6127,11 +6127,13 @@ restart, encrypted-only thinking and a switch to a different model endpoint.
 
 ### Terminal hyperlink capability
 
-`terminal.hyperlinks` accepts `true`, `false`, and `"auto"`. An explicit
-boolean takes precedence over `PI_HYPERLINKS` and automatic terminal
-detection. Both transcript modes redraw Markdown links with the new
-OSC 8 setting after `/reload`. The settings schema validates both hyperlink
-and color capability values.
+An explicit boolean in `terminal.hyperlinks` takes precedence over
+`PI_HYPERLINKS` and automatic terminal detection. Use `"auto"` for automatic
+detection. Existing non-boolean values in `terminal.hyperlinks` and
+`terminal.trueColor` are preserved and use automatic detection too.
+Both transcript modes redraw Markdown links after `/reload`. Returning from
+a boolean hyperlink override to automatic mode refreshes detection, including
+the tmux client capability probe. Subsequent draws reuse the detected result.
 
 ### Terminal color capability
 

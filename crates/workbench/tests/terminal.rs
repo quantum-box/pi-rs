@@ -479,34 +479,7 @@ fn terminal_color_and_hyperlink_capabilities_apply_at_startup_and_reload_in_both
             theme["colors"]["userMessageBg"] = serde_json::json!("#808080");
             std::fs::write(home.join("themes/color-fixture.json"), theme.to_string()).unwrap();
 
-            let mut master_fd = -1;
-            let mut slave_fd = -1;
-            let mut size = libc::winsize {
-                ws_row: 32,
-                ws_col: 110,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            assert_eq!(
-                unsafe {
-                    libc::openpty(
-                        &mut master_fd,
-                        &mut slave_fd,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::addr_of_mut!(size),
-                    )
-                },
-                0
-            );
-            let mut master = unsafe { File::from_raw_fd(master_fd) };
-            let slave = unsafe { File::from_raw_fd(slave_fd) };
-            let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
-            assert_eq!(
-                unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
-                0
-            );
-            let _process = Process(
+            let (mut master, _process) = spawn_capability_test_terminal(
                 Command::new(env!("CARGO_BIN_EXE_pi"))
                     .current_dir(root.path())
                     .env("PI_RS_HOME", &home)
@@ -523,12 +496,7 @@ fn terminal_color_and_hyperlink_capabilities_apply_at_startup_and_reload_in_both
                         mode,
                         "--session",
                     ])
-                    .arg(&session_path)
-                    .stdin(Stdio::from(slave.try_clone().unwrap()))
-                    .stdout(Stdio::from(slave.try_clone().unwrap()))
-                    .stderr(Stdio::from(slave))
-                    .spawn()
-                    .unwrap(),
+                    .arg(&session_path),
             );
             output_until(&mut master, |text| {
                 assert!(
@@ -568,6 +536,133 @@ fn terminal_color_and_hyperlink_capabilities_apply_at_startup_and_reload_in_both
                 ready
             });
         }
+    }
+}
+
+fn spawn_capability_test_terminal(command: &mut Command) -> (File, Process) {
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let process = Process(
+        command
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    (master, process)
+}
+
+#[test]
+fn terminal_hyperlink_capabilities_reprobe_tmux_after_override() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const LABEL: &str = "tmux link fixture";
+    const URL: &str = "https://example.com/tmux-link";
+    let osc_link = format!("\x1b]8;;{URL}\x1b\\");
+    let fallback = format!(" ({URL})");
+
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let settings = home.join("settings.json");
+        let features = root.path().join("features");
+        let probe_log = root.path().join("probe-log");
+        let tmux = root.path().join("tmux");
+        std::fs::write(
+            &tmux,
+            "#!/bin/sh\nprintf 'probe\\n' >> \"$PI_TEST_TMUX_PROBE_LOG\"\n/bin/cat \"$PI_TEST_TMUX_FEATURES\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&features, "RGB\n").unwrap();
+        std::fs::write(
+            &settings,
+            br#"{"terminal":{"hyperlinks":null,"trueColor":null}}"#,
+        )
+        .unwrap();
+        let session_path = root.path().join("session.jsonl");
+        pi_rs::Session::open(&session_path)
+            .unwrap()
+            .append_user_with_images(format!("[{LABEL}]({URL})"), vec![], None)
+            .unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(root.path().to_owned()).chain(
+                std::env::var_os("PATH")
+                    .iter()
+                    .flat_map(std::env::split_paths),
+            ),
+        )
+        .unwrap();
+        let (mut master, _process) = spawn_capability_test_terminal(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(root.path())
+                .env("PI_RS_HOME", &home)
+                .env("TERM", "xterm-256color")
+                .env("TMUX", "fixture")
+                .env("PATH", path)
+                .env("PI_TEST_TMUX_FEATURES", &features)
+                .env("PI_TEST_TMUX_PROBE_LOG", &probe_log)
+                .env_remove("PI_HYPERLINKS")
+                .args([
+                    "--offline",
+                    "--no-trust",
+                    "--no-mcp",
+                    "--no-extensions",
+                    "--tui-mode",
+                    mode,
+                    "--session",
+                ])
+                .arg(&session_path),
+        );
+        let probes = || std::fs::read_to_string(&probe_log).unwrap().lines().count();
+        output_until(&mut master, |text| {
+            text.contains("Enter to send") && text.contains(LABEL) && text.contains(&fallback)
+        });
+        assert_eq!(probes(), 1, "{mode}");
+
+        std::fs::write(&settings, br#"{"terminal":{"hyperlinks":true}}"#).unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Reloaded settings") && text.contains(&osc_link)
+        });
+        assert_eq!(probes(), 1, "{mode}");
+
+        std::fs::write(&features, "RGB,hyperlinks\n").unwrap();
+        std::fs::write(&settings, br#"{"terminal":{"hyperlinks":"auto"}}"#).unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Reloaded settings") && text.contains(&osc_link) && probes() == 2
+        });
+        master.write_all(b"cached probe fixture").unwrap();
+        output_until(&mut master, |text| text.contains("cached probe fixture"));
+        assert_eq!(probes(), 2, "{mode}");
     }
 }
 

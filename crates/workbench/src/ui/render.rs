@@ -378,7 +378,7 @@ pub struct TranscriptOptions<'a> {
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
     pub code_block_indent: Option<&'a str>,
-    pub hyperlinks: Option<bool>,
+    pub hyperlinks: bool,
     pub hidden_thinking_label: Option<&'a str>,
     pub expand_key: Option<crossterm::event::KeyEvent>,
 }
@@ -473,7 +473,7 @@ impl Entry {
                             inner,
                             0,
                             options.mermaid,
-                            options.hyperlinks.unwrap_or_else(|| *HYPERLINKS),
+                            options.hyperlinks,
                             false,
                         ));
                         lines.push(Line::default());
@@ -1370,8 +1370,9 @@ fn tmux_hyperlinks() -> bool {
     }
 }
 
-static HYPERLINKS: LazyLock<bool> =
-    LazyLock::new(|| detect_hyperlinks(|name| std::env::var(name).ok(), tmux_hyperlinks));
+pub(crate) fn detect_terminal_hyperlinks() -> bool {
+    detect_hyperlinks(|name| std::env::var(name).ok(), tmux_hyperlinks)
+}
 
 #[derive(Default)]
 struct Table {
@@ -2007,7 +2008,7 @@ fn transcript_markdown(
         0,
         MarkdownOptions {
             mermaid: options.mermaid,
-            hyperlinks: options.hyperlinks.unwrap_or_else(|| *HYPERLINKS),
+            hyperlinks: options.hyperlinks,
             preserve_source,
             code_block_indent: options
                 .code_block_indent
