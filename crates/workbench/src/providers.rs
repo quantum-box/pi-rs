@@ -943,24 +943,17 @@ impl Client {
         model: &str,
         affinity: Option<(&[&'static str], &str)>,
     ) -> Result<Option<(Client, Option<String>)>> {
-        let (mut client, mut headers) = match self {
-            Self::Deferred(deferred) => deferred.resolve_with_headers().await?,
-            Self::Ollama(client) => (self.clone(), client.context_headers()),
-            Self::Anthropic(client) => (self.clone(), client.context_headers()),
-            Self::Google(client) => (self.clone(), client.context_headers()),
-            Self::OpenAi(client) => (self.clone(), client.context_headers()),
-            Self::PiMessages(client) => (self.clone(), client.context_headers()),
-            Self::Bedrock(client) => (
-                Self::Bedrock(client.clone().bind_reasoning_model(model)),
-                HeaderMap::new(),
-            ),
-        };
+        let (mut client, mut headers) = self.resolve_affinity_headers().await?;
         client = match client {
             Self::PiMessages(client) => Self::PiMessages(client.prepare_context(model).await?),
-            Self::Bedrock(client) if affinity.is_none() => match client.prepare_bedrock().await? {
-                Some(prepared) => Self::Bedrock(prepared),
-                None => Self::Bedrock(client),
-            },
+            Self::Bedrock(client) => {
+                let client = client.bind_reasoning_model(model);
+                if affinity.is_none() {
+                    Self::Bedrock(client.prepare_bedrock().await?.unwrap_or(client))
+                } else {
+                    Self::Bedrock(client)
+                }
+            }
             other => other,
         };
         if let Some((names, external_id)) = affinity {
@@ -6290,6 +6283,205 @@ mod bedrock_tests {
     use clap::Parser;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn read_converse_request(
+        socket: &mut tokio::net::TcpStream,
+    ) -> (String, serde_json::Value) {
+        let mut data = Vec::new();
+        let mut buffer = [0; 8192];
+        let (header_len, body_len) = loop {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0);
+            data.extend_from_slice(&buffer[..read]);
+            if let Some(end) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                let body_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")?
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                    })
+                    .unwrap();
+                break (end + 4, body_len);
+            }
+        };
+        while data.len() < header_len + body_len {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0);
+            data.extend_from_slice(&buffer[..read]);
+        }
+        (
+            String::from_utf8(data[..header_len].to_vec()).unwrap(),
+            serde_json::from_slice(&data[header_len..header_len + body_len]).unwrap(),
+        )
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn deferred_bedrock_reuses_measured_context_with_and_without_affinity() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        const CHILD: &str = "PI_RS_DEFERRED_BEDROCK_CONTEXT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            struct HeaderHook;
+            impl pi_rs::Extension for HeaderHook {
+                fn id(&self) -> &str {
+                    "fixture-provider-headers"
+                }
+                fn handles_before_provider_headers(&self) -> bool {
+                    true
+                }
+            }
+
+            let mut args = super::super::Cli::try_parse_from(["pi", "--offline"]).unwrap();
+            args.provider = Provider::Bedrock;
+            args.model = "anthropic.claude-opus-4-8".into();
+            let client = Client::deferred(
+                Provider::Bedrock,
+                Adapter::Bedrock,
+                "",
+                Some(Credential::BedrockChain),
+                RequestHeaders::default(),
+            )
+            .with_model_options(&args, false)
+            .unwrap();
+            assert!(matches!(client, Client::Deferred(_)));
+            for with_affinity in [false, true] {
+                let registry = if with_affinity {
+                    pi_rs::Registry::compose(vec![Arc::new(HeaderHook)], &Default::default())
+                        .unwrap()
+                } else {
+                    pi_rs::Registry::default()
+                };
+                let model = super::super::image_policy::WorkbenchModel {
+                    strict_policy: None,
+                    client: client.clone(),
+                    block_images: false,
+                    supports_images: Some(true),
+                    session_affinity: &["x-fixture-session"],
+                    price: None,
+                };
+                let mut agent = pi_rs::Agent {
+                    registry: &registry,
+                    system_prompt: "short",
+                    model: &model,
+                    model_name: &args.model,
+                    limits: pi_rs::Limits {
+                        context_window: Some(5000),
+                        output_tokens_per_request: 64,
+                        ..Default::default()
+                    },
+                };
+                let mut session =
+                    pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+                session.auto_compaction_control().set_enabled(false);
+                let (_, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+                let cancel = pi_rs::CancellationToken::new();
+                assert_eq!(
+                    agent
+                        .run(
+                            &mut session,
+                            Some("first".into()),
+                            &mut inputs,
+                            &cancel,
+                            &mut |_| {}
+                        )
+                        .await
+                        .unwrap(),
+                    "fixture reply",
+                );
+                assert!(
+                    session.records().iter().any(|record| matches!(
+                        record.event,
+                        pi_rs::Event::ModelRequested {
+                            context_configuration_sha256: Some(_),
+                            ..
+                        }
+                    )),
+                    "with_affinity={with_affinity}"
+                );
+
+                // The serialized follow-up is short, but the fixture measured
+                // 3000 input tokens on the previous turn. Reuse must reject it.
+                agent.limits.context_window = Some(1000);
+                let result = agent
+                    .run(
+                        &mut session,
+                        Some("next".into()),
+                        &mut inputs,
+                        &cancel,
+                        &mut |_| {},
+                    )
+                    .await;
+                assert!(
+                    matches!(result, Err(pi_rs::Error::Model(message))
+                    if message.contains("automatic compaction is disabled")),
+                    "with_affinity={with_affinity}"
+                );
+            }
+            return;
+        }
+
+        // ConverseStream frames for an assistant text reply with measured
+        // usage (3000 input and 8 output tokens).
+        let response = STANDARD.decode(concat!(
+            "AAAAdgAAAFKW1freDTptZXNzYWdlLXR5cGUHAAVldmVudAs6ZXZlbnQtdHlwZQcADG1lc3NhZ2VTdGFydA06Y29u",
+            "dGVudC10eXBlBwAQYXBwbGljYXRpb24vanNvbnsicm9sZSI6ImFzc2lzdGFudCJ9HMa+GAAAAJ8AAABXw3ur/w06",
+            "bWVzc2FnZS10eXBlBwAFZXZlbnQLOmV2ZW50LXR5cGUHABFjb250ZW50QmxvY2tEZWx0YQ06Y29udGVudC10eXBl",
+            "BwAQYXBwbGljYXRpb24vanNvbnsiY29udGVudEJsb2NrSW5kZXgiOjAsImRlbHRhIjp7InRleHQiOiJmaXh0dXJl",
+            "IHJlcGx5In190d4TcAAAAH0AAABW5mgP1g06bWVzc2FnZS10eXBlBwAFZXZlbnQLOmV2ZW50LXR5cGUHABBjb250",
+            "ZW50QmxvY2tTdG9wDTpjb250ZW50LXR5cGUHABBhcHBsaWNhdGlvbi9qc29ueyJjb250ZW50QmxvY2tJbmRleCI6",
+            "MH1YfqrCAAAAegAAAFHKLEZlDTptZXNzYWdlLXR5cGUHAAVldmVudAs6ZXZlbnQtdHlwZQcAC21lc3NhZ2VTdG9w",
+            "DTpjb250ZW50LXR5cGUHABBhcHBsaWNhdGlvbi9qc29ueyJzdG9wUmVhc29uIjoiZW5kX3R1cm4ifT3DO/oAAAC6",
+            "AAAATq4xo0sNOm1lc3NhZ2UtdHlwZQcABWV2ZW50CzpldmVudC10eXBlBwAIbWV0YWRhdGENOmNvbnRlbnQtdHlw",
+            "ZQcAEGFwcGxpY2F0aW9uL2pzb257InVzYWdlIjp7ImlucHV0VG9rZW5zIjozMDAwLCJvdXRwdXRUb2tlbnMiOjgs",
+            "InRvdGFsVG9rZW5zIjozMDA4fSwibWV0cmljcyI6eyJsYXRlbmN5TXMiOjF9fWFSX5w=",
+        )).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "providers::bedrock_tests::deferred_bedrock_reuses_measured_context_with_and_without_affinity"])
+            .env(CHILD, "1")
+            .env("PI_RS_HOME", directory.path())
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_DEFAULT_REGION", "us-east-1")
+            .env("AWS_ACCESS_KEY_ID", "SYNTHETIC_ACCESS_KEY")
+            .env("AWS_SECRET_ACCESS_KEY", "synthetic-secret")
+            .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", &endpoint)
+            .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env_remove("AWS_BEARER_TOKEN_BEDROCK")
+            .env_remove("AWS_SESSION_TOKEN")
+            .env_remove("AWS_PROFILE")
+            .kill_on_drop(true)
+            .spawn().unwrap();
+        let server = async {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (headers, request) = read_converse_request(&mut socket).await;
+                assert!(
+                    headers.starts_with("POST /model/anthropic.claude-opus-4-8/converse-stream ")
+                );
+                assert_eq!(request["messages"][0]["content"][0]["text"], "first");
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    response.len(),
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(&response).await.unwrap();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::join!(server, async {
+                assert!(child.wait().await.unwrap().success());
+            });
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn bedrock_summary_and_configured_effort_reach_workbench() {
         const CHILD: &str = "PI_RS_BEDROCK_WORKBENCH_SUMMARY_CHILD";
@@ -6529,33 +6721,8 @@ mod bedrock_tests {
             let mut requests = Vec::new();
             for _ in 0..23 {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut bytes = Vec::new();
-                let mut buf = [0; 8192];
-                let (end, len) = loop {
-                    let n = socket.read(&mut buf).await.unwrap();
-                    assert!(n > 0);
-                    bytes.extend_from_slice(&buf[..n]);
-                    if let Some(pos) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&bytes[..pos]);
-                        let len = headers
-                            .lines()
-                            .find_map(|l| {
-                                l.split_once(':')
-                                    .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                                    .map(|(_, v)| v.trim().parse::<usize>().unwrap())
-                            })
-                            .unwrap();
-                        break (pos + 4, len);
-                    }
-                };
-                while bytes.len() < end + len {
-                    let n = socket.read(&mut buf).await.unwrap();
-                    assert!(n > 0);
-                    bytes.extend_from_slice(&buf[..n]);
-                }
-                requests.push(
-                    serde_json::from_slice::<serde_json::Value>(&bytes[end..end + len]).unwrap(),
-                );
+                let (_, request) = read_converse_request(&mut socket).await;
+                requests.push(request);
                 socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: 0\r\n\r\n").await.unwrap();
             }
             requests
