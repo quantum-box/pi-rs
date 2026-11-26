@@ -13915,6 +13915,25 @@ exit {exit}
             assert!(rendered.contains("[Could not save the full output: missing file. Truncated: 10 lines shown (50.0KB limit)]"), "{rendered}");
             assert!(!rendered.contains("/tmp/spill"), "{rendered}");
 
+            let Entry::Tool { rendered, .. } = &mut view.lines[0] else {
+                unreachable!("the progress update belongs to the shell row");
+            };
+            *rendered = Some(std::sync::Arc::new(pi_rs::RenderedTool {
+                result: Some(pi_rs::RenderedExtensionRows {
+                    lines: vec![vec![pi_rs::UiComponentSpan {
+                        text: "missing file (custom renderer)".into(),
+                        ..Default::default()
+                    }]],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+            assert_eq!(text(&view, false).matches("missing file").count(), 1);
+
+            let Entry::Tool { rendered, .. } = &mut view.lines[0] else {
+                unreachable!("the custom result belongs to the shell row");
+            };
+            *rendered = None;
             view.finish_tool(&operation, &pi_rs::Outcome::Succeeded("done".into()), None);
             let finished = text(&view, false);
             assert!(finished.contains("done"), "{finished}");
