@@ -7392,8 +7392,11 @@ original stop reason, even if the edit removes all its text or calls. For
 native completions without a recognized length limit or recorded failure, the
 original presence of tool calls distinguishes `toolUse` from `stop`. Pi
 imports keep their original stop reasons. Marked failed and cancelled turn
-partials can provide display text without entering model context. Older
-unmarked failures and summary partials remain excluded.
+partials can provide display text without entering model context. Scheduling
+automatic retry or overflow recovery records an omission for the superseded
+partial before retry or backoff. The raw attempt and its usage remain in the
+journal. The omission also applies after cancelling backoff or reopening the
+session. Older unmarked failures and summary partials remain excluded.
 [Pinned Pi assistant text selection](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4522-L4549)
 
 ### SDK skill commands

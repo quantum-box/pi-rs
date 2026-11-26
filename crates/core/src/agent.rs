@@ -2507,10 +2507,12 @@ impl Agent<'_> {
                         )
                         .await?;
                 }
-                let attempt = active
+                let ReplyAttempt {
+                    outcome: result,
+                    partial_record,
+                } = active
                     .reply(session, attempt, true, cancel, observer, Some(followups))
                     .await?;
-                let result = attempt.outcome;
                 if let Err(Error::Model(message) | Error::RetryableModel(message)) = &result
                     && crate::retry::context_overflow_error(message)
                     && session.auto_compaction_control().enabled()
@@ -2523,6 +2525,7 @@ impl Agent<'_> {
                     )
                     .is_ok_and(|retention| has_summary_prefix(session, retention.boundary))
                 {
+                    omit_retry_partial(session, partial_record, observer)?;
                     continue;
                 }
                 let control = session.retry_control();
@@ -2532,6 +2535,9 @@ impl Agent<'_> {
                     && retry_attempt < settings.max_retries
                     && request_index + 1 < active.limits.model_requests
                 {
+                    // Persist the omission before notifying the caller or entering
+                    // cancellable backoff. The failed completion remains in history.
+                    omit_retry_partial(session, partial_record, observer)?;
                     retry_attempt += 1;
                     let delay_ms = settings.delay_ms(retry_attempt);
                     let retry_wait = control.begin_wait();
@@ -3957,10 +3963,8 @@ impl Agent<'_> {
         };
         // Only turn replies are displayable. Summary requests can contain
         // private prompt material and must never enter the RPC transcript.
-        if retain_reply
-            && !content.is_empty()
-            && let Some(failure) = failure
-        {
+        let partial_failure = failure.filter(|_| retain_reply && !content.is_empty());
+        if let Some(failure) = partial_failure {
             commit(
                 session,
                 Event::SourceEntry {
@@ -4031,7 +4035,10 @@ impl Agent<'_> {
             observer(Notification::Committed(record));
         });
         self.settle_usage(request_id, &usage, &metadata).await?;
-        Ok(ReplyAttempt { outcome: result })
+        Ok(ReplyAttempt {
+            outcome: result,
+            partial_record: partial_failure.map(|_| record_id),
+        })
     }
 
     async fn settle_usage(
@@ -7358,6 +7365,7 @@ impl PreparedAttempt<'_> {
 
 struct ReplyAttempt {
     outcome: Result<Reply>,
+    partial_record: Option<u64>,
 }
 
 struct Reply {
@@ -7769,6 +7777,24 @@ mod metadata_scope_tests {
 
 fn commit(session: &mut Session, event: Event, observer: &mut Observer<'_>) -> Result<()> {
     observer(Notification::Committed(session.append(event)?));
+    Ok(())
+}
+
+fn omit_retry_partial(
+    session: &mut Session,
+    target: Option<u64>,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    if let Some(target) = target {
+        commit(
+            session,
+            Event::ContextEdited {
+                target,
+                replacement: None,
+            },
+            observer,
+        )?;
+    }
     Ok(())
 }
 
@@ -9748,7 +9774,15 @@ mod tree_tests {
         async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
             assert!(request.max_output_tokens >= self.minimum_output_tokens);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 || self.always_fail {
+            if call == 0 {
+                return Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("overflow partial".into())),
+                    Err(Error::Model(
+                        "prompt is too long: private-fixture-secret".into(),
+                    )),
+                ])));
+            }
+            if self.always_fail {
                 return Err(Error::Model(
                     "prompt is too long: private-fixture-secret".into(),
                 ));
@@ -9830,6 +9864,25 @@ mod tree_tests {
                     &mut |_| {},
                 )
                 .await;
+            let failed = session
+                .records()
+                .iter()
+                .find(|record| {
+                    matches!(&record.event,
+                Event::ModelFinished { partial, .. } if partial == "overflow partial")
+                })
+                .unwrap();
+            assert!(
+                session
+                    .records()
+                    .iter()
+                    .any(|record| matches!(&record.event,
+                Event::ContextEdited { target, replacement: None } if *target == failed.id))
+            );
+            assert_ne!(
+                session.last_assistant_text().as_deref(),
+                Some("overflow partial")
+            );
             if !provide && run_budget == 16 {
                 assert!(matches!(result, Err(Error::Budget)));
                 assert_eq!(model.calls.load(Ordering::SeqCst), 1);
@@ -9905,6 +9958,10 @@ mod tree_tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("prompt is too long"), "{error}");
+        assert_eq!(
+            session.last_assistant_text().as_deref(),
+            Some("overflow partial")
+        );
         assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert!(
             !session

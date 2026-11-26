@@ -10553,6 +10553,125 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn sdk_last_assistant_text_omits_partial_only_when_retry_is_scheduled() {
+        struct RetryPartialModel {
+            calls: AtomicUsize,
+            terminal_text: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl Model for RetryPartialModel {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                assert!(request.messages.iter().all(|message| !matches!(message,
+                    Message::Assistant { content, .. } if content.contains("partial"))));
+                let events = match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => vec![
+                        Ok(ModelEvent::Text("previous answer".into())),
+                        Ok(ModelEvent::Complete {
+                            calls: vec![],
+                            usage: None,
+                        }),
+                    ],
+                    attempt => vec![
+                        Ok(ModelEvent::Text(
+                            if attempt == 1 {
+                                "first partial"
+                            } else {
+                                self.terminal_text
+                            }
+                            .into(),
+                        )),
+                        Err(Error::RetryableModel("fixture failure".into())),
+                    ],
+                };
+                Ok(Box::pin(futures_util::stream::iter(events)))
+            }
+        }
+
+        for (retry, cancel, terminal_text, expected) in [
+            (false, false, "", "first partial"),
+            (true, true, "", "previous answer"),
+            (true, false, "", "previous answer"),
+            (true, false, "terminal partial", "terminal partial"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("retry.jsonl");
+            let model = Arc::new(RetryPartialModel {
+                calls: AtomicUsize::new(0),
+                terminal_text,
+            });
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .open(&path)
+                .unwrap();
+            let controls = session.controls();
+            controls
+                .set_retry_settings(crate::RetrySettings {
+                    enabled: retry,
+                    max_retries: 1,
+                    base_delay_ms: if cancel { 60_000 } else { 0 },
+                    max_agent_delay_ms: 60_000,
+                })
+                .unwrap();
+            session.prompt("first question").await.unwrap();
+            let mut first_partial = None;
+            let mut omission_committed = false;
+            let error = session
+                .prompt_with_observer("second question", &mut |notification| match notification {
+                    crate::Notification::Committed(record) => match &record.event {
+                        crate::Event::ModelFinished {
+                            partial,
+                            failure: Some(crate::ModelFailure::Retryable),
+                            usage: crate::UsageReport::Unconfirmed,
+                            ..
+                        } if partial == "first partial" => first_partial = Some(record.id),
+                        crate::Event::ContextEdited {
+                            target,
+                            replacement: None,
+                        } if Some(*target) == first_partial => omission_committed = true,
+                        _ => {}
+                    },
+                    crate::Notification::Retry(crate::RetryEvent::Start { .. }) => {
+                        assert!(omission_committed);
+                        if cancel {
+                            controls.abort_retry().unwrap();
+                        }
+                    }
+                    _ => {}
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(matches!(error, Error::Cancelled), cancel);
+            assert_eq!(omission_committed, retry);
+            assert_eq!(
+                model.calls.load(Ordering::SeqCst),
+                if retry && !cancel { 3 } else { 2 }
+            );
+            assert_eq!(
+                session.get_last_assistant_text().unwrap().as_deref(),
+                Some(expected)
+            );
+            drop(session);
+
+            let reopened = SessionBuilder::new(model, "fixture").open(&path).unwrap();
+            assert_eq!(
+                reopened.get_last_assistant_text().unwrap().as_deref(),
+                Some(expected)
+            );
+            let journal = reopened.journal().unwrap();
+            let partial = &journal.records()[first_partial.unwrap() as usize - 1];
+            assert!(matches!(&partial.event,
+                crate::Event::ModelFinished { partial, usage: crate::UsageReport::Unconfirmed, .. }
+                    if partial == "first partial"));
+            assert!(
+                journal
+                    .current_messages()
+                    .iter()
+                    .all(|message| !matches!(message,
+                Message::Assistant { content, .. } if content.contains("partial")))
+            );
+        }
+    }
+
     struct ResumeSettlementModel {
         summary_id: Uuid,
         attempts: std::sync::Mutex<Vec<(Uuid, crate::UsageReport, crate::ModelMetadata)>>,

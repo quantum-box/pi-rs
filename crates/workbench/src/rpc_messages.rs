@@ -169,17 +169,18 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                     // Tool-pair repair can elide an empty reply from model
                     // context. Its original stop still matters in the transcript.
                     let edited = edits.contains_key(&record.id);
-                    let metadata = Some(MetadataSource::Session(session));
-                    let value = if edited {
-                        let message = Message::Assistant {
-                            content: additional.get(&record.id)?.text().into_owned(),
-                            calls: vec![],
-                            replay: None,
-                        };
-                        projection.message(session.records(), record, &message, true, metadata)
-                    } else {
-                        projection.raw_message(session.records(), record, metadata)?
+                    let message = Message::Assistant {
+                        content: additional.get(&record.id)?.text().into_owned(),
+                        calls: vec![],
+                        replay: None,
                     };
+                    let value = projection.message(
+                        session.records(),
+                        record,
+                        &message,
+                        edited,
+                        Some(MetadataSource::Session(session)),
+                    );
                     imported_entries
                         .get(&record.id)
                         .and_then(|source| {
@@ -187,7 +188,7 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                                 source,
                                 &value,
                                 record.timestamp_millis().unwrap_or_default(),
-                                edited,
+                                true,
                             )
                         })
                         .unwrap_or(value)
@@ -852,7 +853,7 @@ fn imported_message(
     source: &Value,
     projected: &Value,
     timestamp: i64,
-    edited: bool,
+    use_projected_content: bool,
 ) -> Option<Value> {
     let mut message = if source["type"] == "custom_message" {
         let mut custom = json!({
@@ -867,7 +868,7 @@ fn imported_message(
     } else {
         source.get("message")?.clone()
     };
-    if edited {
+    if use_projected_content || (message["role"] == "assistant" && message["content"].is_null()) {
         message["content"] = projected["content"].clone();
     }
     Some(message)
@@ -1043,6 +1044,49 @@ mod tests {
     }
 
     #[test]
+    fn imported_empty_stop_keeps_repaired_content_in_rpc() {
+        let call = json!({"type":"toolCall","id":"call","name":"fixture","arguments":{}});
+        for content in [Value::Null, json!([call])] {
+            let mut fixture = tempfile::NamedTempFile::new().unwrap();
+            let mut entries = vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"a","parentId":null,"message":{
+                    "role":"assistant","stopReason":"stop","content":[{"type":"text","text":"older"}]
+                }}),
+                json!({"type":"message","id":"u","parentId":"a","message":{
+                    "role":"user","content":"question"
+                }}),
+                json!({"type":"message","id":"b","parentId":"u","message":{
+                    "role":"assistant","stopReason":"stop","content":content
+                }}),
+            ];
+            if content.is_null() {
+                entries.push(json!({"type":"context_edit","id":"e","parentId":"b","targetId":"u","replacement":null}));
+            } else {
+                entries.push(json!({"type":"message","id":"r","parentId":"b","message":{
+                    "role":"toolResult","toolCallId":"call","toolName":"fixture","isError":false,
+                    "content":[{"type":"text","text":"result"}]
+                }}));
+                entries.push(json!({"type":"context_edit","id":"e","parentId":"r","targetId":"r","replacement":null}));
+            }
+            for entry in &entries {
+                writeln!(fixture, "{entry}").unwrap();
+            }
+            let session = super::super::session_import::read(fixture.path()).unwrap();
+            let (visible, native) = snapshot(&session);
+            assert_eq!(visible.len(), if content.is_null() { 2 } else { 3 });
+            assert_eq!(count(&session), visible.len());
+            assert_eq!(native.len() + 1, visible.len());
+            assert_eq!(visible.last().unwrap()["stopReason"], "stop");
+            assert_eq!(visible.last().unwrap()["content"], json!([]));
+            assert_eq!(session.last_assistant_text(), None);
+            assert!(session.records().iter().any(|record| matches!(
+                &record.event, Event::SourceEntry { entry, .. } if entry == &entries[3]
+            )));
+        }
+    }
+
+    #[test]
     fn last_assistant_text_skips_nonfinal_messages_without_visible_text() {
         for (reason, content, expected) in [
             (
@@ -1111,6 +1155,11 @@ mod tests {
         );
         assert_turn_partial(
             pi_rs::ModelFailure::Failed,
+            "pi-rs:failed-turn-partial",
+            "error",
+        );
+        assert_turn_partial(
+            pi_rs::ModelFailure::Retryable,
             "pi-rs:failed-turn-partial",
             "error",
         );
