@@ -18,7 +18,7 @@ use syntect::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::theme::Theme;
+use super::{color::ColorMode, theme::Theme};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
@@ -175,11 +175,12 @@ impl Line {
         }
     }
 
-    pub fn draw(&self, out: &mut impl Write, width: usize) -> std::io::Result<()> {
+    pub fn draw(&self, out: &mut impl Write, width: usize, mode: ColorMode) -> std::io::Result<()> {
+        let background = mode.encode(self.background.unwrap_or(Color::Reset));
         queue!(
             out,
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(self.background.unwrap_or(Color::Reset))
+            SetBackgroundColor(background)
         )?;
         let mut used = 0;
         for span in &self.spans {
@@ -188,8 +189,11 @@ impl Line {
             }
             queue!(
                 out,
-                SetForegroundColor(span.color),
-                SetBackgroundColor(span.background.or(self.background).unwrap_or(Color::Reset)),
+                SetForegroundColor(mode.encode(span.color)),
+                SetBackgroundColor(
+                    span.background
+                        .map_or(background, |color| mode.encode(color))
+                ),
                 SetAttribute(Attribute::NormalIntensity),
                 SetAttribute(if span.bold {
                     Attribute::Bold
@@ -239,7 +243,7 @@ impl Line {
         queue!(
             out,
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(self.background.unwrap_or(Color::Reset)),
+            SetBackgroundColor(background),
             Print(" ".repeat(width.saturating_sub(used))),
             ResetColor
         )
@@ -373,6 +377,7 @@ pub struct TranscriptOptions<'a> {
     pub image_width: Option<usize>,
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
+    pub code_block_indent: Option<&'a str>,
     pub hidden_thinking_label: Option<&'a str>,
     pub expand_key: Option<crossterm::event::KeyEvent>,
 }
@@ -523,15 +528,7 @@ impl Entry {
                 if expanded.unwrap_or(expand_tools) {
                     lines.extend(wrap(&[label], inner));
                     let markdown = format!("**{name}**\n\n{body}");
-                    let mut body = markdown_at_depth(
-                        &markdown,
-                        theme,
-                        inner,
-                        0,
-                        options.mermaid,
-                        *HYPERLINKS,
-                        false,
-                    );
+                    let mut body = transcript_markdown(&markdown, theme, inner, options, false);
                     for span in body.iter_mut().flat_map(|line| &mut line.spans) {
                         if span.color == theme.color("text") && !span.dim {
                             span.color = color;
@@ -561,15 +558,8 @@ impl Entry {
                 lines
             }
             Self::Assistant(text) => {
-                let mut lines = markdown_at_depth(
-                    text.at_width(inner),
-                    theme,
-                    inner,
-                    0,
-                    options.mermaid,
-                    *HYPERLINKS,
-                    false,
-                );
+                let mut lines =
+                    transcript_markdown(text.at_width(inner), theme, inner, options, false);
                 lines.push(Line::default());
                 lines
             }
@@ -595,8 +585,7 @@ impl Entry {
                 let mut lines = vec![Line::default()];
                 lines.extend(wrap(&[label], inner));
                 lines.push(Line::default());
-                let mut body =
-                    markdown_at_depth(text, theme, inner, 0, options.mermaid, *HYPERLINKS, false);
+                let mut body = transcript_markdown(text, theme, inner, options, false);
                 custom_message_base_style(&mut body, theme);
                 lines.extend(body);
                 lines.push(Line::default());
@@ -632,15 +621,7 @@ impl Entry {
                 lines.push(Line::default());
                 if expanded.unwrap_or(expand_tools) {
                     let markdown = format!("**{title}**\n\n{text}");
-                    let mut body = markdown_at_depth(
-                        &markdown,
-                        theme,
-                        inner,
-                        0,
-                        options.mermaid,
-                        *HYPERLINKS,
-                        false,
-                    );
+                    let mut body = transcript_markdown(&markdown, theme, inner, options, false);
                     for span in body.iter_mut().flat_map(|line| &mut line.spans) {
                         if span.color == theme.color("text") && !span.dim {
                             span.color = color;
@@ -698,13 +679,14 @@ impl Entry {
                     // Pi renders thinking as Markdown, but deliberately excludes it
                     // from the Mermaid transformer. Only default text inherits the
                     // thinking style; explicit Markdown roles keep their colors.
-                    let mut lines = markdown_at_depth(
+                    let mut lines = transcript_markdown(
                         text.at_width(inner),
                         theme,
                         inner,
-                        0,
-                        super::mermaid::Mermaid::Off,
-                        *HYPERLINKS,
+                        TranscriptOptions {
+                            mermaid: super::mermaid::Mermaid::Off,
+                            ..options
+                        },
                         false,
                     );
                     for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
@@ -1552,7 +1534,7 @@ fn user_lines(
     width: usize,
     options: TranscriptOptions<'_>,
 ) -> Vec<Line> {
-    let mut lines = markdown_at_depth(text, theme, width, 0, options.mermaid, *HYPERLINKS, true);
+    let mut lines = transcript_markdown(text, theme, width, options, true);
     for line in &mut lines {
         line.background = Some(theme.color("userMessageBg"));
         for span in &mut line.spans {
@@ -2002,6 +1984,37 @@ fn blank_list_separator(line: &str, quote_depth: usize) -> bool {
     rest.is_empty()
 }
 
+#[derive(Clone, Copy)]
+struct MarkdownOptions<'a> {
+    mermaid: super::mermaid::Mermaid,
+    hyperlinks: bool,
+    preserve_source: bool,
+    code_block_indent: &'a str,
+}
+
+fn transcript_markdown(
+    text: &str,
+    theme: &Theme,
+    width: usize,
+    options: TranscriptOptions<'_>,
+    preserve_source: bool,
+) -> Vec<Line> {
+    render_markdown(
+        text,
+        theme,
+        width,
+        0,
+        MarkdownOptions {
+            mermaid: options.mermaid,
+            hyperlinks: *HYPERLINKS,
+            preserve_source,
+            code_block_indent: options
+                .code_block_indent
+                .unwrap_or(crate::config::DEFAULT_CODE_BLOCK_INDENT),
+        },
+    )
+}
+
 fn markdown_at_depth(
     text: &str,
     theme: &Theme,
@@ -2010,6 +2023,27 @@ fn markdown_at_depth(
     mermaid: super::mermaid::Mermaid,
     hyperlinks: bool,
     preserve_source: bool,
+) -> Vec<Line> {
+    render_markdown(
+        text,
+        theme,
+        width,
+        depth,
+        MarkdownOptions {
+            mermaid,
+            hyperlinks,
+            preserve_source,
+            code_block_indent: crate::config::DEFAULT_CODE_BLOCK_INDENT,
+        },
+    )
+}
+
+fn render_markdown(
+    text: &str,
+    theme: &Theme,
+    width: usize,
+    depth: usize,
+    markdown: MarkdownOptions<'_>,
 ) -> Vec<Line> {
     // Pi expands tabs before lexing Markdown, including fenced code. Use the
     // same normalized text for block parsing and reference definitions.
@@ -2027,9 +2061,7 @@ fn markdown_at_depth(
         theme,
         width,
         depth,
-        mermaid,
-        hyperlinks,
-        preserve_source,
+        markdown,
     )
 }
 
@@ -2038,9 +2070,7 @@ fn markdown_at_depth_with_refs(
     theme: &Theme,
     width: usize,
     depth: usize,
-    mermaid: super::mermaid::Mermaid,
-    hyperlinks: bool,
-    preserve_source: bool,
+    markdown: MarkdownOptions<'_>,
 ) -> Vec<Line> {
     let parsed = super::markdown_spaces::inline_indented_comments(parsed);
     let parsed = parsed.as_ref();
@@ -2049,9 +2079,7 @@ fn markdown_at_depth_with_refs(
         theme,
         width,
         depth,
-        mermaid,
-        hyperlinks,
-        preserve_source,
+        markdown,
     ) {
         return lines;
     }
@@ -2065,9 +2093,7 @@ fn markdown_at_depth_with_refs(
             theme,
             width,
             depth,
-            mermaid,
-            hyperlinks,
-            preserve_source,
+            markdown,
         );
     }
     let mut lines = Vec::new();
@@ -2079,9 +2105,7 @@ fn markdown_at_depth_with_refs(
             theme,
             width,
             depth,
-            mermaid,
-            hyperlinks,
-            preserve_source,
+            markdown,
         );
         append_math_section(&mut lines, before);
         let raw = &text[block.source.clone()];
@@ -2107,9 +2131,7 @@ fn markdown_at_depth_with_refs(
         theme,
         width,
         depth,
-        mermaid,
-        hyperlinks,
-        preserve_source,
+        markdown,
     );
     append_math_section(&mut lines, after);
     lines
@@ -2124,9 +2146,7 @@ fn markdown_with_block_spacing(
     theme: &Theme,
     width: usize,
     depth: usize,
-    mermaid: super::mermaid::Mermaid,
-    hyperlinks: bool,
-    preserve_source: bool,
+    markdown: MarkdownOptions<'_>,
 ) -> Option<Vec<Line>> {
     use super::markdown_spaces::{BlockFlavor, BlockTokenKind};
     if text.trim().is_empty() {
@@ -2201,9 +2221,7 @@ fn markdown_with_block_spacing(
                     theme,
                     width,
                     depth,
-                    mermaid,
-                    hyperlinks,
-                    preserve_source,
+                    markdown,
                 );
                 // Masking preserves source newlines after the HTML token for
                 // offset stability; Marked trims them from HTML output.
@@ -2383,10 +2401,14 @@ fn markdown_plain_at_depth(
     theme: &Theme,
     width: usize,
     depth: usize,
-    mermaid: super::mermaid::Mermaid,
-    hyperlinks: bool,
-    preserve_source: bool,
+    markdown: MarkdownOptions<'_>,
 ) -> Vec<Line> {
+    let MarkdownOptions {
+        mermaid,
+        hyperlinks,
+        preserve_source,
+        code_block_indent,
+    } = markdown;
     let mut lines = Vec::new();
     let mut spans = Vec::new();
     let mut bold = 0usize;
@@ -2750,6 +2772,20 @@ fn markdown_plain_at_depth(
                             code_text.pop();
                         }
                     }
+                    let indent = clean(code_block_indent).replace('\n', "");
+                    // Leave room for a wide code character when the block can fit one.
+                    let indent_limit = block_width.saturating_sub(2);
+                    let mut indent_width = 0;
+                    let mut indent_end = 0;
+                    for (offset, grapheme) in indent.grapheme_indices(true) {
+                        let next_width = indent_width + UnicodeWidthStr::width(grapheme);
+                        if next_width > indent_limit {
+                            break;
+                        }
+                        indent_width = next_width;
+                        indent_end = offset + grapheme.len();
+                    }
+                    let indent = Span::themed(&indent[..indent_end], theme, "mdCodeBlock");
                     for line in code_text
                         .split_inclusive('\n')
                         .chain(code_text.is_empty().then_some(""))
@@ -2788,10 +2824,10 @@ fn markdown_plain_at_depth(
                             .unwrap_or_else(|| {
                                 vec![Span::themed(display_line, theme, "mdCodeBlock")]
                             });
-                        let indent = block_width.saturating_sub(1).min(2);
-                        for mut line in wrap(&pieces, block_width.saturating_sub(indent)) {
-                            line.spans
-                                .insert(0, Span::themed(" ".repeat(indent), theme, "mdCodeBlock"));
+                        for mut line in wrap(&pieces, block_width.saturating_sub(indent_width)) {
+                            if indent_end > 0 {
+                                line.spans.insert(0, indent.clone());
+                            }
                             lines.push(line);
                         }
                     }
@@ -2924,9 +2960,7 @@ fn markdown_plain_at_depth(
                         theme,
                         content_width,
                         depth + 1,
-                        mermaid,
-                        hyperlinks,
-                        preserve_source,
+                        markdown,
                     )
                 } else {
                     wrap(&[Span::themed(body, theme, "mdQuote")], content_width)
@@ -4686,6 +4720,75 @@ mod tests {
         );
     }
     #[test]
+    fn transcript_code_block_indent_changes_only_code_rows() {
+        let source =
+            "intro `inline`\n\n```rust\nfn main() {}\n```\n\n> ```unknown\n> nested\n> ```";
+        for theme_source in [
+            include_str!("../../assets/themes/dark.json"),
+            include_str!("../../assets/themes/light.json"),
+        ] {
+            let theme = Theme::parse(theme_source, None).unwrap();
+            let entry = Entry::Assistant(source.into());
+            for (configured, prefix) in [(None, "  "), (Some(""), ""), (Some("· "), "· ")] {
+                let lines = entry.render(
+                    &theme,
+                    80,
+                    false,
+                    true,
+                    TranscriptOptions {
+                        code_block_indent: configured,
+                        ..TranscriptOptions::default()
+                    },
+                );
+                let row_text = |line: &Line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                };
+                let rows = lines.iter().map(row_text).collect::<Vec<_>>();
+                assert_eq!(rows[0], "intro inline");
+                assert_eq!(rows[2], "```rust");
+                assert_eq!(rows[3], format!("{prefix}fn main() {{}}"));
+                assert_eq!(rows[4], "```");
+                assert!(rows.iter().any(|row| row == &format!("│ {prefix}nested")));
+                assert_eq!(lines[2].spans[0].color, theme.color("mdCodeBlockBorder"));
+                if !prefix.is_empty() {
+                    assert_eq!(lines[3].spans[0].color, theme.color("mdCodeBlock"));
+                }
+                assert!(lines[3].spans.iter().any(|span| {
+                    span.text == "fn" && span.color == theme.color("syntaxKeyword")
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_code_block_indent_keeps_narrow_wide_text_and_strips_controls() {
+        let entry = Entry::user("```\n日本\n```".into());
+        let lines = entry.render(
+            &Theme::system(),
+            4,
+            false,
+            true,
+            TranscriptOptions {
+                code_block_indent: Some("│\n\x07  >>>"),
+                ..TranscriptOptions::default()
+            },
+        );
+        let rows = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(&rows[..4], ["```", "│ 日", "│ 本", "```"]);
+    }
+
+    #[test]
     fn empty_fenced_code_has_one_indented_content_row() {
         for language in ["", "rust", "unknown-language"] {
             for content in ["", "\n"] {
@@ -5105,7 +5208,7 @@ mod tests {
                 .any(|span| !span.dim && !span.text.is_empty())
         );
         let mut output = Vec::new();
-        lines[0].draw(&mut output, 6).unwrap();
+        lines[0].draw(&mut output, 6, ColorMode::TrueColor).unwrap();
         assert!(String::from_utf8(output).unwrap().contains("\x1b[2m"));
         let custom = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
         assert!(!Span::themed("muted", &custom, "muted").dim);
@@ -5282,7 +5385,7 @@ mod tests {
             );
             let mut output = Vec::new();
             for line in lines {
-                line.draw(&mut output, width).unwrap();
+                line.draw(&mut output, width, ColorMode::TrueColor).unwrap();
             }
             assert!(
                 !output
@@ -6404,7 +6507,7 @@ mod tests {
             .filter(|line| line.spans.iter().any(|span| !span.text.is_empty()))
         {
             let mut bytes = Vec::new();
-            line.draw(&mut bytes, 6).unwrap();
+            line.draw(&mut bytes, 6, ColorMode::TrueColor).unwrap();
             let output = String::from_utf8(bytes).unwrap();
             assert!(output.contains("\x1b]8;;https://example.com\x1b\\"));
             assert!(output.contains("\x1b]8;;\x1b\\"));
