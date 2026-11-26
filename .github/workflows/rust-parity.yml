@@ -67,7 +67,6 @@ jobs:
   native:
     name: Native tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # The Unix matrix also runs the Durable crash and recovery suite.
     # Unix jobs also run the serial Durable crash and recovery suites.
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || matrix.os == 'macos-latest' && 90 || 75 }}
     strategy:
