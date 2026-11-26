@@ -2529,6 +2529,21 @@ impl Store {
         self.commit_inner(checks, mutations, acquisitions, Some((prefixes, boundary)))
     }
 
+    // Use only while holding the connection mutex. This authorizes writes on
+    // this Store connection and resets the flag before returning it.
+    #[cfg(feature = "experimental-graph-revision")]
+    fn graph_protocol_write_scope(&self) -> impl Drop + '_ {
+        struct Reset<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        self.graph_protocol_active
+            .store(true, std::sync::atomic::Ordering::Release);
+        Reset(&self.graph_protocol_active)
+    }
+
     fn commit_inner(
         &self,
         checks: &[Check],
@@ -2538,17 +2553,7 @@ impl Store {
     ) -> Result<(), Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         #[cfg(feature = "experimental-graph-revision")]
-        let _protocol = {
-            struct Reset<'a>(&'a std::sync::atomic::AtomicBool);
-            impl Drop for Reset<'_> {
-                fn drop(&mut self) {
-                    self.0.store(false, std::sync::atomic::Ordering::Release);
-                }
-            }
-            self.graph_protocol_active
-                .store(true, std::sync::atomic::Ordering::Release);
-            Reset(&self.graph_protocol_active)
-        };
+        let _protocol = self.graph_protocol_write_scope();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| match &error {

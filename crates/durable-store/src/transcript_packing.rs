@@ -178,6 +178,8 @@ impl Store {
             // this same logical version. No logical read has been changed.
             let saved = raw.len() - representation.len();
             let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+            #[cfg(feature = "experimental-graph-revision")]
+            let _protocol = self.graph_protocol_write_scope();
             if conn.execute(
                 "UPDATE durable_store_entries SET value=?1
                  WHERE key=?2 AND version=?3 AND value=?4",
@@ -210,6 +212,39 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "experimental-graph-revision", unix))]
+    #[test]
+    fn packing_preserves_v4_write_guard_and_commit_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("packed-v4.sqlite");
+        let store = Store::open(&path).unwrap();
+        let key = key_for(Uuid::from_u128(1));
+        let value = b"transcript fixture".repeat(400);
+        store
+            .commit(
+                &[],
+                &[crate::Mutation::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                }],
+            )
+            .unwrap();
+        let version = store.get(&key).unwrap().unwrap().version;
+        let commit = store.commit_for_version(&key, version).unwrap();
+        let cursor = store.transcript_packing_start().unwrap();
+        assert_eq!(store.pack_transcript_history(&cursor, 1).unwrap().packed, 1);
+        let logical = store.get_transcript_entry(&key, None).unwrap().unwrap();
+        assert_eq!(logical, Entry { value, version });
+        assert_eq!(store.commit_for_version(&key, version).unwrap(), commit);
+        let connection = rusqlite::Connection::open(path).unwrap();
+        assert!(connection
+            .execute(
+                "UPDATE durable_store_entries SET value=X'00' WHERE key=?1",
+                [&key]
+            )
+            .is_err());
+    }
 
     #[test]
     fn packed_transcript_enforces_declared_length_and_checks_digest() {
