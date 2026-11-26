@@ -4169,6 +4169,16 @@ standalone and summary usage. A loopback RPC test covers message and tool counts
 cache accounting, summary usage deduplication and unknown post-compaction context.
 The complete workspace tests and all-target Clippy pass.
 
+### Rust SDK session statistics
+
+`AgentSession::session_stats()` follows Pi's `getSessionStats()` by combining
+the external session ID, SDK-managed file path, durable totals across the
+session, and context usage for the current branch. The SDK uses the host's
+configured context window and reads the journal once without contacting a
+provider. Its totals retain the native UUID and journal accounting. Workbench
+RPC uses projected Pi message counts and adds usage from native model
+operations. [Pinned Pi implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4363-L4415)
+
 
 ### Imported extension entries
 
