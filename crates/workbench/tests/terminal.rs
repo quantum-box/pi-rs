@@ -745,110 +745,125 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
     }
 }
 
-#[test]
-fn terminal_image_protocol_applies_at_startup_reload_and_resize_in_both_modes() {
+const KITTY_IMAGE: &str = "\x1b_Ga=t,";
+const ITERM_IMAGE: &str = "\x1b]1337;File=inline=1;";
+const IMAGE_TRANSCRIPT: &str = "saved image fixture";
+
+fn completed_frame(text: &str, check: impl Fn(&str) -> bool) -> bool {
+    text.split("\x1b[?2026h")
+        .skip(1)
+        .filter_map(|frame| frame.split_once("\x1b[?2026l"))
+        .any(|(frame, _)| check(frame))
+}
+
+fn write_image_settings(root: &std::path::Path, images: serde_json::Value, show_images: bool) {
+    let value = serde_json::json!({
+        "theme": "dark",
+        "terminal": {"images": images, "showImages": show_images},
+    });
+    std::fs::write(root.join("home/settings.json"), value.to_string()).unwrap();
+}
+
+fn spawn_image_terminal(
+    root: &std::path::Path,
+    mode: &str,
+    protocol: &str,
+    attach_image: bool,
+) -> (File, File, Process, libc::winsize) {
     use base64::Engine;
 
-    const KITTY: &str = "\x1b_Ga=t,";
-    const DELETE_KITTY: &str = "\x1b_Ga=d,d=I,";
-    const ITERM: &str = "\x1b]1337;File=inline=1;";
-    const QUERY_CELL: &str = "\x1b[16t";
-    const TRANSCRIPT: &str = "saved image fixture";
-    fn completed_frame(text: &str, check: impl Fn(&str) -> bool) -> bool {
-        text.split("\x1b[?2026h")
-            .skip(1)
-            .filter_map(|frame| frame.split_once("\x1b[?2026l"))
-            .any(|(frame, _)| check(frame))
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    write_image_settings(root, serde_json::json!(protocol), true);
+    let path = root.join("session.jsonl");
+    let mut attachments = Vec::new();
+    if attach_image {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(201, 101)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        attachments.push(pi_rs::ImageContent {
+            data: base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+            mime_type: "image/png".into(),
+        });
     }
-    let mut png = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::new_rgba8(201, 101)
-        .write_to(&mut png, image::ImageFormat::Png)
+    pi_rs::Session::open(&path)
+        .unwrap()
+        .append_user_with_images(IMAGE_TRANSCRIPT.into(), attachments, None)
         .unwrap();
-    let attachment = pi_rs::ImageContent {
-        data: base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
-        mime_type: "image/png".into(),
-    };
 
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 42,
+        ws_col: 110,
+        ws_xpixel: 990,
+        ws_ypixel: 756,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root)
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env("PI_IMAGE_PROTOCOL", "iterm2")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--tui-mode",
+                mode,
+                "--session",
+            ])
+            .arg(path)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    (master, slave, process, size)
+}
+
+#[test]
+fn terminal_image_protocol_applies_at_startup_reload_and_resize_in_both_modes() {
+    const DELETE_KITTY: &str = "\x1b_Ga=d,d=I,";
+    const QUERY_CELL: &str = "\x1b[16t";
     for mode in ["regular", "fullscreen"] {
         let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let path = root.path().join("session.jsonl");
-        pi_rs::Session::open(&path)
-            .unwrap()
-            .append_user_with_images(TRANSCRIPT.into(), vec![attachment.clone()], None)
-            .unwrap();
-        let settings = home.join("settings.json");
-        let write_settings = |images: serde_json::Value, show_images: bool| {
-            let value = serde_json::json!({
-                "theme": "dark",
-                "terminal": {"images": images, "showImages": show_images},
-            });
-            std::fs::write(&settings, value.to_string()).unwrap();
-        };
-        write_settings(serde_json::json!("kitty"), true);
-
-        let mut master_fd = -1;
-        let mut slave_fd = -1;
-        let mut size = libc::winsize {
-            ws_row: 42,
-            ws_col: 110,
-            ws_xpixel: 990,
-            ws_ypixel: 756,
-        };
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master_fd,
-                    &mut slave_fd,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::addr_of_mut!(size),
-                )
-            },
-            0
-        );
-        let mut master = unsafe { File::from_raw_fd(master_fd) };
-        let slave = unsafe { File::from_raw_fd(slave_fd) };
-        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
-        assert_eq!(
-            unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
-            0
-        );
-        let process = Process(
-            Command::new(env!("CARGO_BIN_EXE_pi"))
-                .current_dir(root.path())
-                .env("PI_RS_HOME", &home)
-                .env("TERM", "xterm-256color")
-                .env("PI_IMAGE_PROTOCOL", "iterm2")
-                .args([
-                    "--offline",
-                    "--no-trust",
-                    "--no-mcp",
-                    "--no-extensions",
-                    "--tui-mode",
-                    mode,
-                    "--session",
-                ])
-                .arg(path)
-                .stdin(Stdio::from(slave.try_clone().unwrap()))
-                .stdout(Stdio::from(slave.try_clone().unwrap()))
-                .stderr(Stdio::from(slave.try_clone().unwrap()))
-                .spawn()
-                .unwrap(),
-        );
+        let (mut master, slave, process, mut size) =
+            spawn_image_terminal(root.path(), mode, "kitty", true);
         output_until(&mut master, |text| {
-            assert!(!text.contains(ITERM), "{mode}");
-            text.contains(TRANSCRIPT)
-                && text.contains(KITTY)
+            assert!(!text.contains(ITERM_IMAGE), "{mode}");
+            text.contains(IMAGE_TRANSCRIPT)
+                && text.contains(KITTY_IMAGE)
                 && text.contains(",c=60,r=15,")
                 && text.contains("Enter to send")
         });
 
-        write_settings(serde_json::json!("iterm2"), true);
+        write_image_settings(root.path(), serde_json::json!("iterm2"), true);
         master.write_all(b"\x1b[?1;2c/reload\r").unwrap();
         output_until(&mut master, |text| {
-            let Some((before, after)) = text.split_once(ITERM) else {
+            let Some((before, after)) = text.split_once(ITERM_IMAGE) else {
                 return false;
             };
             assert!(before.contains(DELETE_KITTY), "{mode}");
@@ -867,10 +882,10 @@ fn terminal_image_protocol_applies_at_startup_reload_and_resize_in_both_modes() 
         );
         output_until(&mut master, |text| {
             text.split_once(QUERY_CELL)
-                .is_some_and(|(_, frame)| frame.contains(ITERM))
+                .is_some_and(|(_, frame)| frame.contains(ITERM_IMAGE))
         });
 
-        write_settings(serde_json::json!(false), true);
+        write_image_settings(root.path(), serde_json::json!(false), true);
         master.write_all(b"/reload\r").unwrap();
         output_until(&mut master, |text| {
             text.contains(if mode == "regular" {
@@ -879,13 +894,13 @@ fn terminal_image_protocol_applies_at_startup_reload_and_resize_in_both_modes() 
                 "\x1b[2J"
             }) && completed_frame(text, |frame| {
                 frame.contains("Reloaded settings")
-                    && frame.contains(TRANSCRIPT)
-                    && !frame.contains(ITERM)
-                    && !frame.contains(KITTY)
+                    && frame.contains(IMAGE_TRANSCRIPT)
+                    && !frame.contains(ITERM_IMAGE)
+                    && !frame.contains(KITTY_IMAGE)
             })
         });
 
-        write_settings(serde_json::json!("auto"), false);
+        write_image_settings(root.path(), serde_json::json!("auto"), false);
         master.write_all(b"/reload\r").unwrap();
         output_until(&mut master, |text| {
             let Some((_, frame)) = text.split_once(QUERY_CELL) else {
@@ -893,17 +908,138 @@ fn terminal_image_protocol_applies_at_startup_reload_and_resize_in_both_modes() 
             };
             completed_frame(frame, |frame| {
                 frame.contains("Reloaded settings")
-                    && !frame.contains(ITERM)
-                    && !frame.contains(KITTY)
+                    && !frame.contains(ITERM_IMAGE)
+                    && !frame.contains(KITTY_IMAGE)
             })
         });
 
-        write_settings(serde_json::json!("auto"), true);
+        write_image_settings(root.path(), serde_json::json!("auto"), true);
         master.write_all(b"/reload\r").unwrap();
         output_until(&mut master, |text| {
-            text.contains(ITERM) && text.contains("Reloaded settings")
+            text.contains(ITERM_IMAGE) && text.contains("Reloaded settings")
         });
     }
+}
+
+#[test]
+fn terminal_image_protocol_switch_preserves_regular_scrollback_without_images() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _slave, _process, _) =
+        spawn_image_terminal(root.path(), "regular", "iterm2", false);
+    output_until(&mut master, |text| {
+        text.contains(IMAGE_TRANSCRIPT) && text.contains("Enter to send")
+    });
+    write_image_settings(root.path(), serde_json::json!("kitty"), true);
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b[3J"), "{text}");
+        completed_frame(text, |frame| frame.contains("Reloaded settings"))
+    });
+}
+
+fn switch_image_terminal_mode(master: &mut File, mode: &str, check: impl Fn(&str) -> bool) {
+    let (previous, control) = if mode == "regular" {
+        ("fullscreen", "\x1b[?1049l")
+    } else {
+        ("regular", "\x1b[?1049h")
+    };
+    master.write_all(b"/settings\r").unwrap();
+    output_until(master, |text| text.contains("Settings"));
+    master.write_all(b"TUI mode").unwrap();
+    output_until(master, |text| {
+        settings_row_shows(text, "TUI mode", previous)
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(master, |text| {
+        text.split_once(control).is_some_and(|(_, restored)| {
+            settings_row_shows(restored, "TUI mode", mode) && check(restored)
+        })
+    });
+    master.write_all(b"\x03").unwrap();
+    output_until(master, |text| {
+        completed_frame(text, |frame| {
+            frame.contains("0 tokens") && !settings_row_shows(frame, "TUI mode", mode)
+        })
+    });
+}
+
+#[test]
+fn terminal_image_visibility_reflows_the_regular_screen_after_fullscreen_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _slave, _process, _) =
+        spawn_image_terminal(root.path(), "regular", "iterm2", true);
+    output_until(&mut master, |text| {
+        text.contains(ITERM_IMAGE) && text.contains("Enter to send")
+    });
+
+    for show_images in [false, true] {
+        switch_image_terminal_mode(&mut master, "fullscreen", |_| true);
+        write_image_settings(root.path(), serde_json::json!("iterm2"), show_images);
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            completed_frame(text, |frame| {
+                frame.contains("Reloaded settings") && frame.contains(ITERM_IMAGE) == show_images
+            })
+        });
+        switch_image_terminal_mode(&mut master, "regular", |text| {
+            completed_frame(text, |frame| {
+                frame.contains("\x1b[3J")
+                    && frame.contains(IMAGE_TRANSCRIPT)
+                    && frame.contains(ITERM_IMAGE) == show_images
+            })
+        });
+    }
+}
+
+#[test]
+fn terminal_image_exit_replay_uses_settings_from_an_interrupted_reload() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _slave, process, _) =
+        spawn_image_terminal(root.path(), "fullscreen", "iterm2", true);
+    output_until(&mut master, |text| {
+        text.contains(ITERM_IMAGE) && text.contains("Enter to send")
+    });
+
+    let package = root.path().join("reload-package.sh");
+    std::fs::write(
+        &package,
+        r#"#!/bin/sh
+: > "$PI_RS_HOME/probe-started"
+for i in $(seq 1 100); do
+    if [ -f "$PI_RS_HOME/probe-release" ]; then
+        printf '%s\n' '{"version":1,"response":{"Ok":{"id":"probe","dependencies":[],"commands":[],"tools":[]}}}'
+        exit 0
+    fi
+    sleep .1
+done
+exit 1
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = root.path().join("home");
+    std::fs::write(
+        home.join("settings.json"),
+        serde_json::json!({"theme":"dark","terminal":{"images":"kitty"},"packages":[package]})
+            .to_string(),
+    )
+    .unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |_| home.join("probe-started").exists());
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    output_until(&mut master, |text| {
+        let Some((_, replay)) = text.split_once("\x1b[?1049l") else {
+            return false;
+        };
+        assert!(!replay.contains(ITERM_IMAGE), "{replay}");
+        replay.contains(IMAGE_TRANSCRIPT) && replay.contains(KITTY_IMAGE)
+    });
+    std::fs::File::create(home.join("probe-release")).unwrap();
 }
 
 #[test]

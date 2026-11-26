@@ -304,7 +304,7 @@ impl Terminal {
         Ok(true)
     }
 
-    fn switch_mode(&mut self, alternate: bool, view: &mut View) -> Result<()> {
+    fn switch_mode(&mut self, alternate: bool, view: &mut View, args: &Cli) -> Result<()> {
         if self.alternate == alternate {
             return Ok(());
         }
@@ -323,14 +323,10 @@ impl Terminal {
                 DisableMouseCapture,
                 LeaveAlternateScreen
             )?;
-            // The restored screen may still contain images from the old protocol.
-            let needs_image_redraw = view.regular.layout.as_ref().is_some_and(|layout| {
-                layout
-                    .output
-                    .inline_images
-                    .is_some_and(|(protocol, _)| Some(protocol) != view.graphics.protocol())
+            let image_layout_changed = view.regular.layout.as_ref().is_some_and(|layout| {
+                layout.output.inline_images != view.inline_image_options(args)
             });
-            if !needs_image_redraw {
+            if !image_layout_changed {
                 view.regular.layout = None;
             }
             view.regular.max_rows = 0;
@@ -2037,11 +2033,11 @@ impl View {
                 for block in blocks {
                     match block {
                         pi_rs::ContentBlock::Text { text: value, .. } => text.push(value.as_str()),
-                        pi_rs::ContentBlock::Image { data, mime_type } => {
-                            images.push(pi_rs::ImageContent {
+                        pi_rs::ContentBlock::Image { data, mime_type } if !data.is_empty() => {
+                            images.push(InlineAttachment::new(pi_rs::ImageContent {
                                 data: data.clone(),
                                 mime_type: mime_type.clone(),
-                            })
+                            }))
                         }
                         _ => {}
                     }
@@ -2053,10 +2049,8 @@ impl View {
             rendered: None,
             custom_type: message.custom_type.clone(),
             text: text.join("\n"),
+            images,
         });
-        if !images.is_empty() {
-            self.add_images(&images);
-        }
     }
     fn refresh_transcript_extension_renderers(&mut self) -> bool {
         self.custom_render_pending = None;
@@ -4431,11 +4425,7 @@ render_call_id: None,
             hidden_thinking_label: None,
             code_block_indent: None,
             notices: args.settings.notices(),
-            inline_images: self
-                .graphics
-                .protocol()
-                .filter(|_| args.settings.show_terminal_images())
-                .map(|protocol| (protocol, args.settings.terminal_image_width())),
+            inline_images: self.inline_image_options(args),
             padding: args.settings.output_padding(),
             expand_key: self.expand_key,
             mermaid: match (args.settings.mermaid_mode(), streaming) {
@@ -4446,7 +4436,14 @@ render_call_id: None,
         }
     }
 
-    fn update_image_protocol(&mut self, args: &Cli, fullscreen: bool) -> Result<bool> {
+    fn inline_image_options(&self, args: &Cli) -> Option<(images::Protocol, usize)> {
+        self.graphics
+            .protocol()
+            .filter(|_| args.settings.show_terminal_images())
+            .map(|protocol| (protocol, args.settings.terminal_image_width()))
+    }
+
+    fn update_image_protocol(&mut self, args: &Cli, terminal: Option<&Terminal>) -> Result<bool> {
         let previous = self.graphics.protocol();
         let protocol = self
             .graphics
@@ -4454,13 +4451,16 @@ render_call_id: None,
         if protocol == previous {
             return Ok(false);
         }
-        let cleared_regular = !fullscreen && previous == Some(images::Protocol::Iterm2);
+        let fullscreen = terminal.map_or(args.tui_mode != Some(TuiMode::Regular), |terminal| {
+            terminal.alternate
+        });
+        let cleared_regular = !fullscreen
+            && previous == Some(images::Protocol::Iterm2)
+            && self.graphics.regular_image_protocol() == previous;
         self.graphics
             .set_protocol(protocol, fullscreen, &mut std::io::stdout().lock())?;
         if cleared_regular {
             self.regular = RegularState::default();
-        } else {
-            self.regular.redraw = true;
         }
         if previous.is_none() && protocol.is_some() {
             images::query_cell_size()?;
@@ -4627,6 +4627,20 @@ render_call_id: None,
             output: base_output,
             code_block_indent: args.settings.code_block_indent().to_owned(),
         };
+        // An image setting can change without affecting any rows in the
+        // restored transcript. Keep scrollback in that case.
+        if let Some(previous) = &mut self.regular.layout
+            && previous.output.inline_images != layout.output.inline_images
+            && self.graphics.regular_image_protocol().is_none()
+            && (layout.output.inline_images.is_none()
+                || !self
+                    .lines
+                    .iter()
+                    .take(self.regular.committed)
+                    .any(|entry| entry.has_inline_images(self.expand_tools)))
+        {
+            previous.output.inline_images = layout.output.inline_images;
+        }
         let redraw = self.regular.layout.is_some()
             && (self.regular.redraw
                 || self.regular.layout.as_ref() != Some(&layout)
@@ -6193,16 +6207,11 @@ pub(super) async fn run(
                 dirty = true;
             }
         }
-        let fullscreen = _terminal
-            .as_ref()
-            .map_or(args.tui_mode != Some(TuiMode::Regular), |terminal| {
-                terminal.alternate
-            });
-        dirty |= view.update_image_protocol(&args, fullscreen)?;
+        dirty |= view.update_image_protocol(&args, _terminal.as_ref())?;
         if let Some(terminal) = &mut _terminal {
             let alternate = args.tui_mode != Some(TuiMode::Regular);
             if terminal.alternate != alternate {
-                terminal.switch_mode(alternate, &mut view)?;
+                terminal.switch_mode(alternate, &mut view, &args)?;
                 dirty = true;
             }
         }
@@ -8188,6 +8197,8 @@ pub(super) async fn run(
                             view.clear_extension_chrome();
                             args.settings =
                                 args.settings.reload_latest(&args.workspace, args.trusted)?;
+                            // Reload preparation can be interrupted before the next frame.
+                            dirty |= view.update_image_protocol(&args, _terminal.as_ref())?;
                             for warning in args.settings.diagnostics() {
                                 view.append(warning);
                             }
@@ -15228,6 +15239,10 @@ exit {exit}
                     data: String::new(),
                     mime_type: "image/png".into(),
                 },
+                pi_rs::ContentBlock::Image {
+                    data: "bm90IGEgUE5H".into(),
+                    mime_type: "image/png".into(),
+                },
                 pi_rs::ContentBlock::Text {
                     text: "second".into(),
                     text_signature: None,
@@ -15240,6 +15255,7 @@ exit {exit}
         assert!(
             matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**first**\nsecond")
         );
+        assert!(!view.lines[0].has_inline_images(true));
     }
 
     #[test]

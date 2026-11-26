@@ -2473,10 +2473,12 @@ override another terminal's image protocol.
 with `false`. Other values use `PI_IMAGE_PROTOCOL` and terminal detection.
 Both terminal modes read the setting at startup and on `/reload`. When the
 protocol changes, pi-rs releases its Kitty uploads or erases the old iTerm2
-image cells before redrawing. The selected protocol also controls Kitty's
-optimized image dimensions. `terminal.showImages` independently controls
-visibility, and retained attachments can be shown again after a settings
-change or resize.
+image cells before redrawing. Regular-mode scrollback is purged for iTerm2
+cleanup only when the regular screen has displayed iTerm2 images. The selected
+protocol also controls Kitty's optimized image dimensions.
+`terminal.showImages` independently controls visibility. Changes made in
+fullscreen apply to the regular transcript when returning to it, and retained
+attachments can be shown again after a settings change or resize.
 
 A PTY fixture verifies both protocols, user and tool images, cached redraw,
 cleanup and terminal restoration. Protocol bytes were checked without a GUI

@@ -100,11 +100,23 @@ impl InlineAttachment {
         padding: usize,
         protocol: Protocol,
     ) -> Option<Vec<Line>> {
-        let image = self.prepared.get_or_init(|| {
-            let source = self.source.lock().expect("inline image source").take()?;
-            InlineImage::decode(&source)
-        });
-        Some(image.as_ref()?.lines(width, image_width, padding, protocol))
+        Some(
+            self.prepared_image()?
+                .lines(width, image_width, padding, protocol),
+        )
+    }
+
+    pub fn is_renderable(&self) -> bool {
+        self.prepared_image().is_some()
+    }
+
+    fn prepared_image(&self) -> Option<&Arc<InlineImage>> {
+        self.prepared
+            .get_or_init(|| {
+                let source = self.source.lock().expect("inline image source").take()?;
+                InlineImage::decode(&source)
+            })
+            .as_ref()
     }
 }
 
@@ -329,6 +341,7 @@ struct CroppedImage {
 pub struct Renderer {
     detected: Option<Protocol>,
     protocol: Option<Protocol>,
+    regular_image_protocol: Option<Protocol>,
     uploaded: BTreeSet<u32>,
     placed: BTreeSet<(u32, u32)>,
     cleanup: Cleanup,
@@ -345,6 +358,7 @@ impl Renderer {
         Self {
             detected,
             protocol: selection.resolve(detected),
+            regular_image_protocol: None,
             uploaded: BTreeSet::new(),
             placed: BTreeSet::new(),
             cleanup: Cleanup::default(),
@@ -357,6 +371,7 @@ impl Renderer {
         Self {
             detected: protocol,
             protocol,
+            regular_image_protocol: None,
             uploaded: BTreeSet::new(),
             placed: BTreeSet::new(),
             cleanup: Cleanup::default(),
@@ -374,6 +389,10 @@ impl Renderer {
         selection.resolve(self.detected)
     }
 
+    pub fn regular_image_protocol(&self) -> Option<Protocol> {
+        self.regular_image_protocol
+    }
+
     pub fn set_protocol(
         &mut self,
         next: Option<Protocol>,
@@ -383,7 +402,9 @@ impl Renderer {
         if self.protocol == next {
             return Ok(false);
         }
-        if self.protocol == Some(Protocol::Iterm2) {
+        if self.protocol == Some(Protocol::Iterm2)
+            && (fullscreen || self.regular_image_protocol == Some(Protocol::Iterm2))
+        {
             // iTerm2 embeds images in the text cells. Erase the old surface
             // before the first frame under the new protocol.
             if fullscreen {
@@ -428,6 +449,7 @@ impl Renderer {
             MoveTo(0, 0),
             Clear(ClearType::Purge)
         )?;
+        self.regular_image_protocol = None;
         self.uploaded.clear();
         Ok(())
     }
@@ -554,6 +576,11 @@ impl Renderer {
                 self.placed.insert((image.id, placement_id));
             }
         }
+        // Regular placements remain in the main screen when the alternate
+        // screen is entered or the placement cache is reset.
+        if row == usize::MAX || placement_id == 2 {
+            self.regular_image_protocol = Some(protocol);
+        }
         queue!(out, RestorePosition)
     }
 
@@ -649,6 +676,7 @@ mod tests {
         Renderer {
             detected: Some(protocol),
             protocol: Some(protocol),
+            regular_image_protocol: None,
             uploaded: BTreeSet::new(),
             placed: BTreeSet::new(),
             cleanup: Cleanup::default(),
@@ -809,7 +837,8 @@ mod tests {
             assert!(String::from_utf8_lossy(&out).contains(&format!("a=d,d=I,i={id},q=2")));
             assert!(renderer.cleanup.0.lock().unwrap().is_empty());
             out.clear();
-            renderer.paint(&line, &mut out, 0, 1).unwrap();
+            let row = if fullscreen { 0 } else { usize::MAX };
+            renderer.paint(&line, &mut out, row, 1).unwrap();
             assert!(String::from_utf8_lossy(&out).contains("1337;File=inline=1;"));
             out.clear();
 
@@ -829,6 +858,28 @@ mod tests {
             renderer.paint(&line, &mut out, 0, 1).unwrap();
             assert!(String::from_utf8_lossy(&out).contains("a=t,f=100"));
         }
+    }
+
+    #[test]
+    fn switching_iterm_without_regular_image_cells_keeps_scrollback() {
+        let mut renderer = renderer(Protocol::Iterm2);
+        let line = Line {
+            image: Some(Placement {
+                image: fixture(),
+                columns: 2,
+                column: 0,
+                rows: 1,
+                offset: 0,
+            }),
+            ..Line::default()
+        };
+        let mut out = Vec::new();
+        renderer.paint(&line, &mut out, 0, 1).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("1337;File=inline=1;"));
+        assert_eq!(renderer.regular_image_protocol(), None);
+        out.clear();
+        assert!(renderer.set_protocol(None, false, &mut out).unwrap());
+        assert!(out.is_empty());
     }
 
     #[test]

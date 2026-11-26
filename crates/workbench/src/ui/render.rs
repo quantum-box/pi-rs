@@ -341,6 +341,7 @@ pub enum Entry {
         id: u64,
         custom_type: String,
         text: String,
+        images: Vec<std::sync::Arc<super::images::InlineAttachment>>,
         rendered: Option<pi_rs::RenderedCustomMessage>,
     },
     CustomRecord {
@@ -383,6 +384,26 @@ pub struct TranscriptOptions<'a> {
 }
 
 impl Entry {
+    pub fn has_inline_images(&self, expand_tools: bool) -> bool {
+        match self {
+            Self::Image(image) => image.is_renderable(),
+            Self::CustomMessage { images, .. } => images.iter().any(|image| image.is_renderable()),
+            Self::Tool {
+                parts,
+                numbered_diff,
+                rendered,
+                ..
+            } if rendered.as_ref().is_some_and(|tool| tool.result.is_some())
+                || (expand_tools && !numbered_diff) =>
+            {
+                parts
+                    .iter()
+                    .any(|part| matches!(part, ToolPart::Image(image) if image.is_renderable()))
+            }
+            _ => false,
+        }
+    }
+
     pub fn user(text: String) -> Self {
         Self::user_markdown(text.into())
     }
@@ -564,11 +585,7 @@ impl Entry {
                 lines
             }
             Self::CustomRecord { rendered: None, .. } => return Vec::new(),
-            Self::CustomMessage {
-                rendered: Some(rendered),
-                ..
-            }
-            | Self::CustomRecord {
+            Self::CustomRecord {
                 rendered: Some(rendered),
                 ..
             } => {
@@ -577,22 +594,41 @@ impl Entry {
                 return lines;
             }
             Self::CustomMessage {
-                custom_type, text, ..
+                custom_type,
+                text,
+                images,
+                rendered,
+                ..
             } => {
-                let mut label =
-                    Span::themed(format!("[{custom_type}]"), theme, "customMessageLabel");
-                label.bold = true;
                 let mut lines = vec![Line::default()];
-                lines.extend(wrap(&[label], inner));
-                lines.push(Line::default());
-                let mut body = transcript_markdown(text, theme, inner, options, false);
-                custom_message_base_style(&mut body, theme);
-                lines.extend(body);
-                lines.push(Line::default());
-                for line in &mut lines {
-                    line.background = Some(theme.color("customMessageBg"));
+                if let Some(rendered) = rendered {
+                    lines.extend(extension_rows(rendered, theme, width));
+                } else {
+                    let mut label =
+                        Span::themed(format!("[{custom_type}]"), theme, "customMessageLabel");
+                    label.bold = true;
+                    lines.extend(wrap(&[label], inner));
+                    lines.push(Line::default());
+                    let mut body = transcript_markdown(text, theme, inner, options, false);
+                    custom_message_base_style(&mut body, theme);
+                    lines.extend(body);
+                    lines.push(Line::default());
+                    for line in &mut lines {
+                        line.background = Some(theme.color("customMessageBg"));
+                    }
+                    lines.push(Line::default());
                 }
-                lines.push(Line::default());
+                if let Some((protocol, limit)) = options.inline_images {
+                    lines.extend(
+                        images
+                            .iter()
+                            .filter_map(|image| image.lines(width, limit, padding, protocol))
+                            .flatten(),
+                    );
+                }
+                if rendered.is_some() {
+                    return lines;
+                }
                 lines
             }
             Self::Summary {
@@ -5331,6 +5367,7 @@ mod tests {
             id: 1,
             custom_type: "card".into(),
             text: "fallback".into(),
+            images: vec![],
             rendered: Some(pi_rs::RenderedCustomMessage {
                 lines: vec![vec![pi_rs::UiComponentSpan {
                     text: "status\u{7}".into(),
@@ -5360,6 +5397,7 @@ mod tests {
             rendered: None,
             custom_type: "fixture\x1b]bad".into(),
             text: "**bold**\n\nplain \x1b]0;bad\x07text".into(),
+            images: vec![],
         };
         for width in [12, 80] {
             let lines = entry.render(
@@ -5416,6 +5454,7 @@ mod tests {
             rendered: None,
             custom_type: "x".into(),
             text: "plain `code`".into(),
+            images: vec![],
         };
         let lines = entry.render(&theme, 80, false, false, TranscriptOptions::default());
         let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
