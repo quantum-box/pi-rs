@@ -3639,6 +3639,7 @@ render_call_id: None,
                 self.text_items.clear();
                 self.streaming_tools.clear();
             }
+            Some("compaction_end") => self.summarizing = false,
             Some("tool_execution_update") => {
                 if !self.render_tool_progress(value) {
                     self.update_tool_progress(value);

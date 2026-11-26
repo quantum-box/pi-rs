@@ -5615,13 +5615,17 @@ invoking the hook for a new user or custom trigger. This follows the order in
 The new starting message and the hook's prompt override are excluded from the
 summary. The saved prior-history token estimate also excludes the incoming
 image prompt when the SDK has already journaled it. A prior assistant older than the latest
-compaction cannot trigger this check. A summary failure or extension veto
-leaves preflight runnable. Cancelling the run stops preflight. If a run is
+compaction cannot trigger this check. Provider failures and extension vetoes
+leave preflight runnable. Journal and usage settlement failures stop it.
+Cancelling the run during preflight stops it before `agent_start`. RPC
+reports a started prompt after compaction and the pre-start hook complete,
+following [Pi's pinned run startup](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L1958-L1984).
+If a run is
 interrupted during pre-start compaction, recovery settles the original summary
 request when one was recorded, skips the interrupted attempt, and resumes
 preflight on the same run. A committed compaction is retained on resume. An
-explicit resume with the same run ID requires the branch that recorded its
-compaction attempt.
+explicit resume with the same run ID requires the branch that contains its
+preflight checkpoints, including any summary request and result.
 
 The native pre-start check covers configured threshold compaction. Explicit
 overflow and length-stop recovery use the existing turn recovery paths, and

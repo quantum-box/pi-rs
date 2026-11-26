@@ -2657,6 +2657,7 @@ async fn execute(
         let mut truncated = false;
         let mut event_observer = |event: pi_rs::AgentEvent<'_>| {
             match event {
+                pi_rs::AgentEvent::Started => {}
                 pi_rs::AgentEvent::Notification(event) => {
                     if let Notification::Committed(record) = &event
                         && let Event::ModelFinished { metadata, .. } = &record.event
@@ -2846,7 +2847,9 @@ fn agent_stream_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
         pi_rs::AgentEvent::ReasoningEnd { index, content } => {
             json!({"type":"reasoning_item_end","index":index,"content":content})
         }
-        pi_rs::AgentEvent::Notification(_) => unreachable!("expected an enriched agent event"),
+        pi_rs::AgentEvent::Started | pi_rs::AgentEvent::Notification(_) => {
+            unreachable!("expected an enriched stream event")
+        }
     }
 }
 

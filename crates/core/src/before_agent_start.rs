@@ -53,11 +53,36 @@ pub(crate) fn compaction_on_another_branch(
     branch: &[&Record],
     run_id: Uuid,
 ) -> bool {
-    compaction_start(branch, run_id).is_none()
-        && session
-            .records()
-            .iter()
-            .any(|record| is_compaction_start(record, run_id))
+    let mut records = session.records().iter();
+    let Some(start) = records.find(|record| is_compaction_start(record, run_id)) else {
+        return false;
+    };
+    if compaction_start(branch, run_id) != Some(start.id) {
+        return true;
+    }
+    // A checkout may keep the marker but leave its request or result on a
+    // different branch. Check the preflight records through the saved plan.
+    for record in records.filter(|record| record.run_id == Some(run_id)) {
+        let plan =
+            matches!(&record.event, Event::SourceEntry { format, .. } if format == PLAN_FORMAT);
+        if (plan
+            || matches!(
+                record.event,
+                Event::ModelRequested { .. }
+                    | Event::ModelFinished { .. }
+                    | Event::Compacted { .. }
+            ))
+            && branch
+                .binary_search_by_key(&record.id, |entry| entry.id)
+                .is_err()
+        {
+            return true;
+        }
+        if plan {
+            break;
+        }
+    }
+    false
 }
 
 pub(crate) fn interrupted_compaction(branch: &[&Record], run_id: Uuid) -> Option<u64> {
@@ -435,6 +460,9 @@ mod tests {
         #[default]
         Success,
         ProviderFailure,
+        ProviderIo,
+        ProviderJson,
+        SettlementIo,
         Veto,
     }
 
@@ -459,8 +487,19 @@ mod tests {
                     matches!(&request.messages[0], Message::System { content } if content == "base prompt")
                 );
                 self.0.lock().unwrap().push("summary request");
-                if matches!(self.1, SummaryOutcome::ProviderFailure) {
-                    return Err(Error::RetryableModel("summary provider unavailable".into()));
+                match self.1 {
+                    SummaryOutcome::ProviderFailure | SummaryOutcome::SettlementIo => {
+                        return Err(Error::RetryableModel("summary provider unavailable".into()));
+                    }
+                    SummaryOutcome::ProviderIo => {
+                        return Err(
+                            std::io::Error::from(std::io::ErrorKind::ConnectionReset).into()
+                        );
+                    }
+                    SummaryOutcome::ProviderJson => {
+                        return Err(serde_json::from_str::<Value>("").unwrap_err().into());
+                    }
+                    _ => {}
                 }
                 "old conversation summary"
             } else {
@@ -496,6 +535,9 @@ mod tests {
         ) -> Result<()> {
             if *usage == crate::UsageReport::Unconfirmed {
                 self.0.lock().unwrap().push("settle unconfirmed summary");
+                if matches!(self.1, SummaryOutcome::SettlementIo) {
+                    return Err(std::io::Error::other("summary settlement unavailable").into());
+                }
             }
             Ok(())
         }
@@ -743,6 +785,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn before_agent_start_distinguishes_provider_errors_from_settlement_errors() {
+        for summary in [
+            SummaryOutcome::ProviderIo,
+            SummaryOutcome::ProviderJson,
+            SummaryOutcome::SettlementIo,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+            let trace = Arc::new(CompactionTrace(Mutex::default(), summary));
+            let mut sdk = compaction_builder(&trace)
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+            let result = sdk.prompt("new question").await;
+            let trace = trace.0.lock().unwrap();
+            if matches!(summary, SummaryOutcome::SettlementIo) {
+                assert!(
+                    matches!(result, Err(Error::Io(error)) if error.to_string() == "summary settlement unavailable")
+                );
+                assert_eq!(
+                    *trace,
+                    [
+                        "before compaction",
+                        "summary request",
+                        "settle unconfirmed summary"
+                    ]
+                );
+            } else {
+                assert_eq!(result.unwrap(), "answer");
+                assert_eq!(
+                    *trace,
+                    [
+                        "before compaction",
+                        "summary request",
+                        "settle unconfirmed summary",
+                        "before_agent_start",
+                        "turn request",
+                    ]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn before_agent_start_full_cancellation_stops_preflight() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
@@ -755,8 +843,12 @@ mod tests {
             .unwrap();
         let control = sdk.controls();
         let result = sdk
-            .prompt_with_observer("new question", &mut |event| {
-                if matches!(event, Notification::SummaryRequest) {
+            .run_with_events(Some("new question".into()), Uuid::new_v4(), &mut |event| {
+                assert!(!matches!(event, crate::AgentEvent::Started));
+                if matches!(
+                    event,
+                    crate::AgentEvent::Notification(Notification::SummaryRequest)
+                ) {
                     control.abort();
                 }
             })
@@ -790,7 +882,7 @@ mod tests {
         let path = directory.path().join("session.jsonl");
         let run_id = Uuid::new_v4();
         let summary_id = Uuid::new_v4();
-        let (running, requested) = {
+        let (running, marker, requested) = {
             let mut journal = Session::open(&path).unwrap();
             seed_compaction_history(&mut journal, false);
             journal.set_run_id(Some(run_id));
@@ -801,12 +893,13 @@ mod tests {
                 })
                 .unwrap()
                 .id;
-            journal
+            let marker = journal
                 .append(Event::SourceEntry {
                     format: COMPACTION_FORMAT.into(),
                     entry: Value::Null,
                 })
-                .unwrap();
+                .unwrap()
+                .id;
             let requested = journal
                 .append(Event::ModelRequested {
                     model: "fixture".into(),
@@ -822,7 +915,7 @@ mod tests {
                 })
                 .unwrap()
                 .id;
-            (running, requested)
+            (running, marker, requested)
         };
         let trace = Arc::new(CompactionTrace::default());
         let mut sdk = compaction_builder(&trace)
@@ -838,12 +931,14 @@ mod tests {
             sdk.prompt("different question").await,
             Err(Error::Session(_))
         ));
-        sdk.checkout(running).unwrap();
-        assert!(matches!(
-            sdk.run(None, run_id, &mut |_| {}).await,
-            Err(Error::Session(message)) if message.contains("branch that recorded its attempt")
-        ));
-        assert!(trace.0.lock().unwrap().is_empty());
+        for target in [running, marker] {
+            sdk.checkout(target).unwrap();
+            assert!(matches!(
+                sdk.run(None, run_id, &mut |_| {}).await,
+                Err(Error::Session(message)) if message.contains("branch that recorded its attempt")
+            ));
+            assert!(trace.0.lock().unwrap().is_empty());
+        }
         sdk.checkout(requested).unwrap();
         assert_eq!(sdk.resume().await.unwrap(), "answer");
         assert_eq!(

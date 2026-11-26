@@ -286,6 +286,8 @@ pub type Observer<'a> = dyn for<'event> FnMut(Notification<'event>) + Send + 'a;
 /// Reasoning item events are transient and are not journal records.
 pub enum AgentEvent<'a> {
     Notification(Notification<'a>),
+    /// Run preparation has completed and the agent can begin its first turn.
+    Started,
     AutoCompaction {
         reason: crate::CompactionTrigger,
         update: &'a AutoCompactionUpdate,
@@ -320,13 +322,17 @@ pub type AgentObserver<'a> = dyn for<'event> FnMut(AgentEvent<'event>) + Send + 
 // internal adapter preserves all non-reasoning notifications and their order.
 fn dispatch_agent_event(event: Notification<'_>, observer: &mut AgentObserver<'_>) {
     if matches!(event, Notification::SummaryRequest)
-        && let Some((reason, update)) =
-            AUTO_COMPACTION_EVENT.with(|stack| stack.borrow().last().cloned())
+        && let Some(boundary) = AGENT_BOUNDARY_EVENT.with(|stack| stack.borrow().last().cloned())
     {
-        observer(AgentEvent::AutoCompaction {
-            reason,
-            update: &update,
-        });
+        match boundary {
+            AgentBoundaryEvent::Started => observer(AgentEvent::Started),
+            AgentBoundaryEvent::AutoCompaction(reason, update) => {
+                observer(AgentEvent::AutoCompaction {
+                    reason,
+                    update: &update,
+                });
+            }
+        }
         return;
     }
     if let Notification::Text(delta) = &event {
@@ -374,7 +380,7 @@ fn dispatch_agent_event(event: Notification<'_>, observer: &mut AgentObserver<'_
 
 fn dispatch_legacy_event(event: Notification<'_>, observer: &mut Observer<'_>) {
     if matches!(event, Notification::SummaryRequest)
-        && AUTO_COMPACTION_EVENT.with(|stack| !stack.borrow().is_empty())
+        && AGENT_BOUNDARY_EVENT.with(|stack| !stack.borrow().is_empty())
     {
         return;
     }
@@ -1031,6 +1037,10 @@ impl Agent<'_> {
             )
             .await;
         }
+        if prior_result.is_ok() && cancel.is_cancelled() {
+            prior_result = Err(Error::Cancelled);
+        }
+        let preflight_failed = prior_result.is_err();
         let mut check_turn_continuation =
             matches!(recovered, Some(RecoveredBoundary::TurnContinue));
         let mut force_request = matches!(recovered, Some(RecoveredBoundary::Continue { .. }));
@@ -1079,6 +1089,9 @@ impl Agent<'_> {
             let mut retry_attempt = 0;
             let mut result = match start {
                 Ok(()) => {
+                    if !in_process_continuation {
+                        notify_agent_boundary(AgentBoundaryEvent::Started, observer);
+                    }
                     let mut retry_observer = |event: Notification<'_>| {
                         match &event {
                             Notification::Retry(crate::RetryEvent::Start { attempt, .. }) => {
@@ -1198,8 +1211,15 @@ impl Agent<'_> {
                     continue;
                 }
             }
-            self.finish_run(session, run_id, &result, lifecycle, ended, observer)
-                .await?;
+            self.finish_run(
+                session,
+                run_id,
+                &result,
+                lifecycle && !preflight_failed,
+                ended,
+                observer,
+            )
+            .await?;
             return result;
         }
     }
@@ -3767,6 +3787,7 @@ impl Agent<'_> {
                 )
             })
             .flatten();
+        let mut input_failed = false;
         let collect = async {
             macro_rules! message_update {
                 ($update:expr) => {
@@ -3801,14 +3822,16 @@ impl Agent<'_> {
             let mut stream = loop {
                 tokio::select! {
                     opened = &mut opening => break opened?,
-                    Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
+                    Some(input) = receive_input(&mut inputs) => {
+                        queue_input(session, input.into(), observer).inspect_err(|_| input_failed = true)?;
+                    }
                 }
             };
             loop {
                 let event = tokio::select! {
                     event = crate::provider_hooks::ProviderHooks::scope(provider_hooks.clone(), stream.next()) => event,
                     Some(input) = receive_input(&mut inputs) => {
-                        queue_input(session, input.into(), observer)?;
+                        queue_input(session, input.into(), observer).inspect_err(|_| input_failed = true)?;
                         continue;
                     }
                 };
@@ -4214,7 +4237,10 @@ impl Agent<'_> {
             observer(Notification::Committed(record));
         });
         self.settle_usage(request_id, &usage, &metadata).await?;
-        Ok(ReplyAttempt { outcome: result })
+        match result {
+            Err(error) if input_failed => Err(error),
+            outcome => Ok(ReplyAttempt { outcome }),
+        }
     }
 
     async fn settle_usage(
@@ -5808,16 +5834,17 @@ impl Agent<'_> {
         // failures visible so they cannot be mistaken for a completed preflight.
         if prestart
             && !progress.request_checkpoint_failed
-            && matches!(
-                result,
-                Err(Error::Model(_)
-                    | Error::RetryableModel(_)
-                    | Error::Extension { .. }
-                    | Error::Config(_)
-                    | Error::AuthorizationRequired { .. }
-                    | Error::Cancelled
-                    | Error::Budget)
-            )
+            && (progress.model_failed
+                || matches!(
+                    result,
+                    Err(Error::Model(_)
+                        | Error::RetryableModel(_)
+                        | Error::Extension { .. }
+                        | Error::Config(_)
+                        | Error::AuthorizationRequired { .. }
+                        | Error::Cancelled
+                        | Error::Budget)
+                ))
         {
             return Ok(None);
         }
@@ -6002,8 +6029,9 @@ impl Agent<'_> {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
             result = platform_time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
-                result.map_err(|_| Error::Config("model preparation timed out".into()))??,
-        };
+                result.map_err(|_| Error::Config("model preparation timed out".into()))?,
+        }
+        .inspect_err(|_| progress.model_failed = true)?;
         let active = Agent {
             model: prepared.as_deref().unwrap_or(self.model),
             limits: self.limits.clone(),
@@ -6050,7 +6078,8 @@ impl Agent<'_> {
             )
             .await
             .inspect_err(|_| progress.request_checkpoint_failed = true)?
-            .outcome?;
+            .outcome
+            .inspect_err(|_| progress.model_failed = true)?;
         if reply.truncated {
             return Err(Error::Model(
                 "summary reached the output token limit".into(),
@@ -6972,6 +7001,7 @@ struct SummaryProgress {
     reported: bool,
     supplied_without_model: bool,
     request_checkpoint_failed: bool,
+    model_failed: bool,
 }
 
 impl SummaryProgress {
@@ -7678,30 +7708,42 @@ fn branch_excerpt(entry: Message) -> String {
     }
 }
 
-// The existing summary notification carries the enriched update only through
-// the synchronous adapter. Legacy observers still receive one SummaryRequest
-// at provider dispatch, with no additional notification variants.
+#[derive(Clone)]
+enum AgentBoundaryEvent {
+    Started,
+    AutoCompaction(crate::CompactionTrigger, Arc<AutoCompactionUpdate>),
+}
+
 fn notify_auto_compaction(
     reason: crate::CompactionTrigger,
     update: AutoCompactionUpdate,
     observer: &mut Observer<'_>,
 ) {
+    notify_agent_boundary(
+        AgentBoundaryEvent::AutoCompaction(reason, Arc::new(update)),
+        observer,
+    );
+}
+
+// Boundary events pass through the synchronous adapter while legacy observers
+// receive SummaryRequest only at provider dispatch.
+fn notify_agent_boundary(event: AgentBoundaryEvent, observer: &mut Observer<'_>) {
     struct Pop;
     impl Drop for Pop {
         fn drop(&mut self) {
-            AUTO_COMPACTION_EVENT.with(|stack| {
+            AGENT_BOUNDARY_EVENT.with(|stack| {
                 stack.borrow_mut().pop();
             });
         }
     }
-    AUTO_COMPACTION_EVENT.with(|stack| stack.borrow_mut().push((reason, Arc::new(update))));
+    AGENT_BOUNDARY_EVENT.with(|stack| stack.borrow_mut().push(event));
     let _guard = Pop;
     observer(Notification::SummaryRequest);
 }
 
 thread_local! {
     static TOOL_ATTEMPT_OPERATION_ID: std::cell::Cell<Option<Uuid>> = const { std::cell::Cell::new(None) };
-    static AUTO_COMPACTION_EVENT: std::cell::RefCell<Vec<(crate::CompactionTrigger, Arc<AutoCompactionUpdate>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static AGENT_BOUNDARY_EVENT: std::cell::RefCell<Vec<AgentBoundaryEvent>> = const { std::cell::RefCell::new(Vec::new()) };
     static TOOL_EVENT_METADATA: std::cell::RefCell<Vec<(Uuid, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static RECORD_EVENT_METADATA: std::cell::RefCell<Vec<(u64, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TEXT_EVENT_METADATA: std::cell::RefCell<Vec<TextEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
