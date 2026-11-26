@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
-use pi_rs::pi_import::{Branch, convert, required};
+use pi_rs::pi_import::{Branch, SourceAncestry, convert_references, source_entry_name};
 use pi_rs::{Error, Event, Record, Result, Session};
 use serde_json::Value;
 use uuid::Uuid;
@@ -36,47 +36,6 @@ pub fn read(path: &Path) -> Result<Session> {
         import_pi(entries)
     } else {
         Session::from_serialized_records(entries)
-    }
-}
-
-// Source entries form an append-only forest. Binary lifting lets repeated
-// compactions validate their retained boundary without scanning the branch.
-struct SourceAncestry {
-    nodes: Vec<(usize, Vec<usize>)>,
-}
-impl Default for SourceAncestry {
-    fn default() -> Self {
-        Self {
-            nodes: vec![(0, Vec::new())],
-        }
-    }
-}
-impl SourceAncestry {
-    fn add(&mut self, parent: usize) -> usize {
-        let mut jumps = vec![parent];
-        while let Some(next) = self.nodes[*jumps.last().unwrap()].1.get(jumps.len() - 1) {
-            jumps.push(*next);
-        }
-        let index = self.nodes.len();
-        self.nodes.push((self.nodes[parent].0 + 1, jumps));
-        index
-    }
-
-    fn is_ancestor(&self, ancestor: usize, mut node: usize) -> bool {
-        let (ancestor_depth, node_depth) = (self.nodes[ancestor].0, self.nodes[node].0);
-        if ancestor_depth > node_depth {
-            return false;
-        }
-        let mut difference = node_depth - ancestor_depth;
-        let mut bit = 0;
-        while difference != 0 {
-            if difference & 1 != 0 {
-                node = self.nodes[node].1[bit];
-            }
-            difference >>= 1;
-            bit += 1;
-        }
-        node == ancestor
     }
 }
 
@@ -373,19 +332,14 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
     let entry_count = entries.len();
     let source_ids: std::collections::BTreeSet<_> = entries
         .iter()
+        .enumerate()
         .skip(1)
-        .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+        .filter_map(|(index, entry)| source_entry_name(entry, version == 1, index))
         .collect();
     for (index, entry) in entries.into_iter().enumerate().skip(1) {
         importer.timestamp = entry["timestamp"].as_str().map(str::to_owned);
-        let id = if version == 1 {
-            entry["id"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("legacy-{index}"))
-        } else {
-            required(&entry, "id")?.to_owned()
-        };
+        let id = source_entry_name(&entry, version == 1, index)
+            .ok_or_else(|| Error::Session("imported entry is missing id".into()))?;
         if id.is_empty() {
             return Err(Error::Session("imported entry ID is empty".into()));
         }
@@ -461,7 +415,14 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
             )));
         }
         let parent_ancestry = branch.ancestry_index;
-        let events = convert(converted, &mut branch, &branches)?;
+        let events = convert_references(
+            converted,
+            &id,
+            &mut branch,
+            &branches,
+            |target| source_ids.contains(target),
+            &ancestry,
+        )?;
         let extra_compaction_metadata = (entry["type"] == "compaction"
             && (entry.get("details").is_some() || entry["fromHook"] == true))
             .then(|| {
@@ -2432,22 +2393,6 @@ mod tests {
     }
 
     #[test]
-    fn source_ancestry_handles_deep_and_divergent_branches() {
-        let mut ancestry = SourceAncestry::default();
-        let first = ancestry.add(0);
-        let mut leaf = first;
-        for _ in 0..8192 {
-            leaf = ancestry.add(leaf);
-        }
-        let sibling = ancestry.add(first);
-        assert!(ancestry.is_ancestor(first, leaf));
-        assert!(ancestry.is_ancestor(leaf, leaf));
-        assert!(!ancestry.is_ancestor(sibling, leaf));
-        assert!(!ancestry.is_ancestor(leaf, sibling));
-        assert!(ancestry.nodes[leaf].1.len() <= 15);
-    }
-
-    #[test]
     fn import_rejects_compaction_boundary_on_another_branch() {
         assert!(import_pi(vec![
             json!({"type":"session","version":3}),
@@ -3661,5 +3606,173 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         assert!(read(&path).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+    }
+    #[test]
+    fn dangling_pi_metadata_stays_inert_across_projection_replay_and_fork() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"original"}}),
+            json!({"type":"label","id":"label","parentId":"root","targetId":"4","label":"dangling"}),
+            json!({"type":"context_edit","id":"edit","parentId":"label","targetId":"4","replacement":null}),
+            json!({"type":"message","id":"child","parentId":"edit","message":{"role":"user","content":"followed"}}),
+        ];
+        let bytes: String = entries.iter().map(|entry| format!("{entry}\n")).collect();
+        std::fs::write(&source, &bytes).unwrap();
+        let session = read(&source).unwrap();
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), bytes);
+
+        let source_id = |name: &str| {
+            session
+                .records()
+                .iter()
+                .find(|record| {
+                    matches!(&record.event, Event::SourceEntry { format, entry }
+                        if format == "pi" && entry["id"] == name)
+                })
+                .unwrap()
+                .id
+        };
+        let label = source_id("label");
+        let edit = source_id("edit");
+        let root = source_id("root");
+        assert_eq!(root.to_string(), "4", "exercise the raw/wire ID collision");
+        let check_messages = |session: &Session| {
+            assert!(session.labels().is_empty());
+            assert_eq!(
+                session.current_messages(),
+                [
+                    Message::User {
+                        content: "original".into()
+                    },
+                    Message::User {
+                        content: "followed".into()
+                    },
+                ]
+            );
+        };
+        let check_wire = |session: &Session| {
+            let wire = super::super::rpc_entries::Entries::new(session)
+                .after(None)
+                .unwrap();
+            for entry in wire["entries"].as_array().unwrap() {
+                if matches!(entry["type"].as_str(), Some("label" | "context_edit")) {
+                    assert!(
+                        entry["targetId"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("pi-rs:unresolved:")
+                    );
+                    assert!(
+                        wire["entries"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|candidate| candidate["id"] != entry["targetId"])
+                    );
+                }
+            }
+        };
+        let metadata: BTreeMap<_, _> = session
+            .records()
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|value| (record.id, value))
+            })
+            .collect();
+        let mut stream = pi_rs::pi_import::StreamVerifier::new();
+        assert!(
+            stream
+                .advance(&session.records()[..label as usize], &metadata, false)
+                .is_err()
+        );
+        assert!(!stream.counts().contains_key(&label));
+        stream.set_authoritative_end(session.records());
+        for end in label as usize..=session.records().len() {
+            stream
+                .advance(&session.records()[..end], &metadata, false)
+                .unwrap();
+        }
+        let counts = session.validated_pi_conversion_counts().unwrap();
+        assert_eq!(stream.counts(), &counts);
+        assert_eq!(counts.get(&label), Some(&0));
+        assert_eq!(counts.get(&edit), Some(&0));
+
+        let mut forged = metadata.clone();
+        forged.insert(label, json!({"pi_rs_import_conversion_count_v1":1}));
+        let forged_session =
+            Session::from_records_with_metadata(session.records().to_vec(), forged.clone())
+                .unwrap();
+        assert!(forged_session.validated_pi_conversion_counts().is_err());
+        assert!(
+            pi_rs::pi_import::StreamVerifier::new()
+                .advance(session.records(), &forged, true)
+                .is_err()
+        );
+
+        let mut forward = session.records().to_vec();
+        let Event::SourceEntry { entry, .. } = &mut forward[(edit - 1) as usize].event else {
+            unreachable!()
+        };
+        entry["targetId"] = json!("child");
+        let forward = Session::from_records_with_metadata(forward, metadata.clone()).unwrap();
+        assert!(forward.validated_pi_conversion_counts().is_err());
+        assert!(
+            pi_rs::pi_import::StreamVerifier::new()
+                .advance(forward.records(), &metadata, true)
+                .is_err()
+        );
+
+        check_messages(&session);
+        check_wire(&session);
+        let native = directory.path().join("native.jsonl");
+        session.export_jsonl(&native).unwrap();
+        let reopened = Session::open(&native).unwrap();
+        assert_eq!(reopened.validated_pi_conversion_counts().unwrap(), counts);
+        check_messages(&reopened);
+        check_wire(&reopened);
+        let fork_path = directory.path().join("fork.jsonl");
+        let fork = reopened.fork_to(reopened.head(), &fork_path).unwrap();
+        assert!(
+            fork.validated_pi_conversion_counts()
+                .unwrap()
+                .values()
+                .any(|count| *count == 0)
+        );
+        check_messages(&fork);
+        check_wire(&fork);
+        assert_eq!(std::fs::read_to_string(source).unwrap(), bytes);
+    }
+
+    #[test]
+    fn metadata_recovery_rejects_forward_self_and_invalid_context_references() {
+        let header = json!({"type":"session","version":3});
+        let root = json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"root"}});
+        let sibling = json!({"type":"message","id":"sibling","parentId":null,"message":{"role":"user","content":"sibling"}});
+        let later = json!({"type":"message","id":"later","parentId":"entry","message":{"role":"user","content":"later"}});
+        for entry in [
+            json!({"type":"label","id":"entry","parentId":"root","targetId":"later","label":"forward"}),
+            json!({"type":"label","id":"entry","parentId":"root","targetId":"entry","label":"self"}),
+            json!({"type":"context_edit","id":"entry","parentId":"root","targetId":"later","replacement":null}),
+            json!({"type":"context_edit","id":"entry","parentId":"root","targetId":"sibling","replacement":null}),
+            json!({"type":"context_edit","id":"entry","parentId":"root","targetId":"missing","replacement":{"content":false}}),
+            json!({"type":"context_edit","id":"entry","parentId":"root","replacement":null}),
+        ] {
+            assert!(
+                import_pi(vec![
+                    header.clone(),
+                    root.clone(),
+                    sibling.clone(),
+                    entry.clone(),
+                    later.clone()
+                ])
+                .is_err(),
+                "{entry}"
+            );
+        }
     }
 }

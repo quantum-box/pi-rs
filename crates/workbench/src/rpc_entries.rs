@@ -512,6 +512,13 @@ impl Cursor {
                             entry[reference] = json!(id.to_string());
                         }
                     }
+                    if matches!(entry["type"].as_str(), Some("label" | "context_edit"))
+                        && self.conversion_counts.get(&record.id) == Some(&0)
+                    {
+                        // Raw Pi IDs and the projected numeric IDs are different
+                        // namespaces. Leave this target unbound in the projection.
+                        entry["targetId"] = json!(format!("pi-rs:unresolved:{}", record.id));
+                    }
                     Some(entry)
                 } else {
                     None

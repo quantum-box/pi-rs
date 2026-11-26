@@ -2250,6 +2250,11 @@ Forward parent references and compaction boundaries on a different branch are
 also rejected. Pi instead drops a retained boundary that is not on the current
 path; native import rejects it rather than silently retaining unrelated history.
 
+Pi labels and context edits whose target IDs are absent from the whole source
+remain inert. The original source nodes are preserved in the native journal,
+and the RPC projection keeps their target IDs unbound. Branch forks retain
+these context edits and rebuild labels only for retained targets. Forward
+references and context edits that target another branch are rejected.
 Context edits are projected onto future model context while the imported raw
 entries remain available. Imported system messages appear as `[system]` in the
 default session tree, where their text can be searched and copied.

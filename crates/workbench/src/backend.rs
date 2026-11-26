@@ -694,7 +694,7 @@ impl SessionSnapshot {
             return Vec::new();
         }
         if changed {
-            self.replay = pi_rs::pi_import::StreamVerifier::new();
+            self.replay.restart();
             *cursor = super::rpc_entries::Cursor::default();
         }
         #[cfg(test)]

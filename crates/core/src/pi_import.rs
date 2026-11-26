@@ -96,6 +96,56 @@ fn summary_usage_metadata(events: &[Event]) -> Option<Box<crate::SummaryUsageMet
     Some(Box::new(metadata))
 }
 
+// Source entries form an append-only forest. Binary lifting lets repeated
+// compactions validate their retained boundary without scanning the branch.
+pub struct SourceAncestry {
+    nodes: Vec<(usize, Vec<usize>)>,
+}
+impl Default for SourceAncestry {
+    fn default() -> Self {
+        Self {
+            nodes: vec![(0, Vec::new())],
+        }
+    }
+}
+impl SourceAncestry {
+    pub fn add(&mut self, parent: usize) -> usize {
+        let mut jumps = vec![parent];
+        while let Some(next) = self.nodes[*jumps.last().unwrap()].1.get(jumps.len() - 1) {
+            jumps.push(*next);
+        }
+        let index = self.nodes.len();
+        self.nodes.push((self.nodes[parent].0 + 1, jumps));
+        index
+    }
+
+    pub fn is_ancestor(&self, ancestor: usize, mut node: usize) -> bool {
+        let (ancestor_depth, node_depth) = (self.nodes[ancestor].0, self.nodes[node].0);
+        if ancestor_depth > node_depth {
+            return false;
+        }
+        let mut difference = node_depth - ancestor_depth;
+        let mut bit = 0;
+        while difference != 0 {
+            if difference & 1 != 0 {
+                node = self.nodes[node].1[bit];
+            }
+            difference >>= 1;
+            bit += 1;
+        }
+        node == ancestor
+    }
+}
+
+/// The reference namespace excludes the session header. Pi v1 used positions
+/// for records that had no explicit ID.
+pub fn source_entry_name(entry: &Value, legacy: bool, index: usize) -> Option<String> {
+    entry["id"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| legacy.then(|| format!("legacy-{index}")))
+}
+
 #[derive(Clone, Default)]
 pub struct Branch {
     pub head: u64,
@@ -109,6 +159,71 @@ pub struct Branch {
     pub provider: Option<Arc<str>>,
     pub thinking: Option<Arc<str>>,
     pub(crate) store: PersistentMap<Arc<str>, Arc<Value>>,
+}
+
+fn metadata_target(entry: &Value) -> Result<Option<&str>> {
+    if !matches!(entry["type"].as_str(), Some("label" | "context_edit")) {
+        return Ok(None);
+    }
+    required(entry, "targetId")
+        .and_then(|id| {
+            if id.is_empty() {
+                Err(Error::Session("imported target ID is empty".into()))
+            } else {
+                Ok(id)
+            }
+        })
+        .map(Some)
+}
+
+/// Convert a source with its position and the complete source namespace.
+/// A dangling metadata entry keeps its source node and contributes no event.
+pub fn convert_references(
+    entry: &Value,
+    name: &str,
+    branch: &mut Branch,
+    branches: &BTreeMap<String, Branch>,
+    namespace_contains: impl FnOnce(&str) -> bool,
+    ancestry: &SourceAncestry,
+) -> Result<Vec<Event>> {
+    if let Some(target) = metadata_target(entry)? {
+        if target == name || (!branches.contains_key(target) && namespace_contains(target)) {
+            return Err(Error::Session(format!(
+                "imported {0} target {target} must precede the entry",
+                entry["type"]
+            )));
+        }
+        if let Some(target_branch) = branches.get(target) {
+            if entry["type"] == "context_edit"
+                && !ancestry.is_ancestor(target_branch.ancestry_index, branch.ancestry_index)
+            {
+                return Err(Error::Session(format!(
+                    "imported context edit target {target} is outside its branch"
+                )));
+            }
+        } else {
+            if entry["type"] == "context_edit" {
+                context_edit_replacement(entry)?;
+            } else if !entry["label"].is_null() && !entry["label"].is_string() {
+                return Err(Error::Session("invalid imported label".into()));
+            }
+            return Ok(Vec::new());
+        }
+    }
+    convert(entry, branch, branches)
+}
+
+fn context_edit_replacement(entry: &Value) -> Result<Option<crate::ContextContent>> {
+    if entry["replacement"].is_null() {
+        return Ok(None);
+    }
+    let replacement = serde_json::from_value(entry["replacement"]["content"].clone())?;
+    if serde_json::to_vec(&replacement)?.len() > 8 * 1024 * 1024 {
+        return Err(Error::Session(
+            "context replacement exceeds size limit".into(),
+        ));
+    }
+    Ok(Some(replacement))
 }
 
 /// A buffering hint only. Ownership must still be established by replay.
@@ -144,12 +259,8 @@ pub fn conversion_count_hint(entry: &Value) -> Option<u64> {
             | "system" => 1,
             _ => return None,
         },
-        "model_change"
-        | "thinking_level_change"
-        | "session_info"
-        | "label"
-        | "custom_message"
-        | "context_edit" => 1,
+        "model_change" | "thinking_level_change" | "session_info" | "custom_message" => 1,
+        "label" | "context_edit" => return None,
         "compaction" | "branch_summary" => 1 + usage(&entry["usage"]),
         "custom" => {
             1 + u64::from(
@@ -257,6 +368,8 @@ pub struct StreamVerifier {
     completed: Vec<bool>,
     source_ids: BTreeMap<String, u64>,
     unresolved_parents: std::collections::BTreeSet<String>,
+    unresolved_targets: std::collections::BTreeSet<String>,
+    ancestry: SourceAncestry,
     states: BTreeMap<u64, Branch>,
     branches: BTreeMap<String, Branch>,
     names: Vec<Option<String>>,
@@ -268,6 +381,7 @@ pub struct StreamVerifier {
     checked_sources: usize,
     pending: Option<StagedConversion>,
     authoritative_source_count: Option<usize>,
+    authoritative_ids: std::collections::BTreeSet<String>,
     legacy_candidates: BTreeMap<u64, (Event, Option<String>)>,
 }
 
@@ -287,6 +401,8 @@ impl Default for StreamVerifier {
             completed: vec![false],
             source_ids: Default::default(),
             unresolved_parents: Default::default(),
+            unresolved_targets: Default::default(),
+            ancestry: Default::default(),
             states: Default::default(),
             branches: Default::default(),
             names: Default::default(),
@@ -298,6 +414,7 @@ impl Default for StreamVerifier {
             checked_sources: 0,
             pending: None,
             authoritative_source_count: None,
+            authoritative_ids: Default::default(),
             legacy_candidates: Default::default(),
         }
     }
@@ -320,9 +437,33 @@ impl StreamVerifier {
         self.processed
     }
 
+    pub fn restart(&mut self) {
+        let authoritative_ids = std::mem::take(&mut self.authoritative_ids);
+        let authoritative_source_count = self.authoritative_source_count;
+        *self = Self {
+            authoritative_ids,
+            authoritative_source_count,
+            ..Self::default()
+        };
+    }
+
     pub fn set_authoritative_end(&mut self, records: &[crate::Record]) {
-        self.authoritative_source_count = Some(records.iter().filter(|record|
-            matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi")).count());
+        let sources = records.iter().filter_map(|record| match &record.event {
+            Event::SourceEntry { format, entry } if format == "pi" => Some(entry),
+            _ => None,
+        });
+        self.authoritative_ids.clear();
+        let mut legacy = false;
+        let mut count = 0;
+        for (index, source) in sources.enumerate() {
+            count += 1;
+            if source["type"] == "session" {
+                legacy = source["version"].as_u64().unwrap_or(1) == 1;
+            } else if let Some(name) = source_entry_name(source, legacy, index) {
+                self.authoritative_ids.insert(name);
+            }
+        }
+        self.authoritative_source_count = Some(count);
     }
 
     /// Verify as much of `records` as possible. A returned ID is the last
@@ -357,8 +498,8 @@ impl StreamVerifier {
             }
         }
         self.validated_records = records.len();
-        if authoritative && self.authoritative_source_count.is_none() {
-            self.authoritative_source_count = Some(records.iter().filter(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi")).count());
+        if authoritative {
+            self.set_authoritative_end(records);
         }
         while self.processed < records.len() {
             let record = &records[self.processed];
@@ -407,10 +548,7 @@ impl StreamVerifier {
             if self.pending.is_none() {
                 self.checked_sources += 1;
                 let index = self.names.len();
-                let name = entry["id"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .or_else(|| self.legacy.then(|| format!("legacy-{index}")))
+                let name = source_entry_name(entry, self.legacy, index)
                     .filter(|name| !name.is_empty())
                     .ok_or_else(|| {
                         Error::Session("missing or invalid imported Pi source ID".into())
@@ -418,6 +556,11 @@ impl StreamVerifier {
                 if self.unresolved_parents.contains(&name) {
                     return Err(Error::Session(
                         "imported Pi parent is a forward reference".into(),
+                    ));
+                }
+                if self.unresolved_targets.contains(&name) {
+                    return Err(Error::Session(
+                        "imported Pi target is a forward reference".into(),
                     ));
                 }
                 if !self.legacy {
@@ -489,7 +632,24 @@ impl StreamVerifier {
                 let marker = metadata
                     .get(&record.id)
                     .and_then(|value| value.get("pi_rs_import_conversion_count_v1"));
-                let events = convert(&migrated, &mut branch, &self.branches)?;
+                if let Some(target) = metadata_target(&migrated)?
+                    && target != name
+                    && !self.branches.contains_key(target)
+                    && !self.authoritative_ids.contains(&name)
+                {
+                    return Err(Error::Session(
+                        "unresolved imported Pi target requires an authoritative source namespace"
+                            .into(),
+                    ));
+                }
+                let events = convert_references(
+                    &migrated,
+                    &name,
+                    &mut branch,
+                    &self.branches,
+                    |target| self.authoritative_ids.contains(target),
+                    &self.ancestry,
+                )?;
                 let events = if marker.is_none()
                     && entry["type"] == "model_change"
                     && records.get(record.id as usize).is_some_and(|next| {
@@ -592,6 +752,11 @@ impl StreamVerifier {
             let StagedConversion {
                 name, mut branch, ..
             } = self.pending.take().expect("staged source");
+            if count == 0
+                && let Some(target) = metadata_target(entry)?
+            {
+                self.unresolved_targets.insert(target.to_owned());
+            }
             self.ids = ids;
             self.reverse = reverse;
             self.nearest.push(Some(record.id));
@@ -604,6 +769,7 @@ impl StreamVerifier {
             branch.entry_start = record.id + u64::from(count != 0);
             branch.context_target = context_target;
             branch.head = end;
+            branch.ancestry_index = self.ancestry.add(branch.ancestry_index);
             self.states.insert(record.id, branch.clone());
             self.branches.insert(name.clone(), branch);
             self.names.push(Some(name));
@@ -644,11 +810,7 @@ pub(crate) fn validate_conversions(
             if entry["type"] == "session" {
                 return None;
             }
-            entry["id"]
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| (legacy && index > 0).then(|| format!("legacy-{index}")))
-                .map(|id| (record.id, id))
+            source_entry_name(entry, legacy && index > 0, index).map(|id| (record.id, id))
         })
         .collect();
     // Source names are the importer's reference namespace, including v1's
@@ -832,6 +994,7 @@ pub(crate) fn validate_conversions(
     }
     let mut states = BTreeMap::<u64, Branch>::new();
     let mut branches = BTreeMap::<String, Branch>::new();
+    let mut ancestry = SourceAncestry::default();
     let mut ids = PersistentMap::new();
     let mut reverse = PersistentMap::new();
     let mut verified = BTreeMap::new();
@@ -947,7 +1110,15 @@ pub(crate) fn validate_conversions(
         let marker = session
             .record_metadata(record.id)
             .and_then(|value| value.get("pi_rs_import_conversion_count_v1"));
-        let events = convert(&migrated, &mut branch, &branches)?;
+        let name = source_names.get(&record.id).expect("validated source name");
+        let events = convert_references(
+            &migrated,
+            name,
+            &mut branch,
+            &branches,
+            |target| by_name.contains_key(target),
+            &ancestry,
+        )?;
         let mut count = events.len() as u64;
         if marker.is_none() {
             let mut local_ids = PersistentMap::new();
@@ -1084,6 +1255,7 @@ pub(crate) fn validate_conversions(
             }
         }
         branch.head = record.id + count;
+        branch.ancestry_index = ancestry.add(branch.ancestry_index);
         if let Some(name) = source_names.get(&record.id) {
             branches.insert(
                 name.clone(),
@@ -1091,6 +1263,7 @@ pub(crate) fn validate_conversions(
                     head: branch.head,
                     entry_start: branch.entry_start,
                     context_target: branch.context_target,
+                    ancestry_index: branch.ancestry_index,
                     ..Branch::default()
                 },
             );
@@ -1766,13 +1939,7 @@ pub fn convert(
                 .ok_or_else(|| {
                     Error::Session(format!("invalid imported context edit target {source}"))
                 })?;
-            let replacement = if entry["replacement"].is_null() {
-                None
-            } else {
-                Some(serde_json::from_value(
-                    entry["replacement"]["content"].clone(),
-                )?)
-            };
+            let replacement = context_edit_replacement(entry)?;
             events.push(Event::ContextEdited {
                 target,
                 replacement,
@@ -1791,6 +1958,22 @@ pub fn convert(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn source_ancestry_handles_deep_and_divergent_branches() {
+        let mut ancestry = SourceAncestry::default();
+        let first = ancestry.add(0);
+        let mut leaf = first;
+        for _ in 0..8192 {
+            leaf = ancestry.add(leaf);
+        }
+        let sibling = ancestry.add(first);
+        assert!(ancestry.is_ancestor(first, leaf));
+        assert!(ancestry.is_ancestor(leaf, leaf));
+        assert!(!ancestry.is_ancestor(sibling, leaf));
+        assert!(!ancestry.is_ancestor(leaf, sibling));
+        assert!(ancestry.nodes[leaf].1.len() <= 15);
+    }
 
     #[test]
     fn openai_reasoning_removal_labels_survive_serialization() {

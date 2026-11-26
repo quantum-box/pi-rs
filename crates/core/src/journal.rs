@@ -3077,6 +3077,9 @@ impl Session {
                 continue;
             }
             if entry["type"] == "label" {
+                if verified_conversions.get(&record.id) == Some(&0) {
+                    continue;
+                }
                 let paired = branch.get(index + 1).is_some_and(|next| {
                     next.parent == Some(record.id) && next.timestamp == record.timestamp
                         && next.run_id.is_none()
