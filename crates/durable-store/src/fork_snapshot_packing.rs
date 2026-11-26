@@ -1,7 +1,7 @@
 //! Losslessly compact aged fork evidence without changing its logical version.
 use crate::{
+    transcript_packing::{unpack, HEADER, MAGIC, MAX_LIMIT},
     Check, Entry, Error, Expected, Mutation, Store,
-    transcript_packing::{HEADER, MAGIC, MAX_LIMIT, unpack},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

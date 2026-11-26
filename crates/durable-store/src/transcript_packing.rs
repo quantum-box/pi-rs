@@ -3,13 +3,13 @@
 
 use std::io::{Read, Write};
 
-use flate2::{Compression, bufread::ZlibDecoder, write::ZlibEncoder};
-use rusqlite::{OptionalExtension, params};
+use flate2::{bufread::ZlibDecoder, write::ZlibEncoder, Compression};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{Check, Entry, Error, Expected, Mutation, Store, prefix_end, read_limit};
+use crate::{prefix_end, read_limit, Check, Entry, Error, Expected, Mutation, Store};
 
 const PREFIX: &[u8] = b"durable/transcript/entry/";
 pub(crate) const MAGIC: &[u8] = b"\x89PI-TRANSCRIPT\0\x01";
@@ -499,14 +499,12 @@ mod tests {
         assert_eq!(logical, Entry { value, version });
         assert_eq!(store.commit_for_version(&key, version).unwrap(), commit);
         let connection = rusqlite::Connection::open(path).unwrap();
-        assert!(
-            connection
-                .execute(
-                    "UPDATE durable_store_entries SET value=X'00' WHERE key=?1",
-                    [&key]
-                )
-                .is_err()
-        );
+        assert!(connection
+            .execute(
+                "UPDATE durable_store_entries SET value=X'00' WHERE key=?1",
+                [&key]
+            )
+            .is_err());
     }
 
     #[test]
