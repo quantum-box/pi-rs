@@ -199,6 +199,38 @@ fn defined_document_incarnations_survive_reopen_and_fork_independently() {
         harness.session_transaction(root, |tx| tx.delete_document(&raw)),
         Err(Error::Document(DocumentError::InvalidDocumentDefinition))
     ));
+    let store = Store::open(&path).unwrap();
+    let docs = Documents::new(&store);
+    let version = docs.get(&raw).unwrap().unwrap().version;
+    let policy = docs.fork_policy(&raw).unwrap().unwrap();
+
+    let mut tx = Transaction::new();
+    tx.delete(&raw, version).unwrap();
+    assert!(matches!(
+        tx.commit(&store),
+        Err(DocumentError::Store(
+            durable_store::Error::InvalidDocumentLifecycle
+        ))
+    ));
+    let mut tx = pi_rs_durable::document::HostTransaction::new(&store);
+    tx.delete(&raw, version).unwrap();
+    assert!(matches!(
+        tx.commit(),
+        Err(DocumentError::Store(
+            durable_store::Error::InvalidDocumentLifecycle
+        ))
+    ));
+    let mut tx = Transaction::new();
+    tx.set_fork_policy(&raw, Expected::Version(policy.version), &policy.policy)
+        .unwrap();
+    assert!(matches!(
+        tx.commit(&store),
+        Err(DocumentError::Store(
+            durable_store::Error::InvalidDocumentLifecycle
+        ))
+    ));
+    assert_eq!(docs.get(&raw).unwrap().unwrap().version, version);
+    assert_eq!(docs.fork_policy(&raw).unwrap().unwrap(), policy);
     let fork = harness.fork(root).unwrap();
     let inherited = harness
         .session_transaction(fork, |tx| {
