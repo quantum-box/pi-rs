@@ -508,7 +508,9 @@ up to 32 recent native messages with the child's live model and tool output.
 Start the text CLI or RPC companion with `--foreground-subagent` to select
 the built-in `subagent` tool on the conversation. The child uses the same
 provider route and model and starts with an empty tool allowlist. Reopening the
-conversation restores the selection before resuming work.
+conversation restores the selection before resuming work. If the parent was
+waiting for a foreground child when the process stopped, the companion resumes
+the original child conversation and delivers its settlement to the parent.
 
 
 `StandaloneNoHooksHost` constructs a standalone scheduler with an explicit

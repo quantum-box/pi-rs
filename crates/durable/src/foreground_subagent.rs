@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::{
     extension::Extension,
-    runtime::{Config, Harness},
-    task::{Checkpoint, Task, TaskOwner, WaitFor},
+    runtime::{Config, Error, Harness, SubmissionNotify},
+    task::{Checkpoint, Task, TaskOwner, TaskState, WaitFor},
     task_scheduler::{Handler, Step},
     task_store::TaskStore,
     task_tool::TaskTool,
@@ -17,10 +17,47 @@ use crate::{
 pub(crate) const PREFIX: &str = "pi-rs.foreground-subagent/";
 pub(crate) const KIND: &str = "pi-rs.foreground-subagent";
 const SIGNAL: &str = "answered";
+const CHILD_KEY: &str = "child";
 
 /// Name of the foreground extension selected on its bound parent.
 pub fn extension_name(parent: Uuid) -> String {
     format!("{PREFIX}{parent}")
+}
+
+pub(crate) fn waiting_child(
+    harness: &Harness,
+    parent: Uuid,
+    task: Uuid,
+) -> Result<Option<Uuid>, Error> {
+    let store = harness.subagent_store()?;
+    let Some(stored) = TaskStore::new(store)
+        .load(task)
+        .map_err(crate::task_scheduler::Error::from)?
+    else {
+        return Ok(None);
+    };
+    let owner = TaskOwner::Conversation(parent);
+    if stored.task.owner() != &owner
+        || stored.task.kind() != Some(KIND)
+        || !stored.task.is_task_tool()
+        || stored.task.abort_requested()
+        || !matches!(
+            stored.task.state(),
+            TaskState::Waiting(WaitFor::TypedSignal(_))
+        )
+    {
+        return Ok(None);
+    }
+    crate::owned_subagent::reserved_foreground_child(
+        store,
+        &owner,
+        CHILD_KEY,
+        &SubmissionNotify {
+            task_id: task,
+            key: SIGNAL.into(),
+        },
+    )
+    .map(Some)
 }
 
 pub(crate) fn extension(
@@ -95,7 +132,7 @@ impl Handler for Foreground {
         let admission = match harness.submit_task_owned_subagent_notified(
             task.id(),
             task.owner().clone(),
-            "child",
+            CHILD_KEY,
             self.config.clone(),
             content.into(),
             self.allowed_tools.clone(),

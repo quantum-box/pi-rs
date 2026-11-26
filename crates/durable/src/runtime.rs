@@ -23727,11 +23727,23 @@ impl Scheduler {
                 "foreground subagent setup requires a paused scheduler before task dispatch".into(),
             ));
         }
+        // A task already waiting for its child's receipt will not invoke its
+        // handler on startup, so it cannot enqueue the child on the new channel.
+        let state = self.harness.conversation(parent)?;
+        let child = match state.phase {
+            Phase::TaskPending { task, .. } if !state.abort_requested => {
+                crate::foreground_subagent::waiting_child(&self.harness, parent, task)?
+            }
+            _ => None,
+        };
         let mut tasks = crate::task_scheduler::Registry::default();
         let receiver =
             Self::configure_foreground(&self.harness, &mut tasks, parent, config, allowed_tools)?;
         let driver = self.start_tasks(tasks)?;
         self.start_foreground_worker(receiver);
+        if let Some(child) = child {
+            self.schedule(child);
+        }
         Ok(driver)
     }
 

@@ -323,17 +323,32 @@ fn frames(output: Output) -> Vec<Value> {
 
 #[test]
 fn foreground_option_drives_a_child_and_exposes_its_live_and_final_rpc_views() {
+    foreground_rpc_round_trip(false);
+}
+
+#[test]
+fn foreground_option_resumes_a_waiting_child_after_process_kill() {
+    foreground_rpc_round_trip(true);
+}
+
+fn foreground_rpc_round_trip(kill_during_child: bool) {
+    use pi_rs_durable::{
+        task::{TaskState, WaitFor},
+        task_store::TaskStore,
+    };
     use serde_json::json;
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
     let (release, released) = mpsc::channel();
+    let (child_started, child_start) = mpsc::channel();
     let provider = thread::spawn(move || {
-        for index in 0..4 {
+        let parent_answer = if kill_during_child { 3 } else { 2 };
+        for index in 0..=parent_answer + 1 {
             let (mut socket, request) = read_fixture_request(&listener, Duration::from_secs(20));
             let tools = request["tools"].as_array();
-            if index == 1 {
+            if (1..parent_answer).contains(&index) {
                 assert!(tools.is_none_or(Vec::is_empty));
                 assert!(request["input"].to_string().contains("delegated input"));
             } else {
@@ -351,13 +366,15 @@ fn foreground_option_drives_a_child_and_exposes_its_live_and_final_rpc_views() {
                     call,
                 )
             } else {
-                let text = match index {
-                    1 => "child answer",
-                    2 => {
-                        assert!(request["input"].to_string().contains("child answer"));
-                        "parent answer"
-                    }
-                    _ => "resumed answer",
+                let text = if index == parent_answer {
+                    assert!(request["input"].to_string().contains("child answer"));
+                    "parent answer"
+                } else if index > parent_answer {
+                    "resumed answer"
+                } else if index == 1 && kill_during_child {
+                    "interrupted child attempt"
+                } else {
+                    "child answer"
                 };
                 (
                     vec![
@@ -377,7 +394,11 @@ fn foreground_option_drives_a_child_and_exposes_its_live_and_final_rpc_views() {
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}", partial.len() + end.len()).unwrap();
             if index == 1 {
                 socket.flush().unwrap();
+                child_started.send(()).unwrap();
                 released.recv_timeout(Duration::from_secs(20)).unwrap();
+                if kill_during_child {
+                    continue;
+                }
             }
             socket.write_all(end.as_bytes()).unwrap();
         }
@@ -395,26 +416,42 @@ fn foreground_option_drives_a_child_and_exposes_its_live_and_final_rpc_views() {
             .args(args);
         command
     };
-    let mut rpc = command(&["--model", "fixture", "--rpc", "--foreground-subagent"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = rpc.stdin.take().unwrap();
-    let stdout = BufReader::new(rpc.stdout.take().unwrap());
-    let (frames, receive) = mpsc::channel();
-    let reader = thread::spawn(move || {
-        for line in stdout.lines() {
-            let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
-            if frames.send(frame).is_err() {
-                break;
+    let start_rpc = |args: &[&str]| {
+        let mut rpc = command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = rpc.stdin.take().unwrap();
+        let stdout = BufReader::new(rpc.stdout.take().unwrap());
+        let (frames, receive) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in stdout.lines() {
+                let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if frames.send(frame).is_err() {
+                    break;
+                }
             }
-        }
-    });
-    let next = || receive.recv_timeout(Duration::from_secs(20)).unwrap();
+        });
+        (rpc, stdin, receive, reader)
+    };
+    let (mut rpc, mut stdin, mut receive, mut reader) =
+        start_rpc(&["--model", "fixture", "--rpc", "--foreground-subagent"]);
+    let next = |rpc: &mut std::process::Child, receive: &mpsc::Receiver<Value>| {
+        receive
+            .recv_timeout(Duration::from_secs(25))
+            .unwrap_or_else(|error| {
+                let _ = rpc.kill();
+                let _ = rpc.wait();
+                panic!("RPC frame was not received: {error}");
+            })
+    };
     writeln!(stdin, "{}", json!({"type":"get_state","id":"root"})).unwrap();
-    let root = next()["data"]["sessionId"].as_str().unwrap().to_owned();
+    let root = next(&mut rpc, &receive)["data"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     writeln!(
         stdin,
         "{}",
@@ -422,7 +459,7 @@ fn foreground_option_drives_a_child_and_exposes_its_live_and_final_rpc_views() {
     )
     .unwrap();
     let child = loop {
-        let frame = next();
+        let frame = next(&mut rpc, &receive);
         assert_ne!(frame["type"], "agent_end", "{frame}");
         if frame["type"] == "durable_foreground_subagents" {
             break frame["conversationIds"][0].clone();
@@ -436,7 +473,7 @@ fn foreground_option_drives_a_child_and_exposes_its_live_and_final_rpc_views() {
     )
     .unwrap();
     loop {
-        let frame = next();
+        let frame = next(&mut rpc, &receive);
         assert_ne!(frame["type"], "agent_end", "{frame}");
         if frame["id"] == "live" {
             assert_eq!(frame["success"], true, "{frame}");
@@ -449,9 +486,33 @@ fn foreground_option_drives_a_child_and_exposes_its_live_and_final_rpc_views() {
             break;
         }
     }
+    child_start.recv_timeout(Duration::from_secs(20)).unwrap();
+    if kill_during_child {
+        // The handler must already be parked on the receipt, so waking the
+        // task driver alone cannot re-enqueue the child's model submission.
+        let store = durable_store::Store::open(&db).unwrap();
+        let tasks = TaskStore::new(&store);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tasks.list().unwrap().iter().any(|stored| {
+            stored.task.kind() == Some("pi-rs.foreground-subagent")
+                && matches!(
+                    stored.task.state(),
+                    TaskState::Waiting(WaitFor::TypedSignal(_))
+                )
+        }) {
+            assert!(Instant::now() < deadline, "foreground task did not park");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(store);
+        rpc.kill().unwrap();
+        assert!(!rpc.wait().unwrap().success());
+        drop(stdin);
+        reader.join().unwrap();
+        (rpc, stdin, receive, reader) = start_rpc(&["--conversation", &root, "--rpc"]);
+    }
     release.send(()).unwrap();
     loop {
-        let frame = next();
+        let frame = next(&mut rpc, &receive);
         if frame["type"] == "agent_end" {
             assert_eq!(frame["success"], true, "{frame}");
             assert!(frame["messages"].to_string().contains("parent answer"));
@@ -464,7 +525,7 @@ fn foreground_option_drives_a_child_and_exposes_its_live_and_final_rpc_views() {
         json!({"type":"get_foreground_subagent","conversationId":child,"id":"settled"})
     )
     .unwrap();
-    let settled = next();
+    let settled = next(&mut rpc, &receive);
     assert_eq!(settled["id"], "settled", "{settled}");
     assert_eq!(settled["success"], true, "{settled}");
     assert!(
