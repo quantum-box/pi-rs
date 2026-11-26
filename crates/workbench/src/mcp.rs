@@ -2247,8 +2247,13 @@ pub async fn resolve_value(value: &str) -> Result<String> {
 }
 
 #[doc(hidden)]
+pub fn credential_command(value: &str) -> Option<&str> {
+    value.strip_prefix('!')
+}
+
+#[doc(hidden)]
 pub async fn resolve_value_with_cleanup(value: &str, cleanup: Option<&Children>) -> Result<String> {
-    if let Some(command) = value.strip_prefix('!') {
+    if let Some(command) = credential_command(value) {
         let mut process = if cfg!(windows) {
             let mut command = tokio::process::Command::new("cmd");
             command.arg("/C");

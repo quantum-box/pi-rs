@@ -8,7 +8,7 @@ use pi_rs::{
 use pi_rs_workbench::mcp::{McpExtension, ServerConfig};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Clone, Subcommand)]
@@ -165,6 +165,14 @@ fn configurations_with_project_scope(
     args: &Cli,
     mode: ConfigurationRead,
 ) -> Result<ScopedConfigurations> {
+    configurations_with_project_scope_at(args, mode, &config::agent_dir())
+}
+
+fn configurations_with_project_scope_at(
+    args: &Cli,
+    mode: ConfigurationRead,
+    user_dir: &Path,
+) -> Result<ScopedConfigurations> {
     let validate_shape = mode.validates_file_shape();
     if !mcp_enabled(args)? {
         return Ok((
@@ -176,7 +184,7 @@ fn configurations_with_project_scope(
         ));
     }
     let mut configuration_errors = Vec::new();
-    let user_path = config::agent_dir().join("mcp.json");
+    let user_path = user_dir.join("mcp.json");
     let user = match config::read_object(&user_path) {
         Ok(user) => user,
         Err(_) if validate_shape => {
@@ -282,29 +290,36 @@ fn defines_project_server(entry: &Value) -> bool {
 }
 
 #[cfg(unix)]
-pub(super) fn project_stdio_requires_approval(project: &Value) -> Result<bool> {
-    let Some(entries) = project.get("mcpServers") else {
-        return Ok(false);
-    };
-    let entries = entries
-        .as_object()
-        .ok_or_else(|| Error::Config("project mcpServers must be an object".into()))?;
-    let mut servers = if entries.values().any(|entry| !defines_project_server(entry)) {
-        config::read_object(&config::agent_dir().join("mcp.json"))?
-            .get("mcpServers")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        Default::default()
-    };
-    merge_project_servers(&mut servers, entries)?;
-    for name in entries.keys() {
-        let server: ServerConfig = serde_json::from_value(servers[name].clone())?;
-        // Even a protected config cannot establish what the local process,
-        // its arguments, or environment will load relative to its cwd.
+pub(super) fn project_mcp_requires_approval(
+    args: &Cli,
+    workspace: &Path,
+    user_dir: &Path,
+) -> Result<bool> {
+    let user_settings = user_dir.join("settings.json");
+    let mut prospective = args.clone();
+    prospective.workspace = workspace.to_owned();
+    prospective.settings = config::Settings::load_from_paths(workspace, false, &user_settings)?;
+    let enabled_without_project = mcp_enabled(&prospective)?;
+    prospective.settings = config::Settings::load_from_paths(workspace, true, &user_settings)?;
+    prospective.trusted = true;
+    let (servers, definitions, overrides, _, _) =
+        configurations_with_project_scope_at(&prospective, ConfigurationRead::Runtime, user_dir)?;
+
+    for (name, value) in servers {
+        // Project settings can enable MCP as a whole, including user servers
+        // that have no entry or override in the project MCP configuration.
+        if enabled_without_project && !definitions.contains(&name) && !overrides.contains(&name) {
+            continue;
+        }
+        let server: ServerConfig = serde_json::from_value(value)?;
         if server.enabled != Some(false)
-            && (server.command.is_some() || server.transport.as_deref() == Some("stdio"))
+            && (server.command.is_some()
+                || server.transport.as_deref() == Some("stdio")
+                || (server.url.is_some()
+                    && server
+                        .headers
+                        .values()
+                        .any(|value| pi_rs_workbench::mcp::credential_command(value).is_some())))
         {
             return Ok(true);
         }
@@ -2236,6 +2251,59 @@ fn path(args: &Cli, local: bool) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn program_resume_checks_project_activation_of_user_mcp_servers() {
+        use clap::Parser;
+        use std::fs;
+
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("user");
+        let workspace = directory.path().join("workspace");
+        let project = workspace.join(".pi");
+        fs::create_dir(&user).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        let user_settings = user.join("settings.json");
+        let user_mcp = user.join("mcp.json");
+        let project_settings = project.join("settings.json");
+        let requires_approval =
+            |args: &Cli| project_mcp_requires_approval(args, &workspace, &user).unwrap();
+
+        fs::write(
+            &user_mcp,
+            r#"{"mcpServers":{"fixture":{"command":"fixture-only"}}}"#,
+        )
+        .unwrap();
+        fs::write(&user_settings, r#"{"extensions":["-builtin:mcp"]}"#).unwrap();
+        assert!(!requires_approval(&args));
+
+        fs::write(&project_settings, r#"{"extensions":["+builtin:mcp"]}"#).unwrap();
+        assert!(requires_approval(&args));
+        args.no_mcp = true;
+        assert!(!requires_approval(&args));
+        args.no_mcp = false;
+        args.no_extensions = true;
+        assert!(!requires_approval(&args));
+        args.no_extensions = false;
+
+        fs::write(&user_settings, "{}").unwrap();
+        assert!(!requires_approval(&args));
+        fs::write(&user_settings, r#"{"extensions":["-builtin:mcp"]}"#).unwrap();
+        fs::write(
+            &user_mcp,
+            r#"{"mcpServers":{"fixture":{"command":"fixture-only","enabled":false}}}"#,
+        )
+        .unwrap();
+        assert!(!requires_approval(&args));
+        fs::write(
+            &user_mcp,
+            r#"{"mcpServers":{"fixture":{"url":"https://fixture.invalid/mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(!requires_approval(&args));
+    }
 
     #[test]
     fn declared_mcp_host_credentials_require_configured_server() {

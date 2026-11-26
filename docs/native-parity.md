@@ -6153,11 +6153,11 @@ new session can create a journal.
 If Pi cannot verify protection for the workspace or its project configuration
 and resource paths at report or restore time, the normal project trust prompt
 requires fresh approval before loading trusted project configuration. Project
-package declarations and enabled project stdio MCP servers also require
-approval because preparation or launch resolves dependencies beyond the
-configuration file. This includes project overrides that enable a user stdio
-server. A previously denied workspace remains untrusted. These safeguards
-are native restrictions on unattended restore.
+package declarations and project MCP configuration that starts a local
+process also require approval. This includes enabled stdio servers and HTTP
+servers with command-backed headers, as well as project overrides or settings
+that enable those user servers. A previously denied workspace remains
+untrusted. These safeguards are native restrictions on unattended restore.
 
 Session switches replace the report. Returning from suspend refreshes it
 immediately, including during package reload. A missing journal or a normal

@@ -217,7 +217,7 @@ fn protected_project(workspace: &Path, args: &Cli) -> bool {
     let mcp = project.join("mcp.json");
     for path in [
         settings.clone(),
-        mcp.clone(),
+        mcp,
         project.join("SYSTEM.md"),
         project.join("APPEND_SYSTEM.md"),
     ] {
@@ -227,18 +227,21 @@ fn protected_project(workspace: &Path, args: &Cli) -> bool {
         }
     }
     // Only read declarations after their path passes the filesystem checks.
-    let mcp_requested = !args.no_mcp
-        && (!args.no_extensions || args.extensions.iter().any(|entry| entry == "builtin:mcp"));
-    if mcp_requested
-        && !super::config::read_object(&mcp)
-            .and_then(|project| super::mcp_config::project_stdio_requires_approval(&project))
-            .is_ok_and(|requires_approval| !requires_approval)
-    {
-        return false;
-    }
     let Ok(settings) = super::config::read_object(&settings) else {
         return false;
     };
+    let mcp_requested = !args.no_mcp
+        && (!args.no_extensions || args.extensions.iter().any(|entry| entry == "builtin:mcp"));
+    if mcp_requested
+        && !super::mcp_config::project_mcp_requires_approval(
+            args,
+            workspace,
+            &super::config::agent_dir(),
+        )
+        .is_ok_and(|requires_approval| !requires_approval)
+    {
+        return false;
+    }
     // Project packages can resolve through local manifests or a package cache.
     // Their complete resource scope is only known during package preparation.
     if settings
@@ -932,7 +935,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn program_resume_requires_approval_for_enabled_project_stdio() {
+    fn program_resume_requires_approval_for_project_mcp_local_launches() {
         use std::fs;
 
         let directory = tempfile::tempdir().unwrap();
@@ -949,22 +952,43 @@ mod tests {
         args.no_trust = false;
         args.no_mcp = false;
         args.no_extensions = false;
+        args.extensions.push("builtin:mcp".into());
         args.trust = true;
 
         let mcp = project.join("mcp.json");
-        let disabled_stdio = r#"{"command":"/usr/bin/true","enabled":false}"#;
-        for config in [disabled_stdio, r#"{"url":"https://fixture.invalid/mcp"}"#] {
+        for (config, approval) in [
+            (r#"{"command":"fixture-only","enabled":false}"#, false),
+            (r#"{"url":"https://fixture.invalid/mcp"}"#, false),
+            (
+                r#"{"url":"https://fixture.invalid/mcp","headers":{"Authorization":"Bearer ${FIXTURE_TOKEN}"}}"#,
+                false,
+            ),
+            (
+                r#"{"url":"https://fixture.invalid/mcp","headers":{"X-Fixture":"!fixture-only"},"enabled":false}"#,
+                false,
+            ),
+            (r#"{"command":"fixture-only","cwd":"."}"#, true),
+            (
+                r#"{"url":"https://fixture.invalid/mcp","headers":{"X-Fixture":"!fixture-only"}}"#,
+                true,
+            ),
+        ] {
             fs::write(&mcp, format!(r#"{{"mcpServers":{{"fixture":{config}}}}}"#)).unwrap();
-            assert_eq!(args.project_trust().unwrap(), Some(true));
+            assert_eq!(
+                args.project_trust().unwrap(),
+                (!approval).then_some(true),
+                "{config}"
+            );
+            if approval {
+                assert_report_requires_project_confirmation(&args, root.join("pi"));
+                args.terminal_resume_approved = true;
+                assert_eq!(args.project_trust().unwrap(), Some(true));
+                args.terminal_resume_approved = false;
+                args.no_trust = true;
+                assert_eq!(args.project_trust().unwrap(), Some(false));
+                args.no_trust = false;
+            }
         }
-
-        fs::write(
-            &mcp,
-            r#"{"mcpServers":{"fixture":{"command":"/usr/bin/true","cwd":"."}}}"#,
-        )
-        .unwrap();
-        assert_eq!(args.project_trust().unwrap(), None);
-        assert_report_requires_project_confirmation(&args, root.join("pi"));
         args.no_mcp = true;
         assert_eq!(args.project_trust().unwrap(), Some(true));
     }
