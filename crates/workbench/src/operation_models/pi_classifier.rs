@@ -153,9 +153,10 @@ fn bearer_token(value: &str) -> Option<&str> {
 
 fn has_opaque_credentials(headers: &HeaderMap) -> bool {
     headers.iter().any(|(name, value)| {
-        name == COOKIE
-            || ((name == AUTHORIZATION || name == PROXY_AUTHORIZATION)
-                && value.to_str().ok().and_then(bearer_token).is_none())
+        if name == AUTHORIZATION || name == PROXY_AUTHORIZATION {
+            return value.to_str().ok().and_then(bearer_token).is_none();
+        }
+        name == COOKIE || value.is_sensitive()
     })
 }
 
@@ -187,7 +188,7 @@ pub(super) async fn http_error(
     };
     let diagnostic = &body["error"];
     if has_opaque_credentials(request_headers) {
-        // A cookie or structured authorization value can contain several
+        // A cookie, authorization value, or custom header can contain several
         // credentials. Keep only known codes instead of echoing arbitrary text.
         return match diagnostic["code"].as_str() {
             Some(
@@ -211,9 +212,8 @@ pub(super) async fn http_error(
     }
     let clean = |field: &str, limit| {
         let value = normalize_diagnostic(diagnostic[field].as_str()?);
-        // The server may echo any of the configured credentials, including
-        // values carried under custom header names. Compare before truncation
-        // so even a credential crossing the display limit is omitted in full.
+        // Compare before truncation so even a credential crossing the display
+        // limit is omitted in full.
         if request_headers
             .values()
             .filter(|header| header.is_sensitive())
@@ -434,6 +434,27 @@ mod tests {
             matches!(Profiles::parse(&config), Err(Error::Config(message))
             if message.contains("openai/chat-fixture requires its own baseUrl"))
         );
+    }
+
+    #[test]
+    fn provider_level_decision_rejects_missing_or_invalid_chat_api() {
+        let mut config = json!({"providers":{"openai":{
+            "api":"pi-decision","baseUrl":"http://127.0.0.1:1/v1",
+            "models":[{"type":"classifier","id":"judge"},{"type":"chat",
+                "id":"gpt-4.1","baseUrl":"http://127.0.0.1:2/v1"}]
+        }}});
+        assert!(
+            matches!(Profiles::parse(&config), Err(Error::Config(message))
+            if message.contains("openai/gpt-4.1 requires its own supported chat api"))
+        );
+        for api in ["fixture-unsupported-api", "pi-decision"] {
+            config["providers"]["openai"]["models"][1]["api"] = json!(api);
+            assert!(
+                matches!(Profiles::parse(&config), Err(Error::Config(message))
+                if message.contains("openai/gpt-4.1 requires its own supported chat api")),
+                "{api}"
+            );
+        }
     }
 
     #[test]
@@ -766,14 +787,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let operation =
             decision_operations(&format!("http://{}/v1", listener.local_addr().unwrap()));
-        let entry = operation
+        let mut entry = operation
             .args
             .model_profiles
             .operations()
             .0
             .iter()
             .find(|entry| entry.provider == "decision-fixture")
-            .unwrap();
+            .unwrap()
+            .clone();
+        entry.model.headers.clear();
         let server = tokio::spawn(async move {
             for (status, body) in [
                 ("429 Too Many Requests", json!({"error":{"message":"retry diagnostic"}}).to_string()),
@@ -782,7 +805,7 @@ mod tests {
                     "details":{"value":"fixture-decision-key"}
                 }}).to_string()),
                 ("401 Unauthorized", json!({"error":{
-                    "code":"echo: fixture-private-header\n value",
+                    "code":"echo: Bearer\n fixture-decision-key",
                     "message":"echo: fixture-decision-key"
                 }}).to_string()),
                 ("400 Bad Request", json!({"error":{"message":"x".repeat(17 * 1024)}}).to_string()),
@@ -791,7 +814,6 @@ mod tests {
                 let (route, headers, _) = request(&mut socket).await;
                 assert_eq!(route, "POST /v1/decision HTTP/1.1\r\n");
                 assert_eq!(headers["authorization"], "Bearer fixture-decision-key");
-                assert_eq!(headers["x-private-fixture"], "fixture-private-header\t value");
                 let response = format!(
                     "HTTP/1.1 {status}\r\nRetry-After-Ms: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -804,7 +826,7 @@ mod tests {
         let terminal_error = || async {
             tokio::time::timeout(
                 Duration::from_secs(5),
-                operation.perform(entry, &context, &Keys::default(), &mut json!({})),
+                operation.perform(&entry, &context, &Keys::default(), &mut json!({})),
             )
             .await
             .unwrap()
@@ -826,7 +848,6 @@ mod tests {
             "{denied}"
         );
         assert!(!denied.contains("fixture-decision-key"));
-        assert!(!denied.contains("fixture-private-header"));
         let oversized = terminal_error().await;
         assert!(
             oversized.ends_with("Pi Decision returned HTTP 400"),
@@ -867,6 +888,18 @@ mod tests {
                 "fixture-session",
                 "fixture-session",
             ),
+            (
+                "x-fixture-auth",
+                r#"{"session":"fixture-custom-session","account":"fixture-account"}"#,
+                "invalid_api_key",
+                "fixture-custom-session",
+            ),
+            (
+                "x-fixture-auth",
+                "session=fixture-custom-session; account=fixture-account",
+                "fixture-custom-session",
+                "fixture-custom-session",
+            ),
         ];
         let server = tokio::spawn(async move {
             for (header, value, code, component) in cases {
@@ -886,6 +919,7 @@ mod tests {
         let context = json!({"state":{},"questions":questions()});
         for (header, value, code, component) in cases {
             let mut entry = entry.clone();
+            entry.model.headers.clear();
             entry.model.headers.insert(header.into(), value.into());
             let diagnostic = tokio::time::timeout(
                 Duration::from_secs(5),
