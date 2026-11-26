@@ -2755,7 +2755,7 @@ impl Session {
 
     pub fn append_bash_execution(&mut self, execution: crate::BashExecution) -> Result<()> {
         self.ensure_settled()?;
-        self.record_bash_result(execution)
+        self.record_bash_result(execution, None)
     }
 
     /// Append extension data without adding a message to the model context.
@@ -2778,12 +2778,21 @@ impl Session {
     /// An interrupted tool can still await reconciliation. Its eventual result
     /// is projected beside its tool call, before this shell output.
     pub fn append_local_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {
+        self.append_local_bash_result_with_output_error(execution, None)
+    }
+
+    #[doc(hidden)]
+    pub fn append_local_bash_result_with_output_error(
+        &mut self,
+        execution: crate::BashExecution,
+        full_output_error: Option<&str>,
+    ) -> Result<()> {
         if self.host_binding().is_some() {
             return Err(Error::Session(
                 "a managed session must record shell output through its host".into(),
             ));
         }
-        self.record_bash_result(execution)
+        self.record_bash_result(execution, full_output_error)
     }
 
     /// Record background cache usage only on the session and branch that sent it.
@@ -2854,12 +2863,19 @@ impl Session {
         })
     }
 
-    fn record_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {
+    fn record_bash_result(
+        &mut self,
+        execution: crate::BashExecution,
+        full_output_error: Option<&str>,
+    ) -> Result<()> {
+        let metadata = execution
+            .output_save_error(full_output_error)
+            .map(|error| serde_json::json!({"fullOutputError":error}));
         let event = Event::BashExecution { execution };
         if serde_json::to_vec(&event)?.len() > 8 * 1024 * 1024 {
             return Err(Error::Config("shell execution exceeds size limit".into()));
         }
-        self.append(event)?;
+        self.append_with_advisory_metadata(event, metadata)?;
         Ok(())
     }
 
@@ -5664,6 +5680,60 @@ mod record_metadata_tests {
         drop(share);
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.record_metadata(id), Some(&metadata));
+    }
+
+    #[test]
+    fn user_shell_save_error_is_advisory_for_legacy_stores() {
+        struct LegacyStore(MemoryStore);
+
+        impl SessionStore for LegacyStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.0.load()
+            }
+
+            fn append(&mut self, record: &Record) -> Result<()> {
+                self.0.append(record)
+            }
+        }
+
+        let execution = crate::BashExecution {
+            command: "fixture".into(),
+            output: "bounded tail".into(),
+            exit_code: Some(19),
+            cancelled: false,
+            truncated: true,
+            full_output_path: None,
+            exclude_from_context: false,
+        };
+        let mut legacy = Session::with_store(LegacyStore(MemoryStore::default())).unwrap();
+        legacy
+            .append_local_bash_result_with_output_error(execution.clone(), Some("disk full"))
+            .unwrap();
+        let record = legacy.records().last().unwrap();
+        assert!(matches!(&record.event, Event::BashExecution { execution }
+            if execution.exit_code == Some(19) && execution.output == "bounded tail"));
+        assert!(legacy.record_metadata(record.id).is_none());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append_local_bash_result_with_output_error(execution, Some("disk full"))
+            .unwrap();
+        let id = session.head();
+        drop(session);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(
+            reopened.record_metadata(id),
+            Some(&serde_json::json!({"fullOutputError":"disk full"}))
+        );
+        assert_eq!(
+            {
+                let fork = reopened.fork_session(id).unwrap();
+                fork.record_metadata(fork.head()).cloned()
+            },
+            reopened.record_metadata(id).cloned()
+        );
     }
 
     #[test]

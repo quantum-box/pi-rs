@@ -73,6 +73,27 @@ cargo run --locked -p pi-rs-ollama --example sdk_chat
 Set `PI_RS_EXAMPLE_MODEL` to use another installed model. For a browser-only
 app, a native server can own the session and expose an application-specific API.
 
+## Session statistics
+
+`AgentSession::session_stats()` reads the Pi-visible session ID, the
+SDK-managed session path when available, durable totals, and current branch
+context usage from one journal snapshot. The path is available for sessions
+opened with the SDK or forked to a path. In-memory sessions and journals passed
+to `SessionBuilder::build` have no SDK-managed path. The call returns an error
+if the session is closed or the journal is busy.
+
+Set `Limits::context_window` to include branch context usage. A missing or
+zero window leaves `context_usage` absent. After compaction, the token count
+can remain unknown until a fresh measured response. The snapshot makes no
+provider calls. Hosts that want provider discovery can call the existing
+`AgentSession::context_usage().await` explicitly.
+
+The `totals` field uses the existing `SessionStats` accounting and native
+session UUID. This includes alternate branches and compacted history. The
+workbench RPC counts Pi-projected message entries and adds usage from its
+native model operations, so message counts and usage totals can differ from
+the SDK snapshot.
+
 ## Model cycling
 
 Call `AgentSession::cycle_model` with the current ordered snapshot of models
