@@ -1626,6 +1626,10 @@ while scanning a single long line. Directory listing runs off the async
 runtime and checks for cancellation during enumeration and metadata reads.
 It sorts lowercased filenames with Unicode collation, using the process
 locale for language-specific ordering before applying the entry limit.
+Unrestricted local `ls` on Unix orders collation ties by the original filename
+bytes, matching Pi's stable sort over Node's byte-sorted directory scan. The
+same order applies whether or not a limit cuts the listing short. Unrestricted
+Windows, scoped local and injected listings keep their scan order for ties.
 On Unix, an unrestricted directory listing denied by the operating system
 reports Pi's `EACCES` scandir message with the requested absolute path.
 Local and injected `ls` select the locale in Node's environment order:
@@ -4111,8 +4115,9 @@ The boundary regression creates 301 long filenames and verifies entry-only,
 byte-only and combined limits. The same cases were executed against the pinned
 Pi distribution, which returned the same 254 retained lines and notices. A
 second fixture verifies 256 entries ending exactly at the byte boundary. This
-covers listing limits; complete locale collation, structured tool details and
-other local-tool output/error parity remain open.
+covers listing limits. Locale fixtures also cover folded filename ties and
+which entry survives a one-entry limit. Other local-tool output/error parity
+remains open.
 
 ### Shell partial-line notice checkpoint
 
