@@ -76,6 +76,20 @@ pub struct TreeNavigationResult {
     pub summary_entry: Option<Box<Record>>,
 }
 
+/// Durable session totals with host-visible identity and active branch context.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SdkSessionStats {
+    /// Pi-visible session ID, including an imported ID when present.
+    pub session_id: String,
+    /// Absolute session path when the SDK was given one.
+    pub session_file: Option<PathBuf>,
+    /// Native journal totals across all branches, with the native UUID.
+    pub totals: crate::SessionStats,
+    /// Active branch usage for the host-configured context window, if known.
+    pub context_usage: Option<crate::ContextUsage>,
+}
+
 // Admission tickets serialize independent control operations without holding a
 // mutex while extension callbacks are running. Host messages bypass admission
 // and are serviced by the session owner while its callback is pending.
@@ -1788,6 +1802,24 @@ impl AgentSession {
     /// Usage and message counts across the complete durable session.
     pub fn statistics(&self) -> Result<crate::SessionStats> {
         Ok(self.journal()?.statistics())
+    }
+
+    /// Read the durable totals and current branch usage from one journal snapshot.
+    ///
+    /// Uses the configured [`Limits::context_window`] without calling the model.
+    /// Returns an error if the session is closed or its journal is busy.
+    pub fn session_stats(&self) -> Result<SdkSessionStats> {
+        self.ensure_open()?;
+        let journal = self.journal()?;
+        Ok(SdkSessionStats {
+            session_id: journal.external_session_id(),
+            session_file: self.session_file.clone(),
+            totals: journal.statistics(),
+            context_usage: self
+                .limits
+                .context_window
+                .and_then(|window| journal.context_usage(window)),
+        })
     }
 
     /// Resolve the configured or provider-reported context window within the model timeout.
@@ -5068,6 +5100,7 @@ mod tests {
         let in_memory = builder().in_memory().unwrap();
         assert_eq!(in_memory.session_name().unwrap(), None);
         assert_eq!(in_memory.session_file(), None);
+        assert_eq!(in_memory.session_stats().unwrap().session_file, None);
 
         let mut source = builder().open(&path).unwrap();
         {
@@ -5088,17 +5121,34 @@ mod tests {
         let record = {
             let journal = source.journal().unwrap();
             assert!(source.session_name().is_err());
+            assert!(source.session_stats().is_err());
             journal.head()
         };
         assert_eq!(source.session_name().unwrap().as_deref(), Some("review"));
+        let stats = source.session_stats().unwrap();
+        assert_eq!(stats.session_id, source_id);
+        assert_ne!(stats.session_id, stats.totals.session_id.to_string());
+        assert_eq!(stats.session_file.as_deref(), Some(path.as_path()));
+        assert_eq!(stats.totals.session_name.as_deref(), Some("review"));
         let fork = source.fork_to(record, &fork_path).unwrap();
         assert_ne!(fork.session_id().unwrap(), source_id);
         assert_eq!(fork.session_file(), Some(fork_path.as_path()));
+        let fork_stats = fork.session_stats().unwrap();
+        assert_eq!(
+            fork_stats.session_id,
+            fork_stats.totals.session_id.to_string()
+        );
+        assert_ne!(fork_stats.session_id, source_id);
+        assert_eq!(
+            fork_stats.session_file.as_deref(),
+            Some(fork_path.as_path())
+        );
         drop(source);
 
         let mut reopened = builder().open(&path).unwrap();
         assert_eq!(reopened.session_id().unwrap(), source_id);
         assert_eq!(reopened.session_name().unwrap().as_deref(), Some("review"));
+        assert_eq!(reopened.session_stats().unwrap(), stats);
         reopened.set_name(" ").unwrap();
         assert_eq!(reopened.session_name().unwrap(), None);
     }
@@ -10272,10 +10322,12 @@ mod tests {
 
     struct StatisticsModel {
         slow_discovery: bool,
+        discoveries: AtomicUsize,
     }
     #[async_trait::async_trait]
     impl Model for StatisticsModel {
         async fn context_window(&self, _: &str) -> Option<u32> {
+            self.discoveries.fetch_add(1, Ordering::SeqCst);
             if self.slow_discovery {
                 std::future::pending::<()>().await;
             }
@@ -10301,10 +10353,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdk_statistics_and_context_usage_share_the_durable_session() {
+    async fn sdk_session_stats_combine_all_branch_totals_with_current_context() {
         let mut session = SessionBuilder::new(
             Arc::new(StatisticsModel {
                 slow_discovery: false,
+                discoveries: AtomicUsize::new(0),
             }),
             "stats",
         )
@@ -10316,9 +10369,13 @@ mod tests {
         .unwrap();
         assert_eq!(session.statistics().unwrap().cost, Some(0.0));
         session.prompt("hello").await.unwrap();
-        let stats = session.statistics().unwrap();
+        let snapshot = session.session_stats().unwrap();
+        let stats = snapshot.totals;
+        assert_eq!(stats, session.statistics().unwrap());
         assert_eq!(stats, session.journal().unwrap().statistics());
         assert_eq!(stats.session_id, session.journal().unwrap().session_id());
+        assert_eq!(snapshot.session_id, stats.session_id.to_string());
+        assert_eq!(snapshot.session_file, None);
         assert_eq!((stats.user_messages, stats.assistant_messages), (1, 1));
         assert_eq!(
             (
@@ -10333,28 +10390,49 @@ mod tests {
         let usage = session.context_usage().await.unwrap().unwrap();
         assert_eq!((usage.context_window, usage.tokens), (4096, Some(13)));
         assert_eq!(usage.percent, Some(13.0 / 4096.0 * 100.0));
+        assert_eq!(snapshot.context_usage.as_ref(), Some(&usage));
         let head = session.journal().unwrap().head();
         let mut fork = session.fork_at(head).unwrap();
         assert_eq!(fork.statistics().unwrap().tokens, stats.tokens);
         assert_ne!(fork.statistics().unwrap().session_id, stats.session_id);
         session.summarize(0).await.unwrap();
-        assert_eq!(session.statistics().unwrap().tokens.total, 26);
-        assert_eq!(session.context_usage().await.unwrap().unwrap().tokens, None);
+        let compacted = session.session_stats().unwrap();
+        assert_eq!(compacted.totals.tokens.total, 26);
+        assert_eq!(compacted.context_usage.unwrap().tokens, None);
+        let compacted_head = session.journal().unwrap().head();
+        session.checkout(head).unwrap();
+        let checked_out = session.session_stats().unwrap();
+        assert_eq!(checked_out.totals, compacted.totals);
+        assert_eq!(checked_out.context_usage, Some(usage));
+        session.prompt("alternate branch").await.unwrap();
+        session.checkout(compacted_head).unwrap();
+        let restored = session.session_stats().unwrap();
+        assert_eq!(restored.totals.tokens.total, 39);
+        assert_eq!(
+            (
+                restored.totals.user_messages,
+                restored.totals.assistant_messages
+            ),
+            (2, 2)
+        );
+        assert_eq!(restored.context_usage.unwrap().tokens, None);
         fork.close().await.unwrap();
         session.close().await.unwrap();
         assert!(session.context_usage().await.is_err());
+        assert!(session.session_stats().is_err());
     }
 
     #[tokio::test]
     async fn sdk_context_discovery_is_bounded_and_used_without_an_override() {
-        let mut session = SessionBuilder::new(
-            Arc::new(StatisticsModel {
-                slow_discovery: false,
-            }),
-            "stats",
-        )
-        .in_memory()
-        .unwrap();
+        let model = Arc::new(StatisticsModel {
+            slow_discovery: false,
+            discoveries: AtomicUsize::new(0),
+        });
+        let mut session = SessionBuilder::new(model.clone(), "stats")
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.session_stats().unwrap().context_usage, None);
+        assert_eq!(model.discoveries.load(Ordering::SeqCst), 0);
         assert_eq!(
             session
                 .context_usage()
@@ -10364,10 +10442,12 @@ mod tests {
                 .context_window,
             8192
         );
+        assert_eq!(model.discoveries.load(Ordering::SeqCst), 1);
         session.close().await.unwrap();
         let mut session = SessionBuilder::new(
             Arc::new(StatisticsModel {
                 slow_discovery: true,
+                discoveries: AtomicUsize::new(0),
             }),
             "stats",
         )

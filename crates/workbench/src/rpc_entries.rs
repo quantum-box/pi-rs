@@ -458,16 +458,19 @@ impl Cursor {
     pub(super) fn appended(
         &mut self,
         records: &[Record],
+        index: usize,
         metadata: Option<&Value>,
         record_metadata: &std::collections::BTreeMap<u64, Value>,
     ) -> Vec<Value> {
         if self.invalid {
             return Vec::new();
         }
-        let Some((record, prefix)) = records.split_last() else {
+        let Some(record) = records.get(index) else {
             return Vec::new();
         };
-        self.advance(prefix);
+        for prior in records.iter().take(index).skip(self.processed()) {
+            self.append(records, prior, None, None, None);
+        }
         if record.id as usize != self.positions.len() {
             return Vec::new();
         }
@@ -517,6 +520,28 @@ impl Cursor {
                         {
                             entry[reference] = json!(id.to_string());
                         }
+                    }
+                    if matches!(entry["type"].as_str(), Some("label" | "context_edit"))
+                        && self.conversion_counts.get(&record.id) == Some(&0)
+                    {
+                        // Raw Pi IDs and the projected numeric IDs are different
+                        // namespaces. Leave this target unbound in the projection.
+                        entry["targetId"] = json!(format!("pi-rs:unresolved:{}", record.id));
+                    }
+                    if entry["type"] == "compaction"
+                        && let Some(count) = self
+                            .conversion_counts
+                            .get(&record.id)
+                            .filter(|&&count| count > 0)
+                        && let Some(compaction) = records.get((record.id + count - 1) as usize)
+                        && let Event::Compacted { retain_from, .. } = &compaction.event
+                    {
+                        // The verified boundary is a native record, even when
+                        // the original Pi entry used a positional v1 index.
+                        let first = retain_from
+                            .and_then(|id| self.positions.get(id as usize)?.visible)
+                            .unwrap_or(record.id);
+                        entry["firstKeptEntryId"] = json!(first.to_string());
                     }
                     Some(entry)
                 } else {
@@ -1115,6 +1140,7 @@ mod tests {
             }
             for entry in cursor.appended(
                 &session.records()[..record.id as usize],
+                record.id as usize - 1,
                 session.record_metadata(record.id),
                 &completion_metadata,
             ) {
@@ -1259,6 +1285,7 @@ mod tests {
         let mut cursor = Cursor::default();
         let entries = cursor.appended(
             &records,
+            records.len() - 1,
             Some(&json!({"fromExtension":true,"details":{"origin":"hook"}})),
             &Default::default(),
         );
@@ -1269,8 +1296,12 @@ mod tests {
             json!({"fromExtension":true}),
             json!({"fromExtension":true,"details":null}),
         ] {
-            let entries =
-                Cursor::default().appended(&records, Some(&metadata), &Default::default());
+            let entries = Cursor::default().appended(
+                &records,
+                records.len() - 1,
+                Some(&metadata),
+                &Default::default(),
+            );
             assert_eq!(entries[0].get("details"), metadata.get("details"));
         }
     }
