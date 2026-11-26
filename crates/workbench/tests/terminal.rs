@@ -478,8 +478,9 @@ fn typing_redraws_in_a_synchronized_frame() {
     }
 }
 
-#[test]
-fn fullscreen_extension_widgets_stay_with_editor_when_scrolling_and_resizing() {
+fn fullscreen_widget_terminal(
+    widgets: &[(&str, Vec<String>)],
+) -> (tempfile::TempDir, File, Process) {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().unwrap();
@@ -487,7 +488,7 @@ fn fullscreen_extension_widgets_stay_with_editor_when_scrolling_and_resizing() {
     std::fs::create_dir(&home).unwrap();
     std::fs::write(
         home.join("settings.json"),
-        r#"{"fullscreenScrollbar":"always"}"#,
+        r#"{"fullscreenScrollbar":"always","showHardwareCursor":true}"#,
     )
     .unwrap();
     let session_path = root.path().join("session.jsonl");
@@ -503,7 +504,7 @@ fn fullscreen_extension_widgets_stay_with_editor_when_scrolling_and_resizing() {
     std::fs::write(
         &extension,
         r#"#!/usr/bin/env python3
-import json, sys
+import json, os, sys
 if '--pi-rs-extension-v1' in sys.argv:
     request = json.load(sys.stdin)
     result = {'id':'widgets-fixture','dependencies':[],'commands':[],'tools':[],
@@ -512,9 +513,8 @@ if '--pi-rs-extension-v1' in sys.argv:
 else:
     event = json.loads(sys.stdin.readline())['request']['event']
     if event['type'] == 'session_start':
-        for placement, lines in [('aboveEditor', ['dock-above'] + ['above-filler-%d' % i for i in range(9)]),
-                                 ('belowEditor', ['dock-below'])]:
-            print(json.dumps({'type':'ui','request':{'method':'setWidget','widgetKey':placement,
+        for key, (placement, lines) in enumerate(json.loads(os.environ['PI_TEST_WIDGETS'])):
+            print(json.dumps({'type':'ui','request':{'method':'setWidget','widgetKey':str(key),
                   'widgetPlacement':placement,'widgetLines':lines}}), flush=True)
             assert json.loads(sys.stdin.readline()) == {'Ok':None}
     print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
@@ -523,10 +523,11 @@ else:
     .unwrap();
     std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let (mut master, process) = spawn_capability_test_terminal(
+    let (master, process) = spawn_capability_test_terminal(
         Command::new(env!("CARGO_BIN_EXE_pi"))
             .current_dir(root.path())
             .env("PI_RS_HOME", &home)
+            .env("PI_TEST_WIDGETS", serde_json::to_string(widgets).unwrap())
             .env("TERM", "xterm-256color")
             .args([
                 "--no-trust",
@@ -542,14 +543,47 @@ else:
             .arg("--extension")
             .arg(&extension),
     );
-    fn wait_for_frame(master: &mut File, predicate: impl Fn(&str) -> bool) {
-        output_until(master, |text| {
-            text.split("\x1b[?2026h")
-                .skip(1)
-                .filter_map(|frame| frame.split_once("\x1b[?2026l").map(|(body, _)| body))
-                .any(&predicate)
-        });
-    }
+    (root, master, process)
+}
+
+fn wait_for_widget_frame(master: &mut File, predicate: impl Fn(&str) -> bool) {
+    output_until(master, |text| {
+        text.split("\x1b[?2026h")
+            .skip(1)
+            .filter_map(|frame| frame.split_once("\x1b[?2026l").map(|(body, _)| body))
+            .any(&predicate)
+    });
+}
+
+fn resize_widget_terminal(master: &File, process: &Process, rows: u16, columns: u16) {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGWINCH) },
+        0
+    );
+}
+
+fn tall_widget(label: &str) -> Vec<String> {
+    std::iter::once(label.to_owned())
+        .chain((0..9).map(|i| format!("{label}-filler-{i}")))
+        .collect()
+}
+
+#[test]
+fn fullscreen_extension_widgets_stay_with_editor_when_scrolling_and_resizing() {
+    let (_root, mut master, process) = fullscreen_widget_terminal(&[
+        ("aboveEditor", tall_widget("dock-above")),
+        ("belowEditor", vec!["dock-below".into()]),
+    ]);
     let assert_dock = |frame: &str, draft: &str| {
         let above = frame.find("dock-above").expect("above-editor widget");
         let editor = frame.find(draft).expect("editor draft");
@@ -559,12 +593,12 @@ else:
             "unexpected dock: {frame:?}"
         );
     };
-    wait_for_frame(&mut master, |frame| {
+    wait_for_widget_frame(&mut master, |frame| {
         frame.contains("dock-below") && frame.contains("history-row-79")
     });
 
     master.write_all(b"dock-draft").unwrap();
-    wait_for_frame(&mut master, |frame| {
+    wait_for_widget_frame(&mut master, |frame| {
         if !frame.contains("history-row-79") || !frame.contains("dock-draft") {
             return false;
         }
@@ -572,7 +606,7 @@ else:
         true
     });
     master.write_all(b"\x1b[5~").unwrap();
-    wait_for_frame(&mut master, |frame| {
+    wait_for_widget_frame(&mut master, |frame| {
         if !frame.contains("history-row-")
             || frame.contains("history-row-79")
             || !frame.contains("dock-draft")
@@ -585,37 +619,102 @@ else:
 
     // Ctrl+Shift+F, followed by text that exists only in the fixed widget.
     master.write_all(b"\x1b[102;6udock-above").unwrap();
-    wait_for_frame(&mut master, |frame| {
-        frame.matches("dock-above").count() == 2 && frame.contains("No matches")
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("dock-above-filler-0") && frame.contains("No matches")
     });
     master.write_all(b"\x1b").unwrap();
-    wait_for_frame(&mut master, |frame| {
+    wait_for_widget_frame(&mut master, |frame| {
         frame.contains("dock-draft") && !frame.contains("No matches")
     });
 
-    let size = libc::winsize {
-        ws_row: 9,
-        ws_col: 72,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    assert_eq!(
-        unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
-        0
-    );
-    assert_eq!(
-        unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGWINCH) },
-        0
-    );
+    resize_widget_terminal(&master, &process, 9, 72);
     master.write_all(b"-short").unwrap();
-    wait_for_frame(&mut master, |frame| {
-        if !frame.contains("dock-draft-short") || frame.contains("above-filler-8") {
+    wait_for_widget_frame(&mut master, |frame| {
+        if !frame.contains("dock-draft-short") || frame.contains("dock-above-filler-8") {
             return false;
         }
         assert_dock(frame, "dock-draft-short");
         // The scroll thumb occupies the one remaining transcript row.
         assert!(frame.contains("┃") && !frame.contains("│"), "{frame:?}");
         true
+    });
+}
+
+#[test]
+fn fullscreen_extension_widgets_yield_to_search_on_a_short_terminal() {
+    let (_root, mut master, process) = fullscreen_widget_terminal(&[
+        ("aboveEditor", tall_widget("dock-above")),
+        ("belowEditor", tall_widget("dock-below")),
+    ]);
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("dock-above") && frame.contains("dock-below")
+    });
+    resize_widget_terminal(&master, &process, 9, 72);
+    master.write_all(b"preserved-draft").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("\x1b[9;1H")
+            && !frame.contains("\x1b[10;1H")
+            && frame.contains("preserved-draft")
+            && frame.contains("dock-below")
+    });
+
+    master.write_all(b"\x1b[102;6u").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("Find in transcript")
+            && frame.contains("preserved-draft")
+            && frame.contains("\x1b[?25h")
+    });
+    master.write_all(b"history-row-79").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains(" 1/1 ")
+            && frame.contains("history-row-79")
+            && frame.contains("preserved-draft")
+    });
+    master.write_all(b"x").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("history-row-79x") && frame.contains("No matches")
+    });
+    master.write_all(b"\x1b").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("preserved-draft")
+            && frame.contains("dock-below")
+            && !frame.contains("No matches")
+    });
+}
+
+#[test]
+fn fullscreen_extension_widgets_yield_to_settings_pagination() {
+    let (_root, mut master, _process) = fullscreen_widget_terminal(&[
+        ("aboveEditor", tall_widget("above-first")),
+        ("aboveEditor", tall_widget("above-second")),
+        ("belowEditor", tall_widget("below-first")),
+        ("belowEditor", tall_widget("below-second")),
+    ]);
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("above-first") && frame.contains("below-second-filler-8")
+    });
+    master.write_all(b"/settings\r").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        if !frame.contains("Settings") || !frame.contains("(1/") {
+            return false;
+        }
+        assert!(
+            frame.contains("Auto-compact") && frame.contains("Editor padding"),
+            "{frame:?}"
+        );
+        true
+    });
+    master.write_all(b"\x1b[6~").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("Settings") && frame.contains("(11/")
+    });
+    master.write_all(b"\x1b[5~").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("Settings") && frame.contains("(1/")
+    });
+    master.write_all(b"\x1b").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("above-first") && frame.contains("below-second-filler-8")
     });
 }
 

@@ -4254,17 +4254,25 @@ render_call_id: None,
         let hardware_cursor = args.settings.show_hardware_cursor();
         let (prompt, cursor_row, column) = self.prompt_rows(args, width, height);
         let prompt_height = prompt.len();
-        let modal = self.picker.is_some() || self.dialog().is_some();
-        let min_body = if modal { 3 } else { 1 };
+        let dialog = self.dialog().is_some();
+        let modal = self.picker.is_some() || dialog;
+        let searching = !modal && self.search.is_some();
+        let min_body = if searching {
+            Search::OVERLAY_HEIGHT
+        } else if modal {
+            3
+        } else {
+            1
+        };
         let chrome_space = height.saturating_sub(prompt_height + 2 + min_body);
         let footer_limit = chrome_space.saturating_sub(usize::from(!modal));
         let mut footer = self.footer_lines(args, theme, width, footer_limit, true);
-        if modal {
+        if modal || searching {
             footer.truncate(footer_limit);
         }
         let header_limit = chrome_space.saturating_sub(footer.len());
         let mut header = self.header_lines(args, theme, width, header_limit, true);
-        if modal {
+        if modal || searching {
             header.truncate(header_limit);
         }
         let header_rows = header.len();
@@ -4275,22 +4283,30 @@ render_call_id: None,
         }
         self.fullscreen_header_rows = header_rows;
         let available = height.saturating_sub(prompt_height + 2 + header_rows + footer.len());
-        let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
-        below.truncate(
-            height
-                .saturating_sub(prompt_height + 4 + footer.len())
-                .min(available.saturating_sub(min_body)),
-        );
-        let above = if self.dialog().is_some() {
-            below.clear();
-            Vec::new()
+        // Lay out the focused picker before the dock takes any of its rows.
+        let picker = self.picker.as_ref().filter(|_| !dialog);
+        let picker_lines =
+            picker.map(|picker| picker.render_in_terminal(theme, width, available, height, keys));
+        let widget_space =
+            available.saturating_sub(min_body.max(picker_lines.as_ref().map_or(0, Vec::len)));
+        let (above, below) = if dialog {
+            (Vec::new(), Vec::new())
         } else {
+            let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
+            below.truncate(
+                height
+                    .saturating_sub(prompt_height + 4 + footer.len())
+                    .min(widget_space),
+            );
             let mut above = self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor);
-            above.truncate(available.saturating_sub(below.len() + min_body));
-            above
+            above.truncate(widget_space - below.len());
+            (above, below)
         };
         let output = self.transcript_options(args, false);
         let body_height = available.saturating_sub(above.len() + below.len());
+        if let Some(picker) = picker {
+            picker.limit_mouse_height(body_height);
+        }
         let mut lines = Vec::new();
         let mut prompts = Vec::new();
         let mut panels = Vec::new();
@@ -4365,8 +4381,8 @@ render_call_id: None,
                 output,
             ));
         }
-        if let Some(picker) = &self.picker {
-            lines = picker.render_in_terminal(theme, width, body_height, height, keys);
+        if let Some(picker_lines) = picker_lines {
+            lines = picker_lines;
         }
         let modal_cursor = if let Some(dialog) = self.dialog() {
             lines = dialog.render(theme, width, body_height, keys);
@@ -4420,7 +4436,7 @@ render_call_id: None,
         let search_overlay = self.search.as_ref().filter(|_| !modal).map(|search| {
             let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
             let left = width.saturating_sub(search_width + 1);
-            let top = usize::from(body_height > 3);
+            let top = usize::from(body_height > Search::OVERLAY_HEIGHT);
             let (mut lines, cursor_row, cursor_column) = search.overlay(theme, keys, search_width);
             if !hardware_cursor && let Some(line) = lines.get_mut(cursor_row) {
                 line.mark_cursor(cursor_column);
