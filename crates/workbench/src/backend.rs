@@ -759,13 +759,8 @@ fn refresh_snapshot(snapshot: &Mutex<SessionSnapshot>, session: &Session) {
     emit_refreshed_entries(entries);
 }
 
-fn open_initial_snapshot(
-    path: &std::path::Path,
-    emit_entries: bool,
-    recover_local: bool,
-) -> Result<SessionSnapshot> {
+fn open_initial_snapshot(path: &std::path::Path, emit_entries: bool) -> Result<SessionSnapshot> {
     let session = match Session::snapshot(path) {
-        Ok(session) if recover_local && session.host_binding().is_none() => Session::open(path)?,
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             Session::open(path)?
         }
@@ -774,7 +769,7 @@ fn open_initial_snapshot(
     if emit_entries {
         session.validated_pi_conversion_counts()?;
     }
-    // Any exclusive lock acquired while creating or recovering the journal ends when this
+    // Any exclusive lock acquired while creating the journal ends when this
     // function returns, before the worker opens the session for a run.
     Ok(SessionSnapshot::from_session(&session, emit_entries))
 }
@@ -993,13 +988,9 @@ async fn run_worker(
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
     let discover_resources = runtime.registry.has_resource_discovery_hooks();
-    // An extension can expose a usable editor from session_start. Release the
-    // recovery lock before that callback unless discovery needs a writable session.
-    let recover_before_hooks = args.terminal_managed_worker && !discover_resources;
     let snapshot = Arc::new(Mutex::new(open_initial_snapshot(
         &args.session,
         args.mode == Some(super::OutputMode::Rpc),
-        recover_before_hooks,
     )?));
     let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
@@ -1057,7 +1048,9 @@ async fn run_worker(
     )
     .await;
     let mut session = Session::snapshot(&args.session)?;
-    if !recover_before_hooks && session.host_binding().is_none() {
+    // The terminal recovers its journal before spawning this worker. Only
+    // reopen for writing when a discovery hook may save state.
+    if (!args.terminal_managed_worker || discover_resources) && session.host_binding().is_none() {
         session = Session::open(&args.session)?;
     }
     let discovered = runtime
@@ -3388,7 +3381,7 @@ mod share_context_tests {
     fn initial_snapshot_releases_new_journal_lock_for_worker() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("new-session.jsonl");
-        let snapshot = open_initial_snapshot(&path, true, false).unwrap();
+        let snapshot = open_initial_snapshot(&path, true).unwrap();
         let worker_session = Session::open(&path).unwrap();
         assert_eq!(snapshot.records[0].id, worker_session.records()[0].id);
     }

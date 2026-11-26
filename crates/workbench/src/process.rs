@@ -411,6 +411,11 @@ impl Worker {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if args.mode != Some(super::OutputMode::Rpc) && operation.first() == Some(&"serve") {
+            // Recover a torn tail from a previous worker synchronously, before
+            // either the replacement worker or the terminal can write again.
+            drop(Session::open(&args.session)?);
+        }
         let mut child = command.spawn()?;
         let mut stdin = child.stdin.take();
         if let Some(bytes) = bootstrap {
