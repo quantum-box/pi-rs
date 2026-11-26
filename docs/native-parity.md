@@ -3110,9 +3110,16 @@ index, which uses Cargo metadata for Cargo builds and the manifest version for
 other packages. A package needs at least one enabled executable in the
 terminal worker's registry. Standalone executables and packages that only
 supply skills, prompts or themes do not produce these notices.
-pi-rs preserves the upstream `enableInstallTelemetry` key in shared settings
-files. Native pi-rs sends no install or update reports to `pi.dev` and never
-adds upstream Pi attribution headers as a side effect of that setting.
+Upstream Pi removed installation telemetry, the `enableInstallTelemetry`
+setting, and its `PI_TELEMETRY` override in [484da3a86][pi-remove-telemetry].
+Native pi-rs preserves the legacy key when editing shared settings and keeps
+its changelog state local. The key and environment variable have no effect in
+pi-rs. Upstream Pi now applies its client attribution to supported provider
+requests independently of telemetry. Native pi-rs retains its own provider
+identity and does not add upstream Pi attribution. This also keeps the
+identity of a host-embedded Rust SDK independent of a legacy settings file.
+
+[pi-remove-telemetry]: https://github.com/earendil-works/pi/commit/484da3a8696b4726ddfe9677d3ba98bbd64b076c
 The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the
@@ -4750,10 +4757,10 @@ Its global `selfUpdateCommand` setting and `PI_SELF_UPDATE_COMMAND`
 environment variable customize the JavaScript installation step.
 Install or update the pi-rs binary through its original installation method.
 
-Pi's `enableInstallTelemetry`, `enableAnalytics`, and `trackingId` settings
-are specific to upstream Pi. pi-rs keeps changelog state local. Explicit
-model diagnostics, OAuth, and package downloads follow their own
-configuration.
+Shared settings can contain Pi's legacy `enableInstallTelemetry` and the
+analytics metadata keys `enableAnalytics` and `trackingId`. pi-rs preserves
+these fields and keeps changelog state local. Explicit model diagnostics,
+OAuth, and package downloads follow their own configuration.
 
 `--offline` and `PI_OFFLINE=1` suppress automatic Cargo registry and Git package downloads,
 including refreshes of temporary packages, and reuse the installed resources.

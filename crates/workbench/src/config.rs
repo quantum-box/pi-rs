@@ -2212,6 +2212,28 @@ mod tests {
     }
 
     #[test]
+    fn settings_edit_preserves_legacy_pi_telemetry_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = json!({
+            "enableInstallTelemetry": true,
+            "enableAnalytics": false,
+            "trackingId": "legacy-fixture"
+        });
+        std::fs::write(&path, original.to_string()).unwrap();
+
+        let mut settings = Settings::load_from_paths(dir.path(), false, &path).unwrap();
+        settings
+            .set_user_at(&path, "hideThinkingBlock", json!(true))
+            .unwrap();
+
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut expected = original;
+        expected["hideThinkingBlock"] = json!(true);
+        assert_eq!(saved, expected);
+    }
+
+    #[test]
     fn settings_validation_reports_nested_package_errors_without_values() {
         let path = Path::new("settings.json");
         let invalid = json!({
