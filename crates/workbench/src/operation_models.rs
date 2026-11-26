@@ -47,6 +47,8 @@ enum Api {
     OpenAiDecisions,
     #[serde(rename = "pi-classifier")]
     PiClassifier,
+    #[serde(rename = "pi-decision")]
+    PiDecision,
     #[serde(rename = "typesafe-system-one")]
     SystemOne,
     #[serde(rename = "cloudflare-workers-ai-system-one")]
@@ -64,6 +66,7 @@ impl Api {
             | Self::WorkersAiSystemOne
             | Self::OpenAiDecisions
             | Self::PiClassifier
+            | Self::PiDecision
             | Self::LlamaCppClassifier => Kind::Classifier,
             Self::OpenRouterImages => Kind::Image,
         }
@@ -73,6 +76,7 @@ impl Api {
         match self {
             Self::OpenAiDecisions => "decisions",
             Self::PiClassifier => "classify",
+            Self::PiDecision => "decision",
             Self::SystemOne => "systemone",
             Self::WorkersAiSystemOne => "run",
             Self::OpenRouterImages => "chat/completions",
@@ -565,11 +569,17 @@ impl Catalogue {
                         configured.id
                     )));
                 }
+                // Pi Decision is an explicitly configured route. A known
+                // provider name does not establish an official decision endpoint.
+                let default_base = match api {
+                    Api::PiDecision => None,
+                    _ => official_base(&name),
+                };
                 let base = configured
                     .base_url
                     .as_deref()
                     .or_else(|| provider["baseUrl"].as_str())
-                    .or_else(|| official_base(&name))
+                    .or(default_base)
                     .ok_or_else(|| {
                         Error::Config(format!("operation provider {name} requires baseUrl"))
                     })?;
@@ -596,7 +606,7 @@ impl Catalogue {
                     Some(binding) => binding.as_deref(),
                     None => provider["baseUrl"]
                         .as_str()
-                        .or_else(|| official_base(&name))
+                        .or(default_base)
                         .or(inferred_base.as_deref()),
                 };
                 let key_endpoint = key_base
@@ -881,6 +891,9 @@ impl Entry {
     }
 
     fn is_official(&self) -> bool {
+        if matches!(self.api, Api::PiDecision) {
+            return false;
+        }
         if self.provider == "github-copilot" {
             return matches!(self.api, Api::SystemOne)
                 && self.endpoint.as_str() == super::copilot_auth::CLASSIFIER_ENDPOINT;
@@ -1582,7 +1595,7 @@ impl Operations {
             }
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
             Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
-            Api::PiClassifier => (pi_classifier::payload(entry, context)?, false),
+            Api::PiClassifier | Api::PiDecision => (pi_classifier::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
         let (endpoint, mut headers) = if let Some((token, configured)) = radius_auth {
@@ -1621,9 +1634,17 @@ impl Operations {
                 data["answers"] =
                     decisions::answers(&context["questions"], &result_body["answers"])?;
             }
-            Api::PiClassifier => {
-                data["answers"] =
-                    pi_classifier::answers(&context["questions"], &result_body["answers"])?;
+            Api::PiClassifier | Api::PiDecision => {
+                if matches!(entry.api, Api::PiDecision)
+                    && let Some(id) = body["responseId"].as_str().filter(|id| !id.is_empty())
+                {
+                    data["responseId"] = json!(id);
+                }
+                data["answers"] = pi_classifier::answers(
+                    entry.api,
+                    &context["questions"],
+                    &result_body["answers"],
+                )?;
             }
             Api::OpenRouterImages => {
                 if let Some(id) = body["id"].as_str() {
