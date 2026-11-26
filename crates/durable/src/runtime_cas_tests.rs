@@ -1128,6 +1128,101 @@ fn session_checkout_keeps_ordered_content_blocks_and_rejects_pending_input() {
 }
 
 #[test]
+fn session_navigation_reedits_user_input_and_keeps_the_original_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let append = |h: &mut Harness, message: Message| {
+        let (mut state, version) = h.load(id).unwrap();
+        state.messages.push(message);
+        h.save(&state, Expected::Version(version)).unwrap();
+        h.session_tree(&h.session_entries_start(id).unwrap())
+            .unwrap()
+            .leaf_id
+            .unwrap()
+    };
+    let user = append(
+        &mut h,
+        Message::User {
+            content: "first prompt".into(),
+        },
+    );
+    let answer = append(
+        &mut h,
+        Message::Assistant {
+            content: "answer".into(),
+            calls: Vec::new(),
+            replay: None,
+        },
+    );
+    let (mut state, version) = h.load(id).unwrap();
+    let blocks = vec![
+        serde_json::json!({"type":"text","text":"image question"}),
+        serde_json::json!({"type":"image","mimeType":"image/png","data":"aW1hZ2U="}),
+    ];
+    let with_image = Uuid::new_v4();
+    state.content_blocks.insert(
+        state.messages.len(),
+        crate::transcript::MessageContentBlocks {
+            message_id: with_image,
+            blocks: blocks.clone(),
+        },
+    );
+    state.messages.push(Message::User {
+        content: String::new(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+
+    let draft = h.navigate_session_entry(id, with_image).unwrap().unwrap();
+    assert_eq!(draft.blocks, Some(blocks));
+    assert_eq!(h.conversation(id).unwrap().messages.len(), 2);
+    assert_eq!(
+        h.session_tree(&h.session_entries_start(id).unwrap())
+            .unwrap()
+            .leaf_id,
+        Some(answer)
+    );
+
+    let draft = h.navigate_session_entry(id, user).unwrap().unwrap();
+    assert_eq!(
+        draft.message,
+        Message::User {
+            content: "first prompt".into()
+        }
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.conversation(id).unwrap().messages.is_empty());
+    let archived = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap();
+    assert_eq!(archived.leaf_id, None);
+    assert_eq!(archived.entries.len(), 3);
+    let replacement = append(
+        &mut h,
+        Message::User {
+            content: "edited prompt".into(),
+        },
+    );
+    let tree = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap();
+    assert_eq!(tree.leaf_id, Some(replacement));
+    assert_eq!(tree.entries[3].parent_id, None);
+    h.checkout_session_entry(id, answer).unwrap();
+    assert!(
+        matches!(&h.conversation(id).unwrap().messages[0], Message::User { content } if content == "first prompt")
+    );
+}
+
+#[test]
 fn interrupted_recovery_retries_racing_stream_append() {
     for initial in [None, Some("first")] {
         let dir = tempfile::tempdir().unwrap();

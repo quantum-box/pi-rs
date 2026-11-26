@@ -776,7 +776,10 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
     let reopened = frames(rpc(
         dir.path(),
         &["--conversation", id],
-        &[json!({"type":"get_messages"})],
+        &[
+            json!({"type":"get_messages"}),
+            json!({"type":"get_entries"}),
+        ],
     ));
     assert!(
         reopened[0]["data"]["messages"]
@@ -794,6 +797,27 @@ fn coding_tool_calls_are_committed_and_reopened_through_rpc() {
     let wrong_workspace = rpc(other.path(), &["--conversation", id], &[]);
     assert!(!wrong_workspace.status.success());
     assert!(String::from_utf8_lossy(&wrong_workspace.stderr).contains("coding tools workspace"));
+    let entries = reopened[1]["data"]["entries"].as_array().unwrap();
+    let first_prompt = entries
+        .iter()
+        .find(|entry| entry["message"]["role"] == "user")
+        .unwrap();
+    let navigation = frames(rpc(
+        dir.path(),
+        &["--conversation", id],
+        &[
+            json!({"type":"navigate_entry","entryId":first_prompt["id"]}),
+            json!({"type":"get_entries"}),
+        ],
+    ));
+    assert_eq!(navigation[0]["data"]["sessionId"], id);
+    assert_eq!(navigation[0]["data"]["messages"], json!([]));
+    assert_eq!(
+        navigation[0]["data"]["editorDraft"],
+        first_prompt["message"]
+    );
+    assert_eq!(navigation[1]["data"]["leafId"], Value::Null);
+    assert_eq!(navigation[1]["data"]["entries"], json!(entries));
     provider.join().unwrap();
 }
 

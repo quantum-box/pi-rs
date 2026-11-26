@@ -3,13 +3,19 @@ use std::io::Write;
 
 use chrono::{DateTime, SecondsFormat};
 use pi_rs_core::Message;
-use pi_rs_durable::runtime::{Scheduler, SessionEntry, SessionTree, SessionTreeEntry};
+use pi_rs_durable::runtime::{
+    Scheduler, SessionEntry, SessionMessageEntry, SessionTree, SessionTreeEntry,
+};
 use serde_json::{Value, json, value::RawValue};
 use uuid::Uuid;
 
 use super::{text_message, user_message};
 
 const UNKNOWN_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
+
+pub(super) fn editor_draft(entry: &SessionMessageEntry) -> Value {
+    project_message(&entry.message, entry.blocks.as_deref(), &mut HashMap::new())
+}
 
 pub(super) struct Snapshot {
     tree: SessionTree,
