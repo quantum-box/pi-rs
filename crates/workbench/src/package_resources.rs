@@ -1,4 +1,5 @@
 //! Read-only discovery in package directories granted by a native SDK host.
+use std::collections::BTreeMap;
 use std::fs::{self, Metadata};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -7,7 +8,8 @@ use globset::GlobMatcher;
 use pi_rs::{Error, Result};
 
 use crate::package_manifest::{
-    has_resource_fields, local_startup_manifest, manifest_pi, resource_glob, resource_patterns,
+    extension_stem_matches, has_resource_fields, is_native_executable, local_startup_manifest,
+    manifest_pi, resource_glob, resource_patterns, select_resource_with, skill_directory,
 };
 
 const MAX_PATHS: usize = 128;
@@ -72,7 +74,7 @@ impl PackageResourcePaths {
                 } else {
                     vec![name.into()]
                 };
-                let candidates = discover_kind(root, kind, &patterns, &mut examined)?;
+                let candidates = discover_kind(root, kind, &patterns, explicit, &mut examined)?;
                 for path in candidates {
                     if !output.contains(&path) {
                         if output.len() == MAX_PATHS {
@@ -110,15 +112,7 @@ impl Kind {
             return false;
         }
         match self {
-            Self::Extension => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    metadata.permissions().mode() & 0o111 != 0
-                }
-                #[cfg(not(unix))]
-                path.extension().is_some_and(|ext| ext == "exe")
-            }
+            Self::Extension => is_native_executable(path, metadata),
             Self::Skill => path.file_name().is_some_and(|name| name == "SKILL.md"),
             Self::Prompt => has_suffix(path, b".md"),
             Self::Theme => has_suffix(path, b".json"),
@@ -131,10 +125,35 @@ fn has_suffix(path: &Path, suffix: &[u8]) -> bool {
         .is_some_and(|name| name.as_encoded_bytes().ends_with(suffix))
 }
 
+fn has_glob(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '[', '{'])
+}
+
+fn normalize_pattern(pattern: &str) -> Result<String> {
+    let normalized = pattern.replace('\\', "/");
+    let value = normalized
+        .strip_prefix(['!', '+', '-'])
+        .unwrap_or(&normalized);
+    if value.is_empty()
+        || value.contains(':')
+        || value == "~"
+        || value.starts_with("~/")
+        || Path::new(value)
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(Error::Config(format!(
+            "package resource pattern must be relative without parent components: {pattern:?}"
+        )));
+    }
+    Ok(normalized)
+}
+
 fn discover_kind(
     root: &Path,
     kind: Kind,
     patterns: &[String],
+    explicit: bool,
     examined: &mut usize,
 ) -> Result<Vec<PathBuf>> {
     if patterns.is_empty() {
@@ -143,49 +162,122 @@ fn discover_kind(
     if patterns.len() > MAX_PATHS {
         return Err(Error::Config("too many package resource patterns".into()));
     }
+    let patterns = patterns
+        .iter()
+        .map(|pattern| normalize_pattern(pattern))
+        .collect::<Result<Vec<_>>>()?;
+    let mut candidates = if matches!(kind, Kind::Extension) {
+        discover_extensions(root, &patterns, explicit, examined)?
+    } else {
+        discover_file_resources(root, kind, &patterns, explicit, examined)?
+    };
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn discover_extensions(
+    root: &Path,
+    patterns: &[String],
+    explicit: bool,
+    examined: &mut usize,
+) -> Result<Vec<PathBuf>> {
+    let extension_dir = root.join("extensions");
+    let mut candidates = Vec::new();
+    if metadata(&extension_dir)?.is_some_and(|metadata| metadata.is_dir()) {
+        for entry in fs::read_dir(&extension_dir)? {
+            count_entry(examined)?;
+            let path = entry?.path();
+            if metadata(&path)?.is_some_and(|metadata| is_native_executable(&path, &metadata)) {
+                candidates.push(path);
+            }
+        }
+    }
+
+    let mut matchers = BTreeMap::new();
+    for pattern in patterns {
+        if pattern.starts_with(['+', '-']) {
+            continue;
+        }
+        let value = pattern.strip_prefix('!').unwrap_or(pattern);
+        matchers.insert(value, compile_glob(value)?);
+        if explicit && !pattern.starts_with('!') && !has_glob(value) {
+            let path = root.join(value);
+            if metadata(&path)?.is_some_and(|metadata| is_native_executable(&path, &metadata)) {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.retain(|path| {
+        select_resource_with(patterns, |pattern, exact| {
+            extension_stem_matches(path, pattern)
+                || if exact {
+                    path == &root.join(pattern)
+                } else {
+                    matches_file(path, root, pattern, &matchers[pattern])
+                }
+        })
+    });
+    Ok(candidates)
+}
+
+fn discover_file_resources(
+    root: &Path,
+    kind: Kind,
+    patterns: &[String],
+    explicit: bool,
+    examined: &mut usize,
+) -> Result<Vec<PathBuf>> {
     let mut sources = Vec::new();
     let mut includes = Vec::new();
     let mut excludes = Vec::new();
     let mut force_includes = Vec::new();
     let mut force_excludes = Vec::new();
     for pattern in patterns {
-        let (prefix, value) = match pattern.as_bytes().first() {
-            Some(b'!' | b'+' | b'-') => (pattern.as_bytes()[0], &pattern[1..]),
-            _ => (b' ', pattern.as_str()),
-        };
-        let value = value.replace('\\', "/");
-        let path = Path::new(&value);
-        if value.is_empty()
-            || value.contains(':')
-            || value == "~"
-            || value.starts_with("~/")
-            || path
-                .components()
-                .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
-        {
-            return Err(Error::Config(format!(
-                "package resource pattern must be relative without parent components: {pattern:?}"
-            )));
-        }
-        match prefix {
-            b'+' => force_includes.push(root.join(path)),
-            b'-' => force_excludes.push(root.join(path)),
-            b'!' => {
-                let matcher = compile_glob(&value)?;
-                excludes.push((value, matcher));
-            }
-            _ if value.contains(['*', '?', '[', '{']) => includes.push(compile_glob(&value)?),
-            _ => sources.push(root.join(path)),
+        if let Some(value) = pattern.strip_prefix('+') {
+            force_includes.push(root.join(value));
+        } else if let Some(value) = pattern.strip_prefix('-') {
+            force_excludes.push(root.join(value));
+        } else if let Some(value) = pattern.strip_prefix('!') {
+            excludes.push((value, compile_glob(value)?));
+        } else if has_glob(pattern) {
+            includes.push(compile_glob(pattern)?);
+        } else {
+            sources.push(root.join(pattern));
         }
     }
 
     let mut candidates = Vec::new();
-    if !includes.is_empty() || sources.is_empty() {
+    let implicit = includes.is_empty() && sources.is_empty();
+    let mut skill_names = Vec::new();
+    for source in &sources {
+        match metadata(source)? {
+            Some(info) if info.is_dir() => {
+                scan(source, kind, examined, |path| candidates.push(path))?;
+            }
+            Some(info) if kind.accepts(source, &info) => candidates.push(source.clone()),
+            None if explicit && matches!(kind, Kind::Skill) && source.parent() == Some(root) => {
+                if let Some(name) = source.file_name() {
+                    skill_names.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    if implicit || !includes.is_empty() || !skill_names.is_empty() {
         scan(root, kind, examined, |path| {
             let relative = path
                 .strip_prefix(root)
                 .expect("package scan stays in its root");
-            if includes.is_empty()
+            let skill_name_matches = matches!(kind, Kind::Skill)
+                && skill_directory(&path)
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| {
+                        skill_names.contains(&name)
+                            || includes.iter().any(|glob| glob.is_match(name))
+                    });
+            if implicit
+                || skill_name_matches
                 || relative.ancestors().any(|candidate| {
                     !candidate.as_os_str().is_empty()
                         && includes.iter().any(|glob| glob.is_match(candidate))
@@ -195,35 +287,45 @@ fn discover_kind(
             }
         })?;
     }
-    for source in sources {
-        if let Some(metadata) = metadata(&source)? {
-            if metadata.is_dir() {
-                scan(&source, kind, examined, |path| candidates.push(path))?;
-            } else if kind.accepts(&source, &metadata) {
-                candidates.push(source);
-            }
-        }
-    }
     candidates.retain(|path| {
-        let relative = path
-            .strip_prefix(root)
-            .expect("package path is root-relative");
         !excludes.iter().any(|(pattern, glob)| {
-            glob.is_match(relative)
-                || path.file_name().is_some_and(|name| glob.is_match(name))
-                || (!pattern.contains(['*', '?', '[', '{'])
-                    && relative.starts_with(pattern.trim_start_matches("./")))
+            matches_file(path, root, pattern, glob)
+                || matches!(kind, Kind::Skill)
+                    && skill_directory(path)
+                        .is_some_and(|parent| matches_file(parent, root, pattern, glob))
         })
     });
-    for path in force_includes {
-        if metadata(&path)?.is_some_and(|metadata| kind.accepts(&path, &metadata)) {
+    for mut path in force_includes {
+        let Some(mut info) = metadata(&path)? else {
+            continue;
+        };
+        if info.is_dir() && matches!(kind, Kind::Skill) {
+            path.push("SKILL.md");
+            let Some(index) = metadata(&path)? else {
+                continue;
+            };
+            info = index;
+        }
+        if kind.accepts(&path, &info) {
             candidates.push(path);
         }
     }
-    candidates.retain(|path| !force_excludes.contains(path));
-    candidates.sort();
-    candidates.dedup();
+    candidates.retain(|path| {
+        !force_excludes.contains(path)
+            && !(matches!(kind, Kind::Skill)
+                && skill_directory(path)
+                    .is_some_and(|parent| force_excludes.iter().any(|target| target == parent)))
+    });
     Ok(candidates)
+}
+
+fn matches_file(path: &Path, root: &Path, pattern: &str, glob: &GlobMatcher) -> bool {
+    let relative = path
+        .strip_prefix(root)
+        .expect("package path is root-relative");
+    glob.is_match(relative)
+        || path.file_name().is_some_and(|name| glob.is_match(name))
+        || (!has_glob(pattern) && relative.starts_with(pattern.trim_start_matches("./")))
 }
 
 fn compile_glob(value: &str) -> Result<GlobMatcher> {
@@ -265,8 +367,8 @@ fn scan(
         if entry.depth() == 0 {
             continue;
         }
-        *examined += 1;
-        if *examined > MAX_ENTRIES || entry.depth() > MAX_DEPTH {
+        count_entry(examined)?;
+        if entry.depth() > MAX_DEPTH {
             return Err(Error::Config(
                 "package directory scan limit exceeded".into(),
             ));
@@ -275,6 +377,16 @@ fn scan(
         if metadata(&path)?.is_some_and(|metadata| kind.accepts(&path, &metadata)) {
             accept(path);
         }
+    }
+    Ok(())
+}
+
+fn count_entry(examined: &mut usize) -> Result<()> {
+    *examined += 1;
+    if *examined > MAX_ENTRIES {
+        return Err(Error::Config(
+            "package directory scan limit exceeded".into(),
+        ));
     }
     Ok(())
 }

@@ -7451,16 +7451,26 @@ precedence of `pi-package.json`, Cargo metadata and Pi `package.json`. Explicit
 Pi `package.json` resource lists contribute themes only, as in the native CLI.
 Without an explicit resource list, discovery uses the conventional resource
 directories. The SDK supports package-relative paths and globs. `!` exclusions
-can match a basename or a literal directory subtree. Lists with only `!`,
-`+` or `-` overrides first gather the package's eligible resources. The
-`+` and `-` overrides apply to exact files. A package is evaluated in
-grant order, with paths sorted within each resource kind. Recursive scans
-have entry and depth limits and skip hidden entries, linked directories,
-`target` and `node_modules`. Exact manifest paths can include hidden entries
-and follow symlinks, as can granted package roots. Scans can also discover
-file symlinks, so grants allow reading those targets even outside the directory.
-SDK package scans use the manifest patterns for filtering. Pi also applies
-its local ignore rules.
+can match a basename or a literal directory subtree. Skill patterns can match
+the directory containing `SKILL.md`, including exact `+` and `-` overrides.
+Native skill discovery looks for `SKILL.md` and can include nested skill
+directories.
+For extensions, discovery starts with executable files directly inside
+`extensions/` and adds executable files named by plain exact manifest paths.
+Extension filters also match the executable stem, so `!helper` excludes
+`helper.exe`. Windows discovery uses the native CLI's `.exe` suffix check.
+Override-only extension lists filter the conventional candidates. For skills,
+prompts and themes, override-only lists retain package-wide discovery, and a
+force-include can add an exact file outside the plain sources.
+
+Packages are evaluated in grant order, with paths sorted within each resource
+kind. Recursive scans have entry and depth limits and skip hidden entries,
+linked directories, `target` and `node_modules`. Exact manifest paths can
+include hidden entries and follow symlinks, as can granted package roots.
+Scans can also discover file symlinks, so grants allow reading those targets
+even outside the directory. SDK scans use manifest patterns without Pi's
+local ignore rules. The SDK uses the native CLI's executable convention in
+place of Pi's JavaScript and TypeScript extension entrypoints.
 
 Package discovery reads manifests and file metadata. Extensions appear as
 candidate paths, and the host authorizes each executable separately with

@@ -98,6 +98,103 @@ fn override_only_lists_keep_default_candidates_and_exclude_basenames_and_directo
     );
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn extension_discovery_uses_native_candidates_and_stem_overrides() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let manifest = root.join("pi-package.json");
+    let executable = |name: &str| {
+        let path = write(root, name, "metadata-only fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    };
+    let helper = executable("extensions/helper.exe");
+    let runner = executable("extensions/runner.exe");
+    let nested = executable("extensions/nested/tool.exe");
+    let elsewhere = executable("tools/worker.exe");
+    #[cfg(windows)]
+    executable("extensions/no-executable-suffix");
+
+    let candidates = || {
+        PackageResourcePaths::discover(&[root.to_owned()])
+            .unwrap()
+            .extension_candidates
+    };
+    assert_eq!(candidates(), [helper.clone(), runner.clone()]);
+
+    let discover = |patterns: &[&str]| {
+        fs::write(&manifest, json!({"pi":{"extensions":patterns}}).to_string()).unwrap();
+        candidates()
+    };
+    assert_eq!(discover(&["!helper"]), [runner.clone()]);
+    assert_eq!(
+        discover(&["!helper", "+helper"]),
+        [helper.clone(), runner.clone()]
+    );
+    assert_eq!(
+        discover(&["!helper", "+helper", "-helper"]),
+        [runner.clone()]
+    );
+    assert!(discover(&["+tools/worker.exe", "!*.exe"]).is_empty());
+    assert_eq!(
+        discover(&[
+            "extensions/*.exe",
+            "!helper",
+            "extensions/nested/tool.exe",
+            "tools/worker.exe"
+        ]),
+        [nested, runner, elsewhere]
+    );
+    assert_eq!(discover(&["helper"]), [helper]);
+    assert!(discover(&[]).is_empty());
+}
+
+#[test]
+fn skill_patterns_match_containing_directories_and_exact_overrides() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let manifest = root.join("pi-package.json");
+    let public = write(root, "skills/public/SKILL.md", "");
+    let internal = write(root, "skills/internal-guide/SKILL.md", "");
+    let outside = write(root, "docs/additional/SKILL.md", "");
+    let discover = |patterns: &[&str]| {
+        fs::write(&manifest, json!({"pi":{"skills":patterns}}).to_string()).unwrap();
+        PackageResourcePaths::discover(&[root.to_owned()])
+            .unwrap()
+            .skills
+    };
+
+    assert_eq!(
+        discover(&["skills", "!skills/internal-*"]),
+        [public.clone()]
+    );
+    assert_eq!(discover(&["skills/*", "!internal-*"]), [public.clone()]);
+    assert_eq!(discover(&["public"]), [public.clone()]);
+    assert_eq!(
+        discover(&["!internal-*"]),
+        [outside.clone(), public.clone()]
+    );
+    assert_eq!(
+        discover(&["skills", "!internal-*", "+skills/internal-guide"]),
+        [internal, public.clone()]
+    );
+    assert_eq!(
+        discover(&[
+            "skills",
+            "!internal-*",
+            "+skills/internal-guide",
+            "-skills/internal-guide",
+            "+docs/additional"
+        ]),
+        [outside, public]
+    );
+}
+
 #[test]
 fn validates_package_grants_and_manifest_paths() {
     let temp = tempfile::tempdir().unwrap();

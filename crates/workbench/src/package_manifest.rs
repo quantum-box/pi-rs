@@ -1,4 +1,5 @@
 //! Shared read-only package manifest parsing for the CLI and SDK.
+use std::fs::Metadata;
 use std::path::Path;
 
 use pi_rs::{Error, Result};
@@ -224,4 +225,65 @@ pub fn resource_glob(
         .backslash_escape(false)
         .allow_unclosed_class(allow_unclosed_class)
         .build()
+}
+
+/// Match the native extension name in addition to its relative path.
+pub fn extension_stem_matches(path: &Path, pattern: &str) -> bool {
+    path.file_stem().is_some_and(|stem| stem == pattern)
+}
+
+/// A skill can be selected by either its index file or its containing directory.
+pub fn skill_directory(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|_| path.file_name().is_some_and(|name| name == "SKILL.md"))
+}
+
+/// Test a regular file using the native platform's executable convention.
+pub fn is_native_executable(_path: &Path, metadata: &Metadata) -> bool {
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        _path.extension().is_some_and(|ext| ext == "exe")
+    }
+}
+
+/// Apply native include, exclude, force-include and force-exclude precedence.
+pub fn select_resource_with(filters: &[String], matches: impl Fn(&str, bool) -> bool) -> bool {
+    if filters.is_empty() {
+        return false;
+    }
+    let mut plain = filters
+        .iter()
+        .filter(|filter| !filter.starts_with(['!', '+', '-']))
+        .peekable();
+    let mut included = plain.peek().is_none() || plain.any(|pattern| matches(pattern, false));
+    if filters
+        .iter()
+        .filter_map(|filter| filter.strip_prefix('!'))
+        .any(|pattern| matches(pattern, false))
+    {
+        included = false;
+    }
+    if filters
+        .iter()
+        .filter_map(|filter| filter.strip_prefix('+'))
+        .any(|pattern| matches(pattern, true))
+    {
+        included = true;
+    }
+    if filters
+        .iter()
+        .filter_map(|filter| filter.strip_prefix('-'))
+        .any(|pattern| matches(pattern, true))
+    {
+        included = false;
+    }
+    included
 }

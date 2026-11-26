@@ -9,7 +9,8 @@ use pi_rs_workbench::package_manifest::{
     MAX_PACKAGE_MANIFEST_BYTES, read_optional_pi_package_json,
 };
 use pi_rs_workbench::package_manifest::{
-    has_resource_fields, local_startup_manifest, manifest_pi, resource_glob, resource_patterns,
+    extension_stem_matches, has_resource_fields, is_native_executable, local_startup_manifest,
+    manifest_pi, resource_glob, resource_patterns, select_resource_with, skill_directory,
     validate_resource_patterns,
 };
 use pi_rs_workbench::process_cleanup::{Children, owns_kill_target};
@@ -813,43 +814,9 @@ fn select_resource(path: &Path, root: &Path, filters: &[String], directory_roots
 }
 fn extension_selected(path: &Path, root: &Path, filters: &[String]) -> bool {
     select_resource_with(filters, |pattern, exact| {
-        resource_matches(path, root, pattern, exact, true)
-            || path.file_stem().is_some_and(|stem| stem == pattern)
+        resource_matches(path, root, pattern, exact, true) || extension_stem_matches(path, pattern)
     })
 }
-fn select_resource_with(filters: &[String], matches: impl Fn(&str, bool) -> bool) -> bool {
-    if filters.is_empty() {
-        return false;
-    }
-    let plain: Vec<_> = filters
-        .iter()
-        .filter(|filter| !filter.starts_with(['!', '+', '-']))
-        .collect();
-    let mut included = plain.is_empty() || plain.iter().any(|pattern| matches(pattern, false));
-    if filters
-        .iter()
-        .filter_map(|filter| filter.strip_prefix('!'))
-        .any(|pattern| matches(pattern, false))
-    {
-        included = false;
-    }
-    if filters
-        .iter()
-        .filter_map(|filter| filter.strip_prefix('+'))
-        .any(|pattern| matches(pattern, true))
-    {
-        included = true;
-    }
-    if filters
-        .iter()
-        .filter_map(|filter| filter.strip_prefix('-'))
-        .any(|pattern| matches(pattern, true))
-    {
-        included = false;
-    }
-    included
-}
-
 // Match Node's os.homedir(): the platform-specific environment variable takes
 // precedence even when empty; otherwise query the current account.
 fn filter_home_dir() -> Option<PathBuf> {
@@ -996,9 +963,7 @@ pub(crate) fn resource_matches(
         normalize(path),
         normalize(path.strip_prefix(root).unwrap_or(path)),
     ];
-    if path.file_name().is_some_and(|name| name == "SKILL.md")
-        && let Some(parent) = path.parent()
-    {
+    if let Some(parent) = skill_directory(path) {
         candidates.push(normalize(parent));
         candidates.push(normalize(parent.strip_prefix(root).unwrap_or(parent)));
         if !exact && let Some(name) = parent.file_name() {
@@ -2413,21 +2378,11 @@ fn executable_files(path: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(path)? {
         let path = entry?.path();
-        if !path.is_file() {
-            continue;
-        }
-        #[cfg(unix)]
+        if let Ok(metadata) = path.metadata()
+            && is_native_executable(&path, &metadata)
         {
-            use std::os::unix::fs::PermissionsExt;
-            if path.metadata()?.permissions().mode() & 0o111 == 0 {
-                continue;
-            }
+            files.push(path);
         }
-        #[cfg(windows)]
-        if path.extension().is_none_or(|extension| extension != "exe") {
-            continue;
-        }
-        files.push(path);
     }
     Ok(files)
 }
