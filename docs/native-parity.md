@@ -4251,6 +4251,22 @@ stored name, as Pi does, including names imported from external JSONL. A
 whitespace-only name clears the title without falling back to an older name;
 reading preserves internal line breaks and does not rewrite the journal.
 
+### SDK model-facing tool selection
+
+An owned Rust session exposes `active_tool_names` and `set_active_tools` for
+the configured model-facing tool selection. Native branch checkpoints preserve
+their recorded loadout. The runtime intersects that loadout with the selected
+registry tools and uses current schemas. A selected tool can therefore be absent
+from a request on a restored branch. Request-time registry hooks can also
+change the advertised list.
+
+The setter requires mutable ownership and an available journal, so hosts apply
+it to future runs. Pi can apply a selection on the next turn of an active run.
+Native registry validation rejects unknown names without replacing the previous
+selection. Native nested orchestration can call registered tools regardless of
+selection. In Pi, inactive callable tools must have `codemode` or `deferred`
+exposure.
+
 ### SDK queued input inspection
 
 Pi exposes the pending steering and follow-up text and each queue's delivery
