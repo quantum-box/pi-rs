@@ -3143,17 +3143,32 @@ impl Agent<'_> {
             Some(before) => &branch[..branch.partition_point(|record| record.id < before)],
             None => &branch,
         };
-        let (system_prompt, tools) = crate::journal::system_context(
+        let run_id = session.current_run_id();
+        let run_override =
+            run_id.and_then(|id| crate::before_agent_start::prompt_override(history, id));
+        let section_edits = if run_override.is_none()
+            && let Some(id) = run_id
+        {
+            crate::before_agent_start::prompt_section_edits(history, id)?
+        } else {
+            None
+        };
+        let (mut system_prompt, tools) = crate::journal::resolve_system_context(
             history,
             self.system_prompt,
             self.registry.active_tool_specs(),
+            section_edits
+                .as_ref()
+                .and(self.registry.host_system_prompt.as_deref()),
         );
-        let run_override = session
-            .current_run_id()
-            .and_then(|id| crate::before_agent_start::prompt_override(history, id));
+        if let Some((_, sections)) = &section_edits {
+            system_prompt.apply_sections(sections);
+        }
         let preserve_system_transcript = run_override.is_none();
         let mut messages = vec![Message::System {
-            content: run_override.clone().unwrap_or(system_prompt),
+            content: run_override
+                .clone()
+                .unwrap_or_else(|| system_prompt.render()),
         }];
         if let Some(summary) = summary {
             // Compaction content has the authority of conversation history.
@@ -3171,7 +3186,7 @@ impl Agent<'_> {
                 keep_group
             });
         }
-        let transcript = if purpose == RequestPurpose::Turn && preserve_system_transcript {
+        let mut transcript = if purpose == RequestPurpose::Turn && preserve_system_transcript {
             crate::journal::system_transcript(
                 history,
                 &conversation,
@@ -3181,6 +3196,9 @@ impl Agent<'_> {
         } else {
             None
         };
+        if let (Some(transcript), Some((source, sections))) = (&mut transcript, &section_edits) {
+            transcript.append_section_update(*source, sections, &conversation, messages.len());
+        }
         messages.extend(conversation.into_iter().map(|(_, message)| message));
         if messages.len() == 1 {
             return Err(Error::Session("there is no conversation to resume".into()));
@@ -3350,7 +3368,8 @@ impl Agent<'_> {
         request
             .tools
             .retain(|spec| self.registry.has_tool(&spec.name));
-        let transformed = request.model != original.model
+        let transformed = section_edits.is_some()
+            || request.model != original.model
             || request.messages != original.messages
             || request.tools != original.tools;
         Ok((request, transformed, transcript))

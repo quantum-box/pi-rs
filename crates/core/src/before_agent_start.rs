@@ -8,16 +8,20 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    Agent, AgentInput, AgentStartTrigger, BeforeAgentStartEvent, CancellationToken, CustomMessage,
-    CustomMessageDelivery, Error, Event, Notification, Observer, Record, Result, RunState, Session,
+    Agent, AgentInput, AgentStartTrigger, BeforeAgentStartEvent, BeforeAgentStartPromptOptions,
+    CancellationToken, CustomMessage, CustomMessageDelivery, Error, Event, Notification, Observer,
+    Record, Result, RunState, Session,
 };
 
 const PLAN_FORMAT: &str = "pi-rs:before-agent-start-v1";
+type PromptSectionEdits = Vec<(String, Option<String>)>;
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Plan {
     system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    system_prompt_sections: PromptSectionEdits,
     pub(crate) messages: Vec<(Uuid, CustomMessage)>,
     // New plans use their own journal position as the next-turn queue cutoff.
     #[serde(default)]
@@ -41,6 +45,32 @@ pub(crate) fn prompt_override(branch: &[&Record], run_id: Uuid) -> Option<String
         .get("systemPrompt")?
         .as_str()
         .map(str::to_owned)
+}
+
+pub(crate) fn prompt_section_edits(
+    branch: &[&Record],
+    run_id: Uuid,
+) -> Result<Option<(u64, PromptSectionEdits)>> {
+    let Some((source, edits)) = recorded_plan(branch, run_id).and_then(|(source, plan)| {
+        plan.get("systemPromptSections")
+            .map(|edits| (source, edits))
+    }) else {
+        return Ok(None);
+    };
+    let edits: PromptSectionEdits = serde_json::from_value(edits.clone())?;
+    // An image-bearing or already accepted prompt can precede its preflight plan.
+    let source = branch
+        .iter()
+        .take_while(|record| record.id < source)
+        .find(|record| match &record.event {
+            Event::User { input_id, .. } | Event::UserWithImages { input_id, .. } => {
+                *input_id == Some(run_id)
+            }
+            Event::CustomMessageDelivered { id, .. } => *id == run_id,
+            _ => false,
+        })
+        .map_or(source, |record| record.id);
+    Ok((!edits.is_empty()).then_some((source, edits)))
 }
 
 pub(crate) fn plan(session: &Session, run_id: Uuid) -> Result<Option<(u64, Plan)>> {
@@ -178,11 +208,19 @@ pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
     let Some(trigger) = starting_input(session, &branch, run_id, effective_input) else {
         return Ok(());
     };
+    let (base_prompt, _) = crate::journal::resolve_system_context(
+        &branch,
+        agent.system_prompt,
+        Vec::new(),
+        agent.registry.host_system_prompt.as_deref(),
+    );
     let mut event = BeforeAgentStartEvent {
         trigger,
-        system_prompt: crate::journal::system_context(&branch, agent.system_prompt, Vec::new()).0,
+        system_prompt: base_prompt.render(),
+        system_prompt_options: prompt_options(&base_prompt),
     };
     let states = session.extension_states();
+    let mut edits = indexmap::IndexMap::new();
     let mut plan = Plan {
         captures_next_turn: true,
         ..Plan::default()
@@ -232,6 +270,44 @@ pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
                     event.system_prompt.clone_from(&prompt);
                     plan.system_prompt = Some(prompt);
                 }
+                let changes = result.system_prompt_options.sections;
+                if !changes.is_empty() {
+                    if let Some(name) = changes.keys().find(|name| !valid_section_name(name)) {
+                        report(
+                            extension.id(),
+                            &format!("invalid system prompt section name: {name:?}"),
+                            observer,
+                        );
+                        continue;
+                    }
+                    for (name, value) in changes {
+                        if value.as_ref().is_some_and(String::is_empty) {
+                            edits.shift_remove(&name);
+                            continue;
+                        }
+                        let original = base_prompt
+                            .sections
+                            .iter()
+                            .find_map(|(key, text)| (key == &name).then_some(text));
+                        let value = value
+                            .map(|body| crate::journal::wrap_system_prompt_section(&name, &body));
+                        if value.as_ref() == original {
+                            edits.shift_remove(&name);
+                        } else {
+                            edits.insert(name, value);
+                        }
+                    }
+                    let mut prompt = base_prompt.clone();
+                    let applied = edits
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<Vec<_>>();
+                    prompt.apply_sections(&applied);
+                    event.system_prompt_options = prompt_options(&prompt);
+                    if plan.system_prompt.is_none() {
+                        event.system_prompt = prompt.render();
+                    }
+                }
             }
             Err(error) => report(extension.id(), &error, observer),
         }
@@ -240,12 +316,39 @@ pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
     if cancel.is_cancelled() {
         return Err(Error::Cancelled);
     }
+    plan.system_prompt_sections = edits.into_iter().collect();
     let record = session.append(Event::SourceEntry {
         format: PLAN_FORMAT.into(),
         entry: serde_json::to_value(plan)?,
     })?;
     observer(Notification::Committed(record));
     Ok(())
+}
+
+fn valid_section_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    name != "preamble"
+        && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn prompt_options(state: &crate::journal::SystemPromptState) -> BeforeAgentStartPromptOptions {
+    BeforeAgentStartPromptOptions {
+        sections: state
+            .sections
+            .iter()
+            .filter(|(name, _)| valid_section_name(name))
+            .map(|(name, text)| {
+                let body = text
+                    .strip_prefix(&format!("<{name}>\n"))
+                    .and_then(|text| text.strip_suffix(&format!("\n</{name}>")))
+                    .unwrap_or(text);
+                (name.clone(), body.to_owned())
+            })
+            .collect(),
+    }
 }
 
 fn report(extension: &str, message: &str, observer: &mut Observer<'_>) {
@@ -319,9 +422,17 @@ mod tests {
             if matches!(event.trigger, AgentStartTrigger::Custom { .. }) {
                 return Ok(Default::default());
             }
+            if self.id == "section-after-force" {
+                assert!(event.system_prompt.is_empty());
+                return Ok(serde_json::from_value(serde_json::json!({
+                    "systemPromptOptions": {"sections": {"rules": "section after force"}},
+                }))
+                .unwrap());
+            }
             Ok(crate::BeforeAgentStartResult {
                 message: Some(message(self.id)),
                 system_prompt: Some(if self.id == "clear" { "" } else { self.id }.into()),
+                ..Default::default()
             })
         }
     }
@@ -384,6 +495,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn before_agent_start_edits_named_sections_in_order_and_only_for_the_run() {
+        struct EditSections {
+            id: &'static str,
+            observations: Arc<Mutex<Vec<BeforeAgentStartEvent>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Extension for EditSections {
+            fn id(&self) -> &str {
+                self.id
+            }
+
+            fn handles_before_agent_start(&self) -> bool {
+                true
+            }
+
+            async fn before_agent_start(
+                &self,
+                event: &BeforeAgentStartEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<crate::BeforeAgentStartResult> {
+                if !matches!(&event.trigger, AgentStartTrigger::User { prompt, .. } if prompt == "edit")
+                {
+                    return Ok(Default::default());
+                }
+                self.observations.lock().unwrap().push(event.clone());
+                let changes = match self.id {
+                    "first" => {
+                        serde_json::json!({"rules":"first rules","retired":null,"cwd":"first cwd","z-added":"Z"})
+                    }
+                    "invalid" => serde_json::json!({"never_added":"ignored","preamble":"invalid"}),
+                    "last" => serde_json::json!({"rules":"final rules","cwd":"","a_added":"A"}),
+                    _ => unreachable!(),
+                };
+                Ok(serde_json::from_value(serde_json::json!({
+                    "systemPromptOptions": {"sections": changes},
+                }))
+                .unwrap())
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        let prompt = registry.compose_system_prompt(
+            "host prompt".into(),
+            vec![
+                ("rules".into(), "host rules".into()),
+                ("retired".into(), "remove this".into()),
+                ("cwd".into(), "work".into()),
+            ],
+        );
+        for id in ["first", "invalid", "last"] {
+            registry
+                .register(Arc::new(EditSections {
+                    id,
+                    observations: observations.clone(),
+                }))
+                .unwrap();
+        }
+        let model = Capture(requests.clone());
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: &prompt,
+            limits: crate::Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let mut errors = Vec::new();
+        for input in ["edit", "next"] {
+            let (_sender, mut followups) = mpsc::channel::<String>(1);
+            agent
+                .run(
+                    &mut session,
+                    Some(input.into()),
+                    &mut followups,
+                    &CancellationToken::new(),
+                    &mut |notification| {
+                        if let Notification::ExtensionLifecycleError {
+                            extension, message, ..
+                        } = notification
+                        {
+                            errors.push((extension.to_owned(), message.to_owned()));
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "invalid");
+        assert!(errors[0].1.contains("preamble"));
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 3);
+        assert_eq!(observations[0].system_prompt, prompt);
+        let last = &observations[2];
+        let sections = &last.system_prompt_options.sections;
+        assert_eq!(
+            sections.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["rules", "cwd", "z-added"]
+        );
+        assert_eq!(sections["rules"], "first rules");
+        assert_eq!(sections["cwd"], "first cwd");
+        assert!(last.system_prompt.contains("<z-added>\nZ\n</z-added>"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0][0],
+            Message::System {
+                content: "host prompt\n\n<rules>\nfinal rules\n</rules>\n\n<cwd>\nwork\n</cwd>\n\n<z-added>\nZ\n</z-added>\n\n<a_added>\nA\n</a_added>".into(),
+            }
+        );
+        assert_eq!(requests[1][0], Message::System { content: prompt });
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_resumes_structured_edits_with_the_imported_transcript() {
+        struct TranscriptCapture(Capture);
+
+        #[async_trait::async_trait]
+        impl Model for TranscriptCapture {
+            fn supports_mid_conversation_system_messages(&self, _: &str) -> bool {
+                true
+            }
+
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                self.0.stream(request).await
+            }
+        }
+
+        for mid_conversation in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            let run_id = Uuid::new_v4();
+            let mut journal = Session::open(&path).unwrap();
+            journal
+                .append(Event::SystemCheckpoint {
+                    content: "imported base".into(),
+                    sections: vec![("rules".into(), Some("<rules>\nold\n</rules>".into()))],
+                    tools_added: vec![],
+                    tools_removed: vec![],
+                })
+                .unwrap();
+            journal
+                .append(Event::User {
+                    content: "earlier".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(Event::Run {
+                    state: RunState::Running,
+                    initial: (!mid_conversation).then(|| "question".into()),
+                })
+                .unwrap();
+            if mid_conversation {
+                journal
+                    .append(Event::User {
+                        content: "question".into(),
+                        input_id: Some(run_id),
+                    })
+                    .unwrap();
+            }
+            journal
+                .append(Event::SourceEntry {
+                    format: PLAN_FORMAT.into(),
+                    entry: serde_json::to_value(Plan {
+                        system_prompt_sections: vec![(
+                            "rules".into(),
+                            Some("<rules>\nnew\n</rules>".into()),
+                        )],
+                        captures_next_turn: true,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                })
+                .unwrap();
+            drop(journal);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let model: Arc<dyn Model> = if mid_conversation {
+                Arc::new(TranscriptCapture(Capture(requests.clone())))
+            } else {
+                Arc::new(Capture(requests.clone()))
+            };
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let mut sdk = SessionBuilder::new(model, "fixture")
+                .extension(Arc::new(Hook {
+                    id: "unexpected",
+                    observations: observations.clone(),
+                }))
+                .unwrap()
+                .open(&path)
+                .unwrap();
+            sdk.resume().await.unwrap();
+            assert!(observations.lock().unwrap().is_empty());
+            let requests = requests.lock().unwrap();
+            let sections: Vec<_> = requests[0]
+                .iter()
+                .filter_map(|message| match message {
+                    Message::System { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if mid_conversation {
+                assert_eq!(
+                    sections,
+                    [
+                        "imported base\n\n<rules>\nold\n</rules>",
+                        "Updated system prompt section \"rules\":\n\n<rules>\nnew\n</rules>",
+                    ]
+                );
+                assert!(
+                    matches!(&requests[0][1], Message::User { content } if content == "earlier")
+                );
+                assert!(matches!(&requests[0][2], Message::System { .. }));
+            } else {
+                assert_eq!(sections, ["imported base\n\n<rules>\nnew\n</rules>"]);
+            }
+            assert_eq!(user_texts(&requests[0]), ["earlier", "question"]);
+        }
+    }
+
+    #[tokio::test]
     async fn before_agent_start_sdk_resume_reuses_saved_plan_and_run_id() {
         enum Resume {
             BySession,
@@ -427,6 +762,7 @@ mod tests {
                         captures_next_turn: true,
                         system_prompt: Some("saved prompt".into()),
                         messages: vec![(first_id, message("first")), (last_id, message("last"))],
+                        ..Plan::default()
                     })
                     .unwrap(),
                 })
@@ -625,6 +961,11 @@ mod tests {
                 observations: observations.clone(),
             }))
             .unwrap()
+            .extension(Arc::new(Hook {
+                id: "section-after-force",
+                observations: observations.clone(),
+            }))
+            .unwrap()
             .extension(Arc::new(Rewrite))
             .unwrap()
             .in_memory()
@@ -663,7 +1004,7 @@ mod tests {
                 self.release.notified().await;
                 Ok(crate::BeforeAgentStartResult {
                     message: Some(message("hook message")),
-                    system_prompt: None,
+                    ..Default::default()
                 })
             }
         }

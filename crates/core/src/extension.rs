@@ -1140,8 +1140,41 @@ pub enum AgentStartTrigger {
 pub struct BeforeAgentStartEvent {
     #[serde(flatten)]
     pub trigger: AgentStartTrigger,
-    /// The current prompt, including replacements from earlier extensions.
+    /// The current prompt, including edits from earlier extensions.
     pub system_prompt: String,
+    /// The editable portion of the current structured prompt.
+    #[serde(
+        default,
+        skip_serializing_if = "BeforeAgentStartPromptOptions::is_empty"
+    )]
+    pub system_prompt_options: BeforeAgentStartPromptOptions,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BeforeAgentStartPromptOptions {
+    /// Ordered sections with their outer tags removed. The preamble is reserved.
+    pub sections: indexmap::IndexMap<String, String>,
+}
+
+impl BeforeAgentStartPromptOptions {
+    fn is_empty(&self) -> bool {
+        self.sections.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BeforeAgentStartPromptChanges {
+    /// A nonempty string sets the body, an empty string resets it to the base,
+    /// and null removes the section.
+    pub sections: indexmap::IndexMap<String, Option<String>>,
+}
+
+impl BeforeAgentStartPromptChanges {
+    fn is_empty(&self) -> bool {
+        self.sections.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -1152,6 +1185,9 @@ pub struct BeforeAgentStartResult {
     /// An exact prompt replacement for this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Run-local section edits. An exact replacement takes precedence.
+    #[serde(skip_serializing_if = "BeforeAgentStartPromptChanges::is_empty")]
+    pub system_prompt_options: BeforeAgentStartPromptChanges,
 }
 
 /// A shell command entered by the user, before the host executes it.
@@ -2148,9 +2184,23 @@ pub struct Registry {
     pub(crate) publish_tool_attempts: bool,
     branch_models: Arc<RwLock<BranchModels>>,
     branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
+    pub(crate) host_system_prompt: Option<Arc<crate::journal::HostSystemPrompt>>,
 }
 
 impl Registry {
+    /// Render the host prompt and retain its section boundaries for preflight.
+    /// Use the returned string as this registry's agent prompt.
+    pub fn compose_system_prompt(
+        &mut self,
+        preamble: String,
+        sections: Vec<(String, String)>,
+    ) -> String {
+        let prompt = crate::journal::HostSystemPrompt::new(preamble, sections);
+        let rendered = prompt.rendered.clone();
+        self.host_system_prompt = Some(Arc::new(prompt));
+        rendered
+    }
+
     /// Snapshot resolution order and registered tool ownership for presentation.
     pub fn tool_renderers(&self) -> crate::ToolRendererRegistry {
         crate::ToolRendererRegistry {
@@ -3261,6 +3311,7 @@ impl Registry {
             publish_tool_attempts: self.publish_tool_attempts,
             branch_models: self.branch_models.clone(),
             branch_reservations: self.branch_reservations.clone(),
+            host_system_prompt: None,
         })
     }
 

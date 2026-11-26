@@ -338,10 +338,21 @@ To run an extension callback for a submitted user prompt or an idle custom
 trigger, opt into `handles_before_agent_start` and implement
 `before_agent_start`. Executable extensions advertise `before_agent_start_hook`
 and receive the `before_agent_start` protocol request. The event identifies
-the starting message and carries the resolved system prompt. Each handler
-sees the latest prompt override in extension load order, and can return an
-exact prompt for the current run and a custom message. The final override is
-applied after request context hooks. An empty override clears the prompt text.
+the starting message and carries the resolved system prompt and ordered
+`system_prompt_options.sections` bodies. Each handler sees the previous
+handlers' edits in extension load order. Return section edits using
+`system_prompt_options.sections` (wire format `systemPromptOptions.sections`).
+For example, `{"systemPromptOptions":{"sections":{"rules":"New guidance","skills":null}}}`
+replaces the rules text and removes the skills section. Names must begin with
+a lowercase ASCII letter and may contain lowercase ASCII letters, digits,
+underscores and hyphens. The preamble is reserved. Replacements keep their
+position, new sections appear in insertion order, and an empty body restores
+the base value for that section.
+An exact `system_prompt` override still takes precedence and applies after
+request context hooks. An empty exact override clears the prompt text.
+The native options expose section text. Tool loadout, context sources, skills
+discovery and other prompt-builder settings are configured separately.
+An opaque SDK prompt is retained as a preamble with room for added sections.
 Returned messages follow the starting input and the next-turn messages queued
 by the end of preflight. Cancellation interrupts delivery while a returned
 message's lifecycle hook is running. Handler failures are reported while

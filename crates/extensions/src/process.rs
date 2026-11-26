@@ -6251,7 +6251,7 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
     }
 
     #[tokio::test]
-    async fn before_agent_start_negotiates_and_transports_prompt_replacement() {
+    async fn before_agent_start_negotiates_and_transports_prompt_edits() {
         struct Hook;
         #[async_trait::async_trait]
         impl Extension for Hook {
@@ -6274,6 +6274,22 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
                 assert_eq!(prompt, "question");
                 assert!(images.is_empty());
                 assert_eq!(event.system_prompt, "host prompt");
+                if !event.system_prompt_options.sections.is_empty() {
+                    assert_eq!(event.system_prompt_options.sections["rules"], "host rules");
+                    assert_eq!(event.system_prompt_options.sections["cwd"], "workspace");
+                    return Ok(pi_rs_core::BeforeAgentStartResult {
+                        system_prompt_options: pi_rs_core::BeforeAgentStartPromptChanges {
+                            sections: [
+                                ("z-first".into(), Some("new section".into())),
+                                ("cwd".into(), None),
+                                ("rules".into(), Some("new rules".into())),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        },
+                        ..Default::default()
+                    });
+                }
                 Ok(pi_rs_core::BeforeAgentStartResult {
                     system_prompt: Some(String::new()),
                     ..Default::default()
@@ -6305,8 +6321,35 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
             }
         }))
         .unwrap();
-        let response = dispatch(extension, request).await.unwrap();
+        let response = dispatch(extension.clone(), request).await.unwrap();
         assert_eq!(response, serde_json::json!({"systemPrompt": ""}));
+
+        let request = serde_json::from_value::<ProtocolRequest>(serde_json::json!({
+            "type": "before_agent_start",
+            "event": {
+                "messageType": "user",
+                "prompt": "question",
+                "systemPrompt": "host prompt",
+                "systemPromptOptions": {"sections": {"rules": "host rules", "cwd": "workspace"}}
+            }
+        }))
+        .unwrap();
+        let request = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let response = dispatch(extension, request).await.unwrap();
+        let result: pi_rs_core::BeforeAgentStartResult = serde_json::from_value(response).unwrap();
+        assert!(result.system_prompt.is_none());
+        assert_eq!(
+            result
+                .system_prompt_options
+                .sections
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [
+                ("z-first".into(), Some("new section".into())),
+                ("cwd".into(), None),
+                ("rules".into(), Some("new rules".into())),
+            ]
+        );
     }
 
     #[tokio::test]

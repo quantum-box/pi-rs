@@ -5602,17 +5602,20 @@ its existing inline-image display for image blocks when graphics are enabled.
 
 Native and executable `before_agent_start` handlers get the initial user
 prompt and its images or the idle custom trigger, in extension load order.
-The current system prompt reflects earlier handlers' full-prompt replacements.
+The current system prompt reflects earlier handlers' ordered section edits and
+exact full-prompt replacements. Named section edits are supported for CLI
+prompts and imported journal checkpoints. A handler can also add sections to
+an opaque SDK prompt.
 Returned custom messages enter the run after the initial message and next-turn
 messages queued by the end of preflight, including arrivals during handlers.
 The final prompt override applies after request context transforms. A recorded
-preparation plan retains the run-local prompt and deduplicates its appended
+preparation plan retains the run-local prompt edits and deduplicates its appended
 messages when the run resumes before its first model request is journaled.
 
-This API accepts a full text override. Upstream also exposes mutable prompt
-sections, including the tool loadout, and does its incoming-prompt compaction
-before invoking the hook. The native hook currently runs before the existing
-agent loop's automatic compaction checks.
+Native exposes section bodies through a returned patch. Upstream exposes the
+full mutable prompt builder, including tool selection, and compacts incoming
+prompt context before invoking the hook. The native hook runs before the agent
+loop's automatic compaction checks.
 
 ### Rust extension lifecycle observation
 

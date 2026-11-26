@@ -11208,9 +11208,13 @@ async fn mcp_oauth_login_uses_workbench_proxy_setting_and_no_proxy() {
 }
 
 #[test]
-fn before_agent_start_cli_resumes_legacy_plan_on_the_same_run_id() {
+fn before_agent_start_cli_resumes_saved_plans_on_the_same_run_id() {
     use pi_rs::{Event, Record, RunState};
-    for invocation in [&["--mode", "text", "resume"][..], &["--print"][..]] {
+    for (invocation, structured) in [
+        (&["--mode", "text", "resume"][..], false),
+        (&["--print"][..], false),
+        (&["--print"][..], true),
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let path = root.join("session.jsonl");
@@ -11258,7 +11262,14 @@ fn before_agent_start_cli_resumes_legacy_plan_on_the_same_run_id() {
                 Some(run_id),
                 Event::SourceEntry {
                     format: "pi-rs:before-agent-start-v1".into(),
-                    entry: json!({"systemPrompt":"saved override", "messages":[]}),
+                    entry: if structured {
+                        json!({"systemPromptSections":[
+                            ["rules", "<rules>\nsaved rules\n</rules>"],
+                            ["extra", "<extra>\nsaved extra\n</extra>"]
+                        ], "messages":[]})
+                    } else {
+                        json!({"systemPrompt":"saved override", "messages":[]})
+                    },
                 },
             ),
         ])
@@ -11308,7 +11319,15 @@ fn before_agent_start_cli_resumes_legacy_plan_on_the_same_run_id() {
             String::from_utf8_lossy(&output.stderr)
         );
         let body = server.join().unwrap();
-        assert_eq!(body["messages"][0]["content"], "saved override");
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        if structured {
+            assert_eq!(system.matches("<rules>").count(), 1);
+            assert!(system.contains("<rules>\nsaved rules\n</rules>"));
+            assert!(system.contains("<tools>"));
+            assert!(system.find("<cwd>").unwrap() < system.find("<extra>").unwrap());
+        } else {
+            assert_eq!(system, "saved override");
+        }
         assert_eq!(body["messages"][1]["content"], "original input");
         let journal = Session::open(&path).unwrap();
         assert!(
