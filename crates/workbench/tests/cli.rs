@@ -9212,6 +9212,103 @@ fn together_retired_fallback_uses_the_relay_catalog_across_workspace_restore() {
 }
 
 #[test]
+fn together_retired_default_discovers_again_after_rpc_workspace_switch() {
+    let root = tempfile::tempdir().unwrap();
+    let launch = root.path().join("launch");
+    let target = root.path().join("target");
+    std::fs::create_dir(&launch).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    let target_session = root.path().join("target.jsonl");
+    Session::open(&target_session)
+        .unwrap()
+        .set_working_directory(&target)
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"together":{"baseUrl":base,"apiKey":"relay-fixture"}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling"}).to_string(),
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        for id in ["relay-before-switch", "relay-after-switch"] {
+            loop {
+                let (mut socket, mut reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.is_empty() || line == "\r\n" {
+                        break;
+                    }
+                }
+                if first.starts_with("GET /api/ps ") {
+                    write!(
+                        socket,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                assert!(first.starts_with("GET /v1/models "), "{first}");
+                let body = json!({"data":[{"id":id}]}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                break;
+            }
+        }
+    });
+
+    let mut child = together_fixture_cli(root.path())
+        .args(["--mode", "rpc", "--workspace"])
+        .arg(&launch)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for request in [
+        json!({"id":"start","type":"get_state"}),
+        json!({"id":"switch","type":"switch_session","sessionPath":target_session}),
+        json!({"id":"switched","type":"get_state"}),
+        json!({"id":"new","type":"new_session"}),
+        json!({"id":"after","type":"get_state"}),
+    ] {
+        writeln!(input, "{request}").unwrap();
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let reply = |id| events.iter().find(|event| event["id"] == id).unwrap();
+    for id in ["switch", "new"] {
+        assert_eq!(reply(id)["success"], true, "{events:?}");
+    }
+    for (id, model) in [
+        ("start", "relay-before-switch"),
+        ("switched", "relay-after-switch"),
+        ("after", "relay-after-switch"),
+    ] {
+        assert_eq!(reply(id)["data"]["model"]["provider"], "together");
+        assert_eq!(reply(id)["data"]["model"]["id"], model, "{events:?}");
+    }
+    server.join().unwrap();
+}
+
+#[test]
 fn together_saved_retired_id_uses_the_configured_case_and_model_route() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(

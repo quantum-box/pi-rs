@@ -1109,6 +1109,76 @@ impl Cli {
             .as_deref()
             .map(|value| value.split(',').map(str::to_owned).collect())
             .unwrap_or_else(|| self.settings.strings("enabledModels"));
+        let fallback = self
+            .initial_selection
+            .clone()
+            .unwrap_or_else(|| InitialSelection {
+                provider: self.provider.clone(),
+                endpoint: self.endpoint.clone(),
+                model: self.model.clone(),
+            });
+        let configured = self.settings.string("defaultModel");
+        let configured_provider = self.settings.string("defaultProvider");
+        let qualified = configured
+            .filter(|_| configured_provider.is_none())
+            .and_then(|model| model_selection::qualified_model(model, &self.model_profiles));
+        let provider = self
+            .provider_argument
+            .as_deref()
+            .and_then(|name| self.model_profiles.provider(name))
+            .or_else(|| {
+                self.endpoint_explicit
+                    .then(|| {
+                        self.initial_connection
+                            .as_ref()
+                            .map(|(provider, _)| provider.clone())
+                    })
+                    .flatten()
+            })
+            .or_else(|| configured_provider.and_then(|name| self.model_profiles.provider(name)))
+            .or_else(|| qualified.as_ref().map(|(provider, _)| provider.clone()))
+            .unwrap_or_else(|| fallback.provider.clone());
+        let configured_for_provider = configured.filter(|_| {
+            (self.provider_argument.is_none() && !self.endpoint_explicit)
+                || configured_provider
+                    .and_then(|name| self.model_profiles.provider(name))
+                    .or_else(|| qualified.as_ref().map(|(candidate, _)| candidate.clone()))
+                    .unwrap_or_default()
+                    == provider
+        });
+        let configured_model = configured_for_provider.map(|value| {
+            let id = qualified
+                .as_ref()
+                .filter(|(candidate, _)| *candidate == provider)
+                .map_or(value, |(_, id)| *id);
+            if id != value
+                && model_selection::is_unconfigured_retired_builtin_model(
+                    &self.model_profiles,
+                    &provider,
+                    id,
+                )
+                && self.model_profiles.model(&provider, value).is_some()
+            {
+                value
+            } else {
+                id
+            }
+        });
+        let configured_model = configured_model.map(|id| {
+            model_selection::configured_retired_model_id(&self.model_profiles, &provider, id)
+                .unwrap_or(id)
+        });
+        // The saved ID can only be retired on a relay once its catalog has
+        // been checked, even if no scoped models need discovery.
+        let retired_relay_default = self.cli_selection.is_none()
+            && self.custom_together_endpoint(&provider)
+            && configured_model.is_some_and(|model| {
+                model_selection::is_unconfigured_retired_builtin_model(
+                    &self.model_profiles,
+                    &provider,
+                    model,
+                )
+            });
         let mut catalogs = model_selection::cached_catalogs(self);
         let workspace_changed = self.selection_workspace.as_ref().is_some_and(|cwd| {
             cwd != &self.workspace
@@ -1121,6 +1191,7 @@ impl Cli {
         if self.selection_discovery_pending || workspace_changed {
             let args = self.clone();
             let patterns = patterns.clone();
+            let retired_relay_provider = retired_relay_default.then(|| provider.clone());
             let discovered = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1146,7 +1217,9 @@ impl Cli {
                                 .settings
                                 .string("defaultProvider")
                                 .is_some_and(|id| id.eq_ignore_ascii_case(provider.id()));
-                        if (in_scope || needs_default)
+                        if (in_scope
+                            || needs_default
+                            || retired_relay_provider.as_ref() == Some(&provider))
                             && !selected.contains(&provider)
                             && args.allow_endpoint_probes(args.endpoint_for(&provider))
                         {
@@ -1213,65 +1286,6 @@ impl Cli {
         self.model_scope =
             model_selection::scoped_choices(patterns.iter().map(String::as_str), &catalogs).0;
 
-        let fallback = self
-            .initial_selection
-            .clone()
-            .unwrap_or_else(|| InitialSelection {
-                provider: self.provider.clone(),
-                endpoint: self.endpoint.clone(),
-                model: self.model.clone(),
-            });
-        let configured = self.settings.string("defaultModel");
-        let configured_provider = self.settings.string("defaultProvider");
-        let qualified = configured
-            .filter(|_| configured_provider.is_none())
-            .and_then(|model| model_selection::qualified_model(model, &self.model_profiles));
-        let provider = self
-            .provider_argument
-            .as_deref()
-            .and_then(|name| self.model_profiles.provider(name))
-            .or_else(|| {
-                self.endpoint_explicit
-                    .then(|| {
-                        self.initial_connection
-                            .as_ref()
-                            .map(|(provider, _)| provider.clone())
-                    })
-                    .flatten()
-            })
-            .or_else(|| configured_provider.and_then(|name| self.model_profiles.provider(name)))
-            .or_else(|| qualified.as_ref().map(|(provider, _)| provider.clone()))
-            .unwrap_or_else(|| fallback.provider.clone());
-        let configured_for_provider = configured.filter(|_| {
-            (self.provider_argument.is_none() && !self.endpoint_explicit)
-                || configured_provider
-                    .and_then(|name| self.model_profiles.provider(name))
-                    .or_else(|| qualified.as_ref().map(|(candidate, _)| candidate.clone()))
-                    .unwrap_or_default()
-                    == provider
-        });
-        let configured_model = configured_for_provider.map(|value| {
-            let id = qualified
-                .as_ref()
-                .filter(|(candidate, _)| *candidate == provider)
-                .map_or(value, |(_, id)| *id);
-            if id != value
-                && model_selection::is_unconfigured_retired_builtin_model(
-                    &self.model_profiles,
-                    &provider,
-                    id,
-                )
-                && self.model_profiles.model(&provider, value).is_some()
-            {
-                value
-            } else {
-                id
-            }
-        });
-        let configured_model = configured_model.map(|id| {
-            model_selection::configured_retired_model_id(&self.model_profiles, &provider, id)
-                .unwrap_or(id)
-        });
         let missing_retired_default =
             configured_model.is_some_and(|model| self.retired_model_is_missing(&provider, model));
         let custom_fallback = missing_retired_default
