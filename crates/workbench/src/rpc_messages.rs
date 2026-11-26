@@ -1475,6 +1475,115 @@ mod tests {
         assert_eq!(imported.current_messages().len(), 2);
     }
 
+    #[test]
+    fn repeated_native_omissions_follow_the_parent_branch_and_run() {
+        use super::super::rpc_entries::Entries;
+
+        let initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut records = initial.records().to_vec();
+        let run = Uuid::from_u128(1);
+        let other_run = Uuid::from_u128(2);
+        let request = Uuid::from_u128(3);
+        let newer_request = Uuid::from_u128(4);
+        let mut append = |run_id, event| {
+            let last = records.last().unwrap();
+            let id = last.id + 1;
+            let parent = match last.event {
+                Event::Checkout { target } => target,
+                _ => last.id,
+            };
+            records.push(Record {
+                id,
+                parent: Some(parent),
+                version: last.version,
+                timestamp: None,
+                run_id: Some(run_id),
+                event,
+            });
+            id
+        };
+        let marker = |format: &str, request_id| Event::SourceEntry {
+            format: format.into(),
+            entry: json!({"requestId":request_id}),
+        };
+        let failed = |request_id, text: &str| Event::ModelFinished {
+            request_id,
+            metadata: ModelMetadata::default(),
+            usage: UsageReport::Unconfirmed,
+            failure: Some(pi_rs::ModelFailure::Retryable),
+            partial: text.into(),
+            reply: None,
+        };
+        append(run, marker("pi-rs:failed-turn-partial", request));
+        let partial = append(run, failed(request, "original partial"));
+        let valid: Vec<_> = (0..2_048)
+            .map(|index| {
+                let format = if index % 2 == 0 {
+                    "pi-rs:retry-scheduled"
+                } else {
+                    "pi-rs:overflow-recovery"
+                };
+                append(run, marker(format, request))
+            })
+            .collect();
+
+        append(run, Event::Checkout { target: partial });
+        append(run, marker("pi-rs:failed-turn-partial", newer_request));
+        append(run, failed(newer_request, "newer partial"));
+        let stale = append(run, marker("pi-rs:retry-scheduled", request));
+
+        append(run, Event::Checkout { target: partial });
+        append(other_run, marker("fixture:run-boundary", request));
+        let fenced = append(run, marker("pi-rs:retry-scheduled", request));
+
+        append(run, Event::Checkout { target: partial });
+        let resumed = append(run, marker("pi-rs:retry-scheduled", request));
+        let mut session = Session::from_records(records).unwrap();
+        assert_eq!(session.last_assistant_text(), None);
+        assert!(snapshot(&session).0.is_empty());
+
+        let entries = Entries::new(&session).after(None).unwrap();
+        let edits: Vec<_> = entries["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["type"] == "context_edit")
+            .collect();
+        assert_eq!(edits.len(), valid.len() + 1);
+        for (edit, id) in edits.iter().zip(valid.iter().copied().chain([resumed])) {
+            assert_eq!(edit["id"], id.to_string());
+            assert_eq!(edit["targetId"], partial.to_string());
+            assert_eq!(edit[pi_rs::pi_import::SUPERSEDED_PARTIAL_FIELD], true);
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let share = Entries::new(&session)
+            .write_share_branch(&session, directory.path())
+            .unwrap();
+        let entry: Value = serde_json::from_slice(
+            share
+                .trim_ascii_end()
+                .rsplit(|byte| *byte == b'\n')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(entry["id"], resumed.to_string());
+        assert_eq!(entry["targetId"], partial.to_string());
+
+        session.checkout(*valid.last().unwrap()).unwrap();
+        assert_eq!(session.last_assistant_text(), None);
+        assert!(snapshot(&session).0.is_empty());
+        for (head, expected) in [(stale, "newer partial"), (fenced, "original partial")] {
+            session.checkout(head).unwrap();
+            assert_eq!(session.last_assistant_text().as_deref(), Some(expected));
+            assert_eq!(
+                snapshot(&session).0.last().unwrap()["content"][0]["text"],
+                expected
+            );
+        }
+    }
+
     fn assert_turn_partial(failure: pi_rs::ModelFailure, marker: &str, stop: &str) {
         let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
         initial

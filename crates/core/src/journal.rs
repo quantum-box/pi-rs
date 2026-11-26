@@ -17,6 +17,7 @@ mod assistant_transcript;
 pub(crate) use assistant_transcript::RETRY_SCHEDULED;
 pub use assistant_transcript::{
     AssistantTranscriptEntry, native_assistant_stop_reason, superseded_turn_partial,
+    superseded_turn_partial_with_completion,
 };
 
 pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
@@ -4878,8 +4879,35 @@ fn imported_assistant_source<'a>(
         .then_some((entry, completion))
 }
 
-/// Classify edits in branch order so each one can check the preceding
-/// completion without walking the same ancestors again.
+/// Carry the nearest preceding completion from the record's actual parent.
+/// `parent_completion` is the nearest completion strictly before `parent`.
+#[doc(hidden)]
+pub fn nearest_completion_before(
+    record: &Record,
+    parent: Option<&Record>,
+    parent_completion: Option<u64>,
+) -> Option<u64> {
+    let parent = parent
+        .filter(|parent| record.parent == Some(parent.id) && record.run_id == parent.run_id)?;
+    if matches!(parent.event, Event::ModelFinished { .. }) {
+        Some(parent.id)
+    } else {
+        parent_completion
+    }
+}
+
+fn branch_with_nearest_completion<'a, 'b>(
+    branch: &'b [&'a Record],
+) -> impl Iterator<Item = (&'a Record, Option<u64>)> + 'b {
+    let mut parent = None;
+    let mut completion = None;
+    branch.iter().copied().map(move |record| {
+        completion = nearest_completion_before(record, parent, completion);
+        parent = Some(record);
+        (record, completion)
+    })
+}
+
 fn branch_with_context_edits<'a, 'b>(
     branch: &'b [&'a Record],
 ) -> impl Iterator<Item = (&'a Record, bool)> + 'b {
@@ -4889,20 +4917,8 @@ fn branch_with_context_edits<'a, 'b>(
             .ok()
             .map(|index| branch[index])
     };
-    let mut previous: Option<&Record> = None;
-    let mut completion = None;
-    branch.iter().copied().map(move |record| {
-        if !previous.is_some_and(|parent| {
-            record.parent == Some(parent.id) && record.run_id == parent.run_id
-        }) {
-            completion = None;
-        }
-        let context_edit = is_model_context_edit(record, completion, lookup);
-        if matches!(record.event, Event::ModelFinished { .. }) {
-            completion = Some(record.id);
-        }
-        previous = Some(record);
-        (record, context_edit)
+    branch_with_nearest_completion(branch).map(move |(record, completion)| {
+        (record, is_model_context_edit(record, completion, lookup))
     })
 }
 

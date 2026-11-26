@@ -2,8 +2,9 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    Event, ModelFailure, Session, context_edits, is_ecmascript_whitespace,
-    nearest_model_completion, retained_message_floor, turn_partial_failure,
+    Event, ModelFailure, Record, Session, branch_with_nearest_completion, context_edits,
+    is_ecmascript_whitespace, nearest_model_completion, retained_message_floor,
+    turn_partial_failure,
 };
 use crate::{ContentBlock, ContextContent};
 
@@ -12,7 +13,29 @@ pub(crate) const RETRY_SCHEDULED: &str = "pi-rs:retry-scheduled";
 /// Resolve a retry or overflow marker to the marked turn partial it superseded.
 /// The nearest completion must match on the marker's own branch and run.
 #[doc(hidden)]
-pub fn superseded_turn_partial(records: &[super::Record], marker: &super::Record) -> Option<u64> {
+pub fn superseded_turn_partial(records: &[Record], marker: &Record) -> Option<u64> {
+    resolve_superseded_turn_partial(records, marker, || {
+        nearest_model_completion(marker, |id| records.get(id.checked_sub(1)? as usize))
+    })
+}
+
+/// Resolve a marker with the preceding completion computed by the branch traversal.
+#[doc(hidden)]
+pub fn superseded_turn_partial_with_completion(
+    records: &[Record],
+    marker: &Record,
+    nearest_completion: Option<u64>,
+) -> Option<u64> {
+    resolve_superseded_turn_partial(records, marker, || {
+        records.get(nearest_completion?.checked_sub(1)? as usize)
+    })
+}
+
+fn resolve_superseded_turn_partial<'a>(
+    records: &[Record],
+    marker: &Record,
+    completion: impl FnOnce() -> Option<&'a Record>,
+) -> Option<u64> {
     let Event::SourceEntry { format, entry } = &marker.event else {
         return None;
     };
@@ -20,8 +43,7 @@ pub fn superseded_turn_partial(records: &[super::Record], marker: &super::Record
         return None;
     }
     let request = uuid::Uuid::parse_str(entry["requestId"].as_str()?).ok()?;
-    let completion =
-        nearest_model_completion(marker, |id| records.get(id.checked_sub(1)? as usize))?;
+    let completion = completion()?;
     (matches!(completion.event, Event::ModelFinished { request_id, .. } if request_id == request)
         && turn_partial_failure(records, completion).is_some())
     .then_some(completion.id)
@@ -99,7 +121,7 @@ impl Session {
         let mut completions = BTreeMap::new();
         let mut assistant_requests = BTreeSet::new();
         let mut superseded = BTreeSet::new();
-        for record in &branch {
+        for (record, completion) in branch_with_nearest_completion(&branch) {
             match &record.event {
                 Event::ModelFinished {
                     request_id,
@@ -116,7 +138,11 @@ impl Session {
                     assistant_requests.insert(*id);
                 }
                 Event::SourceEntry { .. } => {
-                    superseded.extend(superseded_turn_partial(self.records(), record));
+                    superseded.extend(superseded_turn_partial_with_completion(
+                        self.records(),
+                        record,
+                        completion,
+                    ));
                 }
                 _ => {}
             }
