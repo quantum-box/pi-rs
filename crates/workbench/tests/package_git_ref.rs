@@ -256,6 +256,28 @@ fn installs_explicit_ref_and_preserves_legacy_at_sign_repository() {
     );
 }
 
+fn package_startup(workspace: &Path, home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    // Use print-mode startup with an empty prompt and an explicit local model.
+    // This reaches package preparation without model discovery or inference.
+    command
+        .current_dir(workspace)
+        .env("PI_RS_HOME", home)
+        .env_remove("PI_OFFLINE")
+        .args([
+            "--no-mcp",
+            "--no-session",
+            "--provider",
+            "ollama",
+            "--endpoint",
+            "http://127.0.0.1:9",
+            "--model",
+            "package-fixture",
+            "--print",
+        ]);
+    command
+}
+
 #[test]
 fn configured_git_userinfo_is_not_exposed_in_logs_or_list() {
     let directory = tempfile::tempdir().unwrap();
@@ -267,31 +289,22 @@ fn configured_git_userinfo_is_not_exposed_in_logs_or_list() {
         serde_json::json!({"packages":[source]}).to_string(),
     )
     .unwrap();
-    for offline in [false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
-        command
-            .current_dir(directory.path())
-            .env("PI_RS_HOME", &agent)
-            .env_remove("PI_OFFLINE")
-            .env_remove("GEMINI_API_KEY")
-            .env_remove("GOOGLE_API_KEY")
-            .env_remove("PI_RS_MODEL_TOKEN")
-            .args([
-                "--no-trust",
-                "--no-mcp",
-                "--no-extensions",
-                "--no-skills",
-                "--no-context-files",
-                "--provider",
-                "google",
-                "--model",
-                "gemini-2.5-flash",
-            ]);
+    // Online preparation requires trust. The synthetic credentials are rejected
+    // by the package layer before Git can contact the remote.
+    for (offline, trust) in [(false, "--trust"), (true, "--no-trust")] {
+        let mut command = package_startup(directory.path(), &agent);
+        command.args([
+            trust,
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+        ]);
         if offline {
             command.arg("--offline");
         }
-        let output = command.args(["--print", "hello"]).output().unwrap();
+        let output = command.output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
         assert!(
             stderr.contains(if offline {
                 "skipped in offline mode"
@@ -309,7 +322,11 @@ fn configured_git_userinfo_is_not_exposed_in_logs_or_list() {
                 && !stderr.contains(source),
             "{stderr}"
         );
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("topsecret"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("private-user") && !stdout.contains("topsecret"),
+            "{stdout}"
+        );
     }
     let output = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(directory.path())
@@ -356,6 +373,8 @@ fn configured_git_userinfo_is_not_exposed_in_logs_or_list() {
 #[test]
 fn malformed_remote_package_filter_is_reported_during_startup() {
     let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
     let repo = directory.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "--quiet"]);
@@ -367,7 +386,7 @@ fn malformed_remote_package_filter_is_reported_during_startup() {
     let url = reqwest::Url::from_directory_path(&repo).unwrap();
     let source = format!("git:{}", url.as_str().trim_end_matches('/'));
     let install = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .current_dir(directory.path())
+        .current_dir(&workspace)
         .env("PI_RS_HOME", &home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("PI_OFFLINE")
@@ -387,11 +406,8 @@ fn malformed_remote_package_filter_is_reported_during_startup() {
         .to_string(),
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .current_dir(directory.path())
-        .env("PI_RS_HOME", &home)
-        .env("PI_OFFLINE", "1")
-        .args(["--no-trust", "--no-mcp", "--print", "hello"])
+    let output = package_startup(&workspace, &home)
+        .args(["--no-trust", "--offline"])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -405,6 +421,8 @@ fn malformed_remote_package_filter_is_reported_during_startup() {
 #[test]
 fn invalid_remote_filters_follow_package_settings_order() {
     let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
     let home = directory.path().join("agent");
     let mut sources = Vec::new();
     for name in ["z", "a"] {
@@ -418,7 +436,7 @@ fn invalid_remote_filters_follow_package_settings_order() {
         let url = reqwest::Url::from_directory_path(&repo).unwrap();
         let source = format!("git:{}", url.as_str().trim_end_matches('/'));
         let install = Command::new(env!("CARGO_BIN_EXE_pi"))
-            .current_dir(directory.path())
+            .current_dir(&workspace)
             .env("PI_RS_HOME", &home)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("PI_OFFLINE")
@@ -433,7 +451,7 @@ fn invalid_remote_filters_follow_package_settings_order() {
         sources.push(source);
     }
     let listed = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .current_dir(directory.path())
+        .current_dir(&workspace)
         .env("PI_RS_HOME", &home)
         .args([
             "--no-trust",
@@ -469,11 +487,8 @@ fn invalid_remote_filters_follow_package_settings_order() {
             serde_json::json!({"packages": packages}).to_string(),
         )
         .unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
-            .current_dir(directory.path())
-            .env("PI_RS_HOME", &home)
-            .env("PI_OFFLINE", "1")
-            .args(["--no-trust", "--no-mcp", "--print", "hello"])
+        let output = package_startup(&workspace, &home)
+            .args(["--no-trust", "--offline"])
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -493,17 +508,14 @@ fn invalid_remote_filters_follow_package_settings_order() {
         .to_string(),
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .current_dir(directory.path())
-        .env("PI_RS_HOME", &home)
-        .env("PI_OFFLINE", "1")
-        .args(["--no-trust", "--no-mcp", "--print", "hello"])
+    let output = package_startup(&workspace, &home)
+        .args(["--no-trust", "--offline"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(stderr.contains("encoded"), "{stderr}");
-    let project = directory.path().join(".pi");
+    let project = workspace.join(".pi");
     std::fs::create_dir(&project).unwrap();
     std::fs::write(
         home.join("settings.json"),
@@ -518,7 +530,7 @@ fn invalid_remote_filters_follow_package_settings_order() {
     )
     .unwrap();
     let listed = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .current_dir(directory.path())
+        .current_dir(&workspace)
         .env("PI_RS_HOME", &home)
         .args(["--trust", "list"])
         .output()
@@ -547,11 +559,8 @@ fn invalid_remote_filters_follow_package_settings_order() {
             .collect::<Vec<_>>(),
         vec!["user", "project"]
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .current_dir(directory.path())
-        .env("PI_RS_HOME", &home)
-        .env("PI_OFFLINE", "1")
-        .args(["--trust", "--no-mcp", "--print", "hello"])
+    let output = package_startup(&workspace, &home)
+        .args(["--trust", "--offline"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -567,11 +576,8 @@ fn invalid_remote_filters_follow_package_settings_order() {
         .to_string(),
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .current_dir(directory.path())
-        .env("PI_RS_HOME", &home)
-        .env("PI_OFFLINE", "1")
-        .args(["--trust", "--no-mcp", "--print", "hello"])
+    let output = package_startup(&workspace, &home)
+        .args(["--trust", "--offline"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
