@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 const PREFIX: &[u8] = b"durable/observer/";
 pub(crate) const PROGRESS_HISTORY_PREFIX: &[u8] = b"durable/progress-history/";
+pub(crate) const TOOL_PROGRESS_EVENTS_PREFIX: &[u8] = b"durable/tool-progress-events/";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -114,7 +115,7 @@ impl<'a> Observer<'a> {
         Self {
             store,
             stream,
-            prefix: b"durable/tool-progress-events/",
+            prefix: TOOL_PROGRESS_EVENTS_PREFIX,
         }
     }
 

@@ -324,6 +324,15 @@ mod tests {
         .unwrap();
         snapshot.checks.extend(frame.checks);
         snapshot.mutations.extend(frame.mutations);
+        let observer = Observer::tool_progress(store, ordinary.attempt_id);
+        let attempt_event = observer
+            .prepare_append(&serde_json::json!({
+                "conversation_id":conversation,"attempt":ordinary,
+                "state":progress.state(),"partial_is_null":false
+            }))
+            .unwrap();
+        snapshot.checks.extend(attempt_event.checks);
+        snapshot.mutations.extend(attempt_event.mutations);
         store.commit(&snapshot.checks, &snapshot.mutations).unwrap();
 
         let task = Task::new(
@@ -357,15 +366,31 @@ mod tests {
         store.commit(&report.checks, &report.mutations).unwrap();
         let limit = NonZeroUsize::new(2).unwrap();
         let original = harness.progress_history(&start, limit).unwrap();
+        let original_attempt = harness
+            .tool_progress_events(ordinary.attempt_id, Cursor(0), limit)
+            .unwrap()
+            .records
+            .remove(0);
         let mut after = Vec::new();
+        let mut after_attempts = Vec::new();
         inline::sweep(store, &mut after, inline::Scope::Tools, 10, 20).unwrap();
+        inline::sweep_tool_attempts(store, &mut after_attempts, 10, 20).unwrap();
         assert_eq!(
             harness.progress_history(&start, limit).unwrap().records,
             original.records
         );
 
         let progress = tool_progress::Snapshot::load(store, ordinary.attempt_id).unwrap();
-        let checkpoint = progress.prepare_complete().unwrap();
+        let mut checkpoint = progress.prepare_complete().unwrap();
+        let terminal_event = observer
+            .prepare_append(&serde_json::json!({
+                "conversation_id":conversation,"attempt":ordinary,
+                "state":tool_progress::State::Completed,"partial_is_null":false,
+                "retained_partial":last
+            }))
+            .unwrap();
+        checkpoint.checks.extend(terminal_event.checks);
+        checkpoint.mutations.extend(terminal_event.mutations);
         store
             .commit(&checkpoint.checks, &checkpoint.mutations)
             .unwrap();
@@ -376,6 +401,31 @@ mod tests {
         );
         inline::sweep(store, &mut after, inline::Scope::Tools, 100, 20).unwrap();
         inline::sweep(store, &mut after, inline::Scope::Tools, 120, 20).unwrap();
+        inline::sweep_tool_attempts(store, &mut after_attempts, 100, 20).unwrap();
+        inline::sweep_tool_attempts(store, &mut after_attempts, 119, 20).unwrap();
+        assert_eq!(
+            harness
+                .tool_progress_events(ordinary.attempt_id, Cursor(0), limit)
+                .unwrap()
+                .records[0],
+            original_attempt
+        );
+        inline::sweep_tool_attempts(store, &mut after_attempts, 120, 20).unwrap();
+        let events = harness
+            .tool_progress_events(ordinary.attempt_id, Cursor(0), limit)
+            .unwrap();
+        assert_eq!(events.records[0].cursor, original_attempt.cursor);
+        assert_eq!(events.records[0].value["expired"], true);
+        assert_eq!(events.records[0].value["state"]["state"], "running");
+        assert_eq!(
+            serde_json::from_value::<tool_progress::State>(
+                events.records[0].value["state"].clone()
+            )
+            .unwrap(),
+            tool_progress::State::Running(None),
+        );
+        assert_eq!(events.records[1].value["retained_partial"], last);
+        assert_eq!(events.records[1].value["state"]["state"], "completed");
         let live = harness.progress_history(&start, limit).unwrap();
         assert_eq!(
             live.records[0].changes,

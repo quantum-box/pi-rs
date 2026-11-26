@@ -1355,7 +1355,7 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
     scheduler.shutdown().await.unwrap();
     let store = durable_store::Store::open(&path).unwrap();
     drop(store);
-    let reopened = Scheduler::open(&path, opts()).unwrap();
+    let mut reopened = Scheduler::open(&path, opts()).unwrap();
     assert!(
         reopened
             .tool_attempts(id, discovered.next, limit)
@@ -1432,6 +1432,38 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
             .records
             .is_empty()
     );
+    reopened
+        .start_inline_tool_progress_retention(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(5),
+        )
+        .unwrap();
+    let retired = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let page = reopened
+                .tool_progress_events(
+                    attempt.attempt_id,
+                    pi_rs_durable::observer::Cursor(0),
+                    std::num::NonZeroUsize::new(8).unwrap(),
+                )
+                .unwrap();
+            if page
+                .records
+                .iter()
+                .filter(|record| record.value["expired"] == true)
+                .count()
+                == 2
+            {
+                break page;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(retired.records[0].cursor, first.records[0].cursor);
+    assert_eq!(retired.records[1].cursor, second.records[0].cursor);
+    assert_eq!(retired.records[2], terminal.records[0]);
     reopened.shutdown().await.unwrap();
     let store = durable_store::Store::open(&path).unwrap();
     let snapshot =

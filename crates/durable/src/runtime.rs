@@ -14642,7 +14642,9 @@ impl Harness {
     }
 
     /// Poll committed replacement and terminal events for one attempt. Cursors
-    /// are exclusive and scoped to this attempt and database.
+    /// are exclusive and scoped to this attempt and database. The inline
+    /// retention opt-in exposes retired running reports with `expired: true`
+    /// and no partial at their original cursor.
     pub fn tool_progress_events(
         &self,
         attempt_id: Uuid,
@@ -25975,14 +25977,18 @@ impl Scheduler {
         let cancel = self.reporter_cancel.clone();
         *worker = Some(tokio::spawn(async move {
             let mut after = Vec::new();
+            let mut after_attempts = Vec::new();
             while !cancel.is_cancelled() {
-                inline::sweep(
-                    reader.owner.store(),
-                    &mut after,
-                    scope,
-                    unix_ms(),
-                    retain_ms,
-                )?;
+                let now = unix_ms();
+                inline::sweep(reader.owner.store(), &mut after, scope, now, retain_ms)?;
+                if matches!(scope, Scope::Tools) {
+                    inline::sweep_tool_attempts(
+                        reader.owner.store(),
+                        &mut after_attempts,
+                        now,
+                        retain_ms,
+                    )?;
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(interval) => (),

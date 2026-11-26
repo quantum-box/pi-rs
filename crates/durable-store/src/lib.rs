@@ -2610,29 +2610,17 @@ impl Store {
         observed_ms: Option<u64>,
         class: InlineProgressClass,
     ) -> Result<(), Error> {
-        let suffix = key
-            .strip_prefix(b"durable/progress-history/")
+        let attempt_stream = key.strip_prefix(b"durable/tool-progress-events/");
+        let suffix = attempt_stream
+            .or_else(|| key.strip_prefix(b"durable/progress-history/"))
             .filter(|suffix| suffix.len() == 26 && suffix[16..18] == *b"/r")
             .ok_or(Error::InvalidSnapshot)?;
-        let conversation =
-            uuid::Uuid::from_slice(&suffix[..16]).map_err(|_| Error::InvalidSnapshot)?;
-        if conversation.is_nil() || suffix[18..].iter().all(|byte| *byte == 0) {
+        let stream = uuid::Uuid::from_slice(&suffix[..16]).map_err(|_| Error::InvalidSnapshot)?;
+        if stream.is_nil() || suffix[18..].iter().all(|byte| *byte == 0) {
             return Err(Error::InvalidSnapshot);
         }
         let original: serde_json::Value =
             serde_json::from_slice(&frame.value).map_err(|_| Error::InvalidSnapshot)?;
-        let change = original["changes"]
-            .as_array()
-            .filter(|changes| changes.len() == 1)
-            .map(|changes| &changes[0])
-            .ok_or(Error::InvalidSnapshot)?;
-        if original["version"] != 1
-            || original["conversation"] != conversation.to_string()
-            || !original["generation"].is_null()
-            || !original["checkpointable"].is_null()
-        {
-            return Err(Error::InvalidSnapshot);
-        }
         let id = |value: &serde_json::Value| {
             value
                 .as_str()
@@ -2640,7 +2628,46 @@ impl Store {
                 .filter(|id| !id.is_nil())
                 .ok_or(Error::InvalidSnapshot)
         };
+        let change = if attempt_stream.is_some() {
+            if !matches!(class, InlineProgressClass::Tool)
+                || !original["expired"].is_null()
+                || !original["kind"].is_null()
+                || id(&original["attempt"]["attempt_id"])? != stream
+                || original["state"]["state"] != "running"
+            {
+                return Err(Error::InvalidSnapshot);
+            }
+            &original
+        } else {
+            if original["version"] != 1
+                || original["conversation"] != stream.to_string()
+                || !original["generation"].is_null()
+                || !original["checkpointable"].is_null()
+            {
+                return Err(Error::InvalidSnapshot);
+            }
+            original["changes"]
+                .as_array()
+                .filter(|changes| changes.len() == 1)
+                .map(|changes| &changes[0])
+                .ok_or(Error::InvalidSnapshot)?
+        };
         let (terminal_key, expiry, settled) = match (class, change["kind"].as_str()) {
+            (InlineProgressClass::Tool, None) if attempt_stream.is_some() => {
+                let operation = id(&change["attempt"]["operation_id"])?;
+                let conversation = id(&change["conversation_id"])?;
+                (
+                    format!("durable/tool-progress/{stream}").into_bytes(),
+                    serde_json::json!({
+                        "conversation_id":conversation,
+                        "attempt":{"attempt_id":stream,"operation_id":operation},
+                        "state":{"state":"running","partial":null},
+                        "partial_is_null":false,
+                        "expired":true
+                    }),
+                    progress_checkpoint_finished(&terminal.value)?,
+                )
+            }
             (InlineProgressClass::Generation, Some("generation"))
                 if change["state"]["state"] == "running" =>
             {
@@ -2707,12 +2734,12 @@ impl Store {
             .map_err(|_| Error::InvalidSnapshot)?;
             (Mutation::Put { key: marker, value }, None)
         } else {
-            let expiration = serde_json::to_vec(&serde_json::json!({
-                "version": 4,
-                "conversation": conversation,
-                "changes": [expiry]
-            }))
-            .map_err(|_| Error::InvalidSnapshot)?;
+            let expiration = if attempt_stream.is_some() {
+                expiry
+            } else {
+                serde_json::json!({"version":4,"conversation":stream,"changes":[expiry]})
+            };
+            let expiration = serde_json::to_vec(&expiration).map_err(|_| Error::InvalidSnapshot)?;
             (Mutation::Delete { key: marker }, Some(expiration))
         };
         self.commit_inner(
