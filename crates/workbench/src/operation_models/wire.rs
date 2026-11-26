@@ -195,7 +195,7 @@ pub(super) fn classifier_answers(questions: &Value, answers: &Value) -> Result<V
     Ok(json!(result))
 }
 
-pub(super) fn image_payload(entry: &Entry, context: &Value) -> Result<Value> {
+pub(super) fn image_payload(entry: &Entry, context: &Value, options: &Value) -> Result<Value> {
     let input = context["input"]
         .as_array()
         .filter(|items| !items.is_empty() && items.len() <= 64)
@@ -222,10 +222,22 @@ pub(super) fn image_payload(entry: &Entry, context: &Value) -> Result<Value> {
         .output
         .as_ref()
         .is_some_and(|types| types.iter().any(|kind| kind == "text"));
-    Ok(
-        json!({"model":entry.model.id,"messages":[{"role":"user","content":content}],"stream":false,
-        "modalities":if outputs_text { vec!["image","text"] } else { vec!["image"] }}),
-    )
+    let mut payload = json!({
+        "model":entry.model.id,"messages":[{"role":"user","content":content}],"stream":false,
+        "modalities":if outputs_text { vec!["image","text"] } else { vec!["image"] }
+    });
+    let image_config: Map<_, _> = [("aspectRatio", "aspect_ratio"), ("size", "image_size")]
+        .into_iter()
+        .filter_map(|(option, field)| {
+            options[option]
+                .as_str()
+                .map(|value| (field.into(), json!(value)))
+        })
+        .collect();
+    if !image_config.is_empty() {
+        payload["image_config"] = Value::Object(image_config);
+    }
+    Ok(payload)
 }
 
 pub(super) fn image_output(body: &Value, blocks: &mut Vec<Value>) -> Result<()> {

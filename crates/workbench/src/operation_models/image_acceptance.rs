@@ -12,12 +12,17 @@ use super::*;
 const WAIT: Duration = Duration::from_secs(10);
 const IMAGE: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jCUcAAAAASUVORK5CYII=";
-const GENERATE: &str = r#"
+fn generate(options: Option<&str>) -> String {
+    let options = options.map_or_else(String::new, |options| format!(", {options}"));
+    format!(
+        r#"
 const result = await models.generateImages(
-    {provider:"relay", id:"image-fixture", baseUrl:"http://127.0.0.1:1", headers:{authorization:"wrong"}},
-    {input:[{type:"text",text:"private fixture prompt"}]}
+    {{provider:"relay", id:"image-fixture", baseUrl:"http://127.0.0.1:1", headers:{{authorization:"wrong"}}}},
+    {{input:[{{type:"text",text:"private fixture prompt"}}]}}{options}
 );
-"#;
+"#
+    )
+}
 
 struct ImageHost {
     operations: Operations,
@@ -123,7 +128,7 @@ impl ToolHost for ImageHost {
     }
 }
 
-async fn receive(listener: &TcpListener) -> TcpStream {
+async fn receive(listener: &TcpListener, image_config: Option<Value>) -> TcpStream {
     let (mut socket, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
     let mut reader = BufReader::new(&mut socket);
     let mut line = String::new();
@@ -148,13 +153,14 @@ async fn receive(listener: &TcpListener) -> TcpStream {
     let mut body = vec![0; length.unwrap()];
     reader.read_exact(&mut body).await.unwrap();
     assert_eq!(authorization.as_deref(), Some("Bearer fixture-key"));
-    assert_eq!(
-        serde_json::from_slice::<Value>(&body).unwrap(),
-        json!({
-            "model":"image-fixture","stream":false,"modalities":["image","text"],
-            "messages":[{"role":"user","content":[{"type":"text","text":"private fixture prompt"}]}]
-        })
-    );
+    let mut expected = json!({
+        "model":"image-fixture","stream":false,"modalities":["image","text"],
+        "messages":[{"role":"user","content":[{"type":"text","text":"private fixture prompt"}]}]
+    });
+    if let Some(image_config) = image_config {
+        expected["image_config"] = image_config;
+    }
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), expected);
     socket
 }
 
@@ -187,18 +193,59 @@ async fn codemode_openrouter_image_loopback_acceptance() {
         return;
     }
 
-    for (response, expected) in [
-        ("HTTP/1.1 429 Fixture\r\nx-should-retry: true\r\nretry-after-ms: 0\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned(), "HTTP 429"),
-        (format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", RESPONSE_LIMIT + 1), "exceeds the size limit"),
+    let rejected_value = "HTTP/1.1 400 Fixture\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    for (options, image_config, response, expected) in [
+        (
+            None,
+            None,
+            concat!(
+                "HTTP/1.1 429 Fixture\r\nx-should-retry: true\r\n",
+                "retry-after-ms: 0\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .into(),
+            "HTTP 429",
+        ),
+        (
+            Some(r#"{aspectRatio:" 4:3 "}"#),
+            Some(json!({"aspect_ratio":"4:3"})),
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                RESPONSE_LIMIT + 1
+            ),
+            "exceeds the size limit",
+        ),
+        (
+            Some(r#"{size:" 1024x1536 "}"#),
+            Some(json!({"image_size":"1024x1536"})),
+            rejected_value.into(),
+            "HTTP 400",
+        ),
+        (Some("null"), None, rejected_value.into(), "HTTP 400"),
+        (
+            Some("{size:undefined}"),
+            None,
+            rejected_value.into(),
+            "HTTP 400",
+        ),
     ] {
         let (listener, host) = fixture().await;
         let server = tokio::spawn(async move {
-            let mut socket = receive(&listener).await;
+            let mut socket = receive(&listener, image_config).await;
             socket.write_all(response.as_bytes()).await.unwrap();
             drop(socket);
-            assert!(timeout(Duration::from_millis(200), listener.accept()).await.is_err());
+            assert!(
+                timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err()
+            );
         });
-        let reply = host.run(format!("{GENERATE} text(result.stopReason + ': ' + result.errorMessage);"), Default::default()).await;
+        let generate = generate(options);
+        let reply = host
+            .run(
+                format!("{generate} text(result.stopReason + ': ' + result.errorMessage);"),
+                Default::default(),
+            )
+            .await;
         assert!(!reply.outcome.is_error(), "{:?}", reply.outcome);
         let text = reply.outcome.tool_content();
         assert!(text.contains("error:") && text.contains(expected), "{text}");
@@ -211,7 +258,7 @@ async fn codemode_openrouter_image_loopback_acceptance() {
         let cancellation = CancellationToken::new();
         let cancel = cancellation.clone();
         let server = tokio::spawn(async move {
-            let mut socket = receive(&listener).await;
+            let mut socket = receive(&listener, abort.then(|| json!({"image_size":"1K"}))).await;
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1024\r\n\r\n{")
                 .await
@@ -230,7 +277,8 @@ async fn codemode_openrouter_image_loopback_acceptance() {
         } else {
             "// @options: {\"timeout_ms\":1000}\n"
         };
-        let reply = host.run(format!("{options}text('partial text'); store('discard', true); {GENERATE} text('unexpected completion');"), cancellation).await;
+        let generate = generate(abort.then_some(r#"{size:"1K"}"#));
+        let reply = host.run(format!("{options}text('partial text'); store('discard', true); {generate} text('unexpected completion');"), cancellation).await;
         assert!(reply.outcome.is_error(), "{:?}", reply.outcome);
         assert!(reply.state.is_none());
         let text = reply.outcome.tool_content();
@@ -247,7 +295,11 @@ async fn codemode_openrouter_image_loopback_acceptance() {
 
     let (listener, host) = fixture().await;
     let server = tokio::spawn(async move {
-        let mut socket = receive(&listener).await;
+        let mut socket = receive(
+            &listener,
+            Some(json!({"aspect_ratio":"16:9","image_size":"2K"})),
+        )
+        .await;
         let body = json!({"id":"loopback-image","choices":[{"message":{"content":"generated description","images":[
             {"image_url":{"url":format!("data:image/png;base64,{IMAGE}")}}
         ]}}],"usage":{"prompt_tokens":2,"completion_tokens":3}}).to_string();
@@ -262,7 +314,8 @@ async fn codemode_openrouter_image_loopback_acceptance() {
             .await
             .unwrap();
     });
-    let reply = host.run(format!("// @options: {{\"max_output_tokens\":0}}\n{GENERATE} text(result.output[0].text); image(result.output[1]);"), Default::default()).await;
+    let generate = generate(Some(r#"{aspectRatio:" 16:9 ", size:"2K"}"#));
+    let reply = host.run(format!("// @options: {{\"max_output_tokens\":0}}\n{generate} text(result.output[0].text); image(result.output[1]);"), Default::default()).await;
     let Outcome::Structured { data, .. } = reply.outcome else {
         panic!("expected structured image output")
     };

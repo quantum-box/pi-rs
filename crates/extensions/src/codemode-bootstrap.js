@@ -142,7 +142,28 @@
             throw new Error(`${name} context.input must be a non-empty array of text or image blocks`);
         }
     };
-    const modelOperation = async (action, model, context) => {
+    const checkImagesOptions = options => {
+        if (options == null) return undefined;
+        const fail = problem => {
+            throw new Error(`models.generateImages() ${problem}. Expected options: { aspectRatio?, size? }.`);
+        };
+        if (!record(options))
+            fail(`expects an options object as its third argument, got ${describeModelArg(options)}`);
+        const keys = Object.keys(options);
+        const unknown = keys.find(key => key !== "aspectRatio" && key !== "size");
+        if (unknown !== undefined) fail(`does not accept options.${unknown}`);
+        if (!keys.length) return undefined;
+        const checked = {};
+        for (const key of ["aspectRatio", "size"]) {
+            if (!Object.hasOwn(options, key)) continue;
+            const value = options[key];
+            if (typeof value !== "string" || !value.trim())
+                fail(`options.${key} must be a non-empty string, got ${describeModelArg(value)}`);
+            checked[key] = value.trim();
+        }
+        return checked;
+    };
+    const modelOperation = async (action, model, context, options) => {
         if (!record(model) || typeof model.provider !== "string" || typeof model.id !== "string")
             throw new Error(`models.${action}() expects a model with provider and id strings`);
         const { provider, id } = model;
@@ -150,8 +171,13 @@
         if (!resolved.ok) throw new Error(resolved.error);
         // Match the sandbox JSON boundary: holes, undefined and toJSON values
         // must be validated exactly as the host will receive them.
-        const argumentsJson = JSON.stringify({ action, provider, id, context });
-        validateContext(action, JSON.parse(argumentsJson).context);
+        let argumentsJson = JSON.stringify({ action, provider, id, context, options });
+        const args = JSON.parse(argumentsJson);
+        validateContext(action, args.context);
+        if (action === "generateImages" && Object.hasOwn(args, "options")) {
+            args.options = checkImagesOptions(args.options);
+            argumentsJson = JSON.stringify(args);
+        }
         const reply = JSON.parse(await callModel(argumentsJson));
         if (!reply.ok) throw new Error(reply.error);
         return reply.value;
@@ -167,7 +193,7 @@
             return (await listModels(false, true, kind, owner, modelId))[0];
         },
         classify: (model, context) => modelOperation("classify", model, context),
-        generateImages: (model, context) => modelOperation("generateImages", model, context),
+        generateImages: (model, context, options) => modelOperation("generateImages", model, context, options),
     });
     const exitToken = Symbol("exit");
     globalThis.exit = () => { throw exitToken; };
