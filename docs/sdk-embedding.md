@@ -168,6 +168,29 @@ credential, and network policies. The SDK's session state is not a sandbox.
 See [Tauri's state guide](https://v2.tauri.app/develop/state-management/) and
 [command guide](https://v2.tauri.app/develop/calling-rust/).
 
+## Native HTML export
+
+Use `pi_rs_workbench::session_html::export_agent_session(&session, &path)`
+from the native host to export the selected branch. The host chooses the
+destination, for example through a native save dialog in a Tauri command.
+Both disk-backed and in-memory sessions use the CLI and RPC renderer. Export
+is synchronous and reports a busy journal through the usual SDK error.
+
+For a shared `Session`, `session_html::render(&journal)` returns the document
+without filesystem access. `session_html::export(&journal, &path, Some(&source))`
+atomically writes the document and rejects destinations that refer to the
+source journal. Supply the source path for host-managed file stores and
+imported snapshots. Exports without a known source create a new file without
+replacing an existing destination. The destination's parent must already exist.
+
+Pi's SDK chooses a default output filename, supports a theme override, and
+uses extension tool HTML renderers. The native SDK export requires an explicit
+path and uses the Workbench's fixed style and built-in tool formatting. It
+exports the journal's selected branch, with escaped Markdown and a restrictive
+content security policy. Browser WASM hosts can request export from a native
+backend. The Workbench exporter adds no filesystem API to Core or the browser
+SDK. [Pinned Pi SDK export](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4462-L4486)
+
 ## Browser WASM status
 
 The standalone `pi-rs-tool-arguments` crate isolates complete tool-argument

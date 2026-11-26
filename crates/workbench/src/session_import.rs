@@ -515,7 +515,6 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
     }
     Session::from_records_with_metadata(importer.records, compaction_metadata)
 }
-pub(super) use pi_rs::pi_import::imported_custom_message;
 
 #[cfg(test)]
 mod tests {

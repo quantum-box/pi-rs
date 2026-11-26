@@ -528,6 +528,28 @@ pub fn format_skill_invocation(name: &str, path: &Path, body: &str, arguments: &
     text
 }
 
+#[doc(hidden)]
+pub fn skill_invocation(text: &str) -> Option<(&str, &str, Option<&str>)> {
+    static BLOCK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let captures = BLOCK
+        .get_or_init(|| {
+            regex::Regex::new(
+                r#"(?s)\A<skill name="([^"]+)" location="[^"]+">\n(.*?)\n</skill>(?:\n\n(.+))?\z"#,
+            )
+            .expect("Pi skill invocation block")
+        })
+        .captures(text)?;
+    let message = captures
+        .get(3)
+        .map(|text| text.as_str().trim_matches(is_js_space))
+        .filter(|text| !text.is_empty());
+    Some((
+        captures.get(1)?.as_str(),
+        captures.get(2)?.as_str(),
+        message,
+    ))
+}
+
 fn is_js_space(ch: char) -> bool {
     (ch.is_whitespace() && ch != '\u{0085}') || ch == '\u{feff}'
 }

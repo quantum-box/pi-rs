@@ -53,6 +53,7 @@ pub mod process_cleanup;
 pub mod prompt_resources;
 pub mod prompt_template_arguments;
 pub mod resource_factory;
+pub mod session_html;
 mod shell_config;
 mod shell_output;
 pub mod skill_resources;
