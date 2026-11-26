@@ -214,10 +214,7 @@ pub(super) async fn run(
         .filter(|input| !matches!(input.status, Status::Queued | Status::Running))
         .map(|input| input.id)
         .collect();
-    let mut watching = state
-        .submissions
-        .iter()
-        .any(|input| matches!(input.status, Status::Queued | Status::Running));
+    let mut watching = state.has_runnable_input();
     if watching {
         scheduler.schedule(id);
     }
@@ -300,11 +297,13 @@ async fn respond(
     };
     let command = request["type"].as_str().unwrap_or_default();
     let mut admitted = false;
+    let mut staged_run_start = None;
     let result = match command {
         "prompt" | "steer" | "follow_up" => {
             let state = prepare_input_adapter(scheduler, id, has_image_adapter)
                 .map_err(io::Error::other)?;
             publish_turns(&state, active, seen, None, true, None)?;
+            let idle_queue = command != "prompt" && !state.input_run_active();
             let mut result = submit_input(scheduler, &state, command, &request, false).await;
             if matches!(result, Err(Error::Admission(AdmissionError::Idle)))
                 && state.input_run_active()
@@ -316,10 +315,16 @@ async fn respond(
                     .map_err(io::Error::other)?;
                 publish_turns(&settled, active, seen, None, true, None)?;
                 result = submit_input(scheduler, &settled, command, &request, true)
-                    .await.map(|_| false);
+                    .await.map(|(id, _)| (id, false));
             }
-            result.map_err(|error| error.to_string()).map(|started| {
-                admitted = true;
+            result.map_err(|error| error.to_string()).map(|(submission, started)| {
+                admitted = !idle_queue;
+                if started
+                    && !state.has_runnable_input()
+                    && state.submissions.iter().any(|input| input.status == Status::Queued)
+                {
+                    staged_run_start = Some(submission);
+                }
                 Some(json!({"disposition": if started { "started" } else { "queued" }}))
             })
         },
@@ -377,6 +382,20 @@ async fn respond(
         _ => Err("unsupported durable RPC command".into()),
     };
     reply(&request, result)?;
+    if let Some(submission) = staged_run_start {
+        // Idle staged inputs precede the new prompt in admission order, but the
+        // prompt plays first. Open its event stream before polling both results.
+        let state = scheduler.conversation(id).map_err(io::Error::other)?;
+        if active.is_none()
+            && let Some(input) = state
+                .submissions
+                .iter()
+                .find(|input| input.id == submission && input.status != Status::Queued)
+        {
+            seen.insert(submission);
+            *active = Some(Turn::start(input)?);
+        }
+    }
     Ok(admitted)
 }
 
@@ -399,7 +418,7 @@ async fn submit_input(
     command: &str,
     request: &Value,
     continue_after_settlement: bool,
-) -> Result<bool, Error> {
+) -> Result<(Uuid, bool), Error> {
     let attachments = match request.get("images") {
         Some(value) => value
             .as_array()
@@ -424,6 +443,7 @@ async fn submit_input(
     };
     let running = state.input_run_active();
     let queued = command != "prompt" || running;
+    let hold = command != "prompt" && !running && !continue_after_settlement;
     if queued && behavior.is_none() {
         return Err(Error::Invalid(
             "a running prompt needs streamingBehavior".into(),
@@ -436,7 +456,11 @@ async fn submit_input(
         on_abort: OnAbort::Keep,
     };
     let submission = if attachments.is_empty() {
-        scheduler.submit_with_options(state.id, None, message.to_owned(), options)
+        if hold {
+            scheduler.stage_input(state.id, message.to_owned(), options.mode)
+        } else {
+            scheduler.submit_with_options(state.id, None, message.to_owned(), options)
+        }
     } else {
         if attachments.iter().any(|image| {
             image["type"] != "image" || !image["data"].is_string() || !image["mimeType"].is_string()
@@ -448,19 +472,21 @@ async fn submit_input(
         let mut blocks = vec![json!({"type": "text", "text": message})];
         blocks.extend_from_slice(attachments);
         let admission = UserImageAdmission::new(Arc::new(BuiltinImageProcessor));
-        scheduler
-            .submit_fitted_user_blocks_with_options(
-                state.id,
-                None,
-                blocks,
-                &admission,
-                options,
-                &CancellationToken::default(),
-            )
-            .await
-            .map(|input| input.submission_id)
+        let cancel = CancellationToken::default();
+        let fitted = if hold {
+            scheduler
+                .stage_fitted_user_blocks(state.id, blocks, &admission, options.mode, &cancel)
+                .await
+        } else {
+            scheduler
+                .submit_fitted_user_blocks_with_options(
+                    state.id, None, blocks, &admission, options, &cancel,
+                )
+                .await
+        };
+        fitted.map(|input| input.submission_id)
     };
-    submission.map(|_| !queued)
+    submission.map(|id| (id, !queued))
 }
 
 fn set_queue_mode(

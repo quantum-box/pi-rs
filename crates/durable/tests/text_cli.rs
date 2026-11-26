@@ -35,6 +35,8 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             "new prompt answer",
             "transient rate limit",
             "image prompt answer",
+            "idle queue start answer",
+            "staged image answer",
         ]
         .into_iter()
         .enumerate()
@@ -479,18 +481,73 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     )
     .unwrap();
     drop(stdin);
-    let frames = frames(rpc.wait_with_output().unwrap());
-    let saved = frames[0]["data"]["messages"].as_array().unwrap();
+    let image_frames = frames(rpc.wait_with_output().unwrap());
+    let saved = image_frames[0]["data"]["messages"].as_array().unwrap();
     assert!(saved.iter().any(|entry| {
         entry["content"][0]["text"] == "deliver after base" && entry["content"][1] == image
     }));
-    assert_eq!(frames[1]["data"]["disposition"], "started");
-    let end = frames.last().unwrap();
+    assert_eq!(image_frames[1]["data"]["disposition"], "started");
+    let end = image_frames.last().unwrap();
     assert_eq!(end["messages"][0]["content"][1], image);
     assert_eq!(
         end["messages"][1]["content"][0]["text"],
         "image prompt answer"
     );
+
+    let rpc_batch = |requests: &[Value]| {
+        let mut process = command(&endpoint, &["--conversation", id, "--rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = process.stdin.take().unwrap();
+        for request in requests {
+            writeln!(stdin, "{request}").unwrap();
+        }
+        drop(stdin);
+        frames(process.wait_with_output().unwrap())
+    };
+    let staged = rpc_batch(&[
+        json!({"type":"steer", "message":"idle steer", "id":"steer"}),
+        json!({"type":"follow_up", "message":"withdraw idle", "id":"withdraw"}),
+        json!({"type":"clear_queue", "id":"clear"}),
+        json!({"type":"steer", "message":"steer before first model", "id":"kept-steer"}),
+        json!({"type":"follow_up", "message":"idle image", "images":[image], "id":"image"}),
+        json!({"type":"get_state", "id":"state"}),
+    ]);
+    assert_eq!(staged.len(), 6, "staging must not emit model events");
+    assert_eq!(staged[0]["data"]["disposition"], "queued");
+    assert_eq!(staged[1]["data"]["disposition"], "queued");
+    assert_eq!(
+        staged[2]["data"],
+        json!({"steering":["idle steer"], "followUp":["withdraw idle"]})
+    );
+    assert_eq!(staged[3]["data"]["disposition"], "queued");
+    assert_eq!(staged[4]["data"]["disposition"], "queued");
+    assert_eq!(staged[5]["data"]["isStreaming"], false);
+    assert_eq!(staged[5]["data"]["pendingMessageCount"], 2);
+
+    let reopened = rpc_batch(&[json!({"type":"get_state"})]);
+    assert_eq!(reopened.len(), 1, "reopen must not emit model events");
+    assert_eq!(reopened[0]["data"]["pendingMessageCount"], 2);
+    assert_eq!(reopened[0]["data"]["isStreaming"], false);
+
+    let released = rpc_batch(&[json!({"type":"prompt", "message":"start idle queue"})]);
+    assert_eq!(released[0]["data"]["disposition"], "started");
+    let users: Vec<_> = released
+        .iter()
+        .filter_map(|frame| {
+            let message = &frame["message"];
+            (frame["type"] == "message_end" && message["role"] == "user")
+                .then_some(&message["content"])
+        })
+        .collect();
+    assert_eq!(users.len(), 3);
+    assert_eq!(users[0][0]["text"], "start idle queue");
+    assert_eq!(users[1][0]["text"], "steer before first model");
+    assert_eq!(users[2][0]["text"], "idle image");
+    assert_eq!(users[2][1], image);
 
     let bodies = worker.join().unwrap();
     assert_eq!(bodies[0]["model"], "fixture");
@@ -525,6 +582,13 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         }));
     }
     assert_eq!(bodies[12]["model"], "fixture");
+    let started = bodies[14]["input"].to_string();
+    assert!(started.contains("start idle queue"));
+    assert!(started.contains("steer before first model"));
+    assert!(!started.contains("idle image"));
+    let follow_up = bodies[15]["input"].to_string();
+    assert!(follow_up.contains("idle image"));
+    assert!(!follow_up.contains("withdraw idle"));
 }
 
 fn frames(output: Output) -> Vec<Value> {
