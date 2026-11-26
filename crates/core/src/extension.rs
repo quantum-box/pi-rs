@@ -44,7 +44,7 @@ struct BranchModels {
 }
 
 type ReservedBranchModel = (Uuid, String, String);
-struct BranchModelReservation {
+pub(crate) struct BranchModelReservation {
     reserved: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
     key: ReservedBranchModel,
 }
@@ -2560,12 +2560,20 @@ impl Registry {
         )
     }
 
-    /// Reserve the entire session while startup commits and installs its
-    /// complete staged model set. A concurrent revocation wins as a unit.
-    /// A supplied cycle list replaces this session's cache, including when empty.
+    /// Reserve startup bindings before calling host resolvers. The reservation
+    /// remains active across authorization without holding the registry locks.
+    pub(crate) fn reserve_startup_model_bindings(
+        &self,
+        session: Uuid,
+    ) -> Result<BranchModelReservation> {
+        self.reserve_session_models(session, || Ok(()))
+    }
+
+    /// Publish the staged startup bindings together. A supplied cycle list
+    /// replaces this session's cache, including when empty.
     pub(crate) fn commit_session_model_bindings<T>(
         &self,
-        session_id: Uuid,
+        reservation: &BranchModelReservation,
         bindings: Vec<(Option<String>, String, Arc<dyn crate::Model>)>,
         guarded: Option<(&str, &str, &Arc<dyn crate::Model>)>,
         refreshed_cycles: Option<&[(crate::journal::CycledModelSelection, Arc<dyn crate::Model>)]>,
@@ -2576,47 +2584,41 @@ impl Registry {
         }) {
             return Err(Error::Config("provider or model name is empty".into()));
         }
-        self.commit_reserved_session_models(
-            session_id,
-            || {
-                if let Some((provider, name, client)) = guarded
-                    && self
-                        .branch_models
-                        .read()
-                        .expect("branch models")
-                        .named
-                        .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
-                        .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, client))
-                {
-                    return Err(Error::Config(format!(
-                        "model client changed while resolving {provider}/{name}"
-                    )));
+        let session_id = reservation.key.0;
+        if let Some((provider, name, client)) = guarded
+            && self
+                .branch_models
+                .read()
+                .expect("branch models")
+                .named
+                .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
+                .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, client))
+        {
+            return Err(Error::Config(format!(
+                "model client changed while resolving {provider}/{name}"
+            )));
+        }
+        self.commit_model_reservation(reservation, commit, || {
+            let mut models = self.branch_models.write().expect("branch models");
+            if let Some(refreshed) = refreshed_cycles {
+                models.cycled.retain(|(owner, _), _| *owner != session_id);
+                models.cycled.extend(
+                    refreshed.iter().map(|(selection, client)| {
+                        ((session_id, selection.clone()), client.clone())
+                    }),
+                );
+            }
+            for (provider, name, client) in bindings {
+                let guarded_binding =
+                    guarded.is_some_and(|(p, n, _)| provider.as_deref() == Some(p) && name == n);
+                let key = (Some(session_id), provider, name);
+                if guarded_binding {
+                    models.named.entry(key).or_insert((client, None));
+                } else {
+                    models.named.insert(key, (client, None));
                 }
-                Ok(())
-            },
-            commit,
-            || {
-                let mut models = self.branch_models.write().expect("branch models");
-                if let Some(refreshed) = refreshed_cycles {
-                    models.cycled.retain(|(owner, _), _| *owner != session_id);
-                    models
-                        .cycled
-                        .extend(refreshed.iter().map(|(selection, client)| {
-                            ((session_id, selection.clone()), client.clone())
-                        }));
-                }
-                for (provider, name, client) in bindings {
-                    let guarded_binding = guarded
-                        .is_some_and(|(p, n, _)| provider.as_deref() == Some(p) && name == n);
-                    let key = (Some(session_id), provider, name);
-                    if guarded_binding {
-                        models.named.entry(key).or_insert((client, None));
-                    } else {
-                        models.named.insert(key, (client, None));
-                    }
-                }
-            },
-        )
+            }
+        })
     }
 
     fn commit_reserved_session_models<T>(
@@ -2626,22 +2628,37 @@ impl Registry {
         commit: impl FnOnce() -> Result<T>,
         install: impl FnOnce(),
     ) -> Result<(T, bool)> {
+        let reservation = self.reserve_session_models(session, validate)?;
+        self.commit_model_reservation(&reservation, commit, install)
+    }
+
+    fn reserve_session_models(
+        &self,
+        session: Uuid,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<BranchModelReservation> {
         let key = (session, String::new(), String::new());
-        {
-            let mut reservations = self
-                .branch_reservations
-                .write()
-                .expect("branch reservations");
-            if reservations.keys().any(|(owner, _, _)| *owner == session) {
-                return Err(Error::Config("session models are being resolved".into()));
-            }
-            validate()?;
-            reservations.insert(key.clone(), false);
+        let mut reservations = self
+            .branch_reservations
+            .write()
+            .expect("branch reservations");
+        if reservations.keys().any(|(owner, _, _)| *owner == session) {
+            return Err(Error::Config("session models are being resolved".into()));
         }
-        let reservation = BranchModelReservation {
+        validate()?;
+        reservations.insert(key.clone(), false);
+        Ok(BranchModelReservation {
             reserved: self.branch_reservations.clone(),
             key,
-        };
+        })
+    }
+
+    fn commit_model_reservation<T>(
+        &self,
+        reservation: &BranchModelReservation,
+        commit: impl FnOnce() -> Result<T>,
+        install: impl FnOnce(),
+    ) -> Result<(T, bool)> {
         let result = commit()?;
         let reservations = self
             .branch_reservations

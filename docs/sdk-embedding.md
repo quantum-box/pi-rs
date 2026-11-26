@@ -102,8 +102,9 @@ exact provider, model, and recorded thinking level. The host applies its normal
 credential and capability policy. If it cannot supply that exact client, the
 SDK leaves the selection unresolved and cannot dispatch requests with it.
 On reopen, a configured cycle resolver reauthorizes the active SDK binding,
-even when the supplied registry has cached clients for the journal. Other
-cycled bindings are resolved when their branches are selected. A malformed or
+even when the supplied registry has cached clients for the journal. It also
+reauthorizes the bindings needed to resume pending tree triggers. Other cycled
+bindings are resolved when their branches are selected. A malformed or
 incomplete SDK binding on the active selection causes reopen to fail.
 Explicit SDK model setters keep their existing identity-based behavior.
 

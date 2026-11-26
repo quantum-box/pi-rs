@@ -2485,10 +2485,18 @@ impl Session {
 
     /// Find a callback-triggered run that has not started or was interrupted.
     pub fn pending_custom_trigger(&self) -> Option<Uuid> {
-        let branch = self.branch();
+        self.pending_custom_triggers(true).next()
+    }
+
+    fn pending_custom_triggers(&self, include_branch: bool) -> impl Iterator<Item = Uuid> + '_ {
+        let branch = if include_branch {
+            self.branch()
+        } else {
+            Vec::new()
+        };
         let branch_ids: std::collections::HashSet<_> =
             branch.iter().map(|record| record.id).collect();
-        self.records.iter().find_map(|record| {
+        self.records.iter().filter_map(move |record| {
             let (input, global) = match &record.event {
                 Event::CustomMessageQueued { input } if branch_ids.contains(&record.id) => (input, false),
                 Event::TreeMessageQueued { input } => (input, true),
@@ -2511,6 +2519,22 @@ impl Session {
         })
     }
 
+    fn tree_trigger_run_head(&self, run_id: Uuid) -> Option<u64> {
+        self.records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.run_id == Some(run_id) && !matches!(record.event, Event::Checkout { .. })
+            })
+            .map(|record| record.id)
+    }
+
+    /// Branches with recorded work that startup may resume in a tree handoff.
+    pub(crate) fn pending_tree_trigger_heads(&self) -> impl Iterator<Item = u64> + '_ {
+        self.pending_custom_triggers(false)
+            .filter_map(|id| self.tree_trigger_run_head(id))
+    }
+
     /// Restore the branch that owns an interrupted session-wide tree trigger.
     /// The current branch must be settled; the destination may contain the
     /// pending operation that recovery is about to reconcile.
@@ -2523,15 +2547,7 @@ impl Session {
         if !is_tree_trigger || self.pending_custom_trigger() != Some(run_id) {
             return Ok(None);
         }
-        let Some(target) = self
-            .records
-            .iter()
-            .rev()
-            .find(|record| {
-                record.run_id == Some(run_id) && !matches!(record.event, Event::Checkout { .. })
-            })
-            .map(|record| record.id)
-        else {
+        let Some(target) = self.tree_trigger_run_head(run_id) else {
             return Ok(None);
         };
         if self.head == target {

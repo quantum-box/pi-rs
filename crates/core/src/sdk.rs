@@ -1455,6 +1455,9 @@ impl SessionBuilder {
         if self.model_name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
         }
+        let reservation = self
+            .registry
+            .reserve_startup_model_bindings(session.session_id())?;
         // Session::open already recovers interrupted handoffs, but callers can
         // also supply a custom store whose temporary branch is still checked out.
         crate::extension_boundary::repair_plan_on_open(&mut session)?;
@@ -1466,15 +1469,26 @@ impl SessionBuilder {
         let mut resolved = None;
         let mut model_fallback = None;
         let cycled = session.cycled_model_at(session.head())?;
-        // A new owner with an explicit policy reauthorizes the selected binding.
-        // Historical bindings will be resolved on demand during branch transitions.
-        let refreshed_cycle = match &cycled {
-            Some(selection) => {
-                resolve_cycled_client(self.cycled_model_resolver.as_deref(), selection)?
-                    .map(|client| (selection.clone(), client))
+        let mut refreshed_cycles = Vec::new();
+        if let Some(resolve) = self.cycled_model_resolver.as_deref() {
+            // A new owner reauthorizes its selected binding and any distinct
+            // binding startup needs to resume an interrupted tree trigger.
+            let mut required_cycles = cycled.as_slice().to_vec();
+            for target in session.pending_tree_trigger_heads() {
+                if let Some(selection) = session.cycled_model_at(target)?
+                    && !required_cycles.contains(&selection)
+                {
+                    required_cycles.push(selection);
+                }
             }
-            None => None,
-        };
+            for selection in required_cycles {
+                if let Some(client) =
+                    resolve(&selection.provider, &selection.model, &selection.thinking)?
+                {
+                    refreshed_cycles.push((selection, client));
+                }
+            }
+        }
         if cycled.is_none()
             && let Some(resolver) = &self.historical_model_resolver
             && let Some((Some(provider), name, _)) = session.model_identity_at(session.head())
@@ -1509,8 +1523,8 @@ impl SessionBuilder {
                 HistoricalModelResolution::Unavailable => {}
             }
         }
-        // Stage every builder binding and reserve the session before any write.
-        // The fallback identity must not replace a different opaque client.
+        // Stage every builder binding before publishing. The fallback
+        // identity must not replace a different opaque client.
         if let Some((provider, name, client)) = &resolved {
             let same_default = self.model_provider.as_deref() == Some(provider.as_str())
                 && self.model_name == *name;
@@ -1548,12 +1562,12 @@ impl SessionBuilder {
         // historical selections (including unqualified ones) untouched.
         let initial_selection = session.model_identity_at(session.head()).is_none();
         let (_, revoked) = self.registry.commit_session_model_bindings(
-            session.session_id(),
+            &reservation,
             bindings,
             guarded,
             self.cycled_model_resolver
                 .is_some()
-                .then_some(refreshed_cycle.as_slice()),
+                .then_some(refreshed_cycles.as_slice()),
             || {
                 if let (Some((provider, name, _)), Some(_)) = (&resolved, &model_fallback) {
                     session.select_provider_model_atomic(provider, name)?;
@@ -1563,12 +1577,13 @@ impl SessionBuilder {
                 Ok(())
             },
         )?;
+        drop(reservation);
         if let Some((provider, name, client)) = resolved {
             self.model = client;
             self.model_name = name;
             self.model_provider = Some(provider);
         }
-        if revoked && refreshed_cycle.is_some() {
+        if revoked && !refreshed_cycles.is_empty() {
             return Err(Error::Config(
                 "cycled model client was revoked during open".into(),
             ));
@@ -5542,6 +5557,216 @@ mod tests {
         assert_eq!(refused.journal().unwrap().head(), before);
     }
 
+    #[test]
+    fn sdk_model_cycle_reopen_honors_revocation_inside_resolver() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        let selection = CycledModelSelection {
+            id: Uuid::new_v4(),
+            provider: "provider".into(),
+            model: "shared".into(),
+            thinking: "high".into(),
+        };
+        journal.select_cycled_model(&selection).unwrap();
+        let session_id = journal.session_id();
+        drop(journal);
+
+        let registry = Registry::default();
+        let stale = Arc::new(ProviderBranchModel("stale"));
+        registry
+            .register_session_provider_model(session_id, "provider", "shared", stale.clone())
+            .unwrap();
+        registry
+            .commit_cycled_model(session_id, &selection, stale, false, || Ok(()))
+            .unwrap();
+        let resolver_registry = registry.clone();
+        let result = SessionBuilder::new(Arc::new(ProviderBranchModel("generic")), "shared")
+            .provider("provider")
+            .unwrap()
+            .registry(registry.clone())
+            .cycled_model_resolver(move |provider, model, level| {
+                assert_eq!((provider, model, level), ("provider", "shared", "high"));
+                resolver_registry.remove_session_branch_models(session_id);
+                assert!(
+                    resolver_registry
+                        .register_session_provider_model(
+                            session_id,
+                            provider,
+                            model,
+                            Arc::new(ProviderBranchModel("racing"))
+                        )
+                        .is_err()
+                );
+                Ok(Some(Arc::new(ProviderBranchModel(
+                    "authorized before revocation",
+                ))))
+            })
+            .open(&path);
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("revoked during open"))
+        );
+        assert!(
+            registry
+                .provider_branch_config(session_id, "provider", "shared")
+                .is_none()
+        );
+        assert!(registry.cycled_model(session_id, &selection).is_none());
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_reopen_authorizes_pending_tree_handoff_atomically() {
+        for outcome in [
+            "resolver error",
+            "refused",
+            "revoked before start",
+            "authorized",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            let mut journal = Session::open(&path).unwrap();
+            let origin = CycledModelSelection {
+                id: Uuid::new_v4(),
+                provider: "provider".into(),
+                model: "shared".into(),
+                thinking: "high".into(),
+            };
+            let selected = CycledModelSelection {
+                id: Uuid::new_v4(),
+                thinking: "low".into(),
+                ..origin.clone()
+            };
+            journal.select_cycled_model(&origin).unwrap();
+            let id = Uuid::new_v4();
+            let message = crate::CustomMessage {
+                custom_type: "tree-trigger".into(),
+                content: crate::ContextContent::Text("pending trigger".into()),
+                display: true,
+                details: None,
+            };
+            journal
+                .append(crate::Event::TreeMessageQueued {
+                    input: crate::QueuedCustomMessage {
+                        id,
+                        message: message.clone(),
+                        delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    },
+                })
+                .unwrap();
+            journal.set_run_id(Some(id));
+            journal
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: None,
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::CustomMessageDelivered { id, message })
+                .unwrap();
+            journal.set_run_id(None);
+            journal.checkout(1).unwrap();
+            journal.select_cycled_model(&selected).unwrap();
+            let return_to = journal.head();
+            journal.begin_tree_trigger_handoff(id).unwrap().unwrap();
+            let session_id = journal.session_id();
+            drop(journal);
+
+            let registry = Registry::default();
+            let stale: Arc<dyn Model> = Arc::new(ProviderBranchModel("stale"));
+            registry
+                .register_session_provider_model(session_id, "provider", "shared", stale.clone())
+                .unwrap();
+            for selection in [&selected, &origin] {
+                registry
+                    .commit_cycled_model(session_id, selection, stale.clone(), false, || Ok(()))
+                    .unwrap();
+            }
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let seen = calls.clone();
+            let reopened = SessionBuilder::new(Arc::new(ProviderBranchModel("generic")), "shared")
+                .provider("provider")
+                .unwrap()
+                .registry(registry.clone())
+                .cycled_model_resolver(move |provider, model, level| {
+                    assert_eq!((provider, model), ("provider", "shared"));
+                    seen.lock().unwrap().push(level.to_owned());
+                    match level {
+                        "low" => Ok(Some(Arc::new(ProviderBranchModel("selected authorized")))),
+                        "high" if outcome == "resolver error" => {
+                            Err(Error::Config("origin resolver failed".into()))
+                        }
+                        "high" if outcome == "refused" => Ok(None),
+                        "high" => Ok(Some(Arc::new(ProviderBranchModel("origin authorized")))),
+                        _ => panic!("unexpected thinking level {level}"),
+                    }
+                })
+                .open(&path);
+            assert_eq!(*calls.lock().unwrap(), ["low", "high"]);
+
+            if outcome == "resolver error" {
+                assert!(
+                    matches!(reopened, Err(Error::Config(message)) if message == "origin resolver failed")
+                );
+                let (named, _) = registry
+                    .provider_branch_config(session_id, "provider", "shared")
+                    .unwrap();
+                assert!(Arc::ptr_eq(&named, &stale));
+                for selection in [&selected, &origin] {
+                    assert!(Arc::ptr_eq(
+                        &registry.cycled_model(session_id, selection).unwrap(),
+                        &stale
+                    ));
+                }
+                continue;
+            }
+
+            let mut session = reopened.unwrap();
+            assert_eq!(session.journal().unwrap().head(), return_to);
+            if outcome == "revoked before start" {
+                let client = registry.cycled_model(session_id, &selected).unwrap();
+                registry.remove_session_branch_models(session_id);
+                registry
+                    .commit_cycled_model(session_id, &selected, client, false, || Ok(()))
+                    .unwrap();
+            }
+            let started = session.start().await;
+            if outcome != "authorized" {
+                assert_eq!(*calls.lock().unwrap(), ["low", "high"]);
+                assert!(started.is_err());
+                let journal = session.journal().unwrap();
+                assert_eq!(journal.head(), return_to);
+                assert_eq!(journal.pending_custom_trigger(), Some(id));
+                assert!(journal.pending_tree_trigger_handoff().is_none());
+                assert!(
+                    !journal
+                        .records()
+                        .iter()
+                        .any(|record| matches!(record.event, crate::Event::ModelRequested { .. }))
+                );
+                continue;
+            }
+
+            started.unwrap();
+            let answer = session.prompt("selected prompt").await.unwrap();
+            assert_eq!(answer, "selected authorized");
+            assert_eq!(*calls.lock().unwrap(), ["low", "high"]);
+            let journal = session.journal().unwrap();
+            assert!(journal.pending_custom_trigger().is_none());
+            assert!(journal.pending_tree_trigger_handoff().is_none());
+            assert!(
+                journal
+                    .path(journal.head())
+                    .iter()
+                    .any(|record| record.id == return_to)
+            );
+            assert!(journal.records().iter().any(|record| {
+                record.run_id == Some(id)
+                    && matches!(&record.event,
+                    crate::Event::Assistant { content, .. } if content == "origin authorized")
+            }));
+        }
+    }
+
     #[tokio::test]
     async fn sdk_model_cycle_reopen_rejects_invalid_markers_and_preserves_ordinary_history() {
         use serde_json::json;
@@ -8853,8 +9078,9 @@ mod tests {
             .unwrap()
             .registry(registry.clone())
             .historical_model_resolver(resolver);
+        let reservation = registry.reserve_startup_model_bindings(id).unwrap();
         registry
-            .commit_session_model_bindings(id, vec![], None, None, || {
+            .commit_session_model_bindings(&reservation, vec![], None, None, || {
                 assert!(builder.build(journal).is_err());
                 Ok(())
             })
