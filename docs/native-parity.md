@@ -2061,12 +2061,19 @@ Codemode also accepts explicitly configured `pi-decision` classifiers with a
 provider or model `baseUrl`. This API posts the model and classifier context to
 `<baseUrl>/decision` and preserves typed answers, usage, and an optional response
 ID. Terminal HTTP errors include bounded diagnostics from the decision error
-envelope with echoed request credentials redacted. Cancellation covers credential
-loading and the HTTP operation. A provider-level `api: "pi-decision"` configures
-the decision profile without changing the provider's bundled chat or operation
-routes. Chat models in that profile use their own explicit chat API and `baseUrl`.
-The decision profile's credentials and headers stay on the operation routes.
-Configured classifiers use the existing endpoint-bound credentials
+envelope with echoed request credentials redacted. With cookies or non-Bearer
+authorization, diagnostics retain the HTTP status and recognized error codes.
+Cancellation covers credential loading and the HTTP operation.
+Provider-level `api: "pi-decision"` and profiles
+that only declare operations with a model-level `pi-decision` keep their defaults
+off bundled chat and the remaining bundled operations. A mixed profile with a
+provider-level `pi-decision` uses an explicit chat API and `baseUrl` for each
+chat model. Without a provider discovery endpoint, the catalog lists model-scoped
+chat routes, including Azure, and omits bundled models with no route.
+Azure environment defaults apply to chat. The decision profile's
+credentials and headers stay on its operation routes.
+The legacy `pi-classifier` API keeps its `/classify` route. Explicitly
+configured Pi Decision classifiers use the existing endpoint-bound credentials
 and headers, HTTP limits, and classifier retry policy. A built-in provider name
 supplies neither an implicit decision URL nor ambient credentials for it. An
 explicitly configured Radius classifier with the same ID takes precedence over

@@ -1,5 +1,6 @@
 //! Shared decision and legacy classifier wire format.
 use pi_rs::{Error, Result};
+use reqwest::header::{AUTHORIZATION, COOKIE, HeaderMap, PROXY_AUTHORIZATION};
 use serde_json::{Map, Value, json};
 
 use super::{Api, Cost, Entry, wire};
@@ -138,9 +139,29 @@ fn normalize_diagnostic(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn bearer_token(value: &str) -> Option<&str> {
+    let mut fields = value.split_ascii_whitespace();
+    let scheme = fields.next()?;
+    let token = fields.next()?;
+    (scheme.eq_ignore_ascii_case("bearer")
+        && fields.next().is_none()
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._~+/=".contains(&byte)))
+    .then_some(token)
+}
+
+fn has_opaque_credentials(headers: &HeaderMap) -> bool {
+    headers.iter().any(|(name, value)| {
+        name == COOKIE
+            || ((name == AUTHORIZATION || name == PROXY_AUTHORIZATION)
+                && value.to_str().ok().and_then(bearer_token).is_none())
+    })
+}
+
 pub(super) async fn http_error(
     mut response: reqwest::Response,
-    request_headers: &reqwest::header::HeaderMap,
+    request_headers: &HeaderMap,
 ) -> Error {
     const MAX_ERROR_BODY: usize = 16 * 1024;
     let status = response.status().as_u16();
@@ -165,6 +186,29 @@ pub(super) async fn http_error(
         return fallback();
     };
     let diagnostic = &body["error"];
+    if has_opaque_credentials(request_headers) {
+        // A cookie or structured authorization value can contain several
+        // credentials. Keep only known codes instead of echoing arbitrary text.
+        return match diagnostic["code"].as_str() {
+            Some(
+                code @ ("authentication_error"
+                | "forbidden"
+                | "insufficient_quota"
+                | "internal_error"
+                | "invalid_api_key"
+                | "invalid_question"
+                | "invalid_request"
+                | "invalid_request_error"
+                | "not_found"
+                | "permission_denied"
+                | "rate_limit_exceeded"
+                | "server_error"
+                | "service_unavailable"
+                | "unauthorized"),
+            ) => Error::Model(format!("Pi Decision returned HTTP {status} ({code})")),
+            _ => fallback(),
+        };
+    }
     let clean = |field: &str, limit| {
         let value = normalize_diagnostic(diagnostic[field].as_str()?);
         // The server may echo any of the configured credentials, including
@@ -179,11 +223,7 @@ pub(super) async fn http_error(
                 };
                 let secret = normalize_diagnostic(secret);
                 (!secret.is_empty() && value.contains(&secret))
-                    || secret.split_once(' ').is_some_and(|(scheme, token)| {
-                        scheme.eq_ignore_ascii_case("bearer")
-                            && !token.is_empty()
-                            && value.contains(token)
-                    })
+                    || bearer_token(&secret).is_some_and(|token| value.contains(token))
             })
         {
             return Some("[redacted]".to_owned());
@@ -207,7 +247,7 @@ mod tests {
     use super::*;
     use crate::{
         Cli,
-        model_auth::Keys,
+        model_auth::{Credential, Keys},
         model_profiles::Profiles,
         operation_models::{Catalogue, Operations},
     };
@@ -393,6 +433,125 @@ mod tests {
         assert!(
             matches!(Profiles::parse(&config), Err(Error::Config(message))
             if message.contains("openai/chat-fixture requires its own baseUrl"))
+        );
+    }
+
+    #[test]
+    fn model_level_decision_defaults_do_not_override_bundled_routes() {
+        let mut configured = json!({"providers":{"openai":{
+            "baseUrl":"http://127.0.0.1:1/v1",
+            "apiKey":"fixture-decision-key",
+            "headers":{"x-decision-fixture":"operation-only"},
+            "models":[{"type":"classifier","id":"judge","api":"pi-decision"}]
+        }}});
+        let baseline = Profiles::parse(&json!({})).unwrap();
+        let openai = baseline.provider("openai").unwrap();
+        for model_scoped_base in [false, true] {
+            if model_scoped_base {
+                let provider = &mut configured["providers"]["openai"];
+                let base = provider.as_object_mut().unwrap().remove("baseUrl").unwrap();
+                provider["models"][0]["baseUrl"] = base;
+            }
+            let profiles = Profiles::parse(&configured).unwrap();
+            let endpoint = profiles.endpoint(&openai);
+            assert_eq!(endpoint, baseline.endpoint(&openai));
+            assert_eq!(
+                profiles.model_endpoint(&openai, "gpt-4.1"),
+                baseline.model_endpoint(&openai, "gpt-4.1")
+            );
+            assert!(profiles.credential(&openai, endpoint).is_none());
+            let headers = profiles
+                .header_settings(&openai, endpoint, Some("gpt-4.1"))
+                .static_headers(&openai, None)
+                .unwrap();
+            assert!(!headers.contains_key("x-decision-fixture"));
+
+            let catalogue = &profiles.operations().0;
+            let decision = catalogue
+                .iter()
+                .find(|entry| entry.model.id == "judge")
+                .unwrap();
+            assert_eq!(decision.endpoint.as_str(), "http://127.0.0.1:1/v1/decision");
+            assert_eq!(decision.api_key.as_deref(), Some("fixture-decision-key"));
+            assert_eq!(
+                decision.model.headers["x-decision-fixture"],
+                "operation-only"
+            );
+            let builtin = catalogue
+                .iter()
+                .find(|entry| {
+                    entry.provider == "openai" && matches!(entry.api, Api::OpenAiDecisions)
+                })
+                .unwrap();
+            assert!(builtin.is_official());
+            assert!(builtin.api_key.is_none());
+            assert!(!builtin.model.headers.contains_key("x-decision-fixture"));
+        }
+    }
+
+    #[test]
+    fn azure_chat_environment_stays_out_of_the_decision_profile() {
+        let mut configured = json!({"providers":{"Azure":{
+            "api":"pi-decision","apiKey":"fixture-decision-key",
+            "models":[{"type":"classifier","id":"judge"}]
+        }}});
+        let chat_env =
+            |name: &str| (name == "AZURE_OPENAI_BASE_URL").then(|| "http://127.0.0.1:1".to_owned());
+        assert!(
+            matches!(Profiles::parse_with_azure_env(&configured, chat_env), Err(Error::Config(message))
+            if message.contains("operation provider azure requires baseUrl"))
+        );
+
+        configured["providers"]["Azure"]["baseUrl"] = json!("http://127.0.0.1:2/v1");
+        let baseline = Profiles::parse_with_azure_env(&json!({}), chat_env).unwrap();
+        let profiles = Profiles::parse_with_azure_env(&configured, chat_env).unwrap();
+        let azure = profiles.provider("azure").unwrap();
+        let chat = profiles.endpoint(&azure);
+        assert_eq!(chat, baseline.endpoint(&azure));
+        assert!(!chat.is_empty());
+        assert!(profiles.credential(&azure, chat).is_none());
+        let decision = profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.model.id == "judge")
+            .unwrap();
+        assert_eq!(decision.endpoint.as_str(), "http://127.0.0.1:2/v1/decision");
+        assert_eq!(decision.api_key.as_deref(), Some("fixture-decision-key"));
+    }
+
+    #[test]
+    fn ordinary_mixed_profile_keeps_chat_defaults_and_separates_explicit_operation_routes() {
+        let profiles = Profiles::parse(&json!({"providers":{"openai":{
+            "baseUrl":"http://127.0.0.1:1/v1","apiKey":"fixture-chat-key",
+            "headers":{"x-chat-fixture":"chat-default"},
+            "models":[
+                {"id":"chat-fixture","type":"chat"},
+                {"id":"judge","type":"classifier","api":"pi-decision","baseUrl":"http://127.0.0.1:2/v1","headers":{"x-decision-fixture":"operation-only"}}
+            ]
+        }}})).unwrap();
+        let openai = profiles.provider("openai").unwrap();
+        let chat = profiles.endpoint(&openai);
+        assert_eq!(chat, "http://127.0.0.1:1/v1/responses");
+        assert_eq!(
+            profiles
+                .credential(&openai, chat)
+                .as_ref()
+                .and_then(Credential::literal),
+            Some("fixture-chat-key")
+        );
+        let decision = profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.model.id == "judge")
+            .unwrap();
+        assert_eq!(decision.endpoint.as_str(), "http://127.0.0.1:2/v1/decision");
+        assert!(decision.api_key.is_none());
+        assert!(!decision.model.headers.contains_key("x-chat-fixture"));
+        assert_eq!(
+            decision.model.headers["x-decision-fixture"],
+            "operation-only"
         );
     }
 
@@ -673,6 +832,78 @@ mod tests {
             oversized.ends_with("Pi Decision returned HTTP 400"),
             "{oversized}"
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pi_decision_suppresses_diagnostics_for_opaque_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let operation =
+            decision_operations(&format!("http://{}/v1", listener.local_addr().unwrap()));
+        let entry = operation
+            .args
+            .model_profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "decision-fixture")
+            .unwrap();
+        let cases = [
+            (
+                "cookie",
+                "session=fixture-session; other=fixture-other",
+                "invalid_api_key",
+                "fixture-session",
+            ),
+            (
+                "authorization",
+                "Basic Zml4dHVyZQ==",
+                "Zml4dHVyZQ==",
+                "Zml4dHVyZQ==",
+            ),
+            (
+                "cookie",
+                "session=fixture-session",
+                "fixture-session",
+                "fixture-session",
+            ),
+        ];
+        let server = tokio::spawn(async move {
+            for (header, value, code, component) in cases {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (route, headers, _) = request(&mut socket).await;
+                assert_eq!(route, "POST /v1/decision HTTP/1.1\r\n");
+                assert_eq!(headers[header], value);
+                let body = json!({"error":{"code":code,"message":format!("Denied {component}")}})
+                    .to_string();
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let context = json!({"state":{},"questions":questions()});
+        for (header, value, code, component) in cases {
+            let mut entry = entry.clone();
+            entry.model.headers.insert(header.into(), value.into());
+            let diagnostic = tokio::time::timeout(
+                Duration::from_secs(5),
+                operation.perform(&entry, &context, &Keys::default(), &mut json!({})),
+            )
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+            let expected = if code == "invalid_api_key" {
+                "Pi Decision returned HTTP 401 (invalid_api_key)"
+            } else {
+                "Pi Decision returned HTTP 401"
+            };
+            assert!(diagnostic.ends_with(expected), "{diagnostic}");
+            assert!(!diagnostic.contains(component), "{diagnostic}");
+            assert!(!diagnostic.contains("Denied"), "{diagnostic}");
+        }
         server.await.unwrap();
     }
 
