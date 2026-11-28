@@ -1088,6 +1088,7 @@ pub(crate) struct NestedHooks {
 }
 struct NestedDiagnostic {
     shared: Arc<Shared>,
+    cancellation: CancellationToken,
     key: Vec<u8>,
     operation: Uuid,
     claim: Option<Check>,
@@ -1109,7 +1110,7 @@ impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
     ) -> Result<(), String> {
         let store = self.shared.owner.store();
         loop {
-            if self.shared.cancellation.is_cancelled() {
+            if self.cancellation.is_cancelled() {
                 return Err("nested attempt cancelled".into());
             }
             if self
@@ -1181,6 +1182,7 @@ struct Lifecycle {
 /// parent returns, and its success must precede the parent's durable commit.
 pub struct NestedHost {
     shared: Arc<Shared>,
+    cancellation: CancellationToken,
     parent: Uuid,
     depth: usize,
     serial: tokio::sync::Mutex<()>,
@@ -1280,6 +1282,7 @@ impl NestedHost {
         let mut lifecycle = Lifecycle::default();
         lifecycle.counts.insert(parent, 0);
         Ok(Arc::new(Self {
+            cancellation: cancellation.clone(),
             shared: Arc::new(Shared {
                 owner,
                 root: parent,
@@ -1335,7 +1338,7 @@ impl NestedHost {
         if !valid_key(key) {
             return self.fail("invalid nested call key");
         }
-        self.call_inner(Some(key), name, arguments, false, true)
+        self.call_inner(Some(key), name, arguments, false, true, None)
             .await
     }
     /// Dispatch or reattach without polling a pending result. This is a
@@ -1349,7 +1352,7 @@ impl NestedHost {
         if !valid_key(key) {
             return self.fail("invalid nested call key");
         }
-        self.call_inner(Some(key), name, arguments, false, false)
+        self.call_inner(Some(key), name, arguments, false, false, None)
             .await
     }
 
@@ -1682,7 +1685,7 @@ impl NestedHost {
         poll: bool,
     ) -> KeyedResult {
         let mut outcome = if valid_key(key) {
-            self.call_inner_raw(Some(key), name, arguments.clone(), false, poll)
+            self.call_inner_raw(Some(key), name, arguments.clone(), false, poll, None)
                 .await
         } else {
             self.fail("invalid nested call key")
@@ -1831,7 +1834,7 @@ impl NestedHost {
         let mut outcomes = Vec::with_capacity(calls.len());
         for (key, name, arguments) in &calls {
             let result = self
-                .call_inner(Some(key), name, arguments.clone(), true, false)
+                .call_inner(Some(key), name, arguments.clone(), true, false, None)
                 .await;
             let stop = matches!(result, Outcome::Unknown(_));
             outcomes.push(result);
@@ -1871,7 +1874,7 @@ impl NestedHost {
                     return self.fail("nested pending record changed");
                 }
                 let outcome = self
-                    .poll_pending(&storage_key, record, entry.version, reg)
+                    .poll_pending(&storage_key, record, entry.version, reg, &self.cancellation)
                     .await;
                 self.legacy_outcome(&storage_key, outcome)
             },
@@ -2058,6 +2061,7 @@ impl NestedHost {
         arguments: Value,
         serial_held: bool,
         poll: bool,
+        call_cancellation: Option<&CancellationToken>,
     ) -> Outcome {
         let key = if let Some(member) = explicit {
             self.explicit_key(self.parent, member)
@@ -2069,7 +2073,14 @@ impl NestedHost {
             self.key(self.parent, index)
         };
         let outcome = self
-            .call_inner_raw(explicit, name, arguments, serial_held, poll)
+            .call_inner_raw(
+                explicit,
+                name,
+                arguments,
+                serial_held,
+                poll,
+                call_cancellation,
+            )
             .await;
         self.legacy_outcome(&key, outcome)
     }
@@ -2081,7 +2092,9 @@ impl NestedHost {
         arguments: Value,
         serial_held: bool,
         poll: bool,
+        call_cancellation: Option<&CancellationToken>,
     ) -> Outcome {
+        let cancellation = call_cancellation.unwrap_or(&self.cancellation);
         let _active = match self.enter() {
             Ok(active) => active,
             Err(outcome) => return outcome,
@@ -2182,7 +2195,9 @@ impl NestedHost {
                 }
             } else if let Some(outcome) = &record.outcome {
                 if poll && matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
-                    return self.poll_pending(&key, record, entry.version, reg).await;
+                    return self
+                        .poll_pending(&key, record, entry.version, reg, cancellation)
+                        .await;
                 }
                 return match replay_finalized(&self.shared.output_schemas, name, &record) {
                     Ok(outcome) => outcome,
@@ -2214,16 +2229,19 @@ impl NestedHost {
                     arguments: arguments.to_string(),
                 },
             };
-            let prepared = match crate::tool::prepare(
+            let (prepared, cancelled) = match crate::tool::prepare(
                 reg.tool.as_ref(),
                 &invocation,
-                &self.shared.cancellation,
+                cancellation,
                 self.shared.timeout,
                 |schema, args| jsonschema::validator_for(schema).is_ok_and(|v| v.is_valid(args)),
             )
             .await
             {
-                Ok(p) => p,
+                Ok(p) => (p.arguments().clone(), None),
+                Err(outcome) if call_cancellation.is_some_and(CancellationToken::is_cancelled) => {
+                    (Value::Null, Some(outcome))
+                }
                 Err(outcome) => {
                     return self.fail(format!(
                         "nested preparation failed: {}",
@@ -2234,14 +2252,14 @@ impl NestedHost {
             let record = Record {
                 name: name.into(),
                 arguments,
-                prepared: prepared.arguments().clone(),
-                before_pending: self.shared.hooks.is_some(),
+                prepared,
+                before_pending: cancelled.is_none() && self.shared.hooks.is_some(),
                 child_park: None,
                 before_gate: None,
                 policy: reg.replay,
                 durable_identity: dispatch_identity,
                 operation_id: invocation.operation_id,
-                outcome: None,
+                outcome: cancelled,
                 staged_outcome: None,
                 hooks_required: self.shared.hooks.is_some(),
                 hook_snapshot: self
@@ -2273,6 +2291,11 @@ impl NestedHost {
             ) {
                 return self.fail(format!("nested intent commit: {e}"));
             }
+            // Keep a cancelled position in the journal so replay cannot dispatch
+            // it or shift the identity of the next sibling.
+            if let Some(outcome) = &record.outcome {
+                return outcome.clone();
+            }
             let entry = match store.get(&key) {
                 Ok(Some(v)) => v,
                 Ok(None) => return self.fail("nested intent missing after commit"),
@@ -2281,7 +2304,10 @@ impl NestedHost {
             (record, entry.version)
         };
         if record.before_pending {
-            record = match self.before_nested(&key, record, reg, &call_id).await {
+            record = match self
+                .before_nested(&key, record, reg, &call_id, cancellation)
+                .await
+            {
                 Ok(record) => record,
                 Err(outcome) => return outcome,
             };
@@ -2315,6 +2341,7 @@ impl NestedHost {
             self.claim.clone()
         };
         let child = Arc::new(Self {
+            cancellation: cancellation.clone(),
             shared: self.shared.clone(),
             parent: record.operation_id,
             depth: self.depth + 1,
@@ -2331,6 +2358,7 @@ impl NestedHost {
         }
         let sink = Arc::new(NestedDiagnostic {
             shared: self.shared.clone(),
+            cancellation: cancellation.clone(),
             key: key.clone(),
             operation: record.operation_id,
             claim: child.claim.clone(),
@@ -2349,7 +2377,7 @@ impl NestedHost {
                 prepared,
                 None,
                 child.clone(),
-                &self.shared.cancellation,
+                cancellation,
                 self.shared.timeout,
             ),
         )
@@ -2490,7 +2518,9 @@ impl NestedHost {
                 Ok(Some(entry)) => entry.version,
                 _ => return self.fail("nested pending record missing after commit"),
             };
-            return self.poll_pending(&key, completed, version, reg).await;
+            return self
+                .poll_pending(&key, completed, version, reg, cancellation)
+                .await;
         }
         validate_nested_output(&self.shared.output_schemas, name, outcome)
     }
@@ -2746,6 +2776,7 @@ impl NestedHost {
         mut record: Record,
         reg: &RegisteredTool,
         call_id: &str,
+        cancellation: &CancellationToken,
     ) -> Result<Record, Outcome> {
         let Some(hooks) = &self.shared.hooks else {
             return Err(self.fail("nested before-tool hooks unavailable"));
@@ -2775,7 +2806,7 @@ impl NestedHost {
             match crate::tool::prepare(
                 reg.tool.as_ref(),
                 &invocation,
-                &self.shared.cancellation,
+                cancellation,
                 self.shared.timeout,
                 |schema, args| jsonschema::validator_for(schema).is_ok_and(|v| v.is_valid(args)),
             )
@@ -2790,7 +2821,7 @@ impl NestedHost {
         } else {
             None
         };
-        if self.shared.cancellation.is_cancelled() {
+        if cancellation.is_cancelled() {
             return Err(self.fail("nested before-tool preparation cancelled"));
         }
         let memo = crate::extension::DurableMemo::new(
@@ -2827,7 +2858,7 @@ impl NestedHost {
         {
             return Err(self.fail(error));
         }
-        if self.shared.cancellation.is_cancelled() {
+        if cancellation.is_cancelled() {
             return Err(self.fail("nested before-tool hooks cancelled"));
         }
         let mut invalid_gate = false;
@@ -3276,6 +3307,7 @@ impl NestedHost {
         mut record: Record,
         mut version: u64,
         reg: &RegisteredTool,
+        cancellation: &CancellationToken,
     ) -> Outcome {
         loop {
             let identity_lease = if let Some(expected) = record.durable_identity.as_deref() {
@@ -3303,7 +3335,7 @@ impl NestedHost {
                 reg.tool.as_ref(),
                 record.operation_id,
                 reference,
-                &self.shared.cancellation,
+                cancellation,
                 self.shared.timeout,
             ))
             .catch_unwind()
@@ -3372,7 +3404,7 @@ impl NestedHost {
                 _ => return self.fail("nested pending record missing after poll"),
             };
             tokio::select! {
-                _ = self.shared.cancellation.cancelled() => return self.fail("nested polling cancelled"),
+                _ = cancellation.cancelled() => return self.fail("nested polling cancelled"),
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         }
@@ -3442,12 +3474,33 @@ impl ToolHost for NestedHost {
         tools
     }
     async fn call(&self, name: &str, arguments: Value) -> Outcome {
-        self.call_inner(None, name, arguments, false, true).await
+        self.call_inner(None, name, arguments, false, true, None)
+            .await
+    }
+    async fn call_with_cancellation(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Outcome {
+        let scoped = self.cancellation.child_token();
+        let _guard = scoped.clone().drop_guard();
+        let call = self.call_inner(None, name, arguments, false, true, Some(&scoped));
+        tokio::pin!(call);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                scoped.cancel();
+                // Keep driving the same journal owner through settlement.
+                call.await
+            }
+            outcome = &mut call => outcome,
+        }
     }
     async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
         let mut outcomes = Vec::with_capacity(calls.len());
         for (name, args) in calls {
-            outcomes.push(self.call_inner(None, &name, args, false, true).await);
+            outcomes.push(self.call_inner(None, &name, args, false, true, None).await);
         }
         outcomes
     }
@@ -4125,6 +4178,7 @@ mod tests {
         host.set_resumed_checkpoint(Some(saved.clone())).unwrap();
         assert_eq!(host.resumed_checkpoint(), Some(saved));
         let child = NestedHost {
+            cancellation: host.cancellation.clone(),
             shared: host.shared.clone(),
             parent: Uuid::new_v4(),
             depth: 1,
@@ -4287,6 +4341,138 @@ mod tests {
         )
         .unwrap()
     }
+    #[tokio::test]
+    async fn pre_dispatch_cancellation_retains_order_through_progress_host_and_reopen() {
+        struct Sink;
+
+        #[async_trait]
+        impl crate::tool_progress::Sink for Sink {
+            async fn update(&self, _: Value) -> pi_rs_core::ExtensionResult<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = Uuid::new_v4();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let target = json!({"position": 1});
+        let sibling = json!({"position": 2});
+        let h = host(&path, root, calls.clone(), ReplayPolicy::Unsafe, false, 2);
+        let (wrapped, scope) = crate::tool_progress::scoped_host(h.clone(), Arc::new(Sink));
+        let skipped = wrapped
+            .call_with_cancellation("fake", target.clone(), cancelled)
+            .await;
+        assert_eq!(
+            skipped,
+            Outcome::Skipped("cancelled before dispatch".into())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let sibling_outcome = wrapped.call("fake", sibling.clone()).await;
+        assert!(matches!(sibling_outcome, Outcome::Succeeded(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        h.seal_and_inspect().unwrap();
+        drop((scope, wrapped, h));
+
+        let h = host(&path, root, calls.clone(), ReplayPolicy::Unsafe, false, 2);
+        assert_eq!(h.call("fake", target).await, skipped);
+        assert_eq!(h.call("fake", sibling).await, sibling_outcome);
+        h.seal_and_inspect().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_dispatch_retains_unknown_receipt_without_aborting_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = Uuid::new_v4();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let h = host(&path, root, calls.clone(), ReplayPolicy::Unsafe, true, 2);
+        let cancellation = CancellationToken::new();
+        let mut call = Box::pin(h.call_with_cancellation("fake", json!({}), cancellation.clone()));
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        cancellation.cancel();
+        let outcome = call.await;
+        assert_eq!(
+            outcome,
+            Outcome::Unknown("cancelled after dispatch began".into())
+        );
+        assert!(!h.cancellation.is_cancelled());
+        let entry = h
+            .shared
+            .owner
+            .store()
+            .get(&h.key(root, 0))
+            .unwrap()
+            .unwrap();
+        let record: Record = serde_json::from_slice(&entry.value).unwrap();
+        assert_eq!(record.outcome, Some(outcome.clone()));
+        assert!(h.seal_and_inspect().is_err());
+        drop(h);
+
+        let h = host(&path, root, calls.clone(), ReplayPolicy::Unsafe, false, 2);
+        assert_eq!(h.call("fake", json!({})).await, outcome);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(h.seal_and_inspect().is_err());
+    }
+
+    #[tokio::test]
+    async fn call_cancellation_preserves_pending_reference_for_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = Uuid::new_v4();
+        let tool = Arc::new(Polling {
+            invoked: AtomicUsize::new(0),
+            mode: AtomicUsize::new(0),
+            ids: Mutex::new(vec![]),
+        });
+        let h = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        let cancellation = CancellationToken::new();
+        let mut call =
+            Box::pin(h.call_with_cancellation("polling", json!({}), cancellation.clone()));
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        assert_eq!(tool.invoked.load(Ordering::SeqCst), 1);
+        cancellation.cancel();
+        assert_eq!(
+            call.await,
+            Outcome::Unknown("nested polling cancelled".into())
+        );
+        let entry = h
+            .shared
+            .owner
+            .store()
+            .get(&h.key(root, 0))
+            .unwrap()
+            .unwrap();
+        let record: Record = serde_json::from_slice(&entry.value).unwrap();
+        assert_eq!(
+            record.outcome,
+            Some(Outcome::Pending {
+                reference: "job".into()
+            })
+        );
+        drop(h);
+
+        tool.mode.store(2, Ordering::SeqCst);
+        let h = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        assert_eq!(
+            h.call("polling", json!({})).await,
+            Outcome::Succeeded("done".into())
+        );
+        h.seal_and_inspect().unwrap();
+        assert_eq!(tool.invoked.load(Ordering::SeqCst), 1);
+        assert!(
+            tool.ids
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|id| *id == record.operation_id)
+        );
+    }
+
     #[tokio::test]
     async fn restart_reuses_complete_and_rejects_changed_or_omitted_arguments() {
         let dir = tempfile::tempdir().unwrap();

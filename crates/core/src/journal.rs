@@ -471,6 +471,16 @@ pub struct Record {
 }
 
 impl Record {
+    /// Whether this record and its metadata encode an SDK thinking-only change.
+    pub fn is_sdk_thinking_selection(&self, metadata: &serde_json::Value) -> bool {
+        matches!(self.event, Event::ModelSelected { .. })
+            && metadata
+                .get("sdkThinkingOnly")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && self.sdk_model_binding_thinking(metadata).is_some()
+    }
+
     /// Read current summary billing, or recover it from an older journal's adjacent completion.
     pub fn summary_usage(&self, records: &[Self]) -> Option<(Usage, Option<SummaryUsageMetadata>)> {
         let (usage, metadata) = match &self.event {
@@ -1963,6 +1973,23 @@ impl Session {
             .map(|(_, model, thinking)| (model, thinking))
     }
 
+    /// The SDK client binding active at this journal record, if one was recorded.
+    ///
+    /// A checkout record resolves to its destination's binding. The ID follows
+    /// the selection through native fork and reopen. Hosts can use it to look
+    /// up client configuration in their own storage. Invalid bindings have no ID.
+    pub fn model_binding_id_at(&self, record_id: u64) -> Option<Uuid> {
+        let index = usize::try_from(record_id.checked_sub(1)?).ok()?;
+        let target = match self.records.get(index)?.event {
+            Event::Checkout { target } => target,
+            _ => record_id,
+        };
+        self.cycled_model_at(target)
+            .ok()
+            .flatten()
+            .map(|selection| selection.id)
+    }
+
     fn selection_history(&self, target: u64) -> impl Iterator<Item = &Record> {
         std::iter::successors(
             target
@@ -2045,14 +2072,19 @@ impl Session {
         Some((id, provider, model, thinking))
     }
 
-    pub(crate) fn select_cycled_model(&mut self, selection: &CycledModelSelection) -> Result<()> {
-        self.append_cycled_model_transition(
+    pub(crate) fn select_cycled_model(
+        &mut self,
+        selection: &CycledModelSelection,
+        thinking_only: bool,
+    ) -> Result<()> {
+        self.append_sdk_model_binding(
             Event::ModelSelected {
                 provider: Some(selection.provider.clone()),
                 model: selection.model.clone(),
                 thinking: Some(selection.thinking.clone()),
             },
             selection,
+            thinking_only,
         )?;
         Ok(())
     }
@@ -2062,12 +2094,23 @@ impl Session {
         event: Event,
         selection: &CycledModelSelection,
     ) -> Result<&Record> {
-        self.append_inner_with_metadata(
-            event,
-            false,
-            Some(serde_json::json!({"sdkCycleBinding": selection.id, "sdkCycleThinking": selection.thinking})),
-            false,
-        )
+        self.append_sdk_model_binding(event, selection, false)
+    }
+
+    fn append_sdk_model_binding(
+        &mut self,
+        event: Event,
+        selection: &CycledModelSelection,
+        thinking_only: bool,
+    ) -> Result<&Record> {
+        let mut metadata = serde_json::json!({
+            "sdkCycleBinding": selection.id,
+            "sdkCycleThinking": selection.thinking,
+        });
+        if thinking_only {
+            metadata["sdkThinkingOnly"] = true.into();
+        }
+        self.append_inner_with_metadata(event, false, Some(metadata), false)
     }
 
     /// The provider belongs to the same selection record as the model. Older

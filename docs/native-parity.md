@@ -1189,6 +1189,11 @@ User settings and keybindings use the existing `~/.pi-rs` agent directory (or
 theme. `/reload` reloads settings, context, skills, prompts, native extensions, MCP,
 keybindings and themes. Remaining application key actions are tracked above.
 
+Scrollable native custom dialogs use `tui.select.pageUp` and
+`tui.select.pageDown` in regular and fullscreen terminals. An extension action
+bound to the same key takes priority over scrolling.
+[Upstream selection paging](https://github.com/earendil-works/pi/commit/3bae85274a9ea64d035a8a35753c93031489b659)
+
 In fullscreen mode with `fullscreenCopyOnSelect` disabled, the configured
 `app.message.copy` shortcut copies the active mouse selection before falling
 back to the last assistant message. The fallback reads a session snapshot, so
@@ -1740,9 +1745,15 @@ from Pi-format JSON with line comments and trailing commas. Provider fields
 are inherited unless the model
 overrides them. The grant supplies the actual request endpoint and the model
 factory supplies its exact credential. The import applies descriptive
-`modelOverrides` to selected declarations, including partial prices. Transport options such as
-configuration headers, provider compatibility and command-based keys stay
-under host control. Codex Responses declarations use the Codex transport.
+`modelOverrides` to selected declarations, including partial prices and
+per-key `thinkingLevelMap` overrides. An explicit map exposes Pi's ordered
+selectable levels through `ModelCatalog::thinking_levels`. Null entries
+disable levels, extended levels require a mapping, and a non-reasoning model
+with a map exposes only `off`. Declarations without a map retain `None`.
+The factory still constructs a default client per granted route. Provider
+effort strings, configuration headers, provider compatibility and
+command-based keys stay under host control. Codex Responses declarations use
+the Codex transport.
 The SDK defaults to SSE and uses a host-supplied OAuth access token on the
 exact `openai-codex` route. The typed client lets hosts select another Codex
 transport. ChatGPT plan clients use the separate `openai-responses` API.
@@ -4833,6 +4844,15 @@ Model cycling leaves the current selection intact for lists with fewer than
 two choices. If the current model is outside the list, forward and backward
 cycling start from the first slot, as in Pi.
 
+The Rust SDK also supports standalone thinking changes on the active
+provider-qualified model. Hosts supply the ordered capabilities, clamp policy,
+and an explicitly identified client. An effective change journals the exact
+binding and emits only the thinking selection hook. Native journals preserve a
+binding ID so hosts can restore distinct clients for repeated selections at the
+same level. The SDK leaves global defaults to the host. Native RPC retains its
+host-managed capability and provider resolution.
+[Pinned Pi thinking-level implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2782-L2857)
+
 Scope diagnostics warn about unmatched patterns and invalid thinking suffixes.
 The resolver keeps valid candidates and falls back to normal model selection
 when every pattern misses. Pattern order and the first occurrence of each
@@ -7421,6 +7441,20 @@ handling. Images from Claude error results follow the grouped tool results.
 Tool-free summary requests retain tool history as text and pass structured
 images as image blocks. The SDK chooses the endpoint and signs requests or uses the
 bearer token. No AWS resources are created.
+
+Converse sends the catalog-mapped `reasoning_effort` for Kimi K3, Kimi K3.1
+and GLM 5.3. Kimi's disabled level sends `none`. GLM's catalog omits disabled
+and minimal effort, allowing the service's default when no effort is selected.
+The Kimi K3 family skips earlier reasoning blocks on the wire while retaining
+the visible conversation and tool history. A host can override replay support
+with the Bedrock client builder or `compat.supportsReasoningReplay` in
+`models.json`. The workbench resolves effort and replay against the final
+request model, including after a same-route model rewrite. Kimi summaries
+use the catalog's mapped off effort. When replay is disabled, request
+budgeting estimates the serialized history because measured output usage
+can include omitted reasoning.
+[AWS Kimi K3 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k3.html)
+[AWS GLM 5.3 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5-3.html)
 
 Claude and GPT-family models support the Pi reasoning levels and configured
 thinking-level mappings. Claude uses adaptive thinking on the supported newer
