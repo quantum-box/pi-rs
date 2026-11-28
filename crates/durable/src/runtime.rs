@@ -9006,6 +9006,12 @@ impl Harness {
             let mut batch = crate::document::Documents::new(self.owner.store())
                 .fork_scope(id, state.id, revision)?;
             self.record_display_fork_origin(&state, id, observation, &mut batch)?;
+            crate::document::session_current::append_latest_fork(
+                self.owner.store(),
+                membership.parent,
+                state.id,
+                &mut batch,
+            )?;
             membership
                 .append_to(state.id, &mut batch)
                 .map_err(|error| Error::Invalid(format!("fork session membership: {error}")))?;
@@ -9446,6 +9452,12 @@ impl Harness {
             )?;
             batch.checks.extend_from_slice(evidence);
             batch.checks.extend_from_slice(&source_checks);
+            crate::document::session_current::append_latest_fork(
+                self.owner.store(),
+                membership.parent,
+                state.id,
+                &mut batch,
+            )?;
             membership
                 .append_to(state.id, &mut batch)
                 .map_err(|error| Error::Invalid(format!("fork session membership: {error}")))?;
@@ -9757,6 +9769,7 @@ impl Harness {
                 b"durable/application-entries/",
                 b"durable/document/",
                 b"durable/document-policy/",
+                b"durable/conversation-current-document/v1/",
             ],
             crate::transcript::DISPLAY_FORK_RECORD_LIMIT,
         );

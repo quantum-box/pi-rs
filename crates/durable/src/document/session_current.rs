@@ -23,9 +23,146 @@ pub struct SessionDocument<T> {
     pub initial: T,
 }
 
+/// Fork behavior for a current-only conversation document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LatestDocumentFork {
+    /// Start the child without an instance at this address.
+    Initial,
+    /// Copy the parent's committed current value into a new incarnation.
+    Current,
+}
+
+/// Definition of a conversation document with no rewindable payload history.
+pub struct LatestConversationDocument<T> {
+    pub kind: String,
+    pub version: std::num::NonZeroU32,
+    pub initial: T,
+    pub fork: LatestDocumentFork,
+}
+
+pub(crate) struct CurrentDefinition<'a, T> {
+    kind: &'a str,
+    version: std::num::NonZeroU32,
+    initial: &'a T,
+    fork: Option<LatestDocumentFork>,
+}
+
+impl<'a, T> From<&'a SessionDocument<T>> for CurrentDefinition<'a, T> {
+    fn from(definition: &'a SessionDocument<T>) -> Self {
+        Self {
+            kind: &definition.kind,
+            version: definition.version,
+            initial: &definition.initial,
+            fork: None,
+        }
+    }
+}
+impl<'a, T> From<&'a LatestConversationDocument<T>> for CurrentDefinition<'a, T> {
+    fn from(definition: &'a LatestConversationDocument<T>) -> Self {
+        Self {
+            kind: &definition.kind,
+            version: definition.version,
+            initial: &definition.initial,
+            fork: Some(definition.fork),
+        }
+    }
+}
+
+const CONVERSATION_PREFIX: &[u8] = b"durable/conversation-current-document/v1/";
+
+fn conversation_prefix(id: Uuid) -> Vec<u8> {
+    [CONVERSATION_PREFIX, format!("{id}/").as_bytes()].concat()
+}
+
+fn conversation_key(id: Uuid, kind: &str, key: &str) -> Result<Vec<u8>, Error> {
+    let mut encoded = conversation_prefix(id);
+    encoded.extend(serde_json::to_vec(&(kind, key))?);
+    Ok(encoded)
+}
+
+fn conversation_marker(id: Uuid) -> Vec<u8> {
+    format!("durable/conversation-current-document-marker/v1/{id}").into_bytes()
+}
+
+pub(crate) fn append_latest_fork(
+    store: &Store,
+    parent: Uuid,
+    child: Uuid,
+    batch: &mut OwnedBatch,
+) -> Result<(), Error> {
+    let marker = conversation_marker(parent);
+    let boundary = store.put_version()?;
+    let version = store.get_bounded(&marker, 1)?.map(|entry| entry.version);
+    batch.checks.push(Check {
+        key: marker,
+        expected: version.map_or(Expected::MissingUnchangedSince(boundary), Expected::Version),
+    });
+    let prefix = conversation_prefix(parent);
+    for (key, entry) in fork_rows(store, &prefix)? {
+        let (kind, family): (String, String) = serde_json::from_slice(&key[prefix.len()..])?;
+        if conversation_key(parent, &kind, &family)? != key {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        let mut record: StoredDocument = serde_json::from_slice(&entry.value)?;
+        if record.fork.is_none()
+            || record.value.is_some() != record.definition.incarnation.is_some()
+            || record
+                .definition
+                .incarnation
+                .as_ref()
+                .is_some_and(Uuid::is_nil)
+        {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        if record.fork != Some(LatestDocumentFork::Current) || record.value.is_none() {
+            continue;
+        }
+        record.definition.incarnation = Some(Uuid::new_v4());
+        let key = conversation_key(child, &kind, &family)?;
+        batch.checks.push(Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        });
+        batch.mutations.push(Mutation::Put {
+            key,
+            value: serde_json::to_vec(&record)?,
+        });
+    }
+    Ok(())
+}
+
+fn fork_rows(store: &Store, prefix: &[u8]) -> Result<Vec<durable_store::KeyedEntry>, Error> {
+    if !crate::transcript::bounded_fork_reads() {
+        return Ok(store.list(prefix)?);
+    }
+    let mut result = Vec::new();
+    let mut remaining = crate::transcript::DISPLAY_FORK_RECORD_LIMIT;
+    let mut after = prefix.to_vec();
+    loop {
+        let mut page = store.prefix_page_bounded(
+            prefix,
+            &after,
+            1,
+            crate::transcript::DISPLAY_FORK_RECORD_LIMIT,
+            remaining.max(1),
+        )?;
+        let Some((key, entry)) = page.pop() else {
+            return Ok(result);
+        };
+        remaining = remaining
+            .checked_sub(key.len().saturating_add(entry.value.len()))
+            .ok_or(durable_store::Error::DocumentFrameTooLarge)?;
+        after = key.clone();
+        result.push((key, entry));
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredDocument {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fork: Option<LatestDocumentFork>,
     definition: StoredDocumentDefinition,
     value: Option<Map<String, Value>>,
 }
@@ -91,37 +228,89 @@ impl Staged {
     }
 }
 
-pub(crate) struct SessionDocuments<'a> {
+pub(crate) struct CurrentDocuments<'a> {
     store: &'a Store,
     owner: Uuid,
     scope: Option<(Uuid, [Check; 2])>,
     staged: HashMap<Vec<u8>, Staged>,
+    other_history: HashMap<Vec<u8>, Expected>,
 }
 
-impl<'a> SessionDocuments<'a> {
+impl<'a> CurrentDocuments<'a> {
     pub(crate) fn new(store: &'a Store, owner: Uuid) -> Self {
         Self {
             store,
             owner,
             scope: None,
             staged: HashMap::new(),
+            other_history: HashMap::new(),
         }
+    }
+
+    pub(crate) fn guard_rewindable(&mut self, address: &super::Address) -> Result<(), Error> {
+        let Ok(conversation) = address.scope.parse::<Uuid>() else {
+            return Ok(());
+        };
+        if conversation.to_string() != address.scope {
+            return Ok(());
+        }
+        let key = conversation_key(conversation, &address.name, &address.key)?;
+        let boundary = self.store.put_version()?;
+        if self
+            .staged
+            .get(&key)
+            .is_some_and(|row| row.current.is_some())
+        {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        if self.store.get(&key)?.is_some() {
+            return Err(Error::InvalidDocumentDefinition);
+        }
+        self.other_history
+            .entry(key)
+            .or_insert(Expected::MissingUnchangedSince(boundary));
+        Ok(())
     }
 
     fn document<T: Serialize>(
         &mut self,
-        definition: &SessionDocument<T>,
+        definition: CurrentDefinition<'_, T>,
         key: &str,
     ) -> Result<(&mut Staged, StoredDocumentDefinition), Error> {
         let (binding, _) =
-            defined_document_binding(&definition.kind, definition.version, &definition.initial)?;
-        if self.scope.is_none() {
-            self.scope = Some(crate::session_membership::document_scope(
-                self.store, self.owner,
-            )?);
-        }
-        let (session, _) = self.scope.as_ref().expect("resolved scope");
-        let storage_key = storage_key(*session, &definition.kind, key)?;
+            defined_document_binding(definition.kind, definition.version, definition.initial)?;
+        let storage_key = if definition.fork.is_some() {
+            let address = super::Address {
+                scope: self.owner.to_string(),
+                name: definition.kind.into(),
+                key: key.into(),
+            };
+            let revision = self.store.document_snapshot()?;
+            let document_key = address.storage_key()?;
+            let policy_key = address.policy_key()?;
+            if self
+                .store
+                .document_last_revision(&document_key, revision)?
+                .is_some()
+                || self.store.document_at(&policy_key, revision)?.is_some()
+            {
+                return Err(Error::InvalidDocumentDefinition);
+            }
+            for address_key in [document_key, policy_key] {
+                self.other_history
+                    .entry(address_key)
+                    .or_insert(Expected::DocumentUnchangedSince(revision));
+            }
+            conversation_key(self.owner, definition.kind, key)?
+        } else {
+            if self.scope.is_none() {
+                self.scope = Some(crate::session_membership::document_scope(
+                    self.store, self.owner,
+                )?);
+            }
+            let (session, _) = self.scope.as_ref().expect("resolved scope");
+            storage_key(*session, definition.kind, key)?
+        };
         let staged = match self.staged.entry(storage_key) {
             std::collections::hash_map::Entry::Occupied(staged) => staged.into_mut(),
             std::collections::hash_map::Entry::Vacant(slot) => {
@@ -142,13 +331,16 @@ impl<'a> SessionDocuments<'a> {
         };
         if let Some(record) = &staged.current {
             record.validate(&binding)?;
+            if record.fork != definition.fork {
+                return Err(Error::InvalidDocumentDefinition);
+            }
         }
         Ok((staged, binding))
     }
 
     pub(crate) fn read<T: DeserializeOwned + Serialize>(
         &mut self,
-        definition: &SessionDocument<T>,
+        definition: CurrentDefinition<'_, T>,
         key: &str,
     ) -> Result<Option<DefinedDocumentValue<T>>, Error> {
         self.document(definition, key)?.0.read()
@@ -156,21 +348,24 @@ impl<'a> SessionDocuments<'a> {
 
     pub(crate) fn edit<T: Clone + DeserializeOwned + Serialize, R>(
         &mut self,
-        definition: &SessionDocument<T>,
+        definition: CurrentDefinition<'_, T>,
         key: &str,
         edit: impl FnOnce(&mut T) -> Result<R, Error>,
     ) -> Result<R, Error> {
+        let fork = definition.fork;
+        let initial = definition.initial;
         let (staged, mut binding) = self.document(definition, key)?;
         let current: Option<DefinedDocumentValue<T>> = staged.read()?;
         let (id, mut value) = current
             .map(|current| (current.incarnation, current.value))
-            .unwrap_or_else(|| (Uuid::new_v4(), definition.initial.clone()));
+            .unwrap_or_else(|| (Uuid::new_v4(), initial.clone()));
         let result = edit(&mut value)?;
         let Value::Object(value) = serde_json::to_value(value)? else {
             return Err(Error::InvalidDocumentDefinition);
         };
         binding.incarnation = Some(id);
         staged.current = Some(StoredDocument {
+            fork,
             definition: binding,
             value: Some(value),
         });
@@ -179,7 +374,7 @@ impl<'a> SessionDocuments<'a> {
 
     pub(crate) fn retire<T: Serialize>(
         &mut self,
-        definition: &SessionDocument<T>,
+        definition: CurrentDefinition<'_, T>,
         key: &str,
     ) -> Result<bool, Error> {
         let (staged, _) = self.document(definition, key)?;
@@ -192,15 +387,15 @@ impl<'a> SessionDocuments<'a> {
 
     pub(crate) fn migrate<From: DeserializeOwned + Serialize, To: Serialize>(
         &mut self,
-        old: &SessionDocument<From>,
-        new: &SessionDocument<To>,
+        old: CurrentDefinition<'_, From>,
+        new: CurrentDefinition<'_, To>,
         key: &str,
         migrate: impl FnOnce(From) -> Result<To, Error>,
     ) -> Result<(), Error> {
-        if old.kind != new.kind || old.version >= new.version {
+        if old.kind != new.kind || old.version >= new.version || old.fork != new.fork {
             return Err(Error::InvalidDocumentDefinition);
         }
-        let (mut binding, _) = defined_document_binding(&new.kind, new.version, &new.initial)?;
+        let (mut binding, _) = defined_document_binding(new.kind, new.version, new.initial)?;
         let (staged, _) = self.document(old, key)?;
         if staged.current.is_none() {
             return Err(Error::InvalidDocumentDefinition);
@@ -215,6 +410,7 @@ impl<'a> SessionDocuments<'a> {
             None
         };
         staged.current = Some(StoredDocument {
+            fork: new.fork,
             definition: binding,
             value,
         });
@@ -226,6 +422,7 @@ impl<'a> SessionDocuments<'a> {
             batch.checks.extend(checks);
         }
         let mut changed = false;
+        let mut latest_changed = false;
         for (key, staged) in self.staged {
             batch.checks.push(Check {
                 key: key.clone(),
@@ -233,12 +430,32 @@ impl<'a> SessionDocuments<'a> {
             });
             if staged.current != staged.original {
                 let record = staged.current.ok_or(Error::InvalidDocumentDefinition)?;
+                latest_changed |= record.fork.is_some();
                 batch.mutations.push(Mutation::Put {
                     key,
                     value: serde_json::to_vec(&record)?,
                 });
                 changed = true;
             }
+        }
+        for (key, expected) in self.other_history {
+            if !batch.checks.iter().any(|check| check.key == key) {
+                batch.checks.push(Check { key, expected });
+            }
+        }
+        if latest_changed {
+            let key = conversation_marker(self.owner);
+            let boundary = self.store.put_version()?;
+            let version = self.store.get_bounded(&key, 1)?.map(|entry| entry.version);
+            batch.checks.push(Check {
+                key: key.clone(),
+                expected: version
+                    .map_or(Expected::MissingUnchangedSince(boundary), Expected::Version),
+            });
+            batch.mutations.push(Mutation::Put {
+                key,
+                value: vec![1],
+            });
         }
         Ok(changed)
     }
@@ -300,6 +517,9 @@ impl<T: DeserializeOwned + Serialize> SessionDocumentWatch<T> {
             let Some(entry) = entry else { return Ok(None) };
             let record: StoredDocument = serde_json::from_slice(&entry.value)?;
             record.validate(&binding)?;
+            if record.fork.is_some() {
+                return Err(Error::InvalidDocumentDefinition);
+            }
             let Some(value) = record.typed()? else {
                 return Ok(None);
             };

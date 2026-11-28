@@ -5,7 +5,8 @@
 use crate::{
     document::{
         Address, ConversationDocument, DefinedDocumentValue, Documents, Error, ForkPolicy,
-        SessionDocument, StoredDocumentPolicy, session_current::SessionDocuments,
+        LatestConversationDocument, SessionDocument, StoredDocumentPolicy,
+        session_current::CurrentDocuments,
     },
     runtime::{ApplicationWrite, Conversation, Submission},
     task_store::OwnedBatch,
@@ -57,7 +58,7 @@ type SessionParts = (
 /// The candidate state of one host-initiated session transaction.
 pub struct SessionTransaction<'a> {
     store: &'a Store,
-    session_documents: SessionDocuments<'a>,
+    current_documents: CurrentDocuments<'a>,
     revision: u64,
     pub(crate) state: Conversation,
     pub(crate) table_written: bool,
@@ -96,7 +97,7 @@ impl<'a> SessionTransaction<'a> {
     ) -> Result<Self, Error> {
         Ok(Self {
             store,
-            session_documents: SessionDocuments::new(store, state.id),
+            current_documents: CurrentDocuments::new(store, state.id),
             revision: store.document_snapshot()?,
             state,
             table_written: false,
@@ -343,7 +344,7 @@ impl<'a> SessionTransaction<'a> {
     where
         T: serde::de::DeserializeOwned + serde::Serialize,
     {
-        self.session_documents.read(definition, key)
+        self.current_documents.read(definition.into(), key)
     }
 
     /// Create or edit a shared session document in this checked transaction.
@@ -356,7 +357,7 @@ impl<'a> SessionTransaction<'a> {
     where
         T: Clone + serde::de::DeserializeOwned + serde::Serialize,
     {
-        self.session_documents.edit(definition, key, edit)
+        self.current_documents.edit(definition.into(), key, edit)
     }
 
     /// Retire a shared session document. Recreating it gives it a new identity.
@@ -365,7 +366,7 @@ impl<'a> SessionTransaction<'a> {
         definition: &SessionDocument<T>,
         key: &str,
     ) -> Result<bool, Error> {
-        self.session_documents.retire(definition, key)
+        self.current_documents.retire(definition.into(), key)
     }
 
     /// Upgrade a shared session document in place, preserving its incarnation.
@@ -380,7 +381,58 @@ impl<'a> SessionTransaction<'a> {
         From: serde::de::DeserializeOwned + serde::Serialize,
         To: serde::Serialize,
     {
-        self.session_documents.migrate(old, new, key, migrate)
+        self.current_documents
+            .migrate(old.into(), new.into(), key, migrate)
+    }
+
+    /// Read a latest-only document in this conversation.
+    pub fn read_latest_document<T>(
+        &mut self,
+        definition: &LatestConversationDocument<T>,
+        key: &str,
+    ) -> Result<Option<DefinedDocumentValue<T>>, Error>
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize,
+    {
+        self.current_documents.read(definition.into(), key)
+    }
+
+    /// Create or edit a latest-only document in this conversation.
+    pub fn edit_latest_document<T, R>(
+        &mut self,
+        definition: &LatestConversationDocument<T>,
+        key: &str,
+        edit: impl FnOnce(&mut T) -> Result<R, Error>,
+    ) -> Result<R, Error>
+    where
+        T: Clone + serde::de::DeserializeOwned + serde::Serialize,
+    {
+        self.current_documents.edit(definition.into(), key, edit)
+    }
+
+    /// Retire the current value, keeping only its definition.
+    pub fn retire_latest_document<T: serde::Serialize>(
+        &mut self,
+        definition: &LatestConversationDocument<T>,
+        key: &str,
+    ) -> Result<bool, Error> {
+        self.current_documents.retire(definition.into(), key)
+    }
+
+    /// Change the schema of a latest-only document without changing its fork policy.
+    pub fn migrate_latest_document<From, To>(
+        &mut self,
+        old: &LatestConversationDocument<From>,
+        new: &LatestConversationDocument<To>,
+        key: &str,
+        migrate: impl FnOnce(From) -> Result<To, Error>,
+    ) -> Result<(), Error>
+    where
+        From: serde::de::DeserializeOwned + serde::Serialize,
+        To: serde::Serialize,
+    {
+        self.current_documents
+            .migrate(old.into(), new.into(), key, migrate)
     }
 
     /// Read a document by its definition in this conversation.
@@ -521,6 +573,7 @@ impl<'a> SessionTransaction<'a> {
             name: definition.kind.clone(),
             key: key.to_owned(),
         };
+        self.current_documents.guard_rewindable(&address)?;
         let expected = definition.binding()?;
         let stored = self.stored_document_policy(&address)?;
         let document = self.document(&address)?;
@@ -967,11 +1020,6 @@ impl<'a> SessionTransaction<'a> {
             checks: Vec::new(),
             mutations: Vec::new(),
         };
-        let session_documents_changed = self.session_documents.append_to(&mut batch)?;
-        let changed = self.table_written
-            || !self.writes.is_empty()
-            || !self.policies.is_empty()
-            || session_documents_changed;
         for (id, (expected, _)) in &self.task_reads {
             batch.checks.push(Check {
                 key: crate::task_store::key(*id),
@@ -1018,6 +1066,10 @@ impl<'a> SessionTransaction<'a> {
                 });
             }
         }
+        for address in self.writes.keys().chain(self.policies.keys()) {
+            self.current_documents.guard_rewindable(address)?;
+        }
+        let changed = self.table_written || !self.writes.is_empty() || !self.policies.is_empty();
         for address in self.policy_reads {
             let key = address.policy_key()?;
             batch.checks.push(Check {
@@ -1031,6 +1083,7 @@ impl<'a> SessionTransaction<'a> {
                 });
             }
         }
+        let changed = self.current_documents.append_to(&mut batch)? || changed;
         for child in &mut self.children {
             if child.creating {
                 let parent_key = crate::task_store::key(child.parent.task.id());
