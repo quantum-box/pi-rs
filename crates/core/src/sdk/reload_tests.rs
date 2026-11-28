@@ -775,6 +775,17 @@ async fn sdk_reload_retries_only_unfinished_mcp_change_callbacks() {
             true
         }
 
+        fn mcp_server_declarations(&self) -> Vec<crate::McpServerDeclaration> {
+            if self.id == "added" {
+                vec![crate::McpServerDeclaration {
+                    name: "static-server".into(),
+                    config: serde_json::json!({"command":"fixture"}),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+
         async fn lifecycle_with_mcp_registry(
             &self,
             event: &LifecycleEvent,
@@ -821,7 +832,7 @@ async fn sdk_reload_retries_only_unfinished_mcp_change_callbacks() {
         }
     }
 
-    for queue_second in [false, true] {
+    for (queue_second, register_during_retry) in [(false, false), (true, false), (true, true)] {
         let log = LifecycleLog::default();
         let pause = Arc::new(Pause::default());
         let update = RegistryUpdate {
@@ -852,6 +863,22 @@ async fn sdk_reload_retries_only_unfinished_mcp_change_callbacks() {
         }
         control.abort();
         assert!(matches!(reload.await, Err(Error::Cancelled)));
+        if register_during_retry {
+            session
+                .register_extension(Arc::new(McpObserver {
+                    id: "added",
+                    log: log.clone(),
+                    pause: None,
+                    queue_second,
+                }))
+                .unwrap();
+            assert!(
+                session
+                    .registered_mcp_servers()
+                    .iter()
+                    .any(|registration| registration.server.name == "static-server")
+            );
+        }
         session.start().await.unwrap();
         let mut expected = vec![
             "first:start",
@@ -859,11 +886,19 @@ async fn sdk_reload_retries_only_unfinished_mcp_change_callbacks() {
             "last:start",
             "first:one",
             "paused:one",
-            "paused:one",
-            "last:one",
         ];
+        if register_during_retry {
+            expected.push("added:start");
+        }
+        expected.extend(["paused:one", "last:one"]);
+        if register_during_retry {
+            expected.push("added:one");
+        }
         if queue_second {
             expected.extend(["first:one,two", "paused:one,two", "last:one,two"]);
+            if register_during_retry {
+                expected.push("added:one,two");
+            }
         }
         assert_eq!(*log.lock().unwrap(), expected);
     }

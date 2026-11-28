@@ -1,7 +1,10 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use fluent_uri::Iri;
@@ -368,17 +371,28 @@ impl McpRuntime {
     // Explicit host changes copy the current declarations into the modified
     // registry. Callback changes share the runtime of that registry and its active snapshots.
     pub(crate) fn copy_registrations(&self) -> Self {
-        let registrations = self
-            .state
-            .lock()
-            .expect("MCP registrations")
-            .registrations
-            .clone();
+        self.copy_registrations_with_delivery(false)
+    }
+
+    pub(crate) fn copy_registrations_with_delivery(&self, preserve_delivery: bool) -> Self {
+        let state = self.state.lock().expect("MCP registrations");
+        let mut copy = McpRuntimeState {
+            registrations: state.registrations.clone(),
+            ..Default::default()
+        };
+        if preserve_delivery {
+            copy.pending.clone_from(&state.pending);
+            copy.in_flight = state.in_flight.as_ref().map(|change| {
+                Arc::new(McpChange {
+                    servers: change.servers.clone(),
+                    completed_hooks: AtomicUsize::new(
+                        change.completed_hooks.load(Ordering::Relaxed),
+                    ),
+                })
+            });
+        }
         Self {
-            state: Mutex::new(McpRuntimeState {
-                registrations,
-                ..Default::default()
-            }),
+            state: Mutex::new(copy),
         }
     }
 

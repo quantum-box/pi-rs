@@ -3687,6 +3687,23 @@ impl Registry {
     }
 
     pub fn register(&mut self, extension: Arc<dyn Extension>) -> Result<()> {
+        self.register_inner(extension, false)
+    }
+
+    // The session owns the journal guard, and registration only appends an
+    // extension, so the existing callback cursor still indexes the same hooks.
+    pub(crate) fn register_session_extension(
+        &mut self,
+        extension: Arc<dyn Extension>,
+    ) -> Result<()> {
+        self.register_inner(extension, true)
+    }
+
+    fn register_inner(
+        &mut self,
+        extension: Arc<dyn Extension>,
+        preserve_mcp_delivery: bool,
+    ) -> Result<()> {
         let id = extension.id();
         if id.is_empty() || self.extensions.iter().any(|item| item.id() == id) {
             return Err(Error::Config(format!(
@@ -3747,7 +3764,9 @@ impl Registry {
         if !self.omit_mcp_declarations {
             let servers = extension.mcp_server_declarations();
             if !servers.is_empty() {
-                let mut runtime = self.mcp_servers.copy_registrations();
+                let mut runtime = self
+                    .mcp_servers
+                    .copy_registrations_with_delivery(preserve_mcp_delivery);
                 Self::insert_mcp_declarations(
                     runtime.registrations_mut(),
                     extension.as_ref(),

@@ -3449,7 +3449,7 @@ impl AgentSession {
             .try_lock()
             .map_err(|_| Error::Session("session journal is in use".into()))?;
         let mut registry = self.registry.as_ref().clone();
-        registry.register(extension.clone())?;
+        registry.register_session_extension(extension.clone())?;
         let instances = std::slice::from_ref(&extension);
         if self.exclusive_extensions {
             claim_exclusive_extensions(&[], instances, &self.extension_registration_scope)?;
