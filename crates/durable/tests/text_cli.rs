@@ -629,6 +629,25 @@ fn rpc_session_name_is_sanitized_and_retained_on_reopen() {
     assert_eq!(forked[3]["data"]["tree"][0]["label"], "earlier");
     let parent = rpc(&["--conversation", id], &[json!({"type":"get_state"})]);
     assert_eq!(parent[0]["data"]["sessionName"], "Updated");
+    let checked_out = rpc(
+        &["--conversation", id],
+        &[
+            json!({"type":"checkout_entry","entryId":leaf}),
+            json!({"type":"get_state"}),
+            json!({"type":"get_tree"}),
+            json!({"type":"checkout_entry","entryId":new_entry["id"]}),
+            json!({"type":"get_state"}),
+        ],
+    );
+    assert_eq!(checked_out[0]["data"]["sessionId"], id);
+    assert_eq!(checked_out[1]["data"]["sessionName"], "Test Title");
+    assert_eq!(checked_out[2]["data"]["leafId"], leaf);
+    assert_eq!(
+        checked_out[2]["data"]["tree"][0]["children"][0]["entry"],
+        *new_entry
+    );
+    assert_eq!(checked_out[3]["data"]["sessionId"], id);
+    assert_eq!(checked_out[4]["data"]["sessionName"], "Updated");
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock

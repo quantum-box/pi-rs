@@ -111,12 +111,20 @@ struct Conversation {
     submissions: BTreeMap<Uuid, pi_rs::QueuedMessage>,
     tree: Option<TerminalTree>,
     tree_request: Option<Uuid>,
-    fork_pending: bool,
+    navigation_pending: bool,
+    tree_action: TreeAction,
+}
+
+#[derive(Clone, Copy, Default)]
+enum TreeAction {
+    #[default]
+    Checkout,
+    Fork,
 }
 
 impl Conversation {
     fn busy(&self) -> bool {
-        self.active || self.fork_pending || !self.submissions.is_empty()
+        self.active || self.navigation_pending || !self.submissions.is_empty()
     }
 
     fn event(&mut self, view: &mut View, args: &mut Cli, event: Value) {
@@ -138,8 +146,8 @@ impl Conversation {
                     }
                     return;
                 }
-                if command == Some("fork_at_entry") {
-                    self.fork_pending = false;
+                if matches!(command, Some("fork_at_entry" | "checkout_entry")) {
+                    self.navigation_pending = false;
                     if event["success"] == true {
                         self.tree = None;
                         view.picker = None;
@@ -149,14 +157,18 @@ impl Conversation {
                             args.model = model.to_owned();
                         }
                         restore_messages(view, &event["data"]);
-                        view.append("Forked to new session");
+                        view.append(if command == Some("fork_at_entry") {
+                            "Forked to new session"
+                        } else {
+                            "Moved to selected entry"
+                        });
                         view.viewport.follow();
                         return;
                     }
                     if let Some(picker) = view.picker.as_mut() {
                         picker.show_feedback(Err(event["error"]
                             .as_str()
-                            .unwrap_or("Durable fork failed")
+                            .unwrap_or("Durable session navigation failed")
                             .into()));
                         return;
                     }
@@ -225,7 +237,7 @@ impl Conversation {
         follow_up: bool,
         send: impl FnOnce(&[u8]) -> Result<()>,
     ) -> Result<()> {
-        if view.clipboard.is_some() || self.fork_pending {
+        if view.clipboard.is_some() || self.navigation_pending {
             return Ok(());
         }
         let text = &view.editor.text;
@@ -257,11 +269,12 @@ impl Conversation {
         Ok(())
     }
 
-    fn request_tree(&mut self, worker: &mut Companion) -> Result<()> {
-        if self.tree_request.is_none() && !self.fork_pending {
+    fn request_tree(&mut self, worker: &mut Companion, action: TreeAction) -> Result<()> {
+        if self.tree_request.is_none() && !self.navigation_pending {
             let id = Uuid::new_v4();
             worker.send(json!({"type":"get_entries","id":id}))?;
             self.tree_request = Some(id);
+            self.tree_action = action;
         }
         Ok(())
     }
@@ -279,7 +292,12 @@ impl Conversation {
             ))
         };
         match result {
-            Ok(Some((picker, tree))) => {
+            Ok(Some((mut picker, tree))) => {
+                picker.title = match self.tree_action {
+                    TreeAction::Checkout => "Session tree",
+                    TreeAction::Fork => "Session tree (Enter to fork)",
+                }
+                .into();
                 self.tree = Some(tree);
                 if let (Some(focus), Some(old_picker)) = (focus, view.picker.as_mut()) {
                     old_picker.refresh_tree(picker, focus);
@@ -311,7 +329,7 @@ impl Conversation {
         let Some(mut picker) = view.picker.take() else {
             return Ok(false);
         };
-        if self.fork_pending {
+        if self.navigation_pending {
             view.picker = Some(picker);
             return Ok(true);
         }
@@ -326,16 +344,22 @@ impl Conversation {
             }
             Input::Select(Selection::Checkout(record)) => {
                 if let Some(row) = tree.row(record) {
-                    if Some(row.id) == tree.leaf {
+                    if matches!(self.tree_action, TreeAction::Checkout) && Some(row.id) == tree.leaf
+                    {
                         self.tree = None;
                         view.append("Already at this point");
                         return Ok(true);
                     } else if self.busy() {
-                        picker
-                            .show_feedback(Err("Wait for the current turn before forking".into()));
+                        picker.show_feedback(Err(
+                            "Wait for the current turn before changing the session position".into(),
+                        ));
                     } else {
-                        worker.send(json!({"type":"fork_at_entry","entryId":row.id}))?;
-                        self.fork_pending = true;
+                        let command = match self.tree_action {
+                            TreeAction::Checkout => "checkout_entry",
+                            TreeAction::Fork => "fork_at_entry",
+                        };
+                        worker.send(json!({"type":command,"entryId":row.id}))?;
+                        self.navigation_pending = true;
                     }
                 }
             }
@@ -494,7 +518,6 @@ impl TerminalTree {
             .and_then(|id| ids.get(&id).copied())
             .unwrap_or_default();
         let mut picker = Picker::tree(items, parents, labels, head, filter);
-        picker.title = "Session tree (Enter to fork)".into();
         picker.set_tree_descriptions(descriptions);
         picker.set_label_timestamps(timestamps);
         Ok(Some((picker, Self { rows, leaf })))
@@ -783,7 +806,12 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                         view.draft_images.clear();
                     }
                     "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
-                    "app.session.tree" => conversation.request_tree(&mut worker)?,
+                    "app.session.tree" => {
+                        conversation.request_tree(&mut worker, TreeAction::Checkout)?
+                    }
+                    "app.session.fork" => {
+                        conversation.request_tree(&mut worker, TreeAction::Fork)?
+                    }
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
                     "app.message.dequeue" => {
                         worker.send(json!({"type":"clear_queue","includeContent":true}))?
@@ -794,10 +822,15 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
                     "tui.input.submit"
-                        if view.editor.text.trim() == "/tree" && view.draft_images.is_empty() =>
+                        if matches!(view.editor.text.trim(), "/tree" | "/fork")
+                            && view.draft_images.is_empty() =>
                     {
-                        view.editor.take();
-                        conversation.request_tree(&mut worker)?;
+                        let action = if view.editor.take().trim() == "/fork" {
+                            TreeAction::Fork
+                        } else {
+                            TreeAction::Checkout
+                        };
+                        conversation.request_tree(&mut worker, action)?;
                     }
                     "tui.input.submit" | "app.message.followUp" => {
                         conversation.submit(

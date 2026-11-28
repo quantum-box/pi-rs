@@ -201,6 +201,45 @@ impl<'a> Transcript<'a> {
         Ok(checks)
     }
 
+    /// Move an active head to an authenticated host-selected snapshot. Old
+    /// entries and captured cursors remain readable. The caller commits this
+    /// with the new runtime state and the source evidence.
+    pub(crate) fn prepare_checkout(
+        &self,
+        previous: &Cursor,
+        source: &Cursor,
+    ) -> Result<(Batch, Cursor), Error> {
+        if previous.transcript != self.id {
+            return Err(Error::WrongTranscript);
+        }
+        let (head, version) = self.load_head()?;
+        let key = head_key(self.id);
+        if head.tip != previous.next {
+            return Err(durable_store::Error::Conflict { key }.into());
+        }
+        let tip = source.next.ok_or(Error::Corrupt)?;
+        let checkout = Cursor {
+            transcript: self.id,
+            next: Some(tip),
+        };
+        Ok((
+            Batch {
+                checks: vec![Check {
+                    key: key.clone(),
+                    expected: Expected::Version(version),
+                }],
+                mutations: vec![Mutation::Put {
+                    key,
+                    value: encode(&Head {
+                        format: 1,
+                        tip: Some(tip),
+                    })?,
+                }],
+            },
+            checkout,
+        ))
+    }
+
     /// Create an empty transcript, failing atomically if its ID already exists.
     pub fn prepare_create(&self) -> Result<Batch, Error> {
         let key = head_key(self.id);
