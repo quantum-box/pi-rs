@@ -1084,6 +1084,369 @@ async fn wait_signal_sleep(path: &std::path::Path, key: &str) -> pi_rs_durable::
         tokio::time::sleep(Duration::from_millis(10)).await;
     } }).await.unwrap()
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "manual cross-build database rehearsal"]
+async fn graph_rehearsal_with_parked_conversations() {
+    use pi_rs_durable::{
+        document::{Address, ConversationDocument, DefinedDocumentFork, ForkPolicy},
+        runtime::{Error as RuntimeError, ProgressHistoryCursor, UnifiedHistoryCursor},
+        task::{TaskOwner, TaskState, WaitFor},
+        task_store::{SignalResult, TaskStore},
+    };
+    use serde::{Deserialize, Serialize};
+    use std::{
+        num::{NonZeroU32, NonZeroUsize},
+        path::PathBuf,
+    };
+    use uuid::Uuid;
+
+    struct StreamingModel;
+    #[async_trait]
+    impl Model for StreamingModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            Ok(
+                stream::iter([Ok(ModelEvent::Text("Rehearsal output".into()))])
+                    .chain(ModelStub.stream(request).await?)
+                    .boxed(),
+            )
+        }
+    }
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct RehearsalDocument {
+        count: u32,
+    }
+    #[derive(Clone, Serialize, Deserialize)]
+    struct MigratedDocument {
+        label: String,
+    }
+    let typed = ConversationDocument {
+        kind: "typed-rehearsal".into(),
+        version: NonZeroU32::MIN,
+        initial: RehearsalDocument { count: 0 },
+        fork: DefinedDocumentFork::AsOf,
+    };
+    let typed_v2 = ConversationDocument {
+        kind: typed.kind.clone(),
+        version: NonZeroU32::new(2).unwrap(),
+        initial: MigratedDocument {
+            label: String::new(),
+        },
+        fork: DefinedDocumentFork::AsOf,
+    };
+
+    #[derive(Serialize, Deserialize)]
+    struct Cut {
+        conversation: Uuid,
+        child: Uuid,
+        entry: Uuid,
+        task: Uuid,
+        submission: Uuid,
+        history: UnifiedHistoryCursor,
+        sequences: Vec<u64>,
+        progress: ProgressHistoryCursor,
+        progress_frames: Vec<Value>,
+        typed: Uuid,
+        typed_child: Uuid,
+    }
+    let frame = |record: &pi_rs_durable::runtime::ProgressHistoryFrame| json!({"cursor":record.cursor, "sequence":record.commit_sequence, "changes":record.changes});
+    let directory =
+        PathBuf::from(std::env::var_os("PI_GRAPH_REHEARSAL_DIR").expect("fixture directory"));
+    let mode =
+        std::env::var("PI_GRAPH_REHEARSAL_MODE").expect("seed, migrated, restored, or reject");
+    let output = directory.join("rehearsal");
+    let path = match mode.as_str() {
+        "seed" => directory.join("source.sqlite"),
+        "migrated" | "reject" => output.join("migrated-v4.sqlite"),
+        "restored" => output.join("restored-default.sqlite"),
+        other => panic!("unexpected rehearsal phase {other}"),
+    };
+    let manifest = directory.join("runtime-cuts.json");
+    if mode == "seed" {
+        assert!(
+            !path.exists() && !manifest.exists(),
+            "use a fresh fixture directory"
+        );
+    } else {
+        assert!(
+            path.is_file() && manifest.is_file(),
+            "missing rehearsal output"
+        );
+    }
+    let experimental = cfg!(all(
+        feature = "experimental-graph-revision",
+        feature = "experimental-graph-scope"
+    ));
+    assert_eq!(experimental, mode == "migrated");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (mut options, registry, extensions) =
+        setup_signal(None, Arc::new(Mutex::new(vec![])), calls.clone());
+    options.model = Arc::new(StreamingModel);
+    let open = Scheduler::open_with_extensions(&path, options, extensions);
+    if mode == "reject" {
+        assert!(matches!(
+            open,
+            Err(RuntimeError::Owner(
+                durable_store::owner::OwnerError::Store(
+                    durable_store::Error::IncompatibleGraphProtocol
+                )
+            ))
+        ));
+        return;
+    }
+    let mut scheduler = open.unwrap();
+    let progress_limit = NonZeroUsize::new(128).unwrap();
+    let address = |id: Uuid, key: &str| Address {
+        scope: id.to_string(),
+        name: "rehearsal".into(),
+        key: key.into(),
+    };
+    let wait_key = async |owner: Uuid, key: &str| {
+        let store = durable_store::Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&store);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(parked) = tasks.list().unwrap().into_iter().find(|stored| {
+                    stored.task.owner() == &TaskOwner::Conversation(owner)
+                    && matches!(stored.task.state(), TaskState::Waiting(WaitFor::TypedSleep { signals, .. })
+                        if signals.iter().any(|signal| signal.key() == key))
+                }) {
+                    break parked.task.id();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap()
+    };
+    if mode == "seed" {
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let mut cuts = Vec::new();
+        for index in 0..16 {
+            let id = scheduler
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "rehearsal context ".repeat(64),
+                    max_output_tokens: 100,
+                })
+                .unwrap();
+            scheduler
+                .select_extensions(id, vec!["b".into(), "a".into()])
+                .unwrap();
+            let original = scheduler
+                .session_transaction(id, |tx| {
+                    let doc = address(id, "version");
+                    tx.put_document(&doc, json!({"value":"before"}).as_object().unwrap().clone())?;
+                    tx.set_document_fork_policy(&doc, ForkPolicy::Copy)?;
+                    tx.edit_defined_document(&typed, "phase", |value| {
+                        value.count = 1;
+                        Ok(())
+                    })?;
+                    Ok(tx.defined_document(&typed, "phase")?.unwrap().incarnation)
+                })
+                .unwrap();
+            let progress = scheduler.progress_history_from_now(id).unwrap();
+            let submission = scheduler
+                .submit(id, Some("work".into()), format!("Review item {index}"))
+                .unwrap();
+            let task = wait_key(id, "first").await;
+            let entry = scheduler
+                .view_positioned(id, progress_limit)
+                .unwrap()
+                .entries
+                .into_iter()
+                .find(|row| matches!(row.message, Message::User { .. }))
+                .unwrap()
+                .history
+                .unwrap()
+                .id;
+            let child = scheduler.fork_by_entry_id(id, entry).unwrap();
+            let original_child = scheduler
+                .session_transaction(child, |tx| {
+                    let document = tx.defined_document(&typed, "phase")?.unwrap();
+                    assert_eq!(document.value.count, 1);
+                    Ok(document.incarnation)
+                })
+                .unwrap();
+            assert_ne!(original, original_child);
+            scheduler
+                .session_transaction(id, |tx| {
+                    tx.put_document(
+                        &address(id, "version"),
+                        json!({"value":"at backup"}).as_object().unwrap().clone(),
+                    )?;
+                    tx.edit_defined_document(&typed, "phase", |value| {
+                        value.count = 2;
+                        Ok(())
+                    })
+                })
+                .unwrap();
+            let history = scheduler.unified_history_start(id, false).unwrap();
+            let page = scheduler.unified_history(&history, progress_limit).unwrap();
+            let progress_page = scheduler
+                .progress_history(&progress, progress_limit)
+                .unwrap();
+            assert!(!page.has_more && !progress_page.has_more);
+            assert!(!progress_page.records.is_empty());
+            cuts.push(Cut {
+                conversation: id,
+                child,
+                entry,
+                task,
+                submission,
+                history,
+                sequences: page
+                    .commits
+                    .into_iter()
+                    .map(|commit| commit.sequence)
+                    .collect(),
+                progress,
+                progress_frames: progress_page.records.iter().map(frame).collect(),
+                typed: original,
+                typed_child: original_child,
+            });
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+        std::fs::write(manifest, serde_json::to_vec(&cuts).unwrap()).unwrap();
+        return;
+    }
+
+    let cuts: Vec<Cut> = serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let token = pi_rs_durable::extension::checkpointable_hook_signal_token();
+    for cut in &cuts {
+        let id = cut.conversation;
+        let page = scheduler
+            .unified_history(&cut.history, progress_limit)
+            .unwrap();
+        assert_eq!(
+            page.commits
+                .into_iter()
+                .map(|commit| commit.sequence)
+                .collect::<Vec<_>>(),
+            cut.sequences
+        );
+        let progress = scheduler
+            .progress_history(&cut.progress, progress_limit)
+            .unwrap();
+        assert!(
+            progress
+                .records
+                .iter()
+                .map(frame)
+                .collect::<Vec<_>>()
+                .starts_with(&cut.progress_frames)
+        );
+        assert!(
+            scheduler
+                .document(&address(id, "post-migration"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            scheduler
+                .document(&address(id, "version"))
+                .unwrap()
+                .unwrap()
+                .value["value"],
+            "at backup"
+        );
+        let original = scheduler
+            .session_transaction(id, |tx| Ok(tx.defined_document(&typed, "phase")?.unwrap()))
+            .unwrap();
+        assert_eq!(original.incarnation, cut.typed);
+        assert_eq!(original.value.count, 2);
+        let new_fork = scheduler.fork_by_entry_id(id, cut.entry).unwrap();
+        for child in [cut.child, new_fork] {
+            let inherited = scheduler
+                .session_transaction(child, |tx| {
+                    Ok(tx.defined_document(&typed, "phase")?.unwrap())
+                })
+                .unwrap();
+            assert_eq!(inherited.value.count, 1);
+            if child == cut.child {
+                assert_eq!(inherited.incarnation, cut.typed_child);
+            } else {
+                assert_ne!(inherited.incarnation, cut.typed_child);
+                assert_ne!(inherited.incarnation, cut.typed);
+            }
+            assert_eq!(
+                scheduler
+                    .document(&address(child, "version"))
+                    .unwrap()
+                    .unwrap()
+                    .value["value"],
+                "before"
+            );
+            assert_eq!(
+                scheduler.conversation(child).unwrap().messages,
+                scheduler.conversation(cut.child).unwrap().messages
+            );
+        }
+        assert_eq!(
+            scheduler
+                .submit(id, Some("work".into()), "duplicate".into())
+                .unwrap(),
+            cut.submission
+        );
+        scheduler
+            .session_transaction(id, |tx| {
+                tx.migrate_defined_document(&typed, &typed_v2, "phase", |old| {
+                    Ok(MigratedDocument {
+                        label: old.count.to_string(),
+                    })
+                })?;
+                let migrated = tx.defined_document(&typed_v2, "phase")?.unwrap();
+                assert_eq!(migrated.incarnation, cut.typed);
+                assert_eq!(migrated.value.label, "2");
+                assert!(tx.retire_defined_document(&typed_v2, "phase")?);
+                assert!(tx.defined_document(&typed_v2, "phase")?.is_none());
+                tx.edit_defined_document(&typed_v2, "phase", |_| Ok(()))?;
+                let recreated = tx.defined_document(&typed_v2, "phase")?.unwrap();
+                assert_ne!(recreated.incarnation, cut.typed);
+                assert!(recreated.value.label.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(wait_key(id, "first").await, cut.task);
+        assert_eq!(
+            driver
+                .deliver_signal(cut.task, &token, "first", json!("one"))
+                .unwrap(),
+            SignalResult::Delivered
+        );
+        assert_eq!(
+            driver
+                .deliver_signal(cut.task, &token, "first", json!("one"))
+                .unwrap(),
+            SignalResult::Duplicate
+        );
+        assert_eq!(wait_key(id, "second").await, cut.task);
+        assert_eq!(
+            driver
+                .deliver_signal(cut.task, &token, "second", json!("two"))
+                .unwrap(),
+            SignalResult::Delivered
+        );
+        wait_result(&scheduler, id).await;
+        if mode == "migrated" {
+            scheduler
+                .session_transaction(id, |tx| {
+                    tx.put_document(
+                        &address(id, "post-migration"),
+                        json!({"written":true}).as_object().unwrap().clone(),
+                    )
+                })
+                .unwrap();
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), cuts.len());
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn signal_sleep_worker() {

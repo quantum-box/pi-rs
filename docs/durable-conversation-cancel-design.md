@@ -584,3 +584,56 @@ seeded 4,096 application rows at the new boundary. Restoration retained the
 original revision and row count. The source hash was unchanged. For this
 21,217,280-byte backup, the rehearsal reported 41 ms to back up, 34 ms to
 migrate and reopen, and 490 ms to restore and verify.
+
+The runtime rehearsal also exercises an upgrade with parked work. It creates
+16 conversations waiting on typed hook signals and 16 historical forks using
+the standard SDK. It saves the task and submission IDs, original fork entry
+IDs, and history cursors before taking the backup. Both the migrated v4 copy
+and the restored standard copy must reproduce the captured history, create
+new forks with the original document values, and complete the same 16 tasks.
+Each task accepts its first signal once, recognizes the duplicate, and consumes
+the second signal before running the tool exactly once. The standard runtime
+must reject the v4 copy. Application writes performed on the migrated copy
+must remain absent from the restored copy.
+
+A macOS run used a 1,277,952-byte backup with 656 live rows, including 32
+conversations, 16 parked tasks and 32 documents. Backup, migration and reopen,
+and restore verification took 14 ms, 11 ms, and 31 ms respectively. The source
+SHA-256 stayed the same. Both copies completed all parked tasks and verified
+the saved cursors and original document values. This run covers recovery
+behavior at the fixture's scale. The scan-budget results still support keeping
+both experimental features opt-in.
+
+The typed-document extension of this rehearsal was run against `main`
+`43765fde7` and the migration tooling. The standard source contained 32
+conversations, 16 parked tasks, and 64 documents, with 720 live rows and a
+1,323,008-byte backup. Backup, migration and reopen, and restore verification
+measured 3 ms, 7 ms, and 22 ms on macOS. Both copies retained the original
+document incarnations and branch-local values, and a new historical fork
+received a distinct incarnation. Both copies migrated the document schema
+without changing its incarnation and assigned a new incarnation on retirement
+and recreation. All parked tasks resumed, the standard build rejected the v4
+copy, and the source SHA-256 stayed unchanged. These timings describe the
+fixture. Both experimental features remain opt-in because of the scan limits
+measured above and the requirement to have a pre-migration backup to restore
+a database for the standard build.
+
+Run the ignored fixture against a new temporary directory on Unix.
+
+```sh
+export PI_GRAPH_REHEARSAL_DIR=$(mktemp -d)
+run_runtime_rehearsal() {
+  cargo test --locked -p pi-rs-durable "$@" \
+    --test conversation_checkpointable_multi_hooks \
+    graph_rehearsal_with_parked_conversations -- --ignored --exact
+}
+PI_GRAPH_REHEARSAL_MODE=seed run_runtime_rehearsal
+cargo run --locked -p durable-store \
+  --features experimental-graph-scope,experimental-graph-revision \
+  --bin durable-graph-rehearsal -- \
+  "$PI_GRAPH_REHEARSAL_DIR/source.sqlite" "$PI_GRAPH_REHEARSAL_DIR/rehearsal"
+PI_GRAPH_REHEARSAL_MODE=reject run_runtime_rehearsal
+PI_GRAPH_REHEARSAL_MODE=migrated run_runtime_rehearsal \
+  --features experimental-graph-scope,experimental-graph-revision
+PI_GRAPH_REHEARSAL_MODE=restored run_runtime_rehearsal
+```
