@@ -6570,11 +6570,13 @@ width changes, and existing user and tool images.
 
 Tab opens a selectable list when more than one file or command matches. The
 selection replaces only the current word, preserving text to the right of
-the cursor. Enter in the slash command-name menu submits the completed
-command, matching Pi v1.6.0. Tab and file completion keep the input in the
-editor, and Escape keeps the original draft.
+the cursor. Enter and the configured `app.message.followUp` key submit the
+completed command from the slash command-name menu. Both keys insert a file
+completion and leave the draft in the editor. Tab inserts the selected
+completion, and Escape keeps the original draft.
 `autocompleteMaxVisible` sets the row limit. `enableSkillCommands` controls
 skill suggestions while preserving manual skill invocation and discovery.
+[Pi follow-up autocomplete fix](https://github.com/earendil-works/pi/commit/27157503ed1d5150ac89843e3ba2227654c03f58)
 
 ### Model image delivery setting
 

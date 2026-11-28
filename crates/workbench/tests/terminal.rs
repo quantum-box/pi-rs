@@ -2937,6 +2937,65 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 }
 
 #[test]
+fn follow_up_submits_the_selected_command_with_a_remapped_key() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("keybindings.json"),
+        br#"{"app.message.followUp":"ctrl+q"}"#,
+    )
+    .unwrap();
+    let (mut master, _process) = spawn_capability_test_terminal(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-session",
+            ]),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/re\t").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("/reload") && text.contains("/resume")
+    });
+    master.write_all(b"\x11").unwrap(); // Ctrl+Q
+    output_until(&mut master, |text| text.contains("Reloaded settings"));
+}
+
+#[test]
+fn follow_up_confirms_a_file_completion_and_leaves_the_draft_editable() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("follow-up-a.txt"), "").unwrap();
+    std::fs::write(root.path().join("follow-up-b.txt"), "").unwrap();
+    let (mut master, _process) = spawn_capability_test_terminal(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("TERM", "xterm-256color")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-session",
+            ]),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"check @follow-up-\t").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("@follow-up-a.txt") && text.contains("@follow-up-b.txt")
+    });
+    master.write_all(b"\x1b\r!").unwrap(); // Alt+Enter, then keep typing
+    output_until(&mut master, |text| text.contains("check @follow-up-a.txt!"));
+}
+
+#[test]
 fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
     for mode in ["regular", "fullscreen"] {
         check_numeric_setting_cycle(

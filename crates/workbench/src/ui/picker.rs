@@ -848,7 +848,9 @@ impl Picker {
                 && self.query.text.is_empty()
                 && key.code == KeyCode::Char(' ')
                 && key.modifiers == KeyModifiers::NONE)
-            || (self.completion_limit.is_some() && keys.matches("tui.input.tab", key));
+            || (self.is_completion()
+                && (keys.matches("tui.input.tab", key)
+                    || keys.matches("app.message.followUp", key)));
         if let Some(action) = self.session_action.clone() {
             if cancel {
                 self.session_action = None;
