@@ -746,6 +746,7 @@ mod tests {
                 }
                 let body = json!({"answers":answers, "responseId":"decision-response",
                     "usage":{"input":10,"output":4,"cacheRead":2,"cacheWrite":1,
+                        "reasoning":0,"imageOutput":2,
                         "cost":{"total":0.02,"totalFromProvider":true}}})
                 .to_string();
                 let response = format!(
@@ -767,6 +768,8 @@ mod tests {
         assert_eq!(success["answers"], fixture_answers());
         assert_eq!(success["responseId"], "decision-response");
         assert_eq!(success["usage"]["totalTokens"], 17.0);
+        assert_eq!(success["usage"]["reasoning"], 0.0);
+        assert_eq!(success["usage"]["imageOutput"], 2.0);
         assert_eq!(success["usage"]["cost"]["total"], 0.02);
         assert_eq!(success["usage"]["cost"]["totalFromProvider"], true);
 
