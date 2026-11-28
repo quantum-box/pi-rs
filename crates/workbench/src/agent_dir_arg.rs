@@ -59,13 +59,36 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<PathBuf> {
     Ok(normalized)
 }
 
-pub(super) fn absolute_literal(path: &Path) -> std::io::Result<PathBuf> {
-    std::path::absolute(path)
+pub(super) fn resolve_existing_profile(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    if absolute
+        .components()
+        .any(|part| part == Component::ParentDir)
+    {
+        absolute.canonicalize()
+    } else {
+        Ok(absolute)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_resolves_parent_after_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("nested/child");
+        std::fs::create_dir_all(&child).unwrap();
+        let profile = root.path().join("nested/profile");
+        std::fs::create_dir(&profile).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(child, &link).unwrap();
+        let reported = resolve_existing_profile(&link.join("../profile")).unwrap();
+        assert_eq!(reported, profile.canonicalize().unwrap());
+        assert_eq!(resolve(&reported).unwrap(), reported);
+    }
 
     #[test]
     fn takes_last_profile_before_delimiter() {

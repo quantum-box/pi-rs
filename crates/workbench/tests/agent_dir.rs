@@ -24,6 +24,8 @@ fn explicit_agent_dir_selects_profile_before_listing_and_subcommands() {
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_pi"))
             .current_dir(root.path())
+            .env("HOME", root.path())
+            .env("USERPROFILE", root.path())
             .env("PI_RS_HOME", root.path().join("default"))
             .env("PI_CODING_AGENT_DIR", root.path().join("first"))
             .args(args)
@@ -46,6 +48,7 @@ fn explicit_agent_dir_selects_profile_before_listing_and_subcommands() {
     assert!(!stdout.contains("profile-only"));
     for args in [
         vec!["--offline", "--list-models", "--agent-dir", "other"],
+        vec!["--offline", "--list-models", "--agent-dir", "~//other"],
         vec![
             "--agent-dir",
             "first",

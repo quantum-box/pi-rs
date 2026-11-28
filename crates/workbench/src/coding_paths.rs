@@ -61,6 +61,13 @@ fn plain_input_with_policy(value: &str, home: Option<&Path>, remote: bool) -> Re
             {
                 return Err(Error::Config("invalid backend home-relative path".into()));
             }
+            let tail = if remote {
+                tail
+            } else {
+                Path::new(
+                    value[2..].trim_start_matches(|ch| ch == '/' || (cfg!(windows) && ch == '\\')),
+                )
+            };
             home.join(tail)
         });
     }

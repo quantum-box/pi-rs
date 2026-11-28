@@ -1610,7 +1610,7 @@ fn main() {
     let resume_agent_dir = agent_dir.or_else(|| {
         (std::env::var_os("PI_RS_HOME").is_some()
             || std::env::var_os("PI_CODING_AGENT_DIR").is_some())
-        .then(|| agent_dir_arg::absolute_literal(&pi_rs_workbench::agent_dir()).ok())
+        .then(|| agent_dir_arg::resolve_existing_profile(&pi_rs_workbench::agent_dir()).ok())
         .flatten()
     });
     if let Some(code) = run_durable_cli(&argv) {
