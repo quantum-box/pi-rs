@@ -173,6 +173,8 @@ pub(super) struct Worker {
     refresh_barrier: tempfile::NamedTempFile,
     events: Receiver<Value>,
     pending_events: Vec<Value>,
+    pub(super) header_renderer: Option<uuid::Uuid>,
+    pub(super) pending_header_render: Option<uuid::Uuid>,
     pub(super) pending_theme_requests: std::collections::BTreeSet<Uuid>,
     extension_sources: std::collections::BTreeMap<String, Value>,
     pub(super) message_renderer_types: std::collections::BTreeSet<String>,
@@ -471,6 +473,8 @@ impl Worker {
             refresh_barrier,
             events,
             pending_events: startup_warnings,
+            header_renderer: None,
+            pending_header_render: None,
             pending_theme_requests: Default::default(),
             extension_sources: Default::default(),
             message_renderer_types: Default::default(),
@@ -498,7 +502,7 @@ impl Worker {
             let previous = Self::settings_for(slot, args).cloned();
             let pending = slot
                 .take()
-                .map(|mut worker| std::mem::take(&mut worker.pending_events))
+                .map(|mut worker| worker.take_events_for_replacement())
                 .unwrap_or_default();
             let mut next = Self::start_with_transition(args, &["serve"], None, previous.as_ref())
                 .map_err(|error| retain_warning_on_start_error(error, &pending))?;
@@ -535,7 +539,7 @@ impl Worker {
             let previous = Self::settings_for(slot, args).cloned();
             let pending = slot
                 .take()
-                .map(|mut worker| std::mem::take(&mut worker.pending_events))
+                .map(|mut worker| worker.take_events_for_replacement())
                 .unwrap_or_default();
             let mut next = Self::start_with_transition(args, &["serve"], None, previous.as_ref())
                 .map_err(|error| retain_warning_on_start_error(error, &pending))?;
@@ -729,7 +733,7 @@ impl Worker {
         {
             previous = Self::settings_for(slot, args).cloned();
             if let Some(mut worker) = slot.take() {
-                pending = std::mem::take(&mut worker.pending_events);
+                pending = worker.take_events_for_replacement();
             }
         }
         if slot.is_none() {
@@ -862,7 +866,7 @@ impl Worker {
             shutdown_reason(reason),
             replacing_session.then(|| args.session.clone()),
         ));
-        let mut pending_events = std::mem::take(&mut active.pending_events);
+        let mut pending_events = active.take_events_for_replacement();
         let extension_sources = std::mem::take(&mut active.extension_sources);
         let fallback = Self::settings_for(slot, args).cloned();
         drop(slot.take());
@@ -878,6 +882,17 @@ impl Worker {
         next.extension_sources = extension_sources;
         *slot = Some(next);
         Ok(())
+    }
+
+    fn take_events_for_replacement(&mut self) -> Vec<Value> {
+        let mut events = std::mem::take(&mut self.pending_events);
+        events.retain(|event| {
+            !(matches!(
+                event["type"].as_str(),
+                Some("header_renderer_changed" | "header_renderer_invalidated" | "header_rendered")
+            ) || event["type"] == "extension_ui_request" && event["method"] == "setHeader")
+        });
+        events
     }
 
     pub(super) fn request(&mut self, args: &Cli, mut request: Value) -> Result<()> {
@@ -1110,6 +1125,8 @@ mod tests {
             stdin,
             events,
             pending_events: Vec::new(),
+            header_renderer: None,
+            pending_header_render: None,
             pending_theme_requests: Default::default(),
             extension_sources: Default::default(),
             message_renderer_types: Default::default(),

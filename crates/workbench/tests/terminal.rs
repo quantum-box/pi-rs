@@ -2263,6 +2263,9 @@ import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     request = json.load(sys.stdin)
     result = {'id':'theme-extension','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'lifecycle_host_calls':True,'session_lifecycle_hook':True,'model_selection_hook':True} if request['type'] == 'describe' else None
+    if request['type'] == 'render_header':
+        context = request['context']
+        result = {'lines': [[{'text': f"Mounted header {context['width']} {context['theme']['name']}"}]]}
     print(json.dumps({'version':1,'response':{'Ok':result}}))
     sys.exit(0)
 event = json.loads(sys.stdin.readline())['request']['event']
@@ -2375,6 +2378,30 @@ elif event['type'] == 'model_select':
         assert!(!text.contains("timed out"), "{text}");
         text.contains("Model callback finished with dark theme")
     });
+}
+
+#[test]
+fn mounted_header_redraws_after_extension_theme_selection_in_both_modes() {
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let (mut master, _process) = start_theme_extension(
+            root.path(),
+            &["--tui-mode", mode],
+            r#"
+if event['type'] == 'session_start':
+    assert active() == 'dark'
+    assert ui('setHeaderRenderer', enabled=True) is None
+elif event['type'] == 'thinking_level_select' and event['level'] == 'low':
+    assert ui('setTheme', theme='light') == {'success':True}
+    assert active() == 'light'
+"#,
+        );
+        output_until(&mut master, |text| text.contains("Mounted header 110 dark"));
+        master.write_all(b"/thinking low\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Mounted header 110 light")
+        });
+    }
 }
 
 #[test]

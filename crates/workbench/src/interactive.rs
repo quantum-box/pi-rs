@@ -1226,10 +1226,71 @@ enum SelectionDefault {
 #[derive(Default)]
 struct ExtensionChrome {
     header: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
+    dynamic_header: Option<DynamicHeader>,
     footer: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
     working: ExtensionWorkingStatus,
     hidden_thinking_label: Option<String>,
     editor: Option<crate::ui::editor::ExtensionEditor>,
+}
+
+struct DynamicHeader {
+    renderer: uuid::Uuid,
+    rows: Option<pi_rs::RenderedExtensionRows>,
+    attempted: Option<(u16, Theme)>,
+    pending: Option<uuid::Uuid>,
+}
+
+impl DynamicHeader {
+    fn request(&mut self, width: u16, theme: &Theme) -> Option<(uuid::Uuid, Value)> {
+        if self.pending.is_some() || self.was_requested(width, theme) {
+            return None;
+        }
+        let id = uuid::Uuid::new_v4();
+        self.pending = Some(id);
+        self.rows = None;
+        self.attempted = Some((width, theme.clone()));
+        let context = pi_rs::HeaderRenderContext {
+            width,
+            theme: theme.extension_render_theme(),
+        };
+        Some((
+            id,
+            json!({"type":"render_header","id":id,"renderer":self.renderer,"context":context}),
+        ))
+    }
+
+    fn was_requested(&self, width: u16, theme: &Theme) -> bool {
+        self.attempted
+            .as_ref()
+            .is_some_and(|(columns, palette)| *columns == width && palette == theme)
+    }
+
+    fn invalidate(&mut self) -> bool {
+        // The pending request still holds the worker's slot, but this
+        // generation can no longer accept its response or display its rows.
+        self.attempted = None;
+        self.rows.take().is_some()
+    }
+
+    fn receive(&mut self, event: &Value, width: u16, theme: &Theme) -> bool {
+        if self.pending.is_none_or(|id| event["id"] != json!(id)) {
+            return false;
+        }
+        self.pending = None;
+        if !self.was_requested(width, theme) {
+            self.attempted = None;
+            return false;
+        }
+        let rows =
+            serde_json::from_value::<pi_rs::RenderedExtensionRows>(event["rendered"].clone())
+                .ok()
+                .filter(pi_rs::RenderedExtensionRows::within_header_limits);
+        if self.rows == rows {
+            return false;
+        }
+        self.rows = rows;
+        true
+    }
 }
 
 #[derive(Default)]
@@ -1680,7 +1741,9 @@ impl View {
                 }
             }
             pi_rs::UiRequest::SetHeader { lines } => {
-                if self.extension_chrome.header != lines {
+                if self.extension_chrome.dynamic_header.take().is_some()
+                    || self.extension_chrome.header != lines
+                {
                     self.extension_chrome.header = lines;
                     self.regular.redraw = true;
                 }
@@ -1759,8 +1822,20 @@ impl View {
         }
         Ok(None)
     }
+    fn mount_header_renderer(&mut self, renderer: Option<uuid::Uuid>) {
+        self.extension_chrome.header = None;
+        self.extension_chrome.dynamic_header = renderer.map(|renderer| DynamicHeader {
+            renderer,
+            rows: None,
+            attempted: None,
+            pending: None,
+        });
+        self.regular.redraw = true;
+    }
+
     fn clear_extension_chrome(&mut self) -> bool {
-        let header_changed = self.extension_chrome.header.take().is_some();
+        let static_header = self.extension_chrome.header.take().is_some();
+        let header_changed = self.extension_chrome.dynamic_header.take().is_some() || static_header;
         let label_changed = self.extension_chrome.hidden_thinking_label.take().is_some();
         let editor_changed = self.extension_chrome.editor.take().is_some();
         self.regular.redraw |= header_changed || label_changed;
@@ -1787,6 +1862,17 @@ impl View {
     ) -> Vec<Line> {
         if let Some(lines) = &self.extension_chrome.header {
             return crate::ui::render::component_lines_bounded(lines, theme, width, max.min(16));
+        }
+        if let Some(rows) = self
+            .extension_chrome
+            .dynamic_header
+            .as_ref()
+            .filter(|header| {
+                u16::try_from(width).is_ok_and(|width| header.was_requested(width, theme))
+            })
+            .and_then(|header| header.rows.as_ref())
+        {
+            return crate::ui::render::extension_rows_bounded(rows, theme, width, max.min(16));
         }
         if !show_startup_header(args) {
             return Vec::new();
@@ -6840,6 +6926,15 @@ pub(super) async fn run(
             }
         }
         if let Some(active) = &mut worker {
+            if view
+                .extension_chrome
+                .dynamic_header
+                .as_ref()
+                .is_some_and(|header| Some(header.renderer) != active.header_renderer)
+            {
+                view.mount_header_renderer(None);
+                dirty = true;
+            }
             if (active.busy || active.bashing) && view.request_started.is_none() {
                 view.request_started = Some(Instant::now());
             }
@@ -6871,6 +6966,42 @@ pub(super) async fn run(
                     view.tool_preview_pending = None;
                     dirty |= view.invalidate_tool_renderings();
                 }
+                if value["type"] == "header_renderer_changed" {
+                    active.header_renderer = serde_json::from_value(value["renderer"].clone()).ok();
+                    view.mount_header_renderer(active.header_renderer);
+                    dirty = true;
+                    continue;
+                }
+                if value["type"] == "header_renderer_invalidated" {
+                    if let Some(header) = &mut view.extension_chrome.dynamic_header
+                        && value["renderer"] == json!(header.renderer)
+                        && header.invalidate()
+                    {
+                        view.regular.redraw = true;
+                        dirty = true;
+                    }
+                    continue;
+                }
+                if value["type"] == "header_rendered" {
+                    if active
+                        .pending_header_render
+                        .is_none_or(|id| value["id"] != json!(id))
+                    {
+                        continue;
+                    }
+                    active.pending_header_render = None;
+                    if let Some(header) = &mut view.extension_chrome.dynamic_header
+                        && header.receive(
+                            &value,
+                            terminal::size().map_or(0, |(width, _)| width.max(1)),
+                            &theme,
+                        )
+                    {
+                        view.regular.redraw = true;
+                        dirty = true;
+                    }
+                    continue;
+                }
                 if value["type"] == "tool_rendered" {
                     dirty |= view.receive_tool_render(value);
                     continue;
@@ -6899,7 +7030,11 @@ pub(super) async fn run(
                     match view.ui_request(&value) {
                         Ok(Some((id, value))) => active
                             .send(json!({"type":"extension_ui_response","id":id,"value":value}))?,
-                        Ok(None) => {}
+                        Ok(None) => {
+                            if value["method"] == "setHeader" {
+                                active.header_renderer = None;
+                            }
+                        }
                         Err(error) => {
                             view.append(&error.to_string());
                             active.send(json!({"type":"extension_ui_response","id":value["id"],"value":null}))?;
@@ -7034,6 +7169,19 @@ pub(super) async fn run(
                     }
                 }
                 dirty = true;
+            }
+            // The worker slot remains occupied across replacement mounts
+            // until the old renderer has finished cancelling.
+            if active.pending_header_render.is_none()
+                && let Some(header) = &mut view.extension_chrome.dynamic_header
+                && let Ok((width, _)) = terminal::size()
+                && let Some((id, request)) = header.request(width.max(1), &theme)
+            {
+                if active.send(request).is_ok() {
+                    active.pending_header_render = Some(id);
+                } else {
+                    header.pending = None;
+                }
             }
             dirty |= view.prepare_transcript_extension_render(active, &args);
             dirty |= view.prepare_tool_render(active, &args);
@@ -15526,6 +15674,83 @@ exit {exit}
             view.working_status(true, true, started, 80)
                 .starts_with("⠋ 処理中 ")
         );
+    }
+
+    #[test]
+    fn dynamic_header_renders_current_width_theme_and_data_in_the_shared_header_slot() {
+        use clap::Parser;
+        let args = super::Cli::parse_from(["pi"]);
+        let dark = Theme::load("dark", &[], &args.workspace, false, false).unwrap();
+        let light = Theme::load("light", &[], &args.workspace, false, false).unwrap();
+        let mut view = View::default();
+        let renderer = uuid::Uuid::new_v4();
+        view.mount_header_renderer(Some(renderer));
+        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
+        let (_, first) = header.request(80, &dark).unwrap();
+        assert_eq!(first["context"]["width"], 80);
+        assert_eq!(first["context"]["theme"]["name"], "dark");
+        assert!(first["context"]["theme"]["colors"]["accent"].is_string());
+        assert!(header.request(80, &dark).is_none());
+
+        let response = |request: &Value, text| {
+            json!({
+                "id": request["id"], "rendered":{"lines":[[{"text":text,"color":"accent"}]]}
+            })
+        };
+        assert!(!header.receive(&response(&first, "stale"), 66, &dark));
+        let (_, resized) = header.request(66, &dark).unwrap();
+        assert_eq!(resized["context"]["width"], 66);
+        assert!(header.receive(&response(&resized, "resized"), 66, &dark));
+
+        for fullscreen in [false, true] {
+            for (width, theme) in [(80, &dark), (66, &light)] {
+                assert!(
+                    view.header_lines(&args, theme, width, 2, fullscreen)
+                        .iter()
+                        .flat_map(|row| &row.spans)
+                        .all(|span| span.text != "resized")
+                );
+            }
+        }
+        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
+        let (_, themed) = header.request(66, &light).unwrap();
+        assert_eq!(themed["context"]["theme"]["name"], "light");
+        assert!(!header.invalidate());
+        assert!(!header.receive(&response(&themed, "old data"), 66, &light));
+        let (_, invalidated) = header.request(66, &light).unwrap();
+        assert!(header.receive(&response(&invalidated, "changed"), 66, &light));
+        assert!(header.request(66, &light).is_none());
+
+        for fullscreen in [false, true] {
+            let rows = view.header_lines(&args, &light, 66, 2, fullscreen);
+            assert_eq!(rows[0].spans[0].text, "changed");
+            assert_eq!(rows[0].spans[0].color, light.color("accent"));
+        }
+        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
+        assert!(header.invalidate());
+        for fullscreen in [false, true] {
+            assert!(
+                view.header_lines(&args, &light, 66, 2, fullscreen)
+                    .iter()
+                    .flat_map(|row| &row.spans)
+                    .all(|span| span.text != "changed")
+            );
+        }
+        view.ui_request(&json!({"id":renderer,"method":"setHeader","lines":[[{"text":"static"}]]}))
+            .unwrap();
+        assert!(view.extension_chrome.dynamic_header.is_none());
+        assert_eq!(
+            view.header_lines(&args, &light, 66, 2, false)[0].spans[0].text,
+            "static"
+        );
+        view.mount_header_renderer(Some(uuid::Uuid::new_v4()));
+        assert!(view.extension_chrome.header.is_none());
+        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
+        let (_, replacement) = header.request(66, &light).unwrap();
+        assert!(!header.receive(&response(&invalidated, "previous mount"), 66, &light));
+        assert!(header.receive(&response(&replacement, "replacement"), 66, &light));
+        assert!(view.clear_extension_chrome());
+        assert!(view.extension_chrome.dynamic_header.is_none());
     }
 
     #[test]

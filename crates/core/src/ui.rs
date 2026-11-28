@@ -27,6 +27,49 @@ pub struct UiComponentSpan {
     pub inverse: bool,
 }
 
+/// The active terminal palette, without theme file paths or session data.
+/// Color strings are CSS hex values, decimal ANSI palette indices, terminal
+/// color names, or "default".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiRenderTheme {
+    pub name: String,
+    pub colors: std::collections::BTreeMap<String, String>,
+    pub dimmed: Vec<String>,
+}
+
+/// Read-only layout information for a mounted header.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeaderRenderContext {
+    pub width: u16,
+    pub theme: UiRenderTheme,
+}
+
+/// A mounted header. Returning `None` uses the built-in header. Empty rows hide it.
+/// The host cancels pending renders and releases this instance when it is unmounted.
+#[async_trait::async_trait]
+pub trait HeaderRenderer: Send + Sync {
+    async fn render(
+        &self,
+        context: &HeaderRenderContext,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>>;
+
+    /// Render until completion or cancellation. Implementations that start
+    /// background work must finish its cleanup before returning.
+    async fn render_with_cancellation(
+        &self,
+        context: &HeaderRenderContext,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Ok(None),
+            rows = self.render(context) => rows,
+        }
+    }
+}
+
 /// Layout options for an extension's custom transcript message.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +98,11 @@ pub type RenderedExtensionContent = RenderedCustomMessage;
 pub type RenderedExtensionRows = RenderedCustomMessage;
 
 impl RenderedCustomMessage {
+    /// Whether these rows fit the terminal header's limits.
+    pub fn within_header_limits(&self) -> bool {
+        self.lines.len() <= 16 && self.within_limits()
+    }
+
     pub(crate) fn within_limits(&self) -> bool {
         component_lines_within_limits(&self.lines)
             && self
@@ -421,6 +469,13 @@ pub enum UiRequest {
         #[serde(default)]
         lines: Option<Vec<Vec<UiComponentSpan>>>,
     },
+    /// Mount a new instance of the calling extension's header renderer.
+    /// Disable it to restore the built-in header.
+    SetHeaderRenderer {
+        enabled: bool,
+    },
+    /// Request another render after the mounted header's data changes.
+    InvalidateHeaderRenderer,
     /// Replace the session footer with styled rows. Clear it with `None`.
     SetFooter {
         #[serde(default)]
@@ -666,6 +721,25 @@ pub enum UiResponse {
 
 #[async_trait::async_trait]
 pub trait ExtensionUi: Send + Sync {
+    /// Mount (or clear) a renderer on behalf of an scoped extension callback.
+    fn set_header_renderer(
+        &self,
+        _owner: &str,
+        _renderer: Option<std::sync::Arc<dyn HeaderRenderer>>,
+        _cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        Err("dynamic headers are unavailable in this UI".into())
+    }
+
+    /// Invalidate the header only if it belongs to this callback's extension.
+    fn invalidate_header_renderer(
+        &self,
+        _owner: &str,
+        _cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        Err("dynamic headers are unavailable in this UI".into())
+    }
+
     async fn request(
         &self,
         request: UiRequest,

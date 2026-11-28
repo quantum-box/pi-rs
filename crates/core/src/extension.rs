@@ -1346,6 +1346,11 @@ pub async fn track_tool_result_presence(
 /// Post-hooks prepare state updates and must not perform external operations.
 #[async_trait::async_trait]
 pub trait Extension: Send + Sync {
+    /// Create the instance mounted by this extension's `SetHeaderRenderer` request.
+    fn header_renderer(&self) -> Option<Arc<dyn crate::HeaderRenderer>> {
+        None
+    }
+
     fn id(&self) -> &str;
 
     fn dependencies(&self) -> &[&str] {

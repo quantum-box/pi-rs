@@ -46,6 +46,11 @@ enum Request {
     },
     CacheWarmingChanged,
     TransportChanged,
+    RenderHeader {
+        id: Uuid,
+        renderer: Uuid,
+        context: pi_rs::HeaderRenderContext,
+    },
     RenderTool {
         id: Uuid,
         operation: Uuid,
@@ -1328,6 +1333,7 @@ async fn run_worker(
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
+                ui.clear_header_renderer().await;
                 share_ready.send_replace(false);
                 if runtime.registry.has_resource_discovery_hooks() {
                     resources_ready.send_replace(false);
@@ -2034,6 +2040,7 @@ async fn run_worker(
                 .await;
         }
     }
+    ui.clear_header_renderer().await;
     cancel_active(&active);
     let shell_pending = active.lock().expect("worker control").shell.is_some();
     if shell_pending && let Some(shell) = shell_results.recv().await {
@@ -2363,6 +2370,23 @@ fn read_requests(
                 }
             };
             match request {
+                Request::RenderHeader {
+                    id,
+                    renderer,
+                    context,
+                } => {
+                    if !terminal_managed {
+                        continue;
+                    }
+                    if let Some(render) = ui.admit_header_render(renderer, context) {
+                        runtime.spawn(async move {
+                            let rendered = render.await;
+                            output(json!({"type":"header_rendered","id":id,"rendered":rendered}));
+                        });
+                    } else {
+                        output(json!({"type":"header_rendered","id":id,"rendered":null}));
+                    }
+                }
                 Request::RenderTool {
                     id,
                     operation,

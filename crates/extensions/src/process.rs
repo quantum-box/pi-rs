@@ -60,8 +60,20 @@ impl Endpoint {
         &self,
         request: ProtocolRequest,
     ) -> ExtensionResult<T> {
+        self.request_with_cancellation(request, CancellationToken::new())
+            .await
+    }
+
+    async fn request_with_cancellation<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        request: ProtocolRequest,
+        cancellation: CancellationToken,
+    ) -> ExtensionResult<T> {
+        if cancellation.is_cancelled() {
+            return Err("native extension operation cancelled".into());
+        }
         let path = self.clone();
-        let guard = CancelOnDrop(CancellationToken::new());
+        let guard = CancelOnDrop(cancellation);
         let cancelled = guard.0.clone();
         tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
             .await
@@ -279,6 +291,9 @@ enum ProtocolRequest {
         section: ToolSection,
         context: ToolRenderContext,
         next: Option<RenderedExtensionRows>,
+    },
+    RenderHeader {
+        context: pi_rs_core::HeaderRenderContext,
     },
     RenderToolSection {
         section: ToolSection,
@@ -983,6 +998,10 @@ impl ExecutableExtension {
 
 #[async_trait::async_trait]
 impl Extension for ExecutableExtension {
+    fn header_renderer(&self) -> Option<Arc<dyn pi_rs_core::HeaderRenderer>> {
+        Some(Arc::new(ExecutableHeaderRenderer(self.endpoint.clone())))
+    }
+
     fn handles_turn_end_boundary(&self) -> bool {
         self.description.turn_end_boundary_hook
     }
@@ -2580,6 +2599,37 @@ impl ToolRendererOverrideCallback for ExecutableToolOverride {
                 context: context.clone(),
                 next: next.cloned(),
             })
+            .await
+    }
+}
+
+struct ExecutableHeaderRenderer(Endpoint);
+
+#[async_trait::async_trait]
+impl pi_rs_core::HeaderRenderer for ExecutableHeaderRenderer {
+    async fn render(
+        &self,
+        context: &pi_rs_core::HeaderRenderContext,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        self.0
+            .request_async(ProtocolRequest::RenderHeader {
+                context: context.clone(),
+            })
+            .await
+    }
+
+    async fn render_with_cancellation(
+        &self,
+        context: &pi_rs_core::HeaderRenderContext,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        self.0
+            .request_with_cancellation(
+                ProtocolRequest::RenderHeader {
+                    context: context.clone(),
+                },
+                cancellation.child_token(),
+            )
             .await
     }
 }
@@ -4579,6 +4629,19 @@ async fn dispatch_inner(
                 None => Ok(Value::Null),
             }
         }
+        ProtocolRequest::RenderHeader { context } => {
+            let rows = match extension.header_renderer() {
+                Some(renderer) => renderer.render(&context).await?,
+                None => None,
+            };
+            if rows
+                .as_ref()
+                .is_some_and(|rows| !rows.within_header_limits())
+            {
+                return Err("extension header exceeds its rendering limits".into());
+            }
+            encode(Ok(rows))
+        }
         ProtocolRequest::RenderToolSection { section, context } => {
             let renderers = extension
                 .tools()
@@ -5719,6 +5782,50 @@ mod tests {
             serde_json::from_value::<DuplexFrame>(encoded).unwrap(),
             DuplexFrame::Progress { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn dynamic_header_dispatch_projects_width_theme_and_bounded_rows() {
+        struct Header;
+        #[async_trait::async_trait]
+        impl pi_rs_core::HeaderRenderer for Header {
+            async fn render(
+                &self,
+                context: &pi_rs_core::HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                let text = format!("{}:{}", context.theme.name, context.width);
+                Ok(Some(RenderedExtensionRows {
+                    lines: vec![
+                        vec![pi_rs_core::UiComponentSpan {
+                            text,
+                            ..Default::default()
+                        }];
+                        if context.width == 1 { 17 } else { 1 }
+                    ],
+                    ..Default::default()
+                }))
+            }
+        }
+
+        struct Fixture;
+        impl Extension for Fixture {
+            fn id(&self) -> &str {
+                "dynamic-header"
+            }
+            fn header_renderer(&self) -> Option<Arc<dyn pi_rs_core::HeaderRenderer>> {
+                Some(Arc::new(Header))
+            }
+        }
+
+        let request = |width| {
+            serde_json::from_value(serde_json::json!({
+            "type":"render_header", "context":{"width":width,"theme":{"name":"dark","colors":{},"dimmed":[]}}
+        })).unwrap()
+        };
+        let output = dispatch(Arc::new(Fixture), request(73)).await.unwrap();
+        assert_eq!(output["lines"][0][0]["text"], "dark:73");
+        let error = dispatch(Arc::new(Fixture), request(1)).await.unwrap_err();
+        assert!(error.contains("rendering limits"));
     }
 
     #[tokio::test]

@@ -965,10 +965,16 @@ In-process Rust and executable extensions can set, hide or reset the
 session header and footer using bounded styled rows. Both terminal modes
 use the active theme. Fullscreen layout and mouse offsets include the
 actual header height, and footer rows leave room for the editor. Reload
-and session transitions reset the overrides. Upstream Pi can also mount
-arbitrary live components and passes a footer data provider to its
-factory. Native extensions supply updated rows through non-blocking host UI
-requests, including in terminal session and selection callbacks.
+and session transitions reset the overrides. Native extensions can also
+mount a bounded header renderer from terminal session and selection callbacks.
+It receives the terminal's header width and effective theme palette. A change
+to either, or explicit invalidation by the owning extension, requests a new
+render. The terminal uses the normal banner fallback while a render for the
+current mount, width and palette is pending. Each worker admits one render at a time
+and waits for executable cleanup before releasing that slot. Static and
+dynamic header setters share one slot. Pi's arbitrary live components and
+read-only footer data provider remain TypeScript features.
+The native footer still accepts static styled rows.
 
 ### Native extension theme discovery
 
