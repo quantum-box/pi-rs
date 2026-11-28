@@ -3440,6 +3440,29 @@ macOS pasteboard containing two file URLs, PNG data and plain text inserted the
 two paths in order, with spaces around adjacent draft text. Pi v1.5.0 chose the
 same paths from the same fixture. Each run restored the original pasteboard.
 
+### WSL clipboard fallback
+
+WSL uses the shared keybinding detector, including the kernel signature when
+interop environment variables are absent. Explicit clipboard paste checks for
+native file lists and images first, then tries the Windows clipboard for
+screenshots. Windows PNGs go through the same resize setting and model image
+profile as native clipboard images. Native text takes precedence over a
+Windows text read when no image is available. Bracketed terminal paste keeps
+its existing path.
+
+Copy tries the native clipboard commands first. On WSL, a failed native copy
+can use OSC 52 in Windows Terminal, then PowerShell over interop. PowerShell
+reads text from a private UTF-8 temporary file so Unicode survives the Windows
+console code page. Headless WSL and remote WSL terminals can also receive copy
+via OSC 52. Terminal copy requires a TTY and caps the encoded payload at
+100,000 bytes.
+
+The WSL bridge limits translated paths to 4 KiB, text to 1 MiB, PNG data to
+50 MiB, and decoded image allocation to 128 MiB. Path translation times out
+after one second, and clipboard subprocesses time out after five seconds.
+Fake-command tests exercise the byte streams, fallback order, cleanup,
+timeouts, and payload limits. Real Windows Terminal verification is deferred.
+
 ### Durable queue controls checkpoint
 
 The core session exposes pending inputs, durable queue clearing and separate

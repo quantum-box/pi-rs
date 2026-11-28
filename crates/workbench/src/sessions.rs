@@ -1034,8 +1034,8 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
     Ok(text.into_owned())
 }
 
-pub fn copy_text(text: &str) -> Result<()> {
-    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+fn clipboard_write_commands() -> &'static [(&'static str, &'static [&'static str])] {
+    if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
     } else if cfg!(windows) {
         &[("clip", &[])]
@@ -1045,7 +1045,15 @@ pub fn copy_text(text: &str) -> Result<()> {
             ("xclip", &["-selection", "clipboard"]),
             ("xsel", &["--clipboard", "--input"]),
         ]
-    };
+    }
+}
+
+pub fn copy_text(text: &str) -> Result<()> {
+    let candidates = clipboard_write_commands();
+    #[cfg(target_os = "linux")]
+    if crate::platform::is_wsl() {
+        return super::clipboard_wsl::copy_text_sync(text, candidates);
+    }
     for (program, arguments) in candidates {
         let child = Command::new(program)
             .args(*arguments)
@@ -1076,17 +1084,11 @@ pub fn copy_text(text: &str) -> Result<()> {
 // terminates an in-progress clipboard process rather than leaving a late write.
 pub(super) async fn copy_text_async(text: &str) -> Result<()> {
     use tokio::io::AsyncWriteExt;
-    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
-        &[("pbcopy", &[])]
-    } else if cfg!(windows) {
-        &[("clip", &[])]
-    } else {
-        &[
-            ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
-            ("xsel", &["--clipboard", "--input"]),
-        ]
-    };
+    let candidates = clipboard_write_commands();
+    #[cfg(target_os = "linux")]
+    if crate::platform::is_wsl() {
+        return super::clipboard_wsl::copy_text(text, candidates).await;
+    }
     for (program, arguments) in candidates {
         let mut command = tokio::process::Command::new(program);
         command
