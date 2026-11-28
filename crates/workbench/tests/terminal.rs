@@ -3079,6 +3079,10 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         let home = root.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"models":[{"id":"test-fixture","reasoning":true,"thinkingLevelMap":{"xhigh":"xhigh"}}]}}}"#).unwrap();
+        let project_settings = root.path().join(".pi/settings.json");
+        let project = br#"{"externalEditor":"project-editor"}"#;
+        std::fs::create_dir(project_settings.parent().unwrap()).unwrap();
+        std::fs::write(&project_settings, project).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (finish, finished) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
@@ -3177,7 +3181,7 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
                     root.path().to_str().unwrap(),
                     "--session",
                     session_path.to_str().unwrap(),
-                    "--no-trust",
+                    "--trust",
                     "--no-mcp",
                     "--offline",
                     "--model",
@@ -3289,6 +3293,15 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         output_until(&mut master, |text| {
             text.contains("Edit shellPath") && text.contains("to change")
         });
+        master.write_all(b"\x15Edit externalEditor\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Edit externalEditor as JSON")
+                && text.contains("overridden by the project")
+        });
+        master.write_all(b"\x13").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Edit externalEditor") && text.contains("to change")
+        });
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
                 .unwrap();
@@ -3301,6 +3314,8 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             "high"
         );
         assert_eq!(settings["shellPath"], "");
+        assert_eq!(settings["externalEditor"], "");
+        assert_eq!(std::fs::read(project_settings).unwrap(), project);
         finish.send(()).unwrap();
         server.join().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);

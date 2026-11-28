@@ -10651,6 +10651,7 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         "defaultThinkingLevel",
         "httpProxy",
         "sessionDir",
+        "externalEditor",
         "shellPath",
         "shellCommandPrefix",
         "defaultTools",
@@ -10888,7 +10889,7 @@ fn select(
                         .unwrap_or_else(|| std::path::Path::new(""))
                 ),
                 "fullscreenWheelScrollLines" => json!("auto"),
-                "shellPath" | "shellCommandPrefix" | "httpProxy" => json!(""),
+                "externalEditor" | "shellPath" | "shellCommandPrefix" | "httpProxy" => json!(""),
                 "defaultProjectTrust" => json!("ask"),
                 "defaultTools" => json!(["read", "bash", "edit", "write"]),
                 "modelThinkingLevels" => json!({}),
@@ -10904,18 +10905,38 @@ fn select(
                 }
                 _ => json!([]),
             };
-            let value = args.settings.value().get(&key).unwrap_or(&default);
+            let (value, description) = match key.as_str() {
+                "externalEditor" => {
+                    let user_value = args
+                        .settings
+                        .stored_layer(&crate::config::agent_dir())
+                        .and_then(|layer| layer.get(&key))
+                        .unwrap_or(&default);
+                    let project_override = args.trusted
+                        && args
+                            .settings
+                            .stored_layer(&args.workspace.join(".pi"))
+                            .is_some_and(|layer| layer.get(&key).is_some());
+                    let description = if project_override {
+                        "user setting, overridden by the project"
+                    } else {
+                        "user setting, applies to the next editor launch"
+                    };
+                    (user_value, description)
+                }
+                "steeringMode" | "followUpMode" => (
+                    args.settings.value().get(&key).unwrap_or(&default),
+                    "default for new sessions",
+                ),
+                _ => (
+                    args.settings.value().get(&key).unwrap_or(&default),
+                    "applies on reload/startup",
+                ),
+            };
             let dialog = crate::ui::dialog::Dialog::new(
                 uuid::Uuid::new_v4(),
                 pi_rs::UiRequest::Editor {
-                    title: format!(
-                        "Edit {key} as JSON · {}",
-                        if matches!(key.as_str(), "steeringMode" | "followUpMode") {
-                            "default for new sessions"
-                        } else {
-                            "applies on reload/startup"
-                        }
-                    ),
+                    title: format!("Edit {key} as JSON · {description}"),
                     initial_value: Some(serde_json::to_string_pretty(value)?),
                     timeout: None,
                 },
