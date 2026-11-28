@@ -146,7 +146,7 @@ impl Conversation {
                     }
                     return;
                 }
-                if matches!(command, Some("fork_at_entry" | "checkout_entry")) {
+                if matches!(command, Some("fork_at_entry" | "navigate_entry")) {
                     self.navigation_pending = false;
                     if event["success"] == true {
                         self.tree = None;
@@ -157,8 +157,17 @@ impl Conversation {
                             args.model = model.to_owned();
                         }
                         restore_messages(view, &event["data"]);
+                        if let Some(draft) = event["data"].get("editorDraft")
+                            && view.editor.text.trim().is_empty()
+                            && view.draft_images.is_empty()
+                        {
+                            view.editor.replace(message_text(draft));
+                            view.draft_images = message_images(draft);
+                        }
                         view.append(if command == Some("fork_at_entry") {
                             "Forked to new session"
+                        } else if event["data"].get("editorDraft").is_some() {
+                            "Moved before selected input"
                         } else {
                             "Moved to selected entry"
                         });
@@ -344,7 +353,9 @@ impl Conversation {
             }
             Input::Select(Selection::Checkout(record)) => {
                 if let Some(row) = tree.row(record) {
-                    if matches!(self.tree_action, TreeAction::Checkout) && Some(row.id) == tree.leaf
+                    if matches!(self.tree_action, TreeAction::Checkout)
+                        && Some(row.id) == tree.leaf
+                        && !row.is_user_input
                     {
                         self.tree = None;
                         view.append("Already at this point");
@@ -355,7 +366,7 @@ impl Conversation {
                         ));
                     } else {
                         let command = match self.tree_action {
-                            TreeAction::Checkout => "checkout_entry",
+                            TreeAction::Checkout => "navigate_entry",
                             TreeAction::Fork => "fork_at_entry",
                         };
                         worker.send(json!({"type":command,"entryId":row.id}))?;
@@ -414,6 +425,7 @@ struct TerminalTree {
 struct TreeRow {
     id: Uuid,
     text: String,
+    is_user_input: bool,
 }
 
 impl TerminalTree {
@@ -511,7 +523,11 @@ impl TerminalTree {
             });
             parents.insert(record, (parent, kind));
             descriptions.insert(record, description);
-            rows.push(TreeRow { id, text });
+            rows.push(TreeRow {
+                id,
+                text,
+                is_user_input: kind == TreeEntryKind::User,
+            });
         }
         let leaf = entry_id(&data["leafId"]);
         let head = leaf
@@ -1008,6 +1024,33 @@ mod tests {
         )
         .unwrap();
         assert!(colors.color_queries.is_empty());
+    }
+
+    #[test]
+    fn navigation_restores_an_input_and_its_image_in_an_empty_editor() {
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        let mut view = View::default();
+        let mut conversation = Conversation {
+            navigation_pending: true,
+            ..Default::default()
+        };
+        let response = json!({
+            "type": "response", "command": "navigate_entry", "success": true,
+            "data": {"messages": [], "editorDraft": {
+                "role": "user", "content": [
+                    {"type":"text","text":"original draft"},
+                    {"type":"image","mimeType":"image/png","data":"aW1hZ2U="}
+                ]
+            }}
+        });
+        conversation.event(&mut view, &mut args, response.clone());
+        assert!(!conversation.navigation_pending);
+        assert_eq!(view.editor.text, "original draft");
+        assert_eq!(view.draft_images[0].data, "aW1hZ2U=");
+        view.editor.replace("existing draft".into());
+        conversation.event(&mut view, &mut args, response);
+        assert_eq!(view.editor.text, "existing draft");
+        assert_eq!(view.draft_images.len(), 1);
     }
 
     #[test]

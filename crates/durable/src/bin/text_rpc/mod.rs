@@ -240,18 +240,22 @@ pub(super) async fn run(
             }
             received = input.recv(), if input_open => {
                 match received {
-                    Some(Ok(request)) if matches!(request["type"].as_str(), Some("fork_at_entry" | "checkout_entry")) => {
+                    Some(Ok(request)) if matches!(request["type"].as_str(), Some("fork_at_entry" | "checkout_entry" | "navigate_entry")) => {
                         let result = switch_session_entry(scheduler, model, id, watching, &request)
-                            .map(|(child, state, child_model)| {
-                                id = child;
-                                provider_model = child_model;
-                                seen = settled_submissions(&state);
-                                tools = model.has_coding_tools.then(|| ToolEvents::new(&state));
-                                Some(json!({
+                            .map(|switched| {
+                                id = switched.id;
+                                provider_model = switched.provider_model;
+                                seen = settled_submissions(&switched.state);
+                                tools = model.has_coding_tools.then(|| ToolEvents::new(&switched.state));
+                                let mut data = json!({
                                     "sessionId": id,
                                     "model": {"id": provider_model},
-                                    "messages": messages(&state)
-                                }))
+                                    "messages": messages(&switched.state)
+                                });
+                                if let Some(draft) = switched.draft {
+                                    data["editorDraft"] = draft;
+                                }
+                                Some(data)
                             });
                         reply(&request, result)?;
                     }
@@ -278,13 +282,20 @@ fn settled_submissions(state: &Conversation) -> HashSet<Uuid> {
         .collect()
 }
 
+struct SessionSwitch {
+    id: Uuid,
+    state: Conversation,
+    provider_model: String,
+    draft: Option<Value>,
+}
+
 fn switch_session_entry(
     scheduler: &mut Scheduler,
     model: &RoutedModel,
     source: Uuid,
     watching: bool,
     request: &Value,
-) -> Result<(Uuid, Conversation, String), String> {
+) -> Result<SessionSwitch, String> {
     let current = scheduler
         .conversation(source)
         .map_err(|error| error.to_string())?;
@@ -295,24 +306,41 @@ fn switch_session_entry(
         .as_str()
         .and_then(|id| Uuid::parse_str(id).ok())
         .ok_or("Invalid session entry ID")?;
-    let child = if request["type"] == "checkout_entry" {
-        scheduler
-            .checkout_session_entry(source, entry)
-            .map_err(|error| error.to_string())?;
-        source
-    } else {
-        scheduler
-            .fork_by_entry_id(source, entry)
-            .map_err(|error| error.to_string())?
+    let (id, draft) = match request["type"].as_str() {
+        Some("navigate_entry") => {
+            let draft = scheduler
+                .navigate_session_entry(source, entry)
+                .map_err(|error| error.to_string())?
+                .as_ref()
+                .map(session_history::editor_draft);
+            (source, draft)
+        }
+        Some("checkout_entry") => {
+            scheduler
+                .checkout_session_entry(source, entry)
+                .map_err(|error| error.to_string())?;
+            (source, None)
+        }
+        _ => (
+            scheduler
+                .fork_by_entry_id(source, entry)
+                .map_err(|error| error.to_string())?,
+            None,
+        ),
     };
     let state = scheduler
-        .conversation(child)
+        .conversation(id)
         .map_err(|error| error.to_string())?;
     let provider_model = model
         .provider_model(&state.config.model)
         .map_err(|error| error.to_string())?
         .to_owned();
-    Ok((child, state, provider_model))
+    Ok(SessionSwitch {
+        id,
+        state,
+        provider_model,
+        draft,
+    })
 }
 
 fn input_reader() -> tokio::sync::mpsc::Receiver<Result<Value, String>> {
