@@ -7954,7 +7954,22 @@ with `AgentSession::set_system_prompt`.
 `ResourceFactory::load_with_packages` adds skill metadata, prompt templates and
 themes from host-granted local package directories to the combined snapshot.
 `PackageResourcePaths::discover` also exposes the selected paths for hosts that
-load individual resource kinds. Discovery shares the native CLI's manifest
+load individual resource kinds. `PackageResourcePaths::discover_with_provenance`
+reports the original host-granted root that selected each path, including
+executable candidates. The first grant that selects an equal path supplies its
+root. An earlier root that excludes a path does not prevent a later grant from
+selecting it. Symlink aliases retain their selected paths and granted root.
+
+`ResourceFactory::load_with_package_provenance` returns the combined snapshot
+and provenance from the same traversal. Exact direct skill, template and theme
+files appear first with `DirectFile` origin and take precedence over identical
+package paths. Provenance describes the selected inputs to those file loaders.
+Separately granted resource directories and loader-level validation or name
+collisions follow the existing loader rules. Pi associates resource paths with
+package-manager source and settings scope. Native provenance records the
+explicit host grants. [Pi package manager](https://github.com/earendil-works/pi/blob/524f015b3c951abc4b853ffe4ebd879a9aedd43f/packages/coding-agent/src/core/package-manager.ts)
+
+Discovery shares the native CLI's manifest
 precedence of `pi-package.json`, Cargo metadata and Pi `package.json`. Explicit
 Pi `package.json` resource lists contribute themes only, as in the native CLI.
 Without an explicit resource list, discovery uses the conventional resource

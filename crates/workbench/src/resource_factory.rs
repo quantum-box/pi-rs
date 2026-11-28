@@ -3,7 +3,9 @@ use std::path::{Component, Path, PathBuf};
 
 use pi_rs::{Error, Result, SessionBuilder};
 
-use crate::package_resources::PackageResourcePaths;
+use crate::package_resources::{
+    PackageResourcePaths, PackageResourceProvenance, ResourcePathOrigin, ResourcePathSelection,
+};
 use crate::prompt_resources::{
     ContextReadGrants, ContextResources, ExplicitPromptResourceFactory, PromptReadGrants,
     PromptResources,
@@ -80,16 +82,36 @@ impl ResourceFactory {
         theme_directories: &[PathBuf],
         package_directories: &[PathBuf],
     ) -> Result<PackageResourceSnapshot> {
+        self.load_with_package_provenance(grants, theme_directories, package_directories)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Load the same snapshot as [`Self::load_with_packages`] and return the
+    /// selected package paths and exact skill, template and theme file grants
+    /// sent to the loaders. Exact direct grants precede package paths and take
+    /// precedence on an equal path. Other resource kinds and separately
+    /// granted resource directories are handled by their respective loaders.
+    pub fn load_with_package_provenance(
+        &self,
+        grants: &ResourceReadGrants,
+        theme_directories: &[PathBuf],
+        package_directories: &[PathBuf],
+    ) -> Result<(PackageResourceSnapshot, PackageResourceProvenance)> {
         validate_grants(grants, theme_directories)?;
-        let package = PackageResourcePaths::discover(package_directories)?;
+        let mut provenance = PackageResourcePaths::discover_with_provenance(package_directories)?;
         let mut grants = grants.clone();
-        append_package_paths(&mut grants.skills.files, package.skills);
-        append_package_paths(&mut grants.templates.files, package.prompts);
-        append_package_paths(&mut grants.themes.files, package.themes);
-        Ok(PackageResourceSnapshot {
+        merge_file_grants(&mut grants.skills.files, &mut provenance.skills);
+        merge_file_grants(&mut grants.templates.files, &mut provenance.prompts);
+        merge_file_grants(&mut grants.themes.files, &mut provenance.themes);
+        let snapshot = PackageResourceSnapshot {
             resources: self.load_paths(&grants, theme_directories)?,
-            extension_candidates: package.extension_candidates,
-        })
+            extension_candidates: provenance
+                .extension_candidates
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect(),
+        };
+        Ok((snapshot, provenance))
     }
 
     fn load_paths(
@@ -143,12 +165,18 @@ fn validate_grants(grants: &ResourceReadGrants, theme_directories: &[PathBuf]) -
     Ok(())
 }
 
-fn append_package_paths(grants: &mut Vec<PathBuf>, paths: Vec<PathBuf>) {
-    for path in paths {
-        if !grants.contains(&path) {
-            grants.push(path);
-        }
-    }
+fn merge_file_grants(grants: &mut Vec<PathBuf>, selected: &mut Vec<ResourcePathSelection>) {
+    selected.retain(|entry| !grants.contains(&entry.path));
+    let mut combined: Vec<_> = grants
+        .iter()
+        .map(|path| ResourcePathSelection {
+            path: path.clone(),
+            origin: ResourcePathOrigin::DirectFile,
+        })
+        .collect();
+    grants.extend(selected.iter().map(|entry| entry.path.clone()));
+    combined.append(selected);
+    *selected = combined;
 }
 
 impl ResourceSnapshot {
