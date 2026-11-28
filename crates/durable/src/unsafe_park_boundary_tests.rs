@@ -129,7 +129,7 @@ impl KeyedTool for BoundaryParent {
             if std::env::var("PI_UNSAFE_BOUNDARY_STAGE").ok().as_deref() == Some("handler-started")
                 || self.root.join("hold-woken-execution").exists()
             {
-                std::fs::write(self.root.join("boundary"), b"handler-started").unwrap();
+                crate::publish_ready_marker(self.root.join("boundary"), b"handler-started");
                 std::future::pending::<()>().await;
             }
             let call = host

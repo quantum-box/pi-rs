@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
-use pi_rs::pi_import::{Branch, convert, required};
+use pi_rs::pi_import::{Branch, SourceAncestry, convert_references, source_entry_name};
 use pi_rs::{Error, Event, Record, Result, Session};
 use serde_json::Value;
 use uuid::Uuid;
@@ -36,47 +36,6 @@ pub fn read(path: &Path) -> Result<Session> {
         import_pi(entries)
     } else {
         Session::from_serialized_records(entries)
-    }
-}
-
-// Source entries form an append-only forest. Binary lifting lets repeated
-// compactions validate their retained boundary without scanning the branch.
-struct SourceAncestry {
-    nodes: Vec<(usize, Vec<usize>)>,
-}
-impl Default for SourceAncestry {
-    fn default() -> Self {
-        Self {
-            nodes: vec![(0, Vec::new())],
-        }
-    }
-}
-impl SourceAncestry {
-    fn add(&mut self, parent: usize) -> usize {
-        let mut jumps = vec![parent];
-        while let Some(next) = self.nodes[*jumps.last().unwrap()].1.get(jumps.len() - 1) {
-            jumps.push(*next);
-        }
-        let index = self.nodes.len();
-        self.nodes.push((self.nodes[parent].0 + 1, jumps));
-        index
-    }
-
-    fn is_ancestor(&self, ancestor: usize, mut node: usize) -> bool {
-        let (ancestor_depth, node_depth) = (self.nodes[ancestor].0, self.nodes[node].0);
-        if ancestor_depth > node_depth {
-            return false;
-        }
-        let mut difference = node_depth - ancestor_depth;
-        let mut bit = 0;
-        while difference != 0 {
-            if difference & 1 != 0 {
-                node = self.nodes[node].1[bit];
-            }
-            difference >>= 1;
-            bit += 1;
-        }
-        node == ancestor
     }
 }
 
@@ -373,19 +332,14 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
     let entry_count = entries.len();
     let source_ids: std::collections::BTreeSet<_> = entries
         .iter()
+        .enumerate()
         .skip(1)
-        .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+        .filter_map(|(index, entry)| source_entry_name(entry, version == 1, index))
         .collect();
     for (index, entry) in entries.into_iter().enumerate().skip(1) {
         importer.timestamp = entry["timestamp"].as_str().map(str::to_owned);
-        let id = if version == 1 {
-            entry["id"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("legacy-{index}"))
-        } else {
-            required(&entry, "id")?.to_owned()
-        };
+        let id = source_entry_name(&entry, version == 1, index)
+            .ok_or_else(|| Error::Session("imported entry is missing id".into()))?;
         if id.is_empty() {
             return Err(Error::Session("imported entry ID is empty".into()));
         }
@@ -440,28 +394,15 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
             }
         }
         let converted = converted_entry.as_ref().unwrap_or(&entry);
-        if converted["type"] == "compaction"
-            && (branch.missing_ancestors
-                || converted["firstKeptEntryId"]
-                    .as_str()
-                    .and_then(|target| branches.get(target))
-                    .is_some_and(|target| target.missing_ancestors))
-        {
-            return Err(Error::Session(
-                "cannot import compaction involving an orphaned branch".into(),
-            ));
-        }
-        if converted["type"] == "compaction"
-            && let Some(target) = converted["firstKeptEntryId"].as_str()
-            && let Some(target_branch) = branches.get(target)
-            && !ancestry.is_ancestor(target_branch.ancestry_index, branch.ancestry_index)
-        {
-            return Err(Error::Session(format!(
-                "imported compaction target {target} is outside its branch"
-            )));
-        }
         let parent_ancestry = branch.ancestry_index;
-        let events = convert(converted, &mut branch, &branches)?;
+        let events = convert_references(
+            converted,
+            &id,
+            &mut branch,
+            &branches,
+            |target| source_ids.contains(target),
+            |ancestor, parent| ancestry.is_ancestor(ancestor, parent),
+        )?;
         let extra_compaction_metadata = (entry["type"] == "compaction"
             && (entry.get("details").is_some() || entry["fromHook"] == true))
             .then(|| {
@@ -1273,7 +1214,12 @@ mod tests {
         let mut cursor = super::super::rpc_entries::Cursor::default();
         cursor.set_verified_counts(&session.validated_pi_conversion_counts().unwrap());
         cursor.advance(&session.records()[..(native - 1) as usize]);
-        let live = cursor.appended(session.records(), None, &Default::default());
+        let live = cursor.appended(
+            session.records(),
+            session.records().len() - 1,
+            None,
+            &Default::default(),
+        );
         assert_eq!(changes, live);
         session.set_label(source, Some("source".into())).unwrap();
         session.set_label(native, Some("native".into())).unwrap();
@@ -2351,16 +2297,263 @@ mod tests {
     }
 
     #[test]
-    fn compaction_rejects_boundary_from_another_complete_branch() {
-        let header = json!({"type":"session","version":3});
-        let first = json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"first"}});
-        let second = json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"other branch"}});
-        let compact = json!({"type":"compaction","id":"c","parentId":"b","firstKeptEntryId":"a","summary":"summary","tokensBefore":100});
-        let error = match import_pi(vec![header, first, second, compact]) {
-            Ok(_) => panic!("cross-branch compaction was accepted"),
-            Err(error) => error,
+    fn earlier_sibling_compaction_keeps_only_its_summary_and_descendants() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"root"}}),
+            json!({"type":"message","id":"sibling","parentId":"root","message":{"role":"user","content":"sibling"}}),
+            json!({"type":"message","id":"before","parentId":"root","message":{"role":"user","content":"before"}}),
+            json!({"type":"compaction","id":"compact","parentId":"before","firstKeptEntryId":"sibling","summary":"saved summary","tokensBefore":42,
+                "systemMessage":{"role":"system","content":"saved system"},
+                "usage":{"input":2,"output":1,"cost":{"total":0.125}}}),
+            json!({"type":"message","id":"after","parentId":"compact","message":{"role":"user","content":"after"}}),
+        ]).unwrap();
+        let check = |session: &Session, raw_target: &str| {
+            assert!(
+                session
+                    .records()
+                    .iter()
+                    .any(|record| matches!(&record.event,
+                Event::SourceEntry { entry, .. }
+                    if entry["id"] == "compact" && entry["firstKeptEntryId"] == raw_target))
+            );
+            assert!(session.branch().iter().any(|record| matches!(
+                &record.event,
+                Event::Compacted {
+                    retain_from: None,
+                    system_prompt: Some(_),
+                    tokens_before: Some(42),
+                    ..
+                }
+            )));
+            assert_eq!(
+                session.current_messages(),
+                [
+                    Message::User {
+                        content: "Prior conversation summary:\nsaved summary".into()
+                    },
+                    Message::User {
+                        content: "after".into()
+                    },
+                ]
+            );
+            assert_eq!(session.statistics().cost, Some(0.125));
+            let wire = super::super::rpc_entries::Entries::new(session)
+                .after(None)
+                .unwrap();
+            let compaction = wire["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["type"] == "compaction")
+                .unwrap();
+            assert_eq!(compaction["firstKeptEntryId"], compaction["id"]);
+            assert_eq!(compaction["systemMessage"]["content"], "saved system");
         };
-        assert!(error.to_string().contains("outside its branch"));
+        check(&session, "sibling");
+        let leaf = session.head();
+        let sibling = session.records().iter().find(|record| {
+            matches!(&record.event, Event::User { content, .. } if content == "sibling")
+        }).unwrap().id;
+        session.checkout(sibling).unwrap();
+        assert_eq!(
+            session.current_messages(),
+            [
+                Message::User {
+                    content: "root".into()
+                },
+                Message::User {
+                    content: "sibling".into()
+                },
+            ]
+        );
+        session.checkout(leaf).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let reopened = Session::open(&path).unwrap();
+        check(&reopened, "sibling");
+        let fork = reopened
+            .fork_to(leaf, directory.path().join("fork.jsonl"))
+            .unwrap();
+        check(&fork, "compact");
+        assert!(!fork.records().iter().any(|record| matches!(&record.event,
+            Event::SourceEntry { entry, .. } if entry["id"] == "sibling")));
+
+        let metadata: BTreeMap<_, _> = reopened
+            .records()
+            .iter()
+            .filter_map(|record| {
+                reopened
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|value| (record.id, value))
+            })
+            .collect();
+        let mut verifier = pi_rs::pi_import::StreamVerifier::new();
+        let mut cursor = super::super::rpc_entries::Cursor::default();
+        let mut projected = Vec::new();
+        let mut next = 0;
+        for end in 1..=reopened.records().len() {
+            let prefix = &reopened.records()[..end];
+            if verifier
+                .advance(prefix, &metadata, false)
+                .unwrap()
+                .is_some()
+            {
+                continue;
+            }
+            for (id, count) in verifier.take_new_counts() {
+                cursor.set_verified_count(id, count);
+            }
+            for index in next..end {
+                projected.extend(cursor.appended(
+                    prefix,
+                    index,
+                    metadata.get(&prefix[index].id),
+                    &metadata,
+                ));
+            }
+            next = end;
+        }
+        assert_eq!(
+            verifier.counts(),
+            &reopened.validated_pi_conversion_counts().unwrap()
+        );
+        let compact = projected
+            .iter()
+            .find(|entry| entry["type"] == "compaction")
+            .unwrap();
+        assert_eq!(compact["firstKeptEntryId"], compact["id"]);
+
+        let mut records = reopened.records().to_vec();
+        for record in &mut records {
+            if let Event::Compacted { retain_from, .. } = &mut record.event {
+                *retain_from = Some(sibling);
+            }
+        }
+        let forged = Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+        assert!(forged.validated_pi_conversion_counts().is_err());
+        assert!(
+            pi_rs::pi_import::StreamVerifier::new()
+                .advance(forged.records(), &metadata, true)
+                .is_err()
+        );
+        assert!(forged.fork_session(leaf).is_err());
+
+        let mut records = reopened.records().to_vec();
+        for record in &mut records {
+            if let Event::SourceEntry { entry, .. } = &mut record.event
+                && entry["id"] == "sibling"
+            {
+                entry["parentId"] = json!("missing");
+            }
+        }
+        let orphaned = Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+        assert!(orphaned.validated_pi_conversion_counts().is_err());
+        assert!(
+            pi_rs::pi_import::StreamVerifier::new()
+                .advance(orphaned.records(), &metadata, true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compaction_recovery_rejects_missing_and_forward_boundaries() {
+        for target in ["missing", "later"] {
+            let error = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"before","parentId":null,"message":{"role":"user","content":"before"}}),
+                json!({"type":"compaction","id":"compact","parentId":"before","firstKeptEntryId":target,"summary":"summary"}),
+                json!({"type":"message","id":"later","parentId":"compact","message":{"role":"user","content":"later"}}),
+            ]).err().unwrap();
+            assert!(error.to_string().contains("compaction target"), "{error}");
+        }
+    }
+
+    #[test]
+    fn orphaned_compaction_rejected_in_import_and_both_replay_paths() {
+        for (boundary, parent) in [
+            ("before", None),
+            ("compact", None),
+            ("compact", Some("info")),
+        ] {
+            let mut entries = vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"session_info","id":"info","parentId":null}),
+                json!({"type":"message","id":"before","parentId":parent,"message":{"role":"user","content":"before"}}),
+                json!({"type":"compaction","id":"compact","parentId":"before","firstKeptEntryId":boundary,"summary":"summary"}),
+            ];
+            let session = import_pi(entries.clone()).unwrap();
+            entries[2]["parentId"] = json!("missing");
+            let error = import_pi(entries).err().unwrap();
+            assert!(error.to_string().contains("orphaned branch"), "{error}");
+
+            let mut records = session.records().to_vec();
+            let before = records
+                .iter_mut()
+                .find_map(|record| match &mut record.event {
+                    Event::SourceEntry { entry, .. } if entry["id"] == "before" => Some(entry),
+                    _ => None,
+                })
+                .unwrap();
+            before["parentId"] = json!("missing");
+            let metadata = session
+                .records()
+                .iter()
+                .filter_map(|record| {
+                    session
+                        .record_metadata(record.id)
+                        .cloned()
+                        .map(|value| (record.id, value))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let orphaned = Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+            let error = orphaned.validated_pi_conversion_counts().unwrap_err();
+            assert!(error.to_string().contains("orphaned branch"), "{error}");
+            let error = pi_rs::pi_import::StreamVerifier::new()
+                .advance(orphaned.records(), &metadata, true)
+                .unwrap_err();
+            assert!(error.to_string().contains("orphaned branch"), "{error}");
+        }
+    }
+
+    #[test]
+    fn fork_removed_labels_do_not_make_compaction_ancestry_orphaned() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"label","id":"root-label","parentId":null,"targetId":"missing","label":"dangling"}),
+            json!({"type":"message","id":"before","parentId":"root-label","message":{"role":"user","content":"retained"}}),
+            json!({"type":"label","id":"bookmark","parentId":"before","targetId":"before","label":"bookmark"}),
+            json!({"type":"compaction","id":"compact","parentId":"bookmark","firstKeptEntryId":"before","summary":"summary"}),
+        ]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork.jsonl");
+        session.fork_to(session.head(), &path).unwrap();
+        let reopened = read(&path).unwrap();
+        // Also verify the older form of the same fork without stored conversion counts.
+        let legacy = Session::from_records(reopened.records().to_vec()).unwrap();
+        for fork in [&reopened, &legacy] {
+            assert_eq!(fork.current_messages(), session.current_messages());
+            let counts = fork.validated_pi_conversion_counts().unwrap();
+            let metadata = fork
+                .records()
+                .iter()
+                .filter_map(|record| {
+                    fork.record_metadata(record.id)
+                        .cloned()
+                        .map(|value| (record.id, value))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut verifier = pi_rs::pi_import::StreamVerifier::new();
+            assert!(
+                verifier
+                    .advance(fork.records(), &metadata, true)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(verifier.counts(), &counts);
+        }
     }
 
     #[test]
@@ -2429,22 +2622,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn source_ancestry_handles_deep_and_divergent_branches() {
-        let mut ancestry = SourceAncestry::default();
-        let first = ancestry.add(0);
-        let mut leaf = first;
-        for _ in 0..8192 {
-            leaf = ancestry.add(leaf);
-        }
-        let sibling = ancestry.add(first);
-        assert!(ancestry.is_ancestor(first, leaf));
-        assert!(ancestry.is_ancestor(leaf, leaf));
-        assert!(!ancestry.is_ancestor(sibling, leaf));
-        assert!(!ancestry.is_ancestor(leaf, sibling));
-        assert!(ancestry.nodes[leaf].1.len() <= 15);
     }
 
     #[test]
@@ -2989,8 +3166,30 @@ mod tests {
         assert!(session.records().iter().any(|record| matches!(
             &record.event, Event::SourceEntry { entry, .. } if entry == &compaction
         )));
-        let fork = Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
-        assert_eq!(fork.current_messages(), messages);
+        let directory = tempfile::tempdir().unwrap();
+        let export = directory.path().join("native.jsonl");
+        session.export_jsonl(&export).unwrap();
+        let reopened = read(&export).unwrap();
+        let fork = reopened.fork_session(reopened.head()).unwrap();
+        for snapshot in [&session, &reopened, &fork] {
+            assert_eq!(snapshot.current_messages(), messages);
+            let wire = super::super::rpc_entries::Entries::new(snapshot)
+                .after(None)
+                .unwrap();
+            let entries = wire["entries"].as_array().unwrap();
+            let retained = entries
+                .iter()
+                .find(|entry| entry["message"]["content"] == "retained")
+                .unwrap();
+            let boundary = entries
+                .iter()
+                .find(|entry| entry["type"] == "compaction")
+                .unwrap();
+            assert_eq!(boundary["firstKeptEntryId"], retained["id"]);
+        }
+        assert!(reopened.records().iter().any(|record| matches!(
+            &record.event, Event::SourceEntry { entry, .. } if entry == &compaction
+        )));
     }
 
     #[test]
@@ -3661,5 +3860,216 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         assert!(read(&path).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+    }
+    #[test]
+    fn dangling_pi_metadata_stays_inert_across_projection_replay_and_fork() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"original"}}),
+            json!({"type":"label","id":"label","parentId":"root","targetId":"4","label":"dangling"}),
+            json!({"type":"context_edit","id":"edit","parentId":"label","targetId":"4","replacement":null}),
+            json!({"type":"message","id":"child","parentId":"edit","message":{"role":"user","content":"followed"}}),
+        ];
+        let bytes: String = entries.iter().map(|entry| format!("{entry}\n")).collect();
+        std::fs::write(&source, &bytes).unwrap();
+        let session = read(&source).unwrap();
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), bytes);
+
+        let source_id = |name: &str| {
+            session
+                .records()
+                .iter()
+                .find(|record| {
+                    matches!(&record.event, Event::SourceEntry { format, entry }
+                        if format == "pi" && entry["id"] == name)
+                })
+                .unwrap()
+                .id
+        };
+        let label = source_id("label");
+        let edit = source_id("edit");
+        let root = source_id("root");
+        assert_eq!(root.to_string(), "4", "exercise the raw/wire ID collision");
+        let check_messages = |session: &Session| {
+            assert!(session.labels().is_empty());
+            assert_eq!(
+                session.current_messages(),
+                [
+                    Message::User {
+                        content: "original".into()
+                    },
+                    Message::User {
+                        content: "followed".into()
+                    },
+                ]
+            );
+        };
+        let check_wire = |session: &Session| {
+            let wire = super::super::rpc_entries::Entries::new(session)
+                .after(None)
+                .unwrap();
+            for entry in wire["entries"].as_array().unwrap() {
+                if matches!(entry["type"].as_str(), Some("label" | "context_edit")) {
+                    assert!(
+                        entry["targetId"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("pi-rs:unresolved:")
+                    );
+                    assert!(
+                        wire["entries"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|candidate| candidate["id"] != entry["targetId"])
+                    );
+                }
+            }
+        };
+        let metadata: BTreeMap<_, _> = session
+            .records()
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|value| (record.id, value))
+            })
+            .collect();
+        let mut stream = pi_rs::pi_import::StreamVerifier::new();
+        assert!(
+            stream
+                .advance(&session.records()[..label as usize], &metadata, false)
+                .is_err()
+        );
+        assert!(!stream.counts().contains_key(&label));
+        stream.set_authoritative_end(session.records());
+        for end in label as usize..=session.records().len() {
+            stream
+                .advance(&session.records()[..end], &metadata, false)
+                .unwrap();
+        }
+        let counts = session.validated_pi_conversion_counts().unwrap();
+        assert_eq!(stream.counts(), &counts);
+        assert_eq!(counts.get(&label), Some(&0));
+        assert_eq!(counts.get(&edit), Some(&0));
+
+        let mut forged = metadata.clone();
+        forged.insert(label, json!({"pi_rs_import_conversion_count_v1":1}));
+        let forged_session =
+            Session::from_records_with_metadata(session.records().to_vec(), forged.clone())
+                .unwrap();
+        assert!(forged_session.validated_pi_conversion_counts().is_err());
+        assert!(
+            pi_rs::pi_import::StreamVerifier::new()
+                .advance(session.records(), &forged, true)
+                .is_err()
+        );
+
+        let mut forward = session.records().to_vec();
+        let Event::SourceEntry { entry, .. } = &mut forward[(edit - 1) as usize].event else {
+            unreachable!()
+        };
+        entry["targetId"] = json!("child");
+        let forward = Session::from_records_with_metadata(forward, metadata.clone()).unwrap();
+        assert!(forward.validated_pi_conversion_counts().is_err());
+        assert!(
+            pi_rs::pi_import::StreamVerifier::new()
+                .advance(forward.records(), &metadata, true)
+                .is_err()
+        );
+
+        check_messages(&session);
+        check_wire(&session);
+        let native = directory.path().join("native.jsonl");
+        session.export_jsonl(&native).unwrap();
+        let reopened = Session::open(&native).unwrap();
+        assert_eq!(reopened.validated_pi_conversion_counts().unwrap(), counts);
+        check_messages(&reopened);
+        check_wire(&reopened);
+        let fork_path = directory.path().join("fork.jsonl");
+        let fork = reopened.fork_to(reopened.head(), &fork_path).unwrap();
+        assert!(
+            fork.validated_pi_conversion_counts()
+                .unwrap()
+                .values()
+                .any(|count| *count == 0)
+        );
+        check_messages(&fork);
+        check_wire(&fork);
+        assert_eq!(std::fs::read_to_string(source).unwrap(), bytes);
+    }
+
+    #[test]
+    fn metadata_recovery_rejects_forward_self_and_invalid_context_references() {
+        let header = json!({"type":"session","version":3});
+        let root = json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"root"}});
+        let sibling = json!({"type":"message","id":"sibling","parentId":null,"message":{"role":"user","content":"sibling"}});
+        let later = json!({"type":"message","id":"later","parentId":"entry","message":{"role":"user","content":"later"}});
+        for entry in [
+            json!({"type":"label","id":"entry","parentId":"root","targetId":"later","label":"forward"}),
+            json!({"type":"label","id":"entry","parentId":"root","targetId":"entry","label":"self"}),
+            json!({"type":"context_edit","id":"entry","parentId":"root","targetId":"later","replacement":null}),
+            json!({"type":"context_edit","id":"entry","parentId":"root","targetId":"sibling","replacement":null}),
+            json!({"type":"context_edit","id":"entry","parentId":"root","targetId":"missing","replacement":{"content":false}}),
+            json!({"type":"context_edit","id":"entry","parentId":"root","replacement":null}),
+        ] {
+            assert!(
+                import_pi(vec![
+                    header.clone(),
+                    root.clone(),
+                    sibling.clone(),
+                    entry.clone(),
+                    later.clone()
+                ])
+                .is_err(),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_rejects_context_edit_pointing_to_a_sibling() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"sibling","parentId":null,"message":{"role":"user","content":"sibling"}}),
+            json!({"type":"message","id":"local","parentId":null,"message":{"role":"user","content":"local"}}),
+            json!({"type":"context_edit","id":"edit","parentId":"local","targetId":"local","replacement":null}),
+        ]).unwrap();
+        let mut records = session.records().to_vec();
+        let sibling = records.iter().find(|record| {
+            matches!(&record.event, Event::User { content, .. } if content == "sibling")
+        }).unwrap().id;
+        let mut metadata = BTreeMap::new();
+        for record in &mut records {
+            if let Some(value) = session.record_metadata(record.id) {
+                metadata.insert(record.id, value.clone());
+            }
+            match &mut record.event {
+                Event::SourceEntry { entry, .. } if entry["id"] == "edit" => {
+                    entry["targetId"] = json!("sibling");
+                }
+                Event::ContextEdited { target, .. } => *target = sibling,
+                _ => {}
+            }
+        }
+        let replayed = Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+        assert!(
+            replayed
+                .validated_pi_conversion_counts()
+                .unwrap_err()
+                .to_string()
+                .contains("outside its branch")
+        );
+        let mut stream = pi_rs::pi_import::StreamVerifier::new();
+        assert!(
+            stream
+                .advance(replayed.records(), &metadata, true)
+                .unwrap_err()
+                .to_string()
+                .contains("outside its branch")
+        );
     }
 }
