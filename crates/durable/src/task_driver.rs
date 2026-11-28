@@ -6740,7 +6740,10 @@ mod tests {
             .store()
             .commit(&batch.checks, &batch.mutations)
             .unwrap();
-        std::fs::write(dir.join("ready"), serde_json::to_vec(&chain).unwrap()).unwrap();
+        // The parent reads the marker as soon as it appears.
+        let staged = dir.join("ready.tmp");
+        std::fs::write(&staged, serde_json::to_vec(&chain).unwrap()).unwrap();
+        std::fs::rename(staged, dir.join("ready")).unwrap();
         loop {
             std::hint::black_box(&driver);
             std::thread::park();
