@@ -987,15 +987,19 @@ session header and footer using bounded styled rows. Both terminal modes
 use the active theme. Fullscreen layout and mouse offsets include the
 actual header height, and footer rows leave room for the editor. Reload
 and session transitions reset the overrides. Native extensions can also
-mount a bounded header renderer from terminal session and selection callbacks.
-It receives the terminal's header width and effective theme palette. A change
-to either, or explicit invalidation by the owning extension, requests a new
-render. The terminal uses the normal banner fallback while a render for the
-current mount, width and palette is pending. Each worker admits one render at a time
-and waits for executable cleanup before releasing that slot. Static and
-dynamic header setters share one slot. Pi's arbitrary live components and
-read-only footer data provider remain TypeScript features.
-The native footer still accepts static styled rows.
+mount bounded header and footer renderers from terminal session and selection
+callbacks. Both receive the available width and effective theme palette. The
+footer also receives the local Git branch, visible extension statuses and the
+available provider count. These fields are snapshots, with a fresh render on
+change. The provider count follows the active model scope or the available
+model snapshot. Each section shares one mount between its static and dynamic
+setters, and only its owner can explicitly invalidate its renderer. The
+terminal displays only rows for the current mount and layout. Each worker
+admits one render per section at a time and waits for executable cleanup
+before releasing the slot. An in-process renderer panic completes the render
+request with the built-in fallback. The same section can render again after a
+replacement is mounted. Pi also allows arbitrary live TypeScript components
+and branch-change subscriptions.
 
 ### Native extension theme discovery
 

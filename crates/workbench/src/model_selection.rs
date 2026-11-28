@@ -357,6 +357,15 @@ pub async fn catalogs(args: &Cli, automatic: bool) -> Result<Vec<Catalog>> {
     Ok(catalogs)
 }
 
+pub(super) fn available_provider_count(catalogs: &[Catalog]) -> usize {
+    catalogs
+        .iter()
+        .filter(|catalog| !catalog.models.is_empty())
+        .map(|catalog| catalog.provider.id())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 /// Rebuild a workspace scope from the catalog data already available locally.
 pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
     let providers = std::iter::once(args.provider.clone()).chain(

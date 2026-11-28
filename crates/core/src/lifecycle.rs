@@ -424,35 +424,53 @@ impl ToolHost for LifecycleUiHost {
         if self.cancellation.is_cancelled() {
             return Err("extension UI cancelled".into());
         }
-        match request {
-            crate::UiRequest::SetHeaderRenderer { enabled } => {
-                let extension = self
-                    .extension
-                    .upgrade()
-                    .ok_or("extension callback has finished")?;
-                let renderer = if enabled {
-                    Some(
-                        extension
-                            .header_renderer()
-                            .ok_or("extension has no header renderer")?,
-                    )
-                } else {
-                    None
-                };
-                self.ui
-                    .set_header_renderer(extension.id(), renderer, &self.cancellation)?;
-                return Ok(crate::UiResponse::Cancelled);
+        use crate::UiRequest::{
+            InvalidateFooterRenderer, InvalidateHeaderRenderer, SetFooterRenderer,
+            SetHeaderRenderer,
+        };
+        if matches!(
+            request,
+            SetHeaderRenderer { .. }
+                | SetFooterRenderer { .. }
+                | InvalidateHeaderRenderer
+                | InvalidateFooterRenderer
+        ) {
+            let extension = self
+                .extension
+                .upgrade()
+                .ok_or("extension callback has finished")?;
+            let owner = extension.id();
+            let cancellation = &self.cancellation;
+            match request {
+                SetHeaderRenderer { enabled } => {
+                    let renderer = enabled
+                        .then(|| {
+                            extension
+                                .header_renderer()
+                                .ok_or("extension has no header renderer")
+                        })
+                        .transpose()?;
+                    self.ui.set_header_renderer(owner, renderer, cancellation)?;
+                }
+                SetFooterRenderer { enabled } => {
+                    let renderer = enabled
+                        .then(|| {
+                            extension
+                                .footer_renderer()
+                                .ok_or("extension has no footer renderer")
+                        })
+                        .transpose()?;
+                    self.ui.set_footer_renderer(owner, renderer, cancellation)?;
+                }
+                InvalidateHeaderRenderer => {
+                    self.ui.invalidate_header_renderer(owner, cancellation)?
+                }
+                InvalidateFooterRenderer => {
+                    self.ui.invalidate_footer_renderer(owner, cancellation)?
+                }
+                _ => unreachable!("renderer lifecycle request"),
             }
-            crate::UiRequest::InvalidateHeaderRenderer => {
-                let extension = self
-                    .extension
-                    .upgrade()
-                    .ok_or("extension callback has finished")?;
-                self.ui
-                    .invalidate_header_renderer(extension.id(), &self.cancellation)?;
-                return Ok(crate::UiResponse::Cancelled);
-            }
-            _ => {}
+            return Ok(crate::UiResponse::Cancelled);
         }
         if request.needs_response()
             && !matches!(

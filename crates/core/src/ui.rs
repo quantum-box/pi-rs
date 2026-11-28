@@ -70,6 +70,51 @@ pub trait HeaderRenderer: Send + Sync {
     }
 }
 
+/// Presentation data drawn from the current workspace and model snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FooterRenderData {
+    /// The local branch, "detached" for detached HEAD, or None outside a repository.
+    pub git_branch: Option<String>,
+    pub extension_statuses: std::collections::BTreeMap<String, String>,
+    /// Number of distinct providers with available models in the current scope.
+    pub available_provider_count: usize,
+}
+
+/// Read-only layout and presentation information for a mounted footer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FooterRenderContext {
+    pub width: u16,
+    pub theme: UiRenderTheme,
+    #[serde(flatten)]
+    pub data: FooterRenderData,
+}
+
+/// A mounted footer. Returning `None` restores the default rows. Empty rows hide it.
+/// The host rerenders it when the footer data changes and releases it on unmount.
+#[async_trait::async_trait]
+pub trait FooterRenderer: Send + Sync {
+    async fn render(
+        &self,
+        context: &FooterRenderContext,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>>;
+
+    /// Render until completion or cancellation. Implementations that start
+    /// background work must finish its cleanup before returning.
+    async fn render_with_cancellation(
+        &self,
+        context: &FooterRenderContext,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Ok(None),
+            rows = self.render(context) => rows,
+        }
+    }
+}
+
 /// Layout options for an extension's custom transcript message.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +145,11 @@ pub type RenderedExtensionRows = RenderedCustomMessage;
 impl RenderedCustomMessage {
     /// Whether these rows fit the terminal header's limits.
     pub fn within_header_limits(&self) -> bool {
+        self.within_chrome_limits()
+    }
+
+    /// Whether these rows fit the terminal header and footer limits.
+    pub fn within_chrome_limits(&self) -> bool {
         self.lines.len() <= 16 && self.within_limits()
     }
 
@@ -481,6 +531,13 @@ pub enum UiRequest {
         #[serde(default)]
         lines: Option<Vec<Vec<UiComponentSpan>>>,
     },
+    /// Mount a new instance of the calling extension's footer renderer.
+    /// Disable it to restore the built-in footer.
+    SetFooterRenderer {
+        enabled: bool,
+    },
+    /// Request another render after the mounted footer's own data changes.
+    InvalidateFooterRenderer,
     /// Override the working message. Clear it with `None`.
     SetWorkingMessage {
         #[serde(default)]
@@ -738,6 +795,25 @@ pub trait ExtensionUi: Send + Sync {
         _cancellation: &CancellationToken,
     ) -> ExtensionResult<()> {
         Err("dynamic headers are unavailable in this UI".into())
+    }
+
+    /// Mount or clear a footer on behalf of a scoped extension callback.
+    fn set_footer_renderer(
+        &self,
+        _owner: &str,
+        _renderer: Option<std::sync::Arc<dyn FooterRenderer>>,
+        _cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        Err("dynamic footers are unavailable in this UI".into())
+    }
+
+    /// Invalidate a footer if it belongs to this callback's extension.
+    fn invalidate_footer_renderer(
+        &self,
+        _owner: &str,
+        _cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        Err("dynamic footers are unavailable in this UI".into())
     }
 
     async fn request(

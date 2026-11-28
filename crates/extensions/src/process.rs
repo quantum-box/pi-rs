@@ -295,6 +295,9 @@ enum ProtocolRequest {
     RenderHeader {
         context: pi_rs_core::HeaderRenderContext,
     },
+    RenderFooter {
+        context: pi_rs_core::FooterRenderContext,
+    },
     RenderToolSection {
         section: ToolSection,
         context: ToolRenderContext,
@@ -999,7 +1002,11 @@ impl ExecutableExtension {
 #[async_trait::async_trait]
 impl Extension for ExecutableExtension {
     fn header_renderer(&self) -> Option<Arc<dyn pi_rs_core::HeaderRenderer>> {
-        Some(Arc::new(ExecutableHeaderRenderer(self.endpoint.clone())))
+        Some(Arc::new(ExecutableChromeRenderer(self.endpoint.clone())))
+    }
+
+    fn footer_renderer(&self) -> Option<Arc<dyn pi_rs_core::FooterRenderer>> {
+        Some(Arc::new(ExecutableChromeRenderer(self.endpoint.clone())))
     }
 
     fn handles_turn_end_boundary(&self) -> bool {
@@ -2603,10 +2610,39 @@ impl ToolRendererOverrideCallback for ExecutableToolOverride {
     }
 }
 
-struct ExecutableHeaderRenderer(Endpoint);
+struct ExecutableChromeRenderer(Endpoint);
 
 #[async_trait::async_trait]
-impl pi_rs_core::HeaderRenderer for ExecutableHeaderRenderer {
+impl pi_rs_core::FooterRenderer for ExecutableChromeRenderer {
+    async fn render(
+        &self,
+        context: &pi_rs_core::FooterRenderContext,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        self.0
+            .request_async(ProtocolRequest::RenderFooter {
+                context: context.clone(),
+            })
+            .await
+    }
+
+    async fn render_with_cancellation(
+        &self,
+        context: &pi_rs_core::FooterRenderContext,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        self.0
+            .request_with_cancellation(
+                ProtocolRequest::RenderFooter {
+                    context: context.clone(),
+                },
+                cancellation.child_token(),
+            )
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl pi_rs_core::HeaderRenderer for ExecutableChromeRenderer {
     async fn render(
         &self,
         context: &pi_rs_core::HeaderRenderContext,
@@ -4284,6 +4320,16 @@ async fn dispatch(
     dispatch_inner(extension, request, None, None).await
 }
 
+fn encode_chrome_rows(rows: Option<RenderedExtensionRows>) -> ExtensionResult<Value> {
+    if rows
+        .as_ref()
+        .is_some_and(|rows| !rows.within_chrome_limits())
+    {
+        return Err("extension header or footer exceeds its rendering limits".into());
+    }
+    encode(Ok(rows))
+}
+
 async fn dispatch_with_host(
     extension: Arc<dyn Extension>,
     request: ProtocolRequest,
@@ -4634,13 +4680,14 @@ async fn dispatch_inner(
                 Some(renderer) => renderer.render(&context).await?,
                 None => None,
             };
-            if rows
-                .as_ref()
-                .is_some_and(|rows| !rows.within_header_limits())
-            {
-                return Err("extension header exceeds its rendering limits".into());
-            }
-            encode(Ok(rows))
+            encode_chrome_rows(rows)
+        }
+        ProtocolRequest::RenderFooter { context } => {
+            let rows = match extension.footer_renderer() {
+                Some(renderer) => renderer.render(&context).await?,
+                None => None,
+            };
+            encode_chrome_rows(rows)
         }
         ProtocolRequest::RenderToolSection { section, context } => {
             let renderers = extension
@@ -5826,6 +5873,50 @@ mod tests {
         assert_eq!(output["lines"][0][0]["text"], "dark:73");
         let error = dispatch(Arc::new(Fixture), request(1)).await.unwrap_err();
         assert!(error.contains("rendering limits"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_footer_dispatch_reads_the_snapshot() {
+        struct Footer;
+        #[async_trait::async_trait]
+        impl pi_rs_core::FooterRenderer for Footer {
+            async fn render(
+                &self,
+                context: &pi_rs_core::FooterRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                let text = format!(
+                    "{}:{}:{}:{}:{}",
+                    context.width,
+                    context.theme.name,
+                    context.data.git_branch.as_deref().unwrap(),
+                    context.data.extension_statuses["fixture"],
+                    context.data.available_provider_count
+                );
+                Ok(Some(RenderedExtensionRows {
+                    lines: vec![vec![pi_rs_core::UiComponentSpan {
+                        text,
+                        ..Default::default()
+                    }]],
+                    ..Default::default()
+                }))
+            }
+        }
+        struct Fixture;
+        impl Extension for Fixture {
+            fn id(&self) -> &str {
+                "dynamic-footer"
+            }
+            fn footer_renderer(&self) -> Option<Arc<dyn pi_rs_core::FooterRenderer>> {
+                Some(Arc::new(Footer))
+            }
+        }
+
+        let request = serde_json::from_value(serde_json::json!({
+            "type":"render_footer", "context":{"width":73,"theme":{"name":"dark","colors":{},"dimmed":[]},
+                "gitBranch":"main","extensionStatuses":{"fixture":"ready"},"availableProviderCount":2}
+        })).unwrap();
+        let output = dispatch(Arc::new(Fixture), request).await.unwrap();
+        assert_eq!(output["lines"][0][0]["text"], "73:dark:main:ready:2");
     }
 
     #[tokio::test]

@@ -191,15 +191,30 @@ callback when the renderer's data changes. Only the owner can invalidate a
 mount. A repeated setter replaces the existing mount, and either disabling
 the renderer or clearing the static header restores the built-in banner.
 
-The executable protocol uses the same UI requests as `setHeaderRenderer` and
-`invalidateHeaderRenderer` and calls `render_header` with the read-only
-`context` in the existing v1 render protocol. Executable callbacks can read
-their own state on each request. Return styled rows, an empty row list to
-hide the header, or null for the built-in banner. Renders have a 500 ms
-deadline from worker admission and the same row limits as static headers.
-The worker waits for a cancelled executable to exit before admitting another
-render or shutting down the extension. Pi's arbitrary components and live
-footer data provider remain specific to its TypeScript UI.
+For a dynamic footer, implement `Extension::footer_renderer` and send
+`UiRequest::SetFooterRenderer { enabled: true }`. Its read-only context adds
+`gitBranch`, `extensionStatuses`, and `availableProviderCount` to the width
+and theme. The branch is null outside a Git repository and `detached` for a
+detached HEAD. Statuses come from `SetStatus` and each text is capped at
+1 KiB. The count is the number of distinct providers in the current model
+scope, or in the available model snapshot without a scope. Rendering
+does not trigger model discovery. Only the count is projected from that
+snapshot. Branch, status and count changes request a new render automatically.
+Use `InvalidateFooterRenderer` when the owning renderer's own data changes.
+
+Executable extensions use `setHeaderRenderer`, `invalidateHeaderRenderer`,
+`setFooterRenderer`, and `invalidateFooterRenderer`. The existing v1
+render protocol sends `render_header` or `render_footer` with the read-only
+`context`. Return styled rows, an empty list to hide the section, or null
+for built-in rows. Each section admits one render at a time with a 500 ms
+deadline from worker admission and a 16-row limit. The terminal uses built-in
+rows while it waits for a render for the current mount, width, theme, and
+footer data. Replacing or clearing a section cancels its pending render. The
+worker waits for a cancelled executable to exit before admitting another
+render for that section or shutting down the extension. Session changes and
+reload release both mounts. Pi's TypeScript factory also supports arbitrary
+interactive components and a branch-change subscription. Native footer
+renderers receive a fresh snapshot when the branch changes.
 
 ## Customize the working indicator
 
