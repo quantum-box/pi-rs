@@ -7,6 +7,10 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Advisory wire field on a null edit generated when a partial is superseded.
+#[doc(hidden)]
+pub const SUPERSEDED_PARTIAL_FIELD: &str = "piRsSupersededPartial";
+
 struct StoreView<'a>(&'a PersistentMap<Arc<str>, Arc<Value>>);
 
 impl serde::Serialize for StoreView<'_> {

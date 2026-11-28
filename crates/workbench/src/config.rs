@@ -537,6 +537,16 @@ impl Settings {
             .as_bool()
             .unwrap_or(true)
     }
+    pub fn terminal_image_override(&self) -> crate::ui::images::ProtocolOverride {
+        use crate::ui::images::{Protocol, ProtocolOverride};
+
+        match &self.value["terminal"]["images"] {
+            Value::Bool(false) => ProtocolOverride::Disabled,
+            Value::String(value) if value == "kitty" => ProtocolOverride::Forced(Protocol::Kitty),
+            Value::String(value) if value == "iterm2" => ProtocolOverride::Forced(Protocol::Iterm2),
+            _ => ProtocolOverride::Auto,
+        }
+    }
     pub fn terminal_image_width(&self) -> usize {
         self.value["terminal"]["imageWidthCells"]
             .as_f64()
@@ -1065,7 +1075,7 @@ pub(super) fn update_object_locked(
     if let Some(guard) = shared {
         guard.check()?;
     }
-    write_json(path, &value)
+    write_json_with_guard(path, &value, shared)
 }
 
 pub(super) async fn update_auth_object(
@@ -1289,6 +1299,14 @@ fn injected_json_write_failure(path: &Path, value: &Value, stage: &'static str) 
 }
 
 pub fn write_json(path: &Path, value: &Value) -> Result<()> {
+    write_json_with_guard(path, value, None)
+}
+
+fn write_json_with_guard(
+    path: &Path,
+    value: &Value,
+    guard: Option<&super::auth_lock::Guard>,
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1302,12 +1320,65 @@ pub fn write_json(path: &Path, value: &Value) -> Result<()> {
     file.as_file().sync_all()?;
     #[cfg(test)]
     injected_json_write_failure(path, value, "rename")?;
-    file.persist(path).map_err(|error| Error::Io(error.error))?;
+    #[cfg(windows)]
+    if let Some(guard) = guard {
+        persist_locked_auth(file, path, guard)?;
+    } else {
+        file.persist(path).map_err(|error| Error::Io(error.error))?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = guard;
+        file.persist(path).map_err(|error| Error::Io(error.error))?;
+    }
     #[cfg(all(test, unix))]
     injected_json_write_failure(path, value, "directory-sync")?;
     #[cfg(unix)]
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+std::thread_local! {
+    static AUTH_REPLACE_BLOCKING_READER: std::cell::RefCell<Option<(PathBuf, std::fs::File)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(windows)]
+fn persist_locked_auth(
+    mut file: tempfile::NamedTempFile,
+    path: &Path,
+    guard: &super::auth_lock::Guard,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+    // A reader may hold the destination open while resolving the auth lock
+    // path. Retry replacement with the same synced file under the same lock.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        guard.check()?;
+        match file.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+                ) && Instant::now() < deadline =>
+            {
+                #[cfg(test)]
+                AUTH_REPLACE_BLOCKING_READER.with(|reader| {
+                    let mut reader = reader.borrow_mut();
+                    if reader.as_ref().is_some_and(|(target, _)| target == path) {
+                        drop(reader.take());
+                    }
+                });
+                file = error.file;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(Error::Io(error.error)),
+        }
+    }
 }
 
 fn merge(base: &mut Value, overlay: Value) {
@@ -1352,6 +1423,46 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn auth_update_retries_atomic_replacement_while_a_reader_has_the_file_open() {
+        use super::{AUTH_REPLACE_BLOCKING_READER, Error, read_object, update_object, write_json};
+        use serde_json::{Value, json};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        write_json(&path, &json!({"old": true})).unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            write_json(&path, &json!({"new": true})),
+            Err(Error::Io(error)) if matches!(error.raw_os_error(), Some(5 | 32))
+        ));
+
+        // Keep the reader open through serialization and sync. Only a real
+        // sharing error from the locked persist attempt releases it.
+        let resolved = super::super::auth_lock::resolved_auth_path(&path).unwrap();
+        AUTH_REPLACE_BLOCKING_READER.with(|slot| {
+            assert!(slot.replace(Some((resolved, reader))).is_none());
+        });
+        let result = update_object(&path, |data| {
+            data.insert("new".into(), Value::Bool(true));
+            Ok(())
+        });
+        let remaining_reader = AUTH_REPLACE_BLOCKING_READER.with(|slot| slot.take());
+        result.unwrap();
+        assert!(remaining_reader.is_none(), "locked persist never retried");
+        assert_eq!(
+            read_object(&path).unwrap(),
+            json!({"old": true, "new": true})
+        );
+    }
+
     #[test]
     fn cache_warming_uses_pi_default_and_user_setting() {
         let root = tempfile::tempdir().unwrap();
@@ -1387,6 +1498,48 @@ mod tests {
         assert_eq!(load(true).terminal_true_color(), Some(false));
         std::fs::write(project, br#"{"terminal":{"trueColor":"auto"}}"#).unwrap();
         assert_eq!(load(true).terminal_true_color(), None);
+    }
+
+    #[test]
+    fn terminal_image_setting_uses_the_effective_layer_and_exact_pi_values() {
+        use crate::ui::images::{Protocol, ProtocolOverride};
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("settings.json");
+        let workspace = directory.path().join("project");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        let project = workspace.join(".pi/settings.json");
+        std::fs::write(
+            &user,
+            br#"{"terminal":{"images":"kitty","showImages":false}}"#,
+        )
+        .unwrap();
+        let load = |trusted| super::Settings::load_from_paths(&workspace, trusted, &user).unwrap();
+        for (value, expected) in [
+            (json!("iterm2"), ProtocolOverride::Forced(Protocol::Iterm2)),
+            (json!(false), ProtocolOverride::Disabled),
+            (json!(true), ProtocolOverride::Auto),
+            (json!("KITTY"), ProtocolOverride::Auto),
+            (json!("auto"), ProtocolOverride::Auto),
+            (json!("other"), ProtocolOverride::Auto),
+            (json!(null), ProtocolOverride::Auto),
+        ] {
+            let layer = json!({"terminal": {"images": value}});
+            std::fs::write(&project, layer.to_string()).unwrap();
+            let untrusted = load(false);
+            assert_eq!(
+                untrusted.terminal_image_override(),
+                ProtocolOverride::Forced(Protocol::Kitty)
+            );
+            let trusted = load(true);
+            assert_eq!(trusted.terminal_image_override(), expected, "{layer}");
+            assert!(!trusted.show_terminal_images());
+        }
+        assert_eq!(
+            super::Settings::default().terminal_image_override(),
+            ProtocolOverride::Auto
+        );
     }
 
     #[test]
@@ -2194,14 +2347,19 @@ mod tests {
     fn settings_validation_reports_all_invalid_fields_without_rewriting_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let original = r#"{"hideThinkingBlock":"yes","httpIdleTimeoutMs":"later","retry":{"enabled":"yes"},"extension":{"unknown":true}}"#;
+        let original = r#"{"hideThinkingBlock":"yes","httpIdleTimeoutMs":"later","externalEditor":false,"retry":{"enabled":"yes"},"extension":{"unknown":true}}"#;
         std::fs::write(&path, original).unwrap();
 
         let error = super::Settings::load_from_paths(dir.path(), false, &path)
             .err()
             .unwrap()
             .to_string();
-        for field in ["/hideThinkingBlock", "/httpIdleTimeoutMs", "/retry/enabled"] {
+        for field in [
+            "/externalEditor",
+            "/hideThinkingBlock",
+            "/httpIdleTimeoutMs",
+            "/retry/enabled",
+        ] {
             assert!(
                 error.contains(&format!("{}{field}:", path.display())),
                 "{error}"
@@ -2209,6 +2367,28 @@ mod tests {
         }
         assert!(!error.contains("/extension"), "{error}");
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn settings_edit_preserves_legacy_pi_telemetry_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = json!({
+            "enableInstallTelemetry": true,
+            "enableAnalytics": false,
+            "trackingId": "legacy-fixture"
+        });
+        std::fs::write(&path, original.to_string()).unwrap();
+
+        let mut settings = Settings::load_from_paths(dir.path(), false, &path).unwrap();
+        settings
+            .set_user_at(&path, "hideThinkingBlock", json!(true))
+            .unwrap();
+
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut expected = original;
+        expected["hideThinkingBlock"] = json!(true);
+        assert_eq!(saved, expected);
     }
 
     #[test]

@@ -1,12 +1,17 @@
 //! Correlated extension interactions between the worker and its frontend.
+use futures_util::FutureExt;
 use pi_rs::{
-    CancellationToken, ExtensionResult, ExtensionUi, UiRequest, UiResponse, UiThemePalette,
-    UiThemeSelection,
+    CancellationToken, ExtensionResult, ExtensionUi, HeaderRenderContext, HeaderRenderer,
+    RenderedExtensionRows, UiRequest, UiResponse, UiThemePalette, UiThemeSelection,
 };
 use pi_rs_workbench::theme_resources::{ExtensionThemeSnapshot, extension_theme_snapshot};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -54,7 +59,22 @@ pub(super) enum PreparedTheme {
 pub struct Broker {
     pending: PendingRequests,
     themes: Option<Mutex<ExtensionResult<ExtensionThemeSnapshot>>>,
+    header: Mutex<Option<MountedHeader>>,
+    header_render: Arc<tokio::sync::Mutex<()>>,
 }
+struct MountedHeader {
+    id: Uuid,
+    owner: String,
+    renderer: Arc<dyn HeaderRenderer>,
+    cancellation: CancellationToken,
+}
+
+impl Drop for MountedHeader {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
 struct Pending {
     id: Uuid,
     requests: PendingRequests,
@@ -91,6 +111,72 @@ impl Broker {
             let snapshot = extension_theme_snapshot(paths).map_err(|error| error.to_string());
             *themes.lock().expect("extension theme catalog") = snapshot;
         }
+    }
+
+    pub fn admit_header_render(
+        &self,
+        id: Uuid,
+        context: HeaderRenderContext,
+    ) -> Option<impl Future<Output = Option<RenderedExtensionRows>> + Send + use<>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let slot = self.header_render.clone().try_lock_owned().ok()?;
+        let (renderer, cancellation) = {
+            let header = self.header.lock().expect("extension header");
+            let header = header.as_ref().filter(|header| header.id == id)?;
+            (header.renderer.clone(), header.cancellation.child_token())
+        };
+        Some(async move {
+            let _slot = slot;
+            let rows = {
+                let render = AssertUnwindSafe(async {
+                    if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    renderer
+                        .render_with_cancellation(&context, &cancellation)
+                        .await
+                })
+                .catch_unwind();
+                tokio::pin!(render);
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => None,
+                    _ = tokio::time::sleep_until(deadline) => None,
+                    rows = &mut render => Some(rows),
+                };
+                match result {
+                    Some(Ok(Ok(rows))) => rows.filter(|rows| {
+                        !cancellation.is_cancelled()
+                            && tokio::time::Instant::now() < deadline
+                            && rows.within_header_limits()
+                    }),
+                    Some(Err(_)) => {
+                        cancellation.cancel();
+                        None
+                    }
+                    Some(Ok(Err(_))) => None,
+                    None => {
+                        cancellation.cancel();
+                        // Keep the slot until any background work has been reaped.
+                        let _ = render.await;
+                        None
+                    }
+                }
+            };
+            drop(renderer);
+            rows
+        })
+    }
+
+    pub async fn clear_header_renderer(&self) {
+        {
+            let mut header = self.header.lock().expect("extension header");
+            if header.take().is_some() {
+                super::output(json!({"type":"header_renderer_changed","renderer":null}));
+            }
+        }
+        // Finish render cleanup before extension shutdown.
+        let _slot = self.header_render.lock().await;
     }
 
     fn theme_response(&self, request: &UiRequest) -> ExtensionResult<Option<UiResponse>> {
@@ -179,12 +265,67 @@ impl Broker {
 }
 #[async_trait::async_trait]
 impl ExtensionUi for Broker {
+    fn set_header_renderer(
+        &self,
+        owner: &str,
+        renderer: Option<Arc<dyn HeaderRenderer>>,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        let mut header = self.header.lock().expect("extension header");
+        if cancellation.is_cancelled() {
+            return Err("extension UI cancelled".into());
+        }
+        if self.themes.is_none() {
+            return Ok(());
+        }
+        *header = renderer.map(|renderer| MountedHeader {
+            id: Uuid::new_v4(),
+            owner: owner.into(),
+            renderer,
+            cancellation: CancellationToken::new(),
+        });
+        let renderer = header.as_ref().map(|header| header.id);
+        super::output(json!({"type":"header_renderer_changed","renderer":renderer}));
+        Ok(())
+    }
+
+    fn invalidate_header_renderer(
+        &self,
+        owner: &str,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        let header = self.header.lock().expect("extension header");
+        if cancellation.is_cancelled() {
+            return Err("extension UI cancelled".into());
+        }
+        if let Some(header) = header.as_ref().filter(|header| header.owner == owner) {
+            super::output(json!({"type":"header_renderer_invalidated","renderer":header.id}));
+        }
+        Ok(())
+    }
+
     async fn request(
         &self,
         request: UiRequest,
         cancellation: CancellationToken,
     ) -> ExtensionResult<UiResponse> {
         request.validate()?;
+        if self.themes.is_none()
+            && matches!(
+                request,
+                UiRequest::SetEditorComponent { .. } | UiRequest::GetEditorComponent
+            )
+        {
+            return Ok(UiResponse::Cancelled);
+        }
+        if matches!(
+            request,
+            UiRequest::SetHeaderRenderer { .. } | UiRequest::InvalidateHeaderRenderer
+        ) {
+            return Err(
+                "dynamic headers require an extension presentation lifecycle callback".into(),
+            );
+        }
         if matches!(
             request,
             UiRequest::GetAllThemes
@@ -236,7 +377,16 @@ impl ExtensionUi for Broker {
         let mut event = serde_json::to_value(&request).map_err(|error| error.to_string())?;
         event["type"] = serde_json::json!("extension_ui_request");
         event["id"] = serde_json::json!(id);
-        super::output(event);
+        if matches!(request, UiRequest::SetHeader { .. }) {
+            let mut header = self.header.lock().expect("extension header");
+            if cancellation.is_cancelled() {
+                return Err("extension UI cancelled".into());
+            }
+            header.take();
+            super::output(event);
+        } else {
+            super::output(event);
+        }
         let Some(response) = response else {
             return Ok(UiResponse::Cancelled);
         };
@@ -271,6 +421,26 @@ impl ExtensionUi for Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn editor_component_requests_are_local_noops_in_headless_mode() {
+        let broker = Broker::default();
+        for request in [
+            UiRequest::SetEditorComponent {
+                component: Some(pi_rs::UiEditorComponent::default()),
+            },
+            UiRequest::GetEditorComponent,
+        ] {
+            assert_eq!(
+                broker
+                    .request(request, CancellationToken::new())
+                    .await
+                    .unwrap(),
+                UiResponse::Cancelled
+            );
+        }
+        assert!(broker.pending.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn theme_claim_checks_requester_before_waiter_is_polled() {
@@ -408,6 +578,275 @@ else:
         assert!(broker.claim_theme(id).is_some());
         broker.resolve(id, success.clone());
         assert_eq!(request.await.unwrap(), success);
+    }
+
+    #[tokio::test]
+    async fn dynamic_header_lifecycle_owns_and_cancels_the_mounted_renderer() {
+        struct Renderer(Arc<tokio::sync::Notify>);
+
+        #[async_trait::async_trait]
+        impl HeaderRenderer for Renderer {
+            async fn render(
+                &self,
+                _: &HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        struct Hook(Arc<tokio::sync::Notify>);
+
+        #[async_trait::async_trait]
+        impl pi_rs::Extension for Hook {
+            fn id(&self) -> &str {
+                "header-test"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+            fn header_renderer(&self) -> Option<Arc<dyn HeaderRenderer>> {
+                Some(Arc::new(Renderer(self.0.clone())))
+            }
+            async fn lifecycle_with_host(
+                &self,
+                _: &pi_rs::LifecycleEvent,
+                _: Option<&pi_rs::ExtensionState>,
+                host: Arc<dyn pi_rs::ToolHost>,
+            ) -> ExtensionResult<()> {
+                host.ui(UiRequest::SetHeaderRenderer { enabled: true })
+                    .await?;
+                Ok(())
+            }
+        }
+
+        let ui = Arc::new(Broker::new(true));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut registry =
+            pi_rs::Registry::compose(vec![Arc::new(Hook(entered.clone()))], &Default::default())
+                .unwrap();
+        registry.set_ui(ui.clone());
+        let mount = || async {
+            pi_rs::notify_extension_lifecycle_filtered_with_ui(
+                &registry,
+                pi_rs::LifecycleEvent::SessionStart {
+                    reason: pi_rs::SessionStartReason::Startup,
+                    previous_session_file: None,
+                },
+                &Default::default(),
+                Duration::from_secs(1),
+                &mut |_| panic!("unexpected lifecycle error"),
+                |_| true,
+            )
+            .await
+        };
+        // The worker calls the same snapshot presentation path on session start.
+        mount().await;
+        let header = || {
+            let lock = ui.header.lock().unwrap();
+            let header = lock.as_ref().unwrap();
+            assert_eq!(header.owner, "header-test");
+            (header.id, Arc::downgrade(&header.renderer))
+        };
+        let (first, renderer) = header();
+        let context = HeaderRenderContext {
+            width: 72,
+            theme: crate::ui::theme::Theme::system().extension_render_theme(),
+        };
+        let render = ui.admit_header_render(first, context.clone()).unwrap();
+        let (rendered, ()) = tokio::join!(render, async {
+            entered.notified().await;
+            mount().await;
+            let (replacement, _) = header();
+            assert!(
+                ui.admit_header_render(replacement, context.clone())
+                    .is_none()
+            );
+        });
+        assert!(rendered.is_none());
+        assert!(renderer.upgrade().is_none());
+        let (second, renderer) = header();
+        assert_ne!(first, second);
+        assert!(ui.admit_header_render(first, context).is_none());
+
+        ui.request(
+            UiRequest::SetHeader {
+                lines: Some(vec![]),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(renderer.upgrade().is_none());
+        assert!(ui.header.lock().unwrap().is_none());
+        mount().await;
+        let (_, renderer) = header();
+        ui.clear_header_renderer().await;
+        assert!(renderer.upgrade().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_header_panic_completes_with_fallback_and_allows_replacement() {
+        struct PanickingRenderer {
+            entered: Option<Arc<tokio::sync::Notify>>,
+            request_token: Arc<Mutex<Option<CancellationToken>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl HeaderRenderer for PanickingRenderer {
+            async fn render(
+                &self,
+                _: &HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                panic!("in-process header renderer failed");
+            }
+
+            async fn render_with_cancellation(
+                &self,
+                context: &HeaderRenderContext,
+                cancellation: &CancellationToken,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                *self.request_token.lock().unwrap() = Some(cancellation.clone());
+                if let Some(entered) = &self.entered {
+                    entered.notify_one();
+                    cancellation.cancelled().await;
+                }
+                self.render(context).await
+            }
+        }
+
+        struct GoodRenderer;
+
+        #[async_trait::async_trait]
+        impl HeaderRenderer for GoodRenderer {
+            async fn render(
+                &self,
+                context: &HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                Ok(Some(RenderedExtensionRows {
+                    lines: vec![vec![pi_rs::UiComponentSpan {
+                        text: format!("replacement at {}", context.width),
+                        ..Default::default()
+                    }]],
+                    ..Default::default()
+                }))
+            }
+        }
+
+        let ui = Broker::new(true);
+        let context = HeaderRenderContext {
+            width: 72,
+            theme: crate::ui::theme::Theme::system().extension_render_theme(),
+        };
+        let mount = |renderer: Arc<dyn HeaderRenderer>| {
+            ui.set_header_renderer("test", Some(renderer), &CancellationToken::new())
+                .unwrap();
+            ui.header.lock().unwrap().as_ref().unwrap().id
+        };
+
+        for entered in [None, Some(Arc::new(tokio::sync::Notify::new()))] {
+            let request_token = Arc::new(Mutex::new(None));
+            let id = mount(Arc::new(PanickingRenderer {
+                entered: entered.clone(),
+                request_token: request_token.clone(),
+            }));
+            // As in the worker, a successful join lets the caller report completion.
+            let running = tokio::spawn(ui.admit_header_render(id, context.clone()).unwrap());
+            let replacement = if let Some(entered) = entered {
+                entered.notified().await;
+                Some(mount(Arc::new(GoodRenderer)))
+            } else {
+                None
+            };
+            assert!(running.await.unwrap().is_none());
+            assert!(
+                request_token
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .is_cancelled()
+            );
+            let replacement = replacement.unwrap_or_else(|| mount(Arc::new(GoodRenderer)));
+            let rows = ui
+                .admit_header_render(replacement, context.clone())
+                .unwrap()
+                .await
+                .unwrap();
+            assert_eq!(rows.lines[0][0].text, "replacement at 72");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_header_deadline_includes_scheduling_and_clear_waits_for_cleanup() {
+        #[derive(Default)]
+        struct Renderer {
+            entered: tokio::sync::Notify,
+            cancelled: tokio::sync::Notify,
+            finish_cleanup: tokio::sync::Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl HeaderRenderer for Renderer {
+            async fn render(
+                &self,
+                _: &HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                panic!("the broker must pass a cancellation token");
+            }
+
+            async fn render_with_cancellation(
+                &self,
+                _: &HeaderRenderContext,
+                cancellation: &CancellationToken,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                self.entered.notify_one();
+                cancellation.cancelled().await;
+                self.cancelled.notify_one();
+                self.finish_cleanup.notified().await;
+                Ok(Some(RenderedExtensionRows::default()))
+            }
+        }
+
+        let ui = Broker::new(true);
+        let renderer = Arc::new(Renderer::default());
+        let context = HeaderRenderContext {
+            width: 72,
+            theme: crate::ui::theme::Theme::system().extension_render_theme(),
+        };
+        let mount = || {
+            ui.set_header_renderer("test", Some(renderer.clone()), &CancellationToken::new())
+                .unwrap();
+            ui.header.lock().unwrap().as_ref().unwrap().id
+        };
+
+        let id = mount();
+        let delayed = ui.admit_header_render(id, context.clone()).unwrap();
+        assert!(ui.admit_header_render(id, context.clone()).is_none());
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(delayed.await.is_none());
+        assert!(futures_util::poll!(std::pin::pin!(renderer.entered.notified())).is_pending());
+
+        for expires in [true, false] {
+            let id = mount();
+            let running = tokio::spawn(ui.admit_header_render(id, context.clone()).unwrap());
+            renderer.entered.notified().await;
+            let mut clear = std::pin::pin!(ui.clear_header_renderer());
+            if expires {
+                tokio::time::advance(Duration::from_millis(500)).await;
+            } else {
+                assert!(futures_util::poll!(&mut clear).is_pending());
+            }
+            renderer.cancelled.notified().await;
+            assert!(futures_util::poll!(&mut clear).is_pending());
+            assert!(!running.is_finished());
+            renderer.finish_cleanup.notify_one();
+            clear.await;
+            assert!(running.await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]

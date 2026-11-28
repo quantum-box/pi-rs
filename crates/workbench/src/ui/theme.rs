@@ -392,6 +392,27 @@ impl Theme {
     pub fn color(&self, role: &str) -> Color {
         self.colors.get(role).copied().unwrap_or(Color::Reset)
     }
+    pub fn extension_render_theme(&self) -> pi_rs::UiRenderTheme {
+        let colors = self
+            .colors
+            .iter()
+            .map(|(role, color)| {
+                let color = match color {
+                    Color::Reset => "default".into(),
+                    Color::AnsiValue(index) => index.to_string(),
+                    Color::Rgb { r, g, b } => format!("#{r:02x}{g:02x}{b:02x}"),
+                    color => format!("{color:?}").to_ascii_lowercase(),
+                };
+                (role.clone(), color)
+            })
+            .collect();
+        pi_rs::UiRenderTheme {
+            name: self.name.clone(),
+            colors,
+            dimmed: self.dim.iter().cloned().collect(),
+        }
+    }
+
     pub fn is_dim(&self, role: &str) -> bool {
         self.dim.contains(role)
     }
