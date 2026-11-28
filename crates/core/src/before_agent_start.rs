@@ -568,6 +568,7 @@ mod tests {
         PreparationCancelled,
         PreparationUnavailable,
         ProviderCancelled,
+        StreamCancelled,
         ProviderFailure,
         ProviderIo,
         ProviderJson,
@@ -583,6 +584,8 @@ mod tests {
 
     #[derive(Default)]
     struct CompactionTrace(Mutex<Vec<&'static str>>, SummaryOutcome);
+
+    const PARTIAL_SUMMARY: &str = "unfinished summary";
 
     fn is_summary_request(request: &ModelRequest) -> bool {
         matches!(request.messages.last(), Some(Message::User { content })
@@ -635,6 +638,12 @@ mod tests {
                 self.0.lock().unwrap().push("summary request");
                 match self.1 {
                     SummaryOutcome::ProviderCancelled => return Err(Error::Cancelled),
+                    SummaryOutcome::StreamCancelled => {
+                        return Ok(Box::pin(futures_util::stream::iter([
+                            Ok(ModelEvent::Text(PARTIAL_SUMMARY.into())),
+                            Err(Error::Cancelled),
+                        ])));
+                    }
                     SummaryOutcome::ProviderFailure | SummaryOutcome::SettlementIo => {
                         return Err(Error::RetryableModel("summary provider unavailable".into()));
                     }
@@ -1320,11 +1329,11 @@ mod tests {
 
     #[tokio::test]
     async fn before_agent_start_adapter_cancellation_stops_preflight_and_settles_dispatch() {
-        for (summary, expected_trace, dispatched) in [
+        for (summary, expected_trace, expected_partial) in [
             (
                 SummaryOutcome::PreparationCancelled,
                 &["before compaction", "prepare summary"][..],
-                false,
+                None,
             ),
             (
                 SummaryOutcome::ProviderCancelled,
@@ -1333,7 +1342,16 @@ mod tests {
                     "summary request",
                     "settle unconfirmed summary",
                 ][..],
-                true,
+                Some(""),
+            ),
+            (
+                SummaryOutcome::StreamCancelled,
+                &[
+                    "before compaction",
+                    "summary request",
+                    "settle unconfirmed summary",
+                ][..],
+                Some(PARTIAL_SUMMARY),
             ),
         ] {
             let directory = tempfile::tempdir().unwrap();
@@ -1380,13 +1398,20 @@ mod tests {
                     Event::ModelFinished {
                         request_id,
                         usage: crate::UsageReport::Unconfirmed,
+                        failure: Some(crate::ModelFailure::Cancelled),
+                        ref partial,
                         ..
-                    } => Some(Some(request_id)),
+                    } => Some((Some(request_id), partial.as_str())),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(requests.len(), usize::from(dispatched));
-            assert_eq!(requests, finished);
+            assert_eq!(requests.len(), usize::from(expected_partial.is_some()));
+            let expected: Vec<_> = requests.into_iter().zip(expected_partial).collect();
+            assert_eq!(finished, expected);
+            assert!(!journal.current_messages().iter().any(|message| matches!(
+                message,
+                Message::Assistant { content, .. } if content == PARTIAL_SUMMARY
+            )));
         }
     }
 
@@ -1537,6 +1562,115 @@ mod tests {
                 .any(|record| matches!(&record.event, Event::User {
             content, input_id: Some(id),
         } if *id == run_id && content == "new question"))
+        );
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_resumes_once_after_interrupted_stream_cancellation_settlement() {
+        struct PausedSettlement {
+            trace: Arc<CompactionTrace>,
+            entered: tokio::sync::Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl Model for PausedSettlement {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                self.trace.stream(request).await
+            }
+
+            async fn record_usage_with_metadata(
+                &self,
+                _: Uuid,
+                usage: &crate::UsageReport,
+                _: &crate::ModelMetadata,
+            ) -> Result<()> {
+                assert_eq!(*usage, crate::UsageReport::Unconfirmed);
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+        let trace = Arc::new(CompactionTrace(
+            Mutex::default(),
+            SummaryOutcome::StreamCancelled,
+        ));
+        let model = Arc::new(PausedSettlement {
+            trace: trace.clone(),
+            entered: tokio::sync::Notify::new(),
+        });
+        let run_id = Uuid::new_v4();
+        let mut sdk = SessionBuilder::new(model.clone(), "fixture")
+            .system_prompt("base prompt")
+            .limits(compaction_limits())
+            .extension(trace.clone())
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        let mut observe = |_: Notification<'_>| {};
+        let mut run = Box::pin(sdk.run(Some("new question".into()), run_id, &mut observe));
+        tokio::select! {
+            _ = model.entered.notified() => {}
+            result = &mut run => panic!("run finished before settlement paused: {result:?}"),
+        }
+        drop(run);
+        assert_eq!(
+            *trace.0.lock().unwrap(),
+            ["before compaction", "summary request"]
+        );
+        drop(sdk);
+
+        let mut sdk = compaction_builder(&trace)
+            .extension(trace.clone())
+            .unwrap()
+            .open(path)
+            .unwrap();
+        {
+            let journal = sdk.journal().unwrap();
+            assert_eq!(journal.pending_before_agent_start_run(), Some(run_id));
+            assert!(matches!(
+                &journal.records().last().unwrap().event,
+                Event::ModelFinished {
+                    usage: crate::UsageReport::Unconfirmed,
+                    failure: Some(crate::ModelFailure::Cancelled),
+                    partial,
+                    ..
+                } if partial == PARTIAL_SUMMARY
+            ));
+        }
+        assert_eq!(sdk.resume().await.unwrap(), "answer");
+        assert_eq!(sdk.run(None, run_id, &mut |_| {}).await.unwrap(), "answer");
+        assert_eq!(
+            *trace.0.lock().unwrap(),
+            [
+                "before compaction",
+                "summary request",
+                "settle unconfirmed summary",
+                "before_agent_start",
+                "turn request",
+            ]
+        );
+        let journal = sdk.journal().unwrap();
+        assert_eq!(journal.pending_before_agent_start_run(), None);
+        assert_eq!(
+            journal
+                .records()
+                .iter()
+                .filter(|record| {
+                    record.run_id == Some(run_id)
+                        && matches!(record.event, Event::ModelRequested { .. })
+                })
+                .count(),
+            2
+        );
+        assert_eq!(
+            journal.records().iter().filter(|record| matches!(
+                &record.event,
+                Event::User { content, input_id: Some(id) } if *id == run_id && content == "new question"
+            )).count(),
+            1
         );
     }
 
