@@ -349,15 +349,22 @@ pub(super) fn usage(entry: &Entry, raw: &Value) -> Option<Value> {
             )
         }
     };
+    let details = &raw["completion_tokens_details"];
+    let image_output = details["image_tokens"].as_u64();
+    let priced_image_tokens =
+        if matches!(entry.api, Api::OpenRouterImages) && entry.model.cost.image_output.is_some() {
+            image_output.unwrap_or(output).min(output)
+        } else {
+            0
+        };
     let mut usage = json!({
         "input":input,"output":output,"cacheRead":cache_read,"cacheWrite":cache_write,
         "totalTokens":input+output+cache_read+cache_write,
-        "cost": token_cost(&entry.model.cost, [input, output, cache_read, cache_write].map(|count| count as f64)),
+        "cost": token_cost(&entry.model.cost, [input, output, cache_read, cache_write].map(|count| count as f64), priced_image_tokens as f64),
     });
     if matches!(entry.api, Api::OpenRouterImages) {
-        let details = &raw["completion_tokens_details"];
         usage["reasoning"] = json!(details["reasoning_tokens"].as_u64().unwrap_or_default());
-        if let Some(tokens) = details["image_tokens"].as_u64() {
+        if let Some(tokens) = image_output {
             usage["imageOutput"] = json!(tokens);
         }
         if raw["is_byok"].is_boolean()
@@ -371,7 +378,7 @@ pub(super) fn usage(entry: &Entry, raw: &Value) -> Option<Value> {
     Some(usage)
 }
 
-pub(super) fn token_cost(cost: &super::Cost, counts: [f64; 4]) -> Value {
+pub(super) fn token_cost(cost: &super::Cost, counts: [f64; 4], image_tokens: f64) -> Value {
     let [input, output, cache_read, cache_write] = counts;
     let tier = cost
         .tiers
@@ -379,7 +386,10 @@ pub(super) fn token_cost(cost: &super::Cost, counts: [f64; 4]) -> Value {
         .filter(|tier| input + cache_read + cache_write > tier.input_tokens_above as f64)
         .max_by_key(|tier| tier.input_tokens_above);
     let input_cost = tier.map_or(cost.input, |tier| tier.input) * input / 1_000_000.0;
-    let output_cost = tier.map_or(cost.output, |tier| tier.output) * output / 1_000_000.0;
+    let output_rate = tier.map_or(cost.output, |tier| tier.output);
+    let output_cost = (output_rate * (output - image_tokens)
+        + cost.image_output.unwrap_or_default() * image_tokens)
+        / 1_000_000.0;
     let read_cost = tier.map_or(cost.cache_read, |tier| tier.cache_read) * cache_read / 1_000_000.0;
     let write_cost =
         tier.map_or(cost.cache_write, |tier| tier.cache_write) * cache_write / 1_000_000.0;

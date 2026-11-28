@@ -115,7 +115,7 @@ pub(super) fn usage(cost: &Cost, usage: &Value) -> Option<Value> {
         }
         Value::Object(priced)
     } else {
-        wire::token_cost(cost, counts)
+        wire::token_cost(cost, counts, 0.0)
     };
     Some(json!({
         "input":input,"output":output,"cacheRead":cache_read,"cacheWrite":cache_write,

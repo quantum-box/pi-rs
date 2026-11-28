@@ -391,6 +391,8 @@ struct Compat {
 pub(super) struct Cost {
     input: f64,
     output: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_output: Option<f64>,
     cache_read: f64,
     cache_write: f64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -405,6 +407,9 @@ impl Cost {
                 .all(|rate| rate.is_finite() && (0.0..=1_000_000.0).contains(rate))
         };
         valid_rates([self.input, self.output, self.cache_read, self.cache_write])
+            && self
+                .image_output
+                .is_none_or(|rate| valid_rates([rate, 0.0, 0.0, 0.0]))
             && self.tiers.iter().all(|tier| {
                 valid_rates([tier.input, tier.output, tier.cache_read, tier.cache_write])
             })
@@ -3568,7 +3573,7 @@ mod tests {
     #[test]
     fn openrouter_image_usage_exposes_output_breakdown_and_complete_billing() {
         let config = json!({"relay":{"baseUrl":"https://relay.example/v1", "models":[{
-            "type":"image", "id":"fixture", "api":"openrouter-images"
+            "type":"image", "id":"fixture", "api":"openrouter-images", "cost":{"output":2,"imageOutput":8}
         }]}});
         let catalog = Catalogue::parse(config.as_object().unwrap()).unwrap();
         let entry = catalog
@@ -3586,6 +3591,7 @@ mod tests {
         assert_eq!(billed["reasoning"], 3);
         assert_eq!(billed["totalTokens"], 25);
         assert_eq!(billed["cost"]["total"], 0.25);
+        assert_eq!(billed["cost"]["output"], 0.00004);
         assert_eq!(billed["cost"]["totalFromProvider"], true);
 
         raw["is_byok"] = json!(true);
@@ -3595,6 +3601,7 @@ mod tests {
         assert_eq!(byok["imageOutput"], 14);
         assert_eq!(byok["totalTokens"], 25);
         assert_eq!(byok["cost"]["total"], 0.75);
+        assert_eq!(byok["cost"]["output"], 0.000124);
         assert_eq!(byok["cost"]["totalFromProvider"], true);
 
         raw.as_object_mut()
@@ -3605,6 +3612,7 @@ mod tests {
         assert!(estimated.get("imageOutput").is_none());
         assert_eq!(estimated["reasoning"], 0);
         assert_eq!(estimated["cost"]["totalFromProvider"], false);
+        assert_eq!(estimated["cost"]["total"], 0.00016);
     }
 
     #[test]
