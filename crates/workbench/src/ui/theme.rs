@@ -4,6 +4,7 @@ use palette::Srgb;
 use pi_rs::{Error, Result};
 #[cfg(test)]
 use pi_rs_workbench::theme_parser::resolve;
+use pi_rs_workbench::theme_resources::read_theme_file;
 #[cfg(test)]
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -184,11 +185,12 @@ pub struct Theme {
     pub path: Option<PathBuf>,
     colors: BTreeMap<String, Color>,
     dim: BTreeSet<String>,
+    extension_instance: bool,
 }
 /// Watches the selected custom file while retaining the last valid theme.
 pub struct ThemeWatcher {
     path: Option<PathBuf>,
-    fingerprint: Option<Vec<u8>>,
+    fingerprint: Option<String>,
 }
 impl ThemeWatcher {
     pub fn new(theme: &Theme) -> Self {
@@ -197,7 +199,7 @@ impl ThemeWatcher {
             fingerprint: theme
                 .path
                 .as_ref()
-                .and_then(|path| std::fs::read(path).ok()),
+                .and_then(|path| read_theme_file(path).ok().flatten()),
         }
     }
     pub fn poll(&mut self, theme: &mut Theme) -> Result<bool> {
@@ -208,15 +210,15 @@ impl ThemeWatcher {
         let Some(path) = &self.path else {
             return Ok(false);
         };
-        let contents = std::fs::read(path);
+        let contents = read_theme_file(path).and_then(|text| {
+            text.ok_or_else(|| Error::Config(format!("theme file is missing: {}", path.display())))
+        });
         let fingerprint = contents.as_ref().ok().cloned();
         if fingerprint == self.fingerprint {
             return Ok(false);
         }
         self.fingerprint = fingerprint;
-        let text =
-            String::from_utf8(contents?).map_err(|error| Error::Config(error.to_string()))?;
-        let next = Theme::parse(&text, Some(path.clone()))?;
+        let next = Theme::parse(&contents?, Some(path.clone()))?;
         *theme = next;
         Ok(true)
     }
@@ -249,27 +251,26 @@ impl Theme {
             "dark" => Self::parse(include_str!("../../assets/themes/dark.json"), None),
             "light" => Self::parse(include_str!("../../assets/themes/light.json"), None),
             _ => {
-                let mut paths = vec![
-                    crate::config::agent_dir()
-                        .join("themes")
-                        .join(format!("{name}.json")),
-                ];
-                if !discover {
-                    paths.clear();
+                let mut paths = Vec::new();
+                if discover {
+                    paths.push(
+                        crate::config::agent_dir()
+                            .join("themes")
+                            .join(format!("{name}.json")),
+                    );
                 }
                 if trusted && discover {
                     paths.push(workspace.join(".pi/themes").join(format!("{name}.json")));
                 }
                 for path in extra {
-                    paths.push(if path.is_dir() {
+                    paths.push(if discover && path.is_dir() {
                         path.join(format!("{name}.json"))
                     } else {
                         path.clone()
                     });
                 }
                 for path in paths {
-                    if path.is_file() {
-                        let text = std::fs::read_to_string(&path)?;
+                    if let Some(text) = read_theme_file(&path)? {
                         let theme = Self::parse(&text, Some(path))?;
                         if theme.name == name {
                             return Ok(theme);
@@ -307,7 +308,7 @@ impl Theme {
                 vec![path]
             };
             for file in files {
-                if let Ok(text) = std::fs::read_to_string(&file)
+                if let Ok(Some(text)) = read_theme_file(&file)
                     && let Ok(theme) = Self::parse(&text, Some(file))
                 {
                     names.push(theme.name);
@@ -326,7 +327,67 @@ impl Theme {
             path,
             colors: parsed.colors,
             dim: BTreeSet::new(),
+            extension_instance: false,
         })
+    }
+    pub fn from_named_palette(palette: pi_rs::UiThemePalette, path: Option<PathBuf>) -> Self {
+        Self::from_palette(palette, path, false)
+    }
+
+    pub fn from_extension_palette(palette: pi_rs::UiThemePalette) -> Result<Self> {
+        if palette.colors.is_empty()
+            || palette.colors.len() > 256
+            || palette
+                .dim
+                .iter()
+                .any(|role| !palette.colors.contains_key(role))
+        {
+            return Err(Error::Config("extension theme palette is invalid".into()));
+        }
+        Ok(Self::from_palette(palette, None, true))
+    }
+
+    fn from_palette(
+        palette: pi_rs::UiThemePalette,
+        path: Option<PathBuf>,
+        extension_instance: bool,
+    ) -> Self {
+        let colors = palette
+            .colors
+            .into_iter()
+            .map(|(role, color)| {
+                let color = match color {
+                    pi_rs::UiThemeColor::Rgb { r, g, b } => Color::Rgb { r, g, b },
+                    pi_rs::UiThemeColor::Indexed { index } => Color::AnsiValue(index),
+                    pi_rs::UiThemeColor::Reset => Color::Reset,
+                };
+                (role, color)
+            })
+            .collect();
+        Self {
+            name: palette.name,
+            path,
+            colors,
+            dim: palette.dim,
+            extension_instance,
+        }
+    }
+
+    pub fn is_extension_instance(&self) -> bool {
+        self.extension_instance
+    }
+
+    pub fn uses_terminal_colors(&self) -> bool {
+        self.name == "system" && !self.extension_instance
+    }
+
+    pub fn extension_palette(self) -> pi_rs::UiThemePalette {
+        pi_rs_workbench::theme_resources::ui_theme_palette(
+            self.name,
+            self.path,
+            &self.colors,
+            self.dim,
+        )
     }
     pub fn color(&self, role: &str) -> Color {
         self.colors.get(role).copied().unwrap_or(Color::Reset)
@@ -342,6 +403,7 @@ impl Theme {
                 path: None,
                 colors: generated.colors,
                 dim: generated.dim,
+                extension_instance: false,
             };
         }
         let background = unpack_terminal_color(TERMINAL_BACKGROUND.load(Ordering::Relaxed));
@@ -365,6 +427,7 @@ impl Theme {
             path: None,
             colors: generated.colors,
             dim: generated.dim,
+            extension_instance: false,
         }
     }
 
@@ -489,6 +552,9 @@ mod tests {
             include_str!("../../assets/themes/light.json"),
         ] {
             let theme = Theme::parse(source, None).unwrap();
+            let with_bom = Theme::parse(&format!("\u{feff}{source}"), None).unwrap();
+            assert_eq!(with_bom.name, theme.name);
+            assert_eq!(with_bom.colors, theme.colors);
             assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
             assert_ne!(theme.color("toolErrorBg"), theme.color("toolSuccessBg"));
         }

@@ -1011,6 +1011,7 @@ pub fn checkpointable_leaf(tool: Arc<dyn Tool>) -> Arc<dyn DurableAsyncTool> {
     Arc::new(CheckpointableTool {
         tool,
         child_timeout: None,
+        foreground: None,
     })
 }
 
@@ -1024,12 +1025,91 @@ pub fn checkpointable_tool(
     Arc::new(CheckpointableTool {
         tool,
         child_timeout: Some(child_timeout),
+        foreground: None,
     })
+}
+
+/// Wrap an ordinary replay-safe conversation tool with an explicitly configured
+/// foreground subagent capability. The tool can call `foreground_subagent`
+/// with a stable `key` and `prompt`. Child configuration and its tool allowlist
+/// are fixed by the registration. Register the returned tool with
+/// `register_conversation_replay_safe_durable_tool`.
+pub fn checkpointable_tool_with_foreground_subagent(
+    tool: Arc<dyn Tool>,
+    child_timeout: std::time::Duration,
+    config: crate::runtime::Config,
+    allowed_tools: Vec<String>,
+) -> Arc<dyn DurableAsyncTool> {
+    Arc::new(CheckpointableTool {
+        tool,
+        child_timeout: Some(child_timeout),
+        foreground: Some(ForegroundSubagent {
+            config,
+            allowed_tools,
+        }),
+    })
+}
+
+const FOREGROUND_SUBAGENT: &str = "foreground_subagent";
+
+struct ForegroundSubagent {
+    config: crate::runtime::Config,
+    allowed_tools: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForegroundArguments {
+    key: String,
+    prompt: String,
+}
+
+enum OrdinaryChild {
+    Task(AsyncTaskCall),
+    Foreground(Box<crate::owned_subagent::Admission>),
+}
+
+impl ForegroundSubagent {
+    fn spec() -> ToolSpec {
+        ToolSpec {
+            name: FOREGROUND_SUBAGENT.into(),
+            description: "Start or reattach to a foreground subagent and wait for its answer."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "prompt": {"type": "string", "minLength": 1, "maxLength": 65536}
+                },
+                "required": ["key", "prompt"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn request(&self, arguments: serde_json::Value) -> Result<ForegroundSubagentRequest, String> {
+        let arguments: ForegroundArguments = serde_json::from_value(arguments)
+            .map_err(|_| "foreground subagent requires a key and prompt")?;
+        if arguments.key.trim().is_empty()
+            || arguments.key.len() > 128
+            || arguments.prompt.trim().is_empty()
+            || arguments.prompt.len() > 65536
+        {
+            return Err("invalid foreground subagent key or prompt".into());
+        }
+        Ok(ForegroundSubagentRequest {
+            key: arguments.key,
+            prompt: arguments.prompt,
+            config: self.config.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+        })
+    }
 }
 
 struct CheckpointableTool {
     tool: Arc<dyn Tool>,
     child_timeout: Option<std::time::Duration>,
+    foreground: Option<ForegroundSubagent>,
 }
 
 enum ToolHostRequest {
@@ -1038,6 +1118,7 @@ enum ToolHostRequest {
         tokio::sync::oneshot::Sender<pi_rs_core::ExtensionResult<()>>,
     ),
     Call {
+        index: usize,
         name: String,
         arguments: serde_json::Value,
         cancellation: pi_rs_core::CancellationToken,
@@ -1050,6 +1131,7 @@ enum ToolHostRequest {
 struct CheckpointableToolHost {
     requests: tokio::sync::mpsc::Sender<ToolHostRequest>,
     tools: Vec<ToolSpec>,
+    next_call: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -1104,9 +1186,20 @@ impl pi_rs_core::ToolHost for CheckpointableToolHost {
         if !self.tools.iter().any(|tool| tool.name == name) {
             return Outcome::Skipped("nested tool is not registered for this invocation".into());
         }
+        // A call consumes its replay position even if it is cancelled before
+        // it reaches the channel. Later calls must reconnect to the same keys.
+        let Ok(index) =
+            self.next_call
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |index| {
+                    index.checked_add(1)
+                })
+        else {
+            return Outcome::Failed("nested tool call sequence exhausted".into());
+        };
         let (reply, result) = tokio::sync::oneshot::channel();
         let dispatch_claim = Arc::new(AtomicBool::new(false));
         let request = ToolHostRequest::Call {
+            index,
             name: name.into(),
             arguments,
             cancellation: cancellation.clone(),
@@ -1172,18 +1265,27 @@ impl DurableAsyncTool for CheckpointableTool {
         use futures_util::{StreamExt, stream::FuturesUnordered};
 
         let (requests, mut incoming) = tokio::sync::mpsc::channel(1);
-        let tools = self
+        let mut tools = self
             .child_timeout
             .map_or_else(Vec::new, |_| host.child_tools());
+        if self.foreground.is_some() {
+            if tools.iter().any(|tool| tool.name == FOREGROUND_SUBAGENT) {
+                return Err("foreground_subagent conflicts with a registered child tool".into());
+            }
+            tools.push(ForegroundSubagent::spec());
+        }
         let invocation = self.tool.invoke_with_host(
             arguments,
             context,
             None,
-            Arc::new(CheckpointableToolHost { requests, tools }),
+            Arc::new(CheckpointableToolHost {
+                requests,
+                tools,
+                next_call: std::sync::atomic::AtomicUsize::new(0),
+            }),
         );
         tokio::pin!(invocation);
         let mut calls = FuturesUnordered::new();
-        let mut call_index = 0usize;
         let mut requests_open = true;
         let outcome = loop {
             tokio::select! {
@@ -1194,26 +1296,30 @@ impl DurableAsyncTool for CheckpointableTool {
                     Some(ToolHostRequest::Progress(partial, reply)) => {
                         let _ = reply.send(host.report_progress(partial).await);
                     }
-                    Some(ToolHostRequest::Call { name, arguments, cancellation, dispatch_claim, reply }) => {
+                    Some(ToolHostRequest::Call { index, name, arguments, cancellation, dispatch_claim, reply }) => {
                         let Some(timeout) = self.child_timeout else {
                             let _ = reply.send(Outcome::Skipped("nested tool calls are unavailable".into()));
                             continue;
                         };
-                        let key = format!("ordinary-tool-call-{call_index}");
-                        call_index += 1;
-                        // Admit in receive order so the implicit key matches the
-                        // ordinary caller's sequence on replay.
+                        let key = format!("ordinary-tool-call-{index}");
                         if reply.is_closed() || cancellation.is_cancelled()
                             || dispatch_claim.swap(true, std::sync::atomic::Ordering::AcqRel) {
                             let _ = reply.send(Outcome::Skipped("cancelled before nested dispatch".into()));
                             continue;
                         }
-                        match host.start_child_now(&key, &name, arguments).await {
-                            Ok(call) => calls.push(async move {
+                        let child = match self.foreground.as_ref().filter(|_| name == FOREGROUND_SUBAGENT) {
+                            Some(foreground) => match foreground.request(arguments) {
+                                Ok(request) => host.start_foreground_subagent(request).await.map(|child| OrdinaryChild::Foreground(Box::new(child))),
+                                Err(reason) => Err(reason),
+                            },
+                            None => host.start_child_now(&key, &name, arguments).await.map(OrdinaryChild::Task),
+                        };
+                        match child {
+                            Ok(child) => calls.push(async move {
                                 let outcome = tokio::select! {
                                     biased;
                                     _ = cancellation.cancelled() => Outcome::Unknown("nested call was cancelled after admission".into()),
-                                    result = host.wait_child_result(&call, timeout) => ordinary_child_outcome(result),
+                                    outcome = child.wait(host, timeout) => outcome,
                                 };
                                 let _ = reply.send(outcome);
                             }),
@@ -1227,6 +1333,29 @@ impl DurableAsyncTool for CheckpointableTool {
             }
         };
         Ok(DurableToolStep::Complete(outcome))
+    }
+}
+
+impl OrdinaryChild {
+    async fn wait(self, host: &dyn DurableTaskHost, timeout: std::time::Duration) -> Outcome {
+        use crate::runtime::Status;
+
+        match self {
+            Self::Task(call) => {
+                ordinary_child_outcome(host.wait_child_result(&call, timeout).await)
+            }
+            Self::Foreground(child) => match host.wait_foreground_subagent(&child, timeout).await {
+                Ok(Some(Status::Done { answer })) => Outcome::SucceededWithDetails {
+                    output: answer,
+                    details: serde_json::json!({"conversationId": child.child}),
+                },
+                Ok(Some(Status::Unanswered { reason })) => Outcome::Failed(reason),
+                Ok(_) => Outcome::Unknown(
+                    "foreground subagent did not settle before its deadline".into(),
+                ),
+                Err(reason) => Outcome::Unknown(reason),
+            },
+        }
     }
 }
 
@@ -2715,6 +2844,7 @@ mod tests {
                 description: String::new(),
                 parameters: json!({}),
             }],
+            next_call: AtomicUsize::new(0),
         };
         let (progress_reply, _ack) = tokio::sync::oneshot::channel();
         assert!(
@@ -2740,12 +2870,22 @@ mod tests {
         ));
         assert!(incoming.try_recv().is_err());
 
-        for admitted in [false, true] {
+        let already_cancelled = pi_rs_core::CancellationToken::new();
+        already_cancelled.cancel();
+        assert!(matches!(
+            host.call_with_cancellation("child", json!({}), already_cancelled)
+                .await,
+            Outcome::Skipped(_)
+        ));
+        assert!(incoming.try_recv().is_err());
+
+        for (index, admitted) in [(2, false), (3, true)] {
             let token = pi_rs_core::CancellationToken::new();
             let pending = host.call_with_cancellation("child", json!({}), token.clone());
             tokio::pin!(pending);
             assert!(matches!(futures_util::poll!(&mut pending), Poll::Pending));
             let Ok(ToolHostRequest::Call {
+                index: assigned,
                 dispatch_claim,
                 reply,
                 ..
@@ -2753,6 +2893,7 @@ mod tests {
             else {
                 panic!("nested call was not enqueued");
             };
+            assert_eq!(assigned, index);
             if admitted {
                 assert!(!dispatch_claim.swap(true, Ordering::AcqRel));
             }

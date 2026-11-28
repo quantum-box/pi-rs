@@ -152,6 +152,22 @@ async fn capture_model_headers(
     model: std::sync::Arc<dyn pi_rs::Model>,
     request: pi_rs::ModelRequest,
 ) -> String {
+    capture_model_response(
+        &listener,
+        model,
+        request,
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .0
+}
+
+async fn capture_model_response(
+    listener: &tokio::net::TcpListener,
+    model: std::sync::Arc<dyn pi_rs::Model>,
+    request: pi_rs::ModelRequest,
+    response: &str,
+) -> (String, pi_rs::Result<pi_rs::ModelStream>) {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -168,20 +184,14 @@ async fn capture_model_headers(
                 break;
             }
         }
-        socket
-            .write_all(
-                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .await
-            .unwrap();
+        socket.write_all(response.as_bytes()).await.unwrap();
         String::from_utf8(bytes).unwrap()
     };
-    let (captured, _) = tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(serve, model.stream(request))
     })
     .await
-    .unwrap();
-    captured
+    .unwrap()
 }
 
 #[tokio::test]
@@ -553,6 +563,135 @@ fn auth_file_snapshot_binds_only_granted_routes() {
     assert!(grants.load().unwrap().get("compatible", endpoint).is_none());
 }
 
+#[tokio::test]
+async fn auth_reload_publishes_only_a_complete_catalog_and_keeps_clients_route_bound() {
+    use pi_rs::{ModelCatalog, ModelRequest};
+    use pi_rs_workbench::auth_factory::{AuthFileReadGrants, AuthRoute};
+    use pi_rs_workbench::model_factory::NativeModelDefinition;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    let directory = tempfile::tempdir().unwrap();
+    let granted = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ungranted = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        granted.local_addr().unwrap()
+    );
+    let other_endpoint = format!("http://{}/ungranted", ungranted.local_addr().unwrap());
+    let grants = AuthFileReadGrants {
+        file: directory.path().join("auth.json"),
+        routes: vec![AuthRoute {
+            provider: "relay".into(),
+            endpoint: endpoint.clone(),
+        }],
+    };
+    let definition = |model| NativeModelDefinition {
+        api: NativeModelApi::OpenAiChat,
+        provider: "relay",
+        endpoint: &endpoint,
+        model,
+        info: None,
+    };
+    let save = |key| {
+        let auth = serde_json::json!({ "relay": { "type": "api_key", "key": key } });
+        std::fs::write(&grants.file, auth.to_string()).unwrap();
+    };
+    let reload = |live: &mut ModelCatalog, definitions: Vec<NativeModelDefinition<'_>>| {
+        let factory = ModelClientFactory::new(grants.load()?);
+        *live = factory.catalog(definitions)?;
+        Ok::<_, pi_rs::Error>(())
+    };
+
+    save("Fixture-Old");
+    let mut live = ModelCatalog::default();
+    reload(&mut live, vec![definition("stable")]).unwrap();
+    let retained = live.get("relay", "stable").unwrap();
+    let old_client = Arc::downgrade(&retained);
+
+    std::fs::write(&grants.file, "{").unwrap();
+    assert!(reload(&mut live, vec![definition("stable")]).is_err());
+    assert!(Arc::ptr_eq(
+        &live.get("relay", "stable").unwrap(),
+        &retained
+    ));
+
+    save("Fixture-New");
+    let error = reload(
+        &mut live,
+        vec![
+            definition("candidate-only"),
+            NativeModelDefinition {
+                endpoint: &other_endpoint,
+                ..definition("ungranted")
+            },
+        ],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, pi_rs::Error::Config(message) if message == "model credential is not registered")
+    );
+    assert!(Arc::ptr_eq(
+        &live.get("relay", "stable").unwrap(),
+        &retained
+    ));
+    assert!(live.get("relay", "candidate-only").is_none());
+
+    reload(&mut live, vec![definition("stable")]).unwrap();
+    assert!(live.get("relay", "ungranted").is_none());
+    let replacement = live.get("relay", "stable").unwrap();
+    assert!(!Arc::ptr_eq(&replacement, &retained));
+    let request = || ModelRequest {
+        model: "stable".into(),
+        messages: vec![pi_rs::Message::User {
+            content: "hello".into(),
+        }],
+        tools: vec![],
+        max_output_tokens: 16,
+    };
+    let authorization = |headers: &str, expected: &str| {
+        let values = headers.lines().filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then_some(value.trim())
+        });
+        assert_eq!(values.collect::<Vec<_>>(), [expected]);
+    };
+    let body = "data: [DONE]\n\n";
+    let success = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    for (model, key) in [
+        (replacement.clone(), "Bearer Fixture-New"),
+        (retained.clone(), "Bearer Fixture-Old"),
+    ] {
+        let (headers, result) = capture_model_response(&granted, model, request(), &success).await;
+        assert!(result.is_ok());
+        authorization(&headers, key);
+    }
+    drop(retained);
+    assert!(old_client.upgrade().is_none());
+
+    let redirect = format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {other_endpoint}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let (headers, result) =
+        capture_model_response(&granted, replacement, request(), &redirect).await;
+    let Err(error) = result else {
+        panic!("the redirected request must fail");
+    };
+    assert!(error.to_string().contains("307"));
+    authorization(&headers, "Bearer Fixture-New");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), ungranted.accept())
+            .await
+            .is_err(),
+        "the ungranted endpoint received a connection"
+    );
+}
+
 #[test]
 fn bedrock_catalog_uses_only_granted_regional_runtime_endpoints() {
     use pi_rs_workbench::model_factory::NativeModelDefinition;
@@ -736,7 +875,7 @@ async fn granted_codex_model_routes_use_the_codex_bearer_protocol() {
 async fn bedrock_explicit_factory_prepares_and_sends_bearer_to_the_granted_route() {
     use pi_rs::{Message, Model, ModelRequest};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -770,41 +909,13 @@ async fn bedrock_explicit_factory_prepares_and_sends_bearer_to_the_granted_route
 
     let serve = || async {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        let mut chunk = [0; 2048];
-        let (header_end, body_size) = loop {
-            let count = socket.read(&mut chunk).await.unwrap();
-            assert_ne!(count, 0);
-            bytes.extend_from_slice(&chunk[..count]);
-            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                let size = std::str::from_utf8(&bytes[..position])
-                    .unwrap()
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("Content-Length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap();
-                break (position + 4, size);
-            }
-        };
-        while bytes.len() < header_end + body_size {
-            let count = socket.read(&mut chunk).await.unwrap();
-            assert_ne!(count, 0);
-            bytes.extend_from_slice(&chunk[..count]);
-        }
+        let (head, body) = read_model_json_request(&mut socket).await;
         socket
             .write_all(
                 b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             )
             .await
             .unwrap();
-        let head = std::str::from_utf8(&bytes[..header_end])
-            .unwrap()
-            .to_owned();
-        let body: serde_json::Value =
-            serde_json::from_slice(&bytes[header_end..header_end + body_size]).unwrap();
         (head, body)
     };
     for client in [&model as &dyn Model, prepared.as_ref()] {
@@ -1195,4 +1306,296 @@ async fn configured_model_key_requires_exact_opt_in_and_yields_to_saved_auth() {
     )
     .unwrap();
     assert!(grants.load(&factory).is_err());
+}
+
+#[test]
+fn pi_messages_ignores_ambient_sdk_configuration() {
+    let ambient_home = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pi_messages_streams_on_explicit_sdk_routes"])
+        .env("PI_RS_HOME", ambient_home.path())
+        .env("PI_RADIUS_GATEWAY", "invalid-gateway")
+        .env("RADIUS_API_KEY", "ambient-radius-key")
+        .env("PI_CACHE_RETENTION", "long")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("http_proxy", "http://127.0.0.1:9")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr),
+    );
+    assert!(
+        std::fs::read_dir(ambient_home.path())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn pi_messages_streams_on_explicit_sdk_routes() {
+    use futures_util::TryStreamExt;
+    use pi_rs::{Message, ModelApi, ModelEvent, ModelRequest, Usage};
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = format!("http://{address}/private/messages");
+    let api = NativeModelApi::PiMessages;
+    let provider = "radius";
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        provider,
+        &endpoint,
+        HostCredential::new(HostCredentialKind::Bearer, "fixture-access").unwrap(),
+    )
+    .unwrap();
+    let factory = ModelClientFactory::new(auth.build());
+    assert!(
+        factory
+            .client(api, provider, &endpoint)
+            .unwrap()
+            .context_identity()
+            .is_none()
+    );
+    for (provider, endpoint) in [
+        ("Radius", endpoint.clone()),
+        ("relay", endpoint.clone()),
+        (
+            provider,
+            format!("http://localhost:{}/private/messages", address.port()),
+        ),
+        (provider, format!("http://{address}/private/messages/")),
+    ] {
+        assert!(factory.client(api, provider, &endpoint).is_err());
+    }
+    let empty_factory = ModelClientFactory::default();
+    assert!(empty_factory.client(api, provider, &endpoint).is_err());
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("models.json");
+    let declared_base = "https://declared.example.invalid/v1";
+    std::fs::write(
+        &file,
+        json!({"providers":{"radius":{
+            "api":"pi-messages","baseUrl":declared_base,"apiKey":"fixture-file-key",
+            "headers":{"Authorization":"Bearer ignored-file-header"},
+            "models":[{"id":"fixture-model"},{"id":"ungranted","baseUrl":endpoint}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let grants = ModelFileReadGrants {
+        file,
+        routes: vec![ModelFileRoute {
+            provider: provider.into(),
+            api,
+            base_url: declared_base.into(),
+            endpoint: endpoint.clone(),
+        }],
+    };
+    assert!(grants.load(&empty_factory).is_err());
+    let file_catalog = grants
+        .load_with_api_keys(&empty_factory, &grants.routes, |_, _| None)
+        .unwrap();
+    assert_eq!(
+        file_catalog.identities().collect::<Vec<_>>(),
+        [(provider, "fixture-model")]
+    );
+    let file_model = file_catalog.get(provider, "fixture-model").unwrap();
+    let host_model = factory.client(api, provider, &endpoint).unwrap();
+
+    let request = ModelRequest {
+        model: "fixture-model".into(),
+        messages: vec![
+            Message::System {
+                content: "system prompt".into(),
+            },
+            Message::User {
+                content: "hello".into(),
+            },
+        ],
+        tools: vec![],
+        max_output_tokens: 16,
+    };
+
+    for (model, bearer) in [
+        (host_model, "fixture-access"),
+        (file_model, "fixture-file-key"),
+    ] {
+        let (window, prepared) = tokio::time::timeout(Duration::from_secs(5), async {
+            (
+                model.context_window(&request.model).await,
+                model.prepare_context(&request).await,
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(window, None);
+        assert!(prepared.unwrap().is_none());
+
+        let (received_delta, wait_for_delta) = tokio::sync::oneshot::channel();
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (head, body) = read_model_json_request(&mut socket).await;
+            assert!(head.starts_with("POST /private/messages HTTP/1.1\r\n"));
+            assert!(
+                head.lines()
+                    .any(|line| line.eq_ignore_ascii_case("accept: text/event-stream"))
+            );
+            let auth = head
+                .lines()
+                .filter_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then_some(value.trim())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(auth, [format!("Bearer {bearer}")]);
+            assert_eq!(
+                body,
+                json!({
+                    "model":"fixture-model",
+                    "context":{"systemPrompt":"system prompt","messages":[
+                        {"role":"user","content":"hello","timestamp":0}
+                    ],"tools":[]},
+                    "options":{"maxTokens":16}
+                })
+            );
+            let first_events = concat!(
+                "data: {\"type\":\"text_start\",\"contentIndex\":0}\n\n",
+                "data: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"hel\"}\n\n",
+            );
+            let remaining_events = concat!(
+                "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"hello\"}\n\n",
+                "data: {\"type\":\"done\",\"reason\":\"stop\",\"responseModel\":\"routed-model\",\"usage\":{\"input\":3,\"output\":2,\"cacheRead\":4}}\n\n",
+            );
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first_events}",
+                first_events.len() + remaining_events.len()
+            ).as_bytes()).await.unwrap();
+            wait_for_delta.await.unwrap();
+            socket.write_all(remaining_events.as_bytes()).await.unwrap();
+        };
+        let (_, (first, remaining)) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serve, async {
+                let mut stream = model.stream(request.clone()).await.unwrap();
+                let first = stream.try_next().await.unwrap().unwrap();
+                received_delta.send(()).unwrap();
+                (first, stream.try_collect::<Vec<_>>().await.unwrap())
+            })
+        })
+        .await
+        .unwrap();
+        assert!(matches!(first, ModelEvent::Text(text) if text == "hel"));
+        let [
+            ModelEvent::Text(last),
+            ModelEvent::Metadata(metadata),
+            ModelEvent::Complete { calls, usage },
+        ] = remaining.as_slice()
+        else {
+            panic!("unexpected Pi Messages events: {remaining:?}")
+        };
+        assert_eq!(last, "lo");
+        assert_eq!(metadata.provider_api, Some(ModelApi::PiMessages));
+        let identity = metadata.resolved_model.as_ref().unwrap();
+        assert_eq!(
+            (identity.provider.as_str(), identity.model.as_str()),
+            (provider, "routed-model")
+        );
+        assert_eq!(metadata.cached_input_tokens, Some(4));
+        assert!(calls.is_empty());
+        let usage: Usage = usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (7, 2));
+    }
+}
+
+async fn read_model_json_request(
+    socket: &mut tokio::net::TcpStream,
+) -> (String, serde_json::Value) {
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 2048];
+    let (header_end, body_size) = loop {
+        let count = socket.read(&mut chunk).await.unwrap();
+        assert_ne!(count, 0);
+        bytes.extend_from_slice(&chunk[..count]);
+        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let size = std::str::from_utf8(&bytes[..position])
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("Content-Length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            break (position + 4, size);
+        }
+    };
+    while bytes.len() < header_end + body_size {
+        let count = socket.read(&mut chunk).await.unwrap();
+        assert_ne!(count, 0);
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    let head = std::str::from_utf8(&bytes[..header_end])
+        .unwrap()
+        .to_owned();
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes[header_end..header_end + body_size]).unwrap();
+    (head, body)
+}
+
+#[tokio::test]
+async fn pi_messages_does_not_follow_redirects_from_the_granted_endpoint() {
+    use pi_rs::ModelRequest;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let redirected = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/messages", listener.local_addr().unwrap());
+    let target = format!("http://{}/messages", redirected.local_addr().unwrap());
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "custom",
+        &endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    let model = ModelClientFactory::new(auth.build())
+        .client(NativeModelApi::PiMessages, "custom", &endpoint)
+        .unwrap();
+    let request = ModelRequest {
+        model: "fixture-model".into(),
+        messages: vec![],
+        tools: vec![],
+        max_output_tokens: 16,
+    };
+    let serve = async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_model_json_request(&mut socket).await;
+        socket.write_all(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ).as_bytes()).await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = redirected.accept() => panic!("Pi Messages followed a redirect"),
+            ((), result) = async { tokio::join!(serve, model.stream(request)) } => {
+                assert!(matches!(result, Err(pi_rs::Error::Model(message)) if message.contains("307")));
+            }
+        }
+    }).await.unwrap();
 }

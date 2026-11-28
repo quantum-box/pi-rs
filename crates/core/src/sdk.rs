@@ -2,7 +2,7 @@
 use crate::runtime::time as platform_time;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -56,6 +56,26 @@ pub enum SessionEvent {
     },
 }
 
+/// A live partial tool result for presentation. Arguments and results may contain private data.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ToolProgressUpdate {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    /// The scheduler's bounded argument preview, or null when unavailable.
+    pub args: serde_json::Value,
+    pub partial_result: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
+}
+
+struct SessionEvents {
+    regular: broadcast::Sender<SessionEvent>,
+    // In-flight observers can outlive close. Only the session owns this sender.
+    tool_progress: broadcast::WeakSender<Arc<ToolProgressUpdate>>,
+}
+
 /// A configured extension command for native host command pickers.
 /// `source_path` is a lossy UTF-8 rendering suitable for JSON; it is display
 /// metadata and must not be used as a filesystem authorization boundary.
@@ -74,6 +94,20 @@ pub struct SdkRegisteredCommand {
 pub struct TreeNavigationResult {
     pub editor_text: Option<String>,
     pub summary_entry: Option<Box<Record>>,
+}
+
+/// Durable session totals with host-visible identity and active branch context.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SdkSessionStats {
+    /// Pi-visible session ID, including an imported ID when present.
+    pub session_id: String,
+    /// Absolute session path when the SDK was given one.
+    pub session_file: Option<PathBuf>,
+    /// Native journal totals across all branches, with the native UUID.
+    pub totals: crate::SessionStats,
+    /// Active branch usage for the host-configured context window, if known.
+    pub context_usage: Option<crate::ContextUsage>,
 }
 
 // Admission tickets serialize independent control operations without holding a
@@ -471,7 +505,7 @@ pub struct SessionControl {
     retry: crate::RetryControl,
     input_hooks: Arc<Mutex<InputHooks>>,
     input_order: Arc<InputAdmission>,
-    events: broadcast::WeakSender<SessionEvent>,
+    events: Weak<SessionEvents>,
     tool_timeout: std::time::Duration,
 }
 
@@ -1475,8 +1509,12 @@ impl SessionBuilder {
             None => true,
         };
         let (sender, input) = mpsc::channel(32);
-        let (events, _) = broadcast::channel(64);
-        let weak_events = events.downgrade();
+        let (tool_progress, _) = broadcast::channel(32);
+        let events = Arc::new(SessionEvents {
+            regular: broadcast::channel(64).0,
+            tool_progress: tool_progress.downgrade(),
+        });
+        let weak_events = Arc::downgrade(&events);
         let tool_timeout = self.limits.tool_timeout;
         let auto_compaction = session.auto_compaction_control();
         let retry = session.retry_control();
@@ -1515,6 +1553,7 @@ impl SessionBuilder {
             session,
             input,
             events: Some(events),
+            tool_progress: Some(tool_progress),
             control: SessionControl {
                 scope: None,
                 owner,
@@ -1552,7 +1591,8 @@ pub struct AgentSession {
     session: Arc<tokio::sync::Mutex<Session>>,
     input: Arc<tokio::sync::Mutex<mpsc::Receiver<crate::AgentInput>>>,
     control: SessionControl,
-    events: Option<broadcast::Sender<SessionEvent>>,
+    events: Option<Arc<SessionEvents>>,
+    tool_progress: Option<broadcast::Sender<Arc<ToolProgressUpdate>>>,
     closed: bool,
     pending_start: PendingStart,
     session_file: Option<PathBuf>,
@@ -1737,7 +1777,7 @@ impl AgentSession {
     /// A slow subscriber receives a broadcast lag error instead of blocking execution.
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         match &self.events {
-            Some(events) => events.subscribe(),
+            Some(events) => events.regular.subscribe(),
             None => {
                 let (sender, receiver) = broadcast::channel(1);
                 drop(sender);
@@ -1745,6 +1785,35 @@ impl AgentSession {
             }
         }
     }
+    /// Subscribe to live partial results for direct and control-triggered tool calls.
+    ///
+    /// Subscribe before starting work. The stream is transient and retains up to
+    /// 32 updates. Slow receivers get a broadcast lag error and never hold up a
+    /// tool. The stream closes on session close or drop. Final results and
+    /// durable records remain available through [`Self::subscribe`].
+    pub fn subscribe_tool_progress(&self) -> broadcast::Receiver<Arc<ToolProgressUpdate>> {
+        match &self.tool_progress {
+            Some(progress) => progress.subscribe(),
+            None => broadcast::channel(1).1,
+        }
+    }
+    /// The stable, Pi-visible session ID. Imported journals can retain an
+    /// external ID that differs from their native storage UUID.
+    pub fn session_id(&self) -> Result<String> {
+        Ok(self.journal()?.external_session_id())
+    }
+
+    /// The absolute path supplied to the SDK when opening or forking a session.
+    /// In-memory sessions and caller-supplied journals have no SDK-managed path.
+    pub fn session_file(&self) -> Option<&Path> {
+        self.session_file.as_deref()
+    }
+
+    /// The latest committed display name, if set. A busy journal returns an error.
+    pub fn session_name(&self) -> Result<Option<String>> {
+        Ok(self.journal()?.name().map(str::to_owned))
+    }
+
     /// Try to borrow the journal. Drop the guard before another session operation.
     pub fn journal(&self) -> Result<tokio::sync::MutexGuard<'_, Session>> {
         self.session
@@ -1765,6 +1834,24 @@ impl AgentSession {
     /// Usage and message counts across the complete durable session.
     pub fn statistics(&self) -> Result<crate::SessionStats> {
         Ok(self.journal()?.statistics())
+    }
+
+    /// Read the durable totals and current branch usage from one journal snapshot.
+    ///
+    /// Uses the configured [`Limits::context_window`] without calling the model.
+    /// Returns an error if the session is closed or its journal is busy.
+    pub fn session_stats(&self) -> Result<SdkSessionStats> {
+        self.ensure_open()?;
+        let journal = self.journal()?;
+        Ok(SdkSessionStats {
+            session_id: journal.external_session_id(),
+            session_file: self.session_file.clone(),
+            totals: journal.statistics(),
+            context_usage: self
+                .limits
+                .context_window
+                .and_then(|window| journal.context_usage(window)),
+        })
     }
 
     /// Resolve the configured or provider-reported context window within the model timeout.
@@ -1797,6 +1884,36 @@ impl AgentSession {
     pub fn tools(&self) -> Vec<crate::ToolSpec> {
         self.registry.tool_specs()
     }
+    /// Names of the configured tools selected for model advertisement.
+    /// Branch system checkpoints and per-request registry refreshes can
+    /// narrow or otherwise change the tools sent with an individual request.
+    pub fn active_tool_names(&self) -> Vec<String> {
+        self.registry
+            .active_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect()
+    }
+
+    /// Change the model-facing selection for future runs of this session.
+    /// Branch system checkpoints still control their declared tool loadout.
+    /// Registered tools remain available for orchestration. An unregistered
+    /// name rejects the whole selection, matching native registry validation.
+    pub fn set_active_tools(&mut self, names: impl IntoIterator<Item = String>) -> Result<()> {
+        self.ensure_open()?;
+        let journal = self.session.clone();
+        let journal = journal
+            .try_lock()
+            .map_err(|_| Error::Session("session journal is in use".into()))?;
+        let mut registry = (*self.registry).clone();
+        registry.set_active_tools(names)?;
+        let input_hooks = InputHooks::new(&registry, &journal);
+        self.registry = Arc::new(registry);
+        self.refresh_run_config();
+        *self.control.input_hooks.lock().expect("SDK input hooks") = input_hooks;
+        Ok(())
+    }
+
     /// Inspect the session's configured registry, including extension ownership
     /// and model-advertisement status for inactive as well as active tools.
     /// Per-request registry refreshes during a run are not reflected here.
@@ -2094,11 +2211,12 @@ impl AgentSession {
             Some(_) => return Err(Error::Config("invalid model provider".into())),
             None => None,
         };
-        let (fallback_previous, startup_error) = self
+        let (fallback_previous, startup_error, _) = self
             .start_with_fallback(
                 Some((model.clone(), provider.clone(), name.clone())),
                 true,
                 false,
+                None,
             )
             .await?;
         let (previous_provider, previous_name, previous_level) = match fallback_previous {
@@ -2654,7 +2772,7 @@ impl AgentSession {
     pub async fn set_name_with_hooks(&mut self, name: &str) -> Result<()> {
         self.start().await?;
         self.set_name(name)?;
-        let name = self.journal()?.name().map(str::to_owned);
+        let name = self.session_name()?;
         self.notify_session_event(crate::LifecycleEvent::SessionInfoChanged { name })
             .await?;
         let _ = self.drain_idle_triggers().await?;
@@ -2663,7 +2781,7 @@ impl AgentSession {
 
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
-        let (_, error) = self.start_with_fallback(None, true, false).await?;
+        let (_, error, _) = self.start_with_fallback(None, true, false, None).await?;
         error.map_or(Ok(()), Err)
     }
 
@@ -2675,7 +2793,12 @@ impl AgentSession {
         fallback: Option<(Arc<dyn Model>, Option<String>, String)>,
         drain_triggers: bool,
         defer_startup: bool,
-    ) -> Result<(Option<(Option<String>, String, String)>, Option<Error>)> {
+        correlated_preflight: Option<Uuid>,
+    ) -> Result<(
+        Option<(Option<String>, String, String)>,
+        Option<Error>,
+        bool,
+    )> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
@@ -2688,6 +2811,14 @@ impl AgentSession {
         if !defer_startup && crate::agent::resumable_compaction_run(&journal).is_some() {
             return Err(Error::Session(
                 "pending compaction recovery must be resumed before startup".into(),
+            ));
+        }
+        let pending_preflight = journal.pending_before_agent_start_run();
+        let resume_preflight =
+            pending_preflight.is_some() && pending_preflight == correlated_preflight;
+        if !defer_startup && !resume_preflight && pending_preflight.is_some() {
+            return Err(Error::Session(
+                "pending run preflight must be resumed before startup".into(),
             ));
         }
         let recovered = journal.recover_tree_trigger_handoff()?.cloned();
@@ -2755,7 +2886,7 @@ impl AgentSession {
                 )));
             }
         }
-        let startup = if defer_startup {
+        let startup = if defer_startup || resume_preflight {
             None
         } else {
             self.pending_start.lock().expect("session startup").take()
@@ -2782,13 +2913,15 @@ impl AgentSession {
         drop(journal);
         drop(order);
         let startup_result = match startup_result {
-            Ok(()) if drain_triggers => self.drain_idle_triggers().await.map(|_| ()),
+            Ok(()) if drain_triggers && !resume_preflight => {
+                self.drain_idle_triggers().await.map(|_| ())
+            }
             Ok(()) => Ok(()),
             Err(error) => Err(error),
         };
         match startup_result {
-            Ok(()) => Ok((replaced, None)),
-            Err(error) if replaced.is_some() => Ok((replaced, Some(error))),
+            Ok(()) => Ok((replaced, None, resume_preflight)),
+            Err(error) if replaced.is_some() => Ok((replaced, Some(error), resume_preflight)),
             Err(error) => Err(error),
         }
     }
@@ -3282,15 +3415,22 @@ impl AgentSession {
         .await
     }
     pub async fn resume(&mut self) -> Result<String> {
-        let (recovery, boundary_run) = {
+        let (recovery, resumable_run) = {
             let journal = self.journal_async().await;
             (
                 crate::agent::resumable_compaction_run(&journal),
-                journal.pending_extension_boundary_run(),
+                journal
+                    .pending_extension_boundary_run()
+                    .or_else(|| journal.pending_before_agent_start_run()),
             )
         };
-        let (_, startup_error) = self
-            .start_with_fallback(None, false, recovery.is_some() || boundary_run.is_some())
+        let (_, startup_error, _) = self
+            .start_with_fallback(
+                None,
+                false,
+                recovery.is_some() || resumable_run.is_some(),
+                None,
+            )
             .await?;
         if let Some(error) = startup_error {
             return Err(error);
@@ -3323,7 +3463,7 @@ impl AgentSession {
                     .into(),
             ));
         }
-        let run_id = recovery.map(|(run_id, _, _)| run_id).or(boundary_run);
+        let run_id = recovery.map(|(run_id, _, _)| run_id).or(resumable_run);
         if run_id.is_none() {
             self.drain_idle_triggers().await?;
         }
@@ -3349,6 +3489,7 @@ impl AgentSession {
         result
     }
     /// A duplicate run ID follows the core's durable idempotency rules.
+    /// Pass no input and the saved run ID to resume an interrupted preflight.
     pub async fn run(
         &mut self,
         input: Option<String>,
@@ -3405,9 +3546,19 @@ impl AgentSession {
         already_started: bool,
         observer: &mut crate::AgentObserver<'_>,
     ) -> Result<String> {
-        if !already_started {
-            self.start().await?;
-        }
+        let resume_preflight = if already_started {
+            false
+        } else {
+            let correlated_preflight =
+                (!prepare && input.is_none() && images.is_none()).then_some(run_id);
+            let (_, error, resume_preflight) = self
+                .start_with_fallback(None, true, false, correlated_preflight)
+                .await?;
+            if let Some(error) = error {
+                return Err(error);
+            }
+            resume_preflight
+        };
         let journal_owner = self
             .control
             .owner
@@ -3542,6 +3693,15 @@ impl AgentSession {
             && let Err(error) = final_inputs
         {
             result = Err(error);
+        }
+        if result.is_ok()
+            && resume_preflight
+            && crate::agent::resumable_compaction_run(&journal).is_none()
+        {
+            drop(active);
+            drop(input_queue);
+            drop(journal);
+            self.start().await?;
         }
         result
     }
@@ -3739,6 +3899,7 @@ impl AgentSession {
             return Ok(());
         }
         self.closed = true;
+        drop(self.tool_progress.take());
         self.control.owner.closed.cancel();
         self.control.abort();
         {
@@ -3771,7 +3932,7 @@ impl AgentSession {
             Ok(())
         };
         if let Some(events) = self.events.take() {
-            let _ = events.send(SessionEvent::Closed);
+            let _ = events.regular.send(SessionEvent::Closed);
         }
         notification_result.and(result)
     }
@@ -4057,7 +4218,29 @@ impl Drop for ActiveRun {
         *self.state.lock().expect("session control") = None;
     }
 }
-fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_>) {
+fn emit(events: &SessionEvents, notification: &Notification<'_>) {
+    if let Notification::ToolProgress(crate::LifecycleEvent::ToolExecutionUpdate {
+        tool_call_id,
+        tool_name,
+        args,
+        partial_result,
+        parent_tool_call_id,
+    }) = notification
+    {
+        if let Some(progress) = events.tool_progress.upgrade()
+            && progress.receiver_count() != 0
+        {
+            let _ = progress.send(Arc::new(ToolProgressUpdate {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                args: args.clone(),
+                partial_result: partial_result.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+            }));
+        }
+        return;
+    }
+    let events = &events.regular;
     if events.receiver_count() == 0 {
         return;
     }
@@ -4990,6 +5173,69 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn sdk_session_metadata_reports_persisted_identity_name_and_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.jsonl");
+        let fork_path = directory.path().join("fork.jsonl");
+        let builder = || SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo");
+
+        let in_memory = builder().in_memory().unwrap();
+        assert_eq!(in_memory.session_name().unwrap(), None);
+        assert_eq!(in_memory.session_file(), None);
+        assert_eq!(in_memory.session_stats().unwrap().session_file, None);
+
+        let mut source = builder().open(&path).unwrap();
+        {
+            let mut journal = source.journal().unwrap();
+            let native_id = journal.session_id();
+            journal
+                .append(crate::Event::SourceEntry {
+                    format: "pi-rs:external-session-id".into(),
+                    entry: serde_json::json!({"native_id":native_id,"id":"imported-session"}),
+                })
+                .unwrap();
+        }
+        let source_id = source.session_id().unwrap();
+        assert_eq!(source_id, "imported-session");
+        assert_eq!(source.session_file(), Some(path.as_path()));
+        assert_eq!(source.session_name().unwrap(), None);
+        source.set_name("  review  ").unwrap();
+        let record = {
+            let journal = source.journal().unwrap();
+            assert!(source.session_name().is_err());
+            assert!(source.session_stats().is_err());
+            journal.head()
+        };
+        assert_eq!(source.session_name().unwrap().as_deref(), Some("review"));
+        let stats = source.session_stats().unwrap();
+        assert_eq!(stats.session_id, source_id);
+        assert_ne!(stats.session_id, stats.totals.session_id.to_string());
+        assert_eq!(stats.session_file.as_deref(), Some(path.as_path()));
+        assert_eq!(stats.totals.session_name.as_deref(), Some("review"));
+        let fork = source.fork_to(record, &fork_path).unwrap();
+        assert_ne!(fork.session_id().unwrap(), source_id);
+        assert_eq!(fork.session_file(), Some(fork_path.as_path()));
+        let fork_stats = fork.session_stats().unwrap();
+        assert_eq!(
+            fork_stats.session_id,
+            fork_stats.totals.session_id.to_string()
+        );
+        assert_ne!(fork_stats.session_id, source_id);
+        assert_eq!(
+            fork_stats.session_file.as_deref(),
+            Some(fork_path.as_path())
+        );
+        drop(source);
+
+        let mut reopened = builder().open(&path).unwrap();
+        assert_eq!(reopened.session_id().unwrap(), source_id);
+        assert_eq!(reopened.session_name().unwrap().as_deref(), Some("review"));
+        assert_eq!(reopened.session_stats().unwrap(), stats);
+        reopened.set_name(" ").unwrap();
+        assert_eq!(reopened.session_name().unwrap(), None);
     }
 
     #[tokio::test]
@@ -10161,10 +10407,12 @@ mod tests {
 
     struct StatisticsModel {
         slow_discovery: bool,
+        discoveries: AtomicUsize,
     }
     #[async_trait::async_trait]
     impl Model for StatisticsModel {
         async fn context_window(&self, _: &str) -> Option<u32> {
+            self.discoveries.fetch_add(1, Ordering::SeqCst);
             if self.slow_discovery {
                 std::future::pending::<()>().await;
             }
@@ -10190,10 +10438,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdk_statistics_and_context_usage_share_the_durable_session() {
+    async fn sdk_session_stats_combine_all_branch_totals_with_current_context() {
         let mut session = SessionBuilder::new(
             Arc::new(StatisticsModel {
                 slow_discovery: false,
+                discoveries: AtomicUsize::new(0),
             }),
             "stats",
         )
@@ -10205,9 +10454,13 @@ mod tests {
         .unwrap();
         assert_eq!(session.statistics().unwrap().cost, Some(0.0));
         session.prompt("hello").await.unwrap();
-        let stats = session.statistics().unwrap();
+        let snapshot = session.session_stats().unwrap();
+        let stats = snapshot.totals;
+        assert_eq!(stats, session.statistics().unwrap());
         assert_eq!(stats, session.journal().unwrap().statistics());
         assert_eq!(stats.session_id, session.journal().unwrap().session_id());
+        assert_eq!(snapshot.session_id, stats.session_id.to_string());
+        assert_eq!(snapshot.session_file, None);
         assert_eq!((stats.user_messages, stats.assistant_messages), (1, 1));
         assert_eq!(
             (
@@ -10222,28 +10475,49 @@ mod tests {
         let usage = session.context_usage().await.unwrap().unwrap();
         assert_eq!((usage.context_window, usage.tokens), (4096, Some(13)));
         assert_eq!(usage.percent, Some(13.0 / 4096.0 * 100.0));
+        assert_eq!(snapshot.context_usage.as_ref(), Some(&usage));
         let head = session.journal().unwrap().head();
         let mut fork = session.fork_at(head).unwrap();
         assert_eq!(fork.statistics().unwrap().tokens, stats.tokens);
         assert_ne!(fork.statistics().unwrap().session_id, stats.session_id);
         session.summarize(0).await.unwrap();
-        assert_eq!(session.statistics().unwrap().tokens.total, 26);
-        assert_eq!(session.context_usage().await.unwrap().unwrap().tokens, None);
+        let compacted = session.session_stats().unwrap();
+        assert_eq!(compacted.totals.tokens.total, 26);
+        assert_eq!(compacted.context_usage.unwrap().tokens, None);
+        let compacted_head = session.journal().unwrap().head();
+        session.checkout(head).unwrap();
+        let checked_out = session.session_stats().unwrap();
+        assert_eq!(checked_out.totals, compacted.totals);
+        assert_eq!(checked_out.context_usage, Some(usage));
+        session.prompt("alternate branch").await.unwrap();
+        session.checkout(compacted_head).unwrap();
+        let restored = session.session_stats().unwrap();
+        assert_eq!(restored.totals.tokens.total, 39);
+        assert_eq!(
+            (
+                restored.totals.user_messages,
+                restored.totals.assistant_messages
+            ),
+            (2, 2)
+        );
+        assert_eq!(restored.context_usage.unwrap().tokens, None);
         fork.close().await.unwrap();
         session.close().await.unwrap();
         assert!(session.context_usage().await.is_err());
+        assert!(session.session_stats().is_err());
     }
 
     #[tokio::test]
     async fn sdk_context_discovery_is_bounded_and_used_without_an_override() {
-        let mut session = SessionBuilder::new(
-            Arc::new(StatisticsModel {
-                slow_discovery: false,
-            }),
-            "stats",
-        )
-        .in_memory()
-        .unwrap();
+        let model = Arc::new(StatisticsModel {
+            slow_discovery: false,
+            discoveries: AtomicUsize::new(0),
+        });
+        let mut session = SessionBuilder::new(model.clone(), "stats")
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.session_stats().unwrap().context_usage, None);
+        assert_eq!(model.discoveries.load(Ordering::SeqCst), 0);
         assert_eq!(
             session
                 .context_usage()
@@ -10253,10 +10527,12 @@ mod tests {
                 .context_window,
             8192
         );
+        assert_eq!(model.discoveries.load(Ordering::SeqCst), 1);
         session.close().await.unwrap();
         let mut session = SessionBuilder::new(
             Arc::new(StatisticsModel {
                 slow_discovery: true,
+                discoveries: AtomicUsize::new(0),
             }),
             "stats",
         )
@@ -11635,6 +11911,85 @@ mod tests {
             vec![self.0.clone()]
         }
     }
+    #[tokio::test]
+    async fn sdk_tool_selection_changes_model_requests_without_unregistering_tools() {
+        struct ToolNamesModel;
+
+        #[async_trait::async_trait]
+        impl Model for ToolNamesModel {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                let names = request
+                    .tools
+                    .into_iter()
+                    .map(|spec| spec.name)
+                    .collect::<Vec<_>>();
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text(format!("tools: {}", names.join(", ")))),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+
+        let mut session = SessionBuilder::new(Arc::new(ToolNamesModel), "fixture")
+            .extension(Arc::new(JobExtension(Arc::new(PollingJob {
+                dispatched: AtomicUsize::new(0),
+                polls: AtomicUsize::new(0),
+                started: tokio::sync::Notify::new(),
+            }))))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+
+        assert_eq!(session.active_tool_names(), ["job"]);
+        session.set_active_tools([]).unwrap();
+        assert!(session.active_tool_names().is_empty());
+        assert_eq!(session.tools()[0].name, "job");
+        assert!(!session.registered_tool_info()[0].active);
+        assert_eq!(session.prompt("show selection").await.unwrap(), "tools: ");
+
+        session.set_active_tools(["job".into()]).unwrap();
+        assert!(session.set_active_tools(["missing".into()]).is_err());
+        assert_eq!(session.active_tool_names(), ["job"]);
+        assert_eq!(
+            session.prompt("show new selection").await.unwrap(),
+            "tools: job"
+        );
+
+        let before_checkpoint = session.journal().unwrap().head();
+        session
+            .journal()
+            .unwrap()
+            .append(crate::Event::SystemCheckpoint {
+                content: "Historical context".into(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec![],
+            })
+            .unwrap();
+
+        session.set_active_tools(["job".into()]).unwrap();
+        assert_eq!(session.active_tool_names(), ["job"]);
+        assert_eq!(
+            session.prompt("show checkpoint selection").await.unwrap(),
+            "tools: "
+        );
+
+        let mut before_checkpoint = session.fork_at(before_checkpoint).unwrap();
+        assert_eq!(
+            before_checkpoint
+                .prompt("show fork selection")
+                .await
+                .unwrap(),
+            "tools: job"
+        );
+
+        session.close().await.unwrap();
+        assert!(session.set_active_tools([]).is_err());
+    }
+
     struct LiveKeyResultHook(bool);
     struct LiveKeyTool(bool);
     #[async_trait::async_trait]

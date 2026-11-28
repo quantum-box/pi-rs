@@ -74,3 +74,11 @@ pub mod worker_activity;
 extern crate self as pi_rs_durable;
 #[cfg(test)]
 mod conversation_claim_boundary_tests;
+
+/// Publish the complete payload before another process can observe the marker.
+#[cfg(test)]
+pub(crate) fn publish_ready_marker(path: std::path::PathBuf, data: impl AsRef<[u8]>) {
+    let staging = path.with_extension("tmp");
+    std::fs::write(&staging, data).unwrap();
+    std::fs::rename(staging, path).unwrap();
+}

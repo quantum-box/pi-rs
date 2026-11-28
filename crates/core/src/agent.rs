@@ -5,7 +5,7 @@ mod turn_scheduler;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -529,6 +529,11 @@ impl Agent<'_> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        if session.pending_before_agent_start_run().is_some() {
+            return Err(Error::Session(
+                "pending run preflight must be resumed before starting another run".into(),
+            ));
+        }
         ensure_settled(session.operations())?;
         let event = Session::user_input_event(content, images, Some(input_id))?;
         let event = self.edit_input_event(session, event, observer).await;
@@ -573,14 +578,27 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
+        self.commit_custom_message(session, input.id, input.message, cancel, observer)
+            .await
+    }
+
+    async fn commit_custom_message(
+        &self,
+        session: &mut Session,
+        id: Uuid,
+        message: crate::CustomMessage,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let event = Event::CustomMessageDelivered { id, message };
+        let event = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            event = self.edit_input_event(session, event, observer) => event,
+        };
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let event = Event::CustomMessageDelivered {
-            id: input.id,
-            message: input.message,
-        };
-        let event = self.edit_input_event(session, event, observer).await;
         commit(session, event, observer)
     }
 
@@ -678,6 +696,14 @@ impl Agent<'_> {
         {
             return Err(Error::Session(
                 "pending compaction recovery must be resumed before starting another run".into(),
+            ));
+        }
+        if session
+            .pending_before_agent_start_run()
+            .is_some_and(|pending| pending != run_id)
+        {
+            return Err(Error::Session(
+                "pending run preflight must be resumed before starting another run".into(),
             ));
         }
         if let Some(record) = session.recover_tree_trigger_handoff()? {
@@ -988,6 +1014,20 @@ impl Agent<'_> {
             .resolve_prior_turn_end(session, run_id, cancel, observer)
             .await;
         session.set_run_id(Some(run_id));
+        if prior_result.is_ok() && recovered.is_none() {
+            prior_result = crate::before_agent_start::prepare(
+                self,
+                session,
+                run_id,
+                effective_input
+                    .as_ref()
+                    .map(|(_, content)| content.as_str()),
+                followups,
+                cancel,
+                observer,
+            )
+            .await;
+        }
         let mut check_turn_continuation =
             matches!(recovered, Some(RecoveredBoundary::TurnContinue));
         let mut force_request = matches!(recovered, Some(RecoveredBoundary::Continue { .. }));
@@ -1047,8 +1087,10 @@ impl Agent<'_> {
                         observer(event);
                     };
                     let ui_events = crate::ui_prompt::RunEvents::default();
+                    // The turn driver retains the provider and tool futures. Store it
+                    // on the heap to keep browser resume within the WASM stack.
                     let result = ui_events
-                        .scope(self.drive(
+                        .scope(Box::pin(self.drive(
                             session,
                             run_id,
                             DriveStart {
@@ -1063,7 +1105,7 @@ impl Agent<'_> {
                             followups,
                             cancel,
                             &mut retry_observer,
-                        ))
+                        )))
                         .await;
                     ui_events.finish(&mut retry_observer).await;
                     result
@@ -1648,6 +1690,14 @@ impl Agent<'_> {
                 ));
         let recovering_compaction =
             resumable_compaction_run(session).is_some_and(|(id, _, _)| id == run_id);
+        let plan = if !in_process_continuation && !recovering_compaction {
+            crate::before_agent_start::plan(session, run_id)?
+        } else {
+            None
+        };
+        let captures_next_turn = plan
+            .as_ref()
+            .is_some_and(|(_, plan)| plan.captures_next_turn);
         if !recovering_compaction {
             // The trigger UUID is its run ID, so a restart resumes the same run.
             if let Some((_, message)) =
@@ -1672,7 +1722,8 @@ impl Agent<'_> {
                     } if record.run_id == Some(run_id) => Some(record.id),
                     _ => None,
                 });
-            if has_trigger_message(session, run_id)
+            if !captures_next_turn
+                && has_trigger_message(session, run_id)
                 && let Some(started_at) = trigger_started
             {
                 for (queued_at, pending) in session.queued_custom_messages() {
@@ -1716,19 +1767,20 @@ impl Agent<'_> {
             // Only messages queued before this run's initial user entry belong to it.
             // This also covers image prompts and avoids consuming newly queued next-turn
             // messages if a partially completed run is restored.
-            if let Some(initial_id) =
-                session
-                    .branch()
-                    .iter()
-                    .find_map(|record| match &record.event {
-                        Event::User {
-                            input_id: Some(id), ..
-                        }
-                        | Event::UserWithImages {
-                            input_id: Some(id), ..
-                        } if *id == run_id => Some(record.id),
-                        _ => None,
-                    })
+            if !captures_next_turn
+                && let Some(initial_id) =
+                    session
+                        .branch()
+                        .iter()
+                        .find_map(|record| match &record.event {
+                            Event::User {
+                                input_id: Some(id), ..
+                            }
+                            | Event::UserWithImages {
+                                input_id: Some(id), ..
+                            } if *id == run_id => Some(record.id),
+                            _ => None,
+                        })
             {
                 for (queued_at, input) in session.queued_custom_messages() {
                     if queued_at < initial_id
@@ -1739,6 +1791,33 @@ impl Agent<'_> {
                             .await?;
                     }
                 }
+            }
+        }
+        if let Some((plan_id, plan)) = plan {
+            if captures_next_turn {
+                for (queued_at, input) in session.queued_custom_messages() {
+                    if queued_at < plan_id
+                        && input.delivery == crate::CustomMessageDelivery::NextTurn
+                    {
+                        self.commit_turn_custom_message(session, input, cancel, observer)
+                            .await?;
+                    }
+                }
+            }
+            let delivered: HashSet<_> = session
+                .branch()
+                .iter()
+                .filter_map(|record| match record.event {
+                    Event::CustomMessageDelivered { id, .. } => Some(id),
+                    _ => None,
+                })
+                .collect();
+            for (id, message) in plan.messages {
+                if delivered.contains(&id) {
+                    continue;
+                }
+                self.commit_custom_message(session, id, message, cancel, observer)
+                    .await?;
             }
         }
         let mut pending = pending_reply(session, run_id);
@@ -3069,8 +3148,12 @@ impl Agent<'_> {
             self.system_prompt,
             self.registry.active_tool_specs(),
         );
+        let run_override = session
+            .current_run_id()
+            .and_then(|id| crate::before_agent_start::prompt_override(history, id));
+        let preserve_system_transcript = run_override.is_none();
         let mut messages = vec![Message::System {
-            content: system_prompt,
+            content: run_override.clone().unwrap_or(system_prompt),
         }];
         if let Some(summary) = summary {
             // Compaction content has the authority of conversation history.
@@ -3088,7 +3171,7 @@ impl Agent<'_> {
                 keep_group
             });
         }
-        let transcript = if purpose == RequestPurpose::Turn {
+        let transcript = if purpose == RequestPurpose::Turn && preserve_system_transcript {
             crate::journal::system_transcript(
                 history,
                 &conversation,
@@ -3247,7 +3330,8 @@ impl Agent<'_> {
                 portable = portable_request(&portable);
             }
             request = portable;
-            if had_leading_system
+            if preserve_system_transcript
+                && had_leading_system
                 && !matches!(request.messages.first(), Some(Message::System { .. }))
             {
                 observer(Notification::ExtensionLifecycleError {
@@ -3256,6 +3340,12 @@ impl Agent<'_> {
                     message: "Handler removed the leading system message; the request has no system prompt. Keep it at index 0 or replace the dropped prefix with a system message.",
                 });
             }
+        }
+        if let Some(content) = run_override {
+            request
+                .messages
+                .retain(|message| !matches!(message, Message::System { .. }));
+            request.messages.insert(0, Message::System { content });
         }
         request
             .tools
@@ -7048,7 +7138,103 @@ struct ProgressReporter {
     tool_name: String,
     args: serde_json::Value,
     parent_tool_call_id: Option<String>,
+    settlement: Arc<Mutex<ProgressSettlement>>,
 }
+
+#[derive(Default)]
+struct ProgressSettlement {
+    closed: bool,
+    pending: Option<TurnProgress>,
+    omitted_calls: u64,
+}
+
+impl ProgressReporter {
+    fn close(&self) -> Option<TurnProgress> {
+        let mut settlement = self.settlement.lock().expect("tool progress settlement");
+        settlement.closed = true;
+        let mut pending = settlement.pending.take()?;
+        if let TurnProgress::Event(event) = &mut pending
+            && let crate::LifecycleEvent::ToolExecutionUpdate { partial_result, .. } =
+                event.as_mut()
+            && let Some(count) = partial_result.pointer_mut("/details/omittedCalls")
+            && count
+                .as_u64()
+                .is_some_and(|reported| reported < settlement.omitted_calls)
+        {
+            *count = settlement.omitted_calls.into();
+        }
+        Some(pending)
+    }
+
+    fn event(&self, partial_result: serde_json::Value) -> crate::ExtensionResult<TurnProgress> {
+        // Leave room for the settlement counter to grow to any u64 value.
+        let counter_bytes = partial_result
+            .pointer("/details/omittedCalls")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |count| {
+                20 - (count.checked_ilog10().unwrap_or(0) as usize + 1)
+            });
+        let event = crate::LifecycleEvent::ToolExecutionUpdate {
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+            args: self.args.clone(),
+            partial_result,
+            parent_tool_call_id: self.parent_tool_call_id.clone(),
+        };
+        // Count the entire event, including escaped arguments and identifiers,
+        // without allocating a second copy of its serialized representation.
+        serde_json::to_writer(ProgressSizeLimit(1024 * 1024 - counter_bytes), &event)
+            .map_err(|_| "tool progress event exceeds size limit".to_owned())?;
+        Ok(TurnProgress::Event(Box::new(event)))
+    }
+
+    fn report(
+        &self,
+        partial_result: serde_json::Value,
+        settlement: Option<serde_json::Value>,
+        retain_if_full: bool,
+        cancellation: &CancellationToken,
+    ) -> crate::ExtensionResult<()> {
+        let live = self.event(partial_result)?;
+        let settlement = settlement.map(|value| self.event(value)).transpose()?;
+        let mut pending = self.settlement.lock().expect("tool progress settlement");
+        if pending.closed || cancellation.is_cancelled() {
+            return Err("tool progress cancelled".into());
+        }
+        match &self.sender {
+            ProgressSink::Turn(sender) => match sender.try_reserve() {
+                Ok(permit) => {
+                    permit.send(live);
+                    pending.pending = settlement;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if retain_if_full {
+                        pending.pending = settlement.or(Some(live));
+                    }
+                    return Err("tool progress queue is full".into());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err("tool has finished".into()),
+            },
+        }
+        Ok(())
+    }
+}
+
+struct ProgressSizeLimit(usize);
+impl std::io::Write for ProgressSizeLimit {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or(std::io::ErrorKind::WriteZero)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 enum ProgressSink {
     Turn(mpsc::Sender<TurnProgress>),
@@ -7073,35 +7259,32 @@ impl ToolHost for NestedHost {
         &self,
         partial_result: serde_json::Value,
     ) -> crate::ExtensionResult<()> {
-        let Some(progress) = &self.progress else {
-            return Ok(());
-        };
-        if serde_json::to_vec(&partial_result)
-            .map_err(|error| error.to_string())?
-            .len()
-            > 1024 * 1024
-        {
-            return Err("tool progress exceeds size limit".into());
-        }
-        let event = crate::LifecycleEvent::ToolExecutionUpdate {
-            tool_call_id: progress.tool_call_id.clone(),
-            tool_name: progress.tool_name.clone(),
-            args: progress.args.clone(),
-            partial_result,
-            parent_tool_call_id: progress.parent_tool_call_id.clone(),
-        };
-        if self.cancellation.is_cancelled() {
-            return Err("tool progress cancelled".into());
-        }
-        match &progress.sender {
-            ProgressSink::Turn(sender) => sender
-                .try_send(TurnProgress::Event(Box::new(event)))
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => "tool progress queue is full".into(),
-                    mpsc::error::TrySendError::Closed(_) => "tool has finished".into(),
-                }),
+        self.progress.as_ref().map_or(Ok(()), |progress| {
+            progress.report(partial_result, None, false, &self.cancellation)
+        })
+    }
+    async fn report_progress_with_settlement(
+        &self,
+        partial_result: serde_json::Value,
+        settlement: Option<serde_json::Value>,
+    ) -> crate::ExtensionResult<()> {
+        self.progress.as_ref().map_or(Ok(()), |progress| {
+            progress.report(partial_result, settlement, true, &self.cancellation)
+        })
+    }
+
+    fn update_progress_omitted_calls(&self, count: u64) {
+        if let Some(progress) = &self.progress {
+            let mut settlement = progress
+                .settlement
+                .lock()
+                .expect("tool progress settlement");
+            if !settlement.closed {
+                settlement.omitted_calls = count;
+            }
         }
     }
+
     fn has_ui(&self) -> bool {
         self.ui.is_some()
     }
@@ -7852,7 +8035,7 @@ impl AgentInput {
     }
 }
 
-fn queue_input(
+pub(crate) fn queue_input(
     session: &mut Session,
     input: AgentInput,
     observer: &mut Observer<'_>,
