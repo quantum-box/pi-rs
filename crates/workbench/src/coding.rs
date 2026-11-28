@@ -1,6 +1,7 @@
 //! Local coding tools. Hosted callers opt into their own execution profile.
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -2731,6 +2732,27 @@ fn image_omission(mime: &str, reason: &str) -> Value {
     json!({"content":[{"type":"text", "text":format!("Read image file [{mime}]\n{reason}")}]})
 }
 
+fn sort_local_ls_entries<T>(
+    entries: &mut [(OsString, String, T)],
+    collator: &icu_collator::CollatorBorrowed<'_>,
+    bytewise_ties: bool,
+) {
+    entries.sort_by(
+        |(left_name, left_folded, _), (right_name, right_folded, _)| {
+            let order = collator.compare(left_folded, right_folded);
+            if bytewise_ties {
+                order.then_with(|| {
+                    left_name
+                        .as_encoded_bytes()
+                        .cmp(right_name.as_encoded_bytes())
+                })
+            } else {
+                order
+            }
+        },
+    );
+}
+
 fn directory_read_error(error: std::io::Error, requested: &Path, unrestricted: bool) -> Error {
     #[cfg(unix)]
     if unrestricted && error.raw_os_error() == Some(libc::EACCES) {
@@ -3547,17 +3569,21 @@ impl CodingTool {
             }
             let entry = entry
                 .map_err(|error| directory_read_error(error, &requested, self.unrestricted))?;
-            entries.push((entry.file_name().to_string_lossy().to_lowercase(), entry));
+            let name = entry.file_name();
+            let folded = name.to_string_lossy().to_lowercase();
+            entries.push((name, folded, entry));
         }
         let locale = crate::locale::select(|key| std::env::var(key).ok());
         let collator = crate::locale::collator(&locale).map_err(|error| {
             Error::Config(format!("Cannot initialize directory collation: {error}"))
         })?;
-        entries.sort_by(|(left, _), (right, _)| collator.compare(left, right));
+        // Node's Unix readdir starts in raw filename order. Pi's stable locale
+        // sort keeps that order for ties. On Windows readdir keeps scan order.
+        sort_local_ls_entries(&mut entries, &collator, self.unrestricted && cfg!(unix));
         let mut listing = crate::tool_output::Listing::new();
         let mut result_count = 0usize;
         let mut entry_limit_reached = false;
-        for (_, entry) in entries {
+        for (name, _, entry) in entries {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -3572,7 +3598,7 @@ impl CodingTool {
             if let Ok(metadata) = std::fs::metadata(entry.path()) {
                 listing.push(&format!(
                     "{}{}",
-                    entry.file_name().to_string_lossy(),
+                    name.to_string_lossy(),
                     if metadata.is_dir() { "/" } else { "" }
                 ));
                 result_count += 1;
@@ -7632,6 +7658,70 @@ mod tests {
             .tool_content();
         assert!(output.starts_with("alpha\n"));
         assert!(output.contains("1 entries limit reached"));
+    }
+
+    #[test]
+    fn directory_collation_preserves_locale_and_breaks_unix_ties_by_original_bytes() {
+        let collator = crate::locale::collator("sv_SE.UTF-8").unwrap();
+        for ties in [["readme.txt", "README.txt"], ["README.txt", "readme.txt"]] {
+            let mut entries = ["Älmhult", ties[0], "Zeta", ties[1]]
+                .map(|name| (OsString::from(name), name.to_lowercase(), name));
+            sort_local_ls_entries(&mut entries, &collator, false);
+            assert_eq!(
+                entries.each_ref().map(|entry| entry.2),
+                [ties[0], ties[1], "Zeta", "Älmhult"]
+            );
+            sort_local_ls_entries(&mut entries, &collator, true);
+            assert_eq!(
+                entries.map(|entry| entry.2),
+                ["README.txt", "readme.txt", "Zeta", "Älmhult"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_directory_output_orders_folded_ties_before_applying_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let lower = root.path().join("readme.txt");
+        std::fs::write(&lower, "").unwrap();
+        let (first, second) = match std::fs::create_dir(root.path().join("README.txt")) {
+            Ok(()) => ("README.txt/", "readme.txt"),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // The collator ignores the soft hyphen, even on volumes that
+                // distinguish these filenames but cannot store case variants.
+                match std::fs::create_dir(root.path().join("readme\u{00ad}.txt")) {
+                    Ok(()) => ("readme.txt", "readme\u{00ad}.txt/"),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        eprintln!("Skipping ls fixture: filesystem folds both test name pairs");
+                        return;
+                    }
+                    Err(error) => panic!("create alternate directory for ls fixture: {error}"),
+                }
+            }
+            Err(error) => panic!("create directory for ls fixture: {error}"),
+        };
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::List,
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::new_v4(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        let output = tool.invoke(json!({}), context()).await;
+        assert_eq!(output.tool_content(), format!("{first}\n{second}"));
+        let output = tool.invoke(json!({"limit":1}), context()).await;
+        assert_eq!(
+            output.tool_content(),
+            format!("{first}\n\n[1 entries limit reached. Use limit=2 for more]")
+        );
+        assert!(matches!(
+            output,
+            Outcome::SucceededWithDetails { details, .. } if details == json!({"entryLimitReached":1.0})
+        ));
     }
 
     #[cfg(unix)]
