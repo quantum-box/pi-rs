@@ -1849,7 +1849,15 @@ mod tests {
         });
         let (reserved_tx, reserved_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (ready_checked_tx, ready_checked_rx) = mpsc::channel();
         let setup = Box::new(move |child| {
+            crate::task_scheduler::after_ready_for_test(child, move || {
+                ready_tx.send(()).unwrap();
+                ready_checked_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            });
             crate::task_driver::before_execute_for_test(child, move |_| {
                 reserved_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1901,18 +1909,20 @@ mod tests {
                 .unwrap();
         }
         release_tx.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let task = driver
-                .get(child)
-                .expect("uncertain graph must not stop driver")
-                .unwrap();
-            if task.state() == &TaskState::Ready {
-                break;
-            }
-            assert!(Instant::now() < deadline, "child did not defer");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // The driver can reserve a Ready child again before a polling observer
+        // samples it. Read the committed release while that worker holds its lease.
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("child was not deferred");
+        assert_eq!(
+            TaskStore::new(owner.store())
+                .load(child)
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Ready
+        );
         assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
         assert!(observed.try_recv().is_err());
         let entry = owner.store().get(&edge).unwrap().unwrap();
@@ -1926,6 +1936,8 @@ mod tests {
                 &[Mutation::Delete { key: edge }],
             )
             .unwrap();
+        ready_checked_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
         observed
             .recv_timeout(Duration::from_secs(5))
             .expect("child did not retry after repair");
@@ -2176,7 +2188,15 @@ mod tests {
         });
         let (reserved_tx, reserved_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (ready_checked_tx, ready_checked_rx) = mpsc::channel();
         let setup = Box::new(move |child| {
+            crate::task_scheduler::after_ready_for_test(child, move || {
+                ready_tx.send(()).unwrap();
+                ready_checked_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            });
             crate::task_driver::before_execute_for_test(child, move |_| {
                 reserved_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -2229,18 +2249,20 @@ mod tests {
                 .unwrap();
         }
         release_tx.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let task = driver
-                .get(child)
-                .expect("uncertain graph must not poison driver")
-                .unwrap();
-            if task.state() == &TaskState::Ready {
-                break;
-            }
-            assert!(Instant::now() < deadline, "child was not deferred");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // The driver can reserve a Ready child again before a polling observer
+        // samples it. Read the committed release while that worker holds its lease.
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("child was not deferred");
+        assert_eq!(
+            TaskStore::new(owner.store())
+                .load(child)
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Ready
+        );
         assert!(owner.store().get(&intent_key(child)).unwrap().is_none());
         assert!(observed.try_recv().is_err());
         let entry = owner.store().get(&edge).unwrap().unwrap();
@@ -2254,6 +2276,8 @@ mod tests {
                 &[Mutation::Delete { key: edge }],
             )
             .unwrap();
+        ready_checked_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
         assert!(driver.settle_for_test(parent_result).unwrap());
         while !driver.get(parent).unwrap().unwrap().is_terminal() {
             assert!(
