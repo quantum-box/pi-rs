@@ -1398,6 +1398,7 @@ impl Agent<'_> {
                 self.limits.model_timeout,
                 &mut collect,
                 host,
+                None,
             );
             tokio::pin!(notify);
             loop {

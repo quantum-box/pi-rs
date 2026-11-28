@@ -370,7 +370,7 @@ pub async fn notify_filtered(
         event,
         states,
         timeout,
-        (observer, &mut include, None),
+        (observer, &mut include, None, None),
         None,
         None,
     )
@@ -392,7 +392,7 @@ pub async fn notify_filtered_with_ui(
         event,
         states,
         timeout,
-        (observer, &mut include, registry.ui.as_ref()),
+        (observer, &mut include, registry.ui.as_ref(), None),
         None,
         None,
     )
@@ -492,6 +492,7 @@ pub(crate) async fn notify_with_host(
         timeout,
         observer,
         ActiveHost::Shared(host),
+        None,
     )
     .await;
 }
@@ -512,13 +513,14 @@ pub(crate) async fn notify_with_active_host(
     timeout: Duration,
     observer: &mut Observer<'_>,
     host: ActiveHost,
+    progress: Option<&std::sync::atomic::AtomicUsize>,
 ) {
     notify_inner(
         registry,
         event,
         states,
         timeout,
-        (observer, &mut |_| true, None),
+        (observer, &mut |_| true, None, progress),
         Some(host),
         None,
     )
@@ -576,7 +578,8 @@ pub(crate) async fn notify_session_compaction_with_host(
                 | LifecycleEvent::SessionInfoChanged { .. }
         )
     {
-        return notify_idle_session_entries(registry, session, event, timeout, observer).await;
+        return notify_idle_session_entries(registry, session, event, timeout, observer, None)
+            .await;
     }
     notify_session_callback(
         registry,
@@ -633,7 +636,7 @@ async fn notify_session_callback(
                         event,
                         &states,
                         timeout,
-                        (&mut collect, &mut include_all, None),
+                        (&mut collect, &mut include_all, None, None),
                         Some(ActiveHost::Shared(host)),
                         compaction,
                     )
@@ -679,12 +682,13 @@ async fn notify_session_callback(
     }
 }
 
-async fn notify_idle_session_entries(
+pub(crate) async fn notify_idle_session_entries(
     registry: &Registry,
     session: &mut Session,
     event: LifecycleEvent,
     timeout: Duration,
     observer: &mut Observer<'_>,
+    limit: Option<usize>,
 ) -> crate::Result<()> {
     use crate::extension::{SessionEntryHost, SessionEntryRequest, branch_custom_entries};
     let states = session.extension_states();
@@ -695,6 +699,7 @@ async fn notify_idle_session_entries(
         .extensions
         .iter()
         .filter(|extension| extension.handles_lifecycle() && extension.handles_session_lifecycle())
+        .take(limit.unwrap_or(usize::MAX))
     {
         let (sender, mut messages) = tokio::sync::mpsc::channel(32);
         let (entry_sender, mut entries) = tokio::sync::mpsc::channel(32);
@@ -803,6 +808,7 @@ type LifecycleObservers<'a, 'observer> = (
     &'a mut Observer<'observer>,
     &'a mut (dyn FnMut(&str) -> bool + Send + 'a),
     Option<&'a std::sync::Arc<dyn crate::ExtensionUi>>,
+    Option<&'a std::sync::atomic::AtomicUsize>,
 );
 
 async fn notify_inner(
@@ -810,7 +816,7 @@ async fn notify_inner(
     event: LifecycleEvent,
     states: &ExtensionStates,
     timeout: Duration,
-    (observer, include, ui): LifecycleObservers<'_, '_>,
+    (observer, include, ui, progress): LifecycleObservers<'_, '_>,
     host: Option<ActiveHost>,
     compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
 ) {
@@ -819,7 +825,7 @@ async fn notify_inner(
         event,
         states,
         timeout,
-        (observer, include, ui),
+        (observer, include, ui, progress),
         host.clone(),
         compaction,
     )
@@ -851,19 +857,22 @@ async fn deliver_mcp_changes(
         if remaining.is_zero() {
             return;
         }
-        let Some(servers) = delivery.pop_change() else {
+        let Some(change) = delivery.next_change() else {
             return;
         };
         notify_inner_once(
             registry,
-            LifecycleEvent::McpServersChange { servers },
+            LifecycleEvent::McpServersChange {
+                servers: change.servers(),
+            },
             states,
             remaining,
-            (observer, &mut |_| true, None),
+            (observer, &mut |_| true, None, Some(&change.completed_hooks)),
             host.clone().map(ActiveHost::Shared),
             None,
         )
         .await;
+        delivery.complete_change();
         tokio::task::yield_now().await;
     }
 }
@@ -873,14 +882,17 @@ async fn notify_inner_once(
     event: LifecycleEvent,
     states: &ExtensionStates,
     timeout: Duration,
-    (observer, include, ui): LifecycleObservers<'_, '_>,
+    (observer, include, ui, progress): LifecycleObservers<'_, '_>,
     host: Option<ActiveHost>,
     compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
 ) {
+    use std::sync::atomic::Ordering::Relaxed;
+
     let budget = timeout.min(Duration::from_secs(10));
     let started = platform_time::Instant::now();
     let deadline = started + budget;
-    for extension in registry.extensions.iter().filter(|extension| match event {
+    let completed = progress.map_or(0, |progress| progress.load(Relaxed));
+    let extensions = registry.extensions.iter().filter(|extension| match event {
         LifecycleEvent::McpServersChange { .. } => extension.handles_mcp_servers_change(),
         _ if !extension.handles_lifecycle() => false,
         LifecycleEvent::ModelSelect { .. } | LifecycleEvent::ThinkingLevelSelect { .. } => {
@@ -903,8 +915,9 @@ async fn notify_inner_once(
                 && extension.handles_tool_execution_updates()
         }
         _ => true,
-    }) {
-        let error = match platform_time::timeout_at(
+    });
+    for (index, extension) in extensions.enumerate().skip(completed) {
+        let result = platform_time::timeout_at(
             deadline,
             crate::sdk::scope_extension_callback(
                 match &host {
@@ -994,8 +1007,11 @@ async fn notify_inner_once(
                 },
             ),
         )
-        .await
-        {
+        .await;
+        if let Some(progress) = progress {
+            progress.store(index + 1, Relaxed);
+        }
+        let error = match result {
             Ok(Ok(())) => continue,
             Ok(Err(error)) => error,
             Err(_) => "lifecycle hook timed out".into(),

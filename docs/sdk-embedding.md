@@ -290,14 +290,24 @@ To use a host-configured session, construct it with `SessionBuilder` and pass it
 to `session_state_from_session`. The host owns the choice and authorization of
 its journal, resources, model and extensions; the IPC commands do not accept
 those settings. This constructor neither reloads resources nor switches sessions.
+
+To offer live reload, a native host can expose a command that selects a
+host-prepared `RegistryUpdate` and calls `AgentSession::reload` under the same
+managed session lock used for prompts. The mock IPC fixture uses a command with
+no webview arguments. It verifies that the next prompt uses the host's
+replacement tools and base prompt while retaining the session and its history.
+Ordinary builders can reuse shared extension instances. An owned reload claims
+the active and replacement instances for that session and its forks. Use fresh
+instances for each independent session that will reload.
+
 Closing requests SDK shutdown before waiting for the session lock. The SDK
 cancels the active run and makes later run tokens inherit cancellation; ordinary
 `abort` still affects only the current run. The fixture rejects queued prompts
-and waits for an admitted prompt to settle so SDK cleanup can finish. After SDK
-close completes, the state drops its owned session and releases its journal
-handle; another owner may then reopen it. Close can wait if startup itself never
-settles. The following minimal sketch uses an in-memory session without extension hooks
-or tools; it does not implement the fixture's supervised close lifecycle.
+and waits for an admitted prompt to settle so SDK cleanup can finish. The SDK
+releases the journal writer after Quit and bounds each connection shutdown by
+the configured tool timeout. Close can wait if startup itself never settles.
+The following minimal sketch uses an in-memory session without extension hooks
+or tools. It omits the fixture's supervised close lifecycle.
 Cancellation cannot undo work already begun.
 
 ```rust
@@ -361,8 +371,11 @@ committed records on `AgentSession::subscribe()`.
 
 The progress stream retains up to 32 updates per session. A slow subscription
 reports `RecvError::Lagged` and can then continue with the retained updates.
-Closing or dropping the session closes the stream after buffered updates are
-drained. Progress is transient and reopening the journal cannot replay it.
+Existing subscriptions continue across extension reload. Once close begins
+teardown, or when the session is dropped, the progress stream closes after
+buffered updates are drained. Regular subscribers receive `SessionEvent::Closed`
+when teardown finishes. Progress is transient and reopening the journal cannot
+replay it.
 
 In Tauri, create the receiver while you have access to the managed session,
 then release the state lock before reading the stream. An authorized frontend
