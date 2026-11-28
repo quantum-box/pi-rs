@@ -44,10 +44,7 @@ impl Turn {
     }
 
     fn emit_user(&mut self, input: &Submission) -> io::Result<()> {
-        let user = input.input_blocks.as_ref().map_or_else(
-            || text_message("user", &input.content),
-            |value| user_message(&value.blocks),
-        );
+        let user = submission_message(input);
         emit(&json!({"type":"message_start","message":user}))?;
         emit(&json!({"type":"message_end","message":user}))?;
         self.users.push(user);
@@ -325,12 +322,17 @@ async fn respond(
         },
         "clear_queue" => scheduler.clear_input_queue(id).map(|withdrawn| {
             let (mut steering, mut follow_up) = (Vec::new(), Vec::new());
+            let mut inputs = Vec::new();
+            let include_content = request["includeContent"] == true;
             for input in withdrawn {
                 seen.insert(input.submission.id);
                 let queue = match input.mode {
                     InputMode::Steer => &mut steering,
                     InputMode::FollowUp => &mut follow_up,
                 };
+                if include_content {
+                    inputs.push(submission_message(&input.submission));
+                }
                 let text = input.submission.input_blocks.as_ref()
                     .and_then(|value| value.blocks.first())
                     .and_then(|block| block["text"].as_str())
@@ -338,7 +340,11 @@ async fn respond(
                     .unwrap_or(input.submission.content);
                 queue.push(text);
             }
-            Some(json!({"steering": steering, "followUp": follow_up}))
+            let mut result = json!({"steering": steering, "followUp": follow_up});
+            if include_content {
+                result["inputs"] = json!(inputs);
+            }
+            Some(result)
         }).map_err(|error| error.to_string()),
         "set_steering_mode" | "set_follow_up_mode" => {
             set_queue_mode(scheduler, id, command, &request)
@@ -609,6 +615,13 @@ fn messages(state: &Conversation) -> Vec<Value> {
             _ => None,
         })
         .collect()
+}
+
+fn submission_message(input: &Submission) -> Value {
+    input.input_blocks.as_ref().map_or_else(
+        || text_message("user", &input.content),
+        |value| user_message(&value.blocks),
+    )
 }
 
 fn user_message(blocks: &[Value]) -> Value {
