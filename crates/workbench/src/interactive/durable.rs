@@ -112,6 +112,8 @@ struct Conversation {
     tree: Option<TerminalTree>,
     tree_request: Option<Uuid>,
     navigation_pending: bool,
+    summary_pending: bool,
+    tree_before_summary: Option<Picker>,
     tree_action: TreeAction,
 }
 
@@ -148,6 +150,7 @@ impl Conversation {
                 }
                 if matches!(command, Some("fork_at_entry" | "navigate_entry")) {
                     self.navigation_pending = false;
+                    self.summary_pending = false;
                     if event["success"] == true {
                         self.tree = None;
                         view.picker = None;
@@ -329,6 +332,7 @@ impl Conversation {
         &mut self,
         view: &mut View,
         worker: &mut Companion,
+        args: &Cli,
         key: Option<KeyEvent>,
         keys: &Keys,
     ) -> Result<bool> {
@@ -339,6 +343,12 @@ impl Conversation {
             return Ok(false);
         };
         if self.navigation_pending {
+            if self.summary_pending
+                && key.is_some_and(|key| keys.action(key, true) == Some("app.interrupt"))
+            {
+                worker.send(json!({"type":"abort"}))?;
+                self.summary_pending = false;
+            }
             view.picker = Some(picker);
             return Ok(true);
         }
@@ -348,6 +358,10 @@ impl Conversation {
         };
         match input {
             Input::Cancel => {
+                if let Some(original) = self.tree_before_summary.take() {
+                    view.picker = Some(original);
+                    return Ok(true);
+                }
                 self.tree = None;
                 return Ok(true);
             }
@@ -364,15 +378,46 @@ impl Conversation {
                         picker.show_feedback(Err(
                             "Wait for the current turn before changing the session position".into(),
                         ));
+                    } else if matches!(self.tree_action, TreeAction::Checkout)
+                        && Some(row.id) != tree.leaf
+                        && args.settings.value()["branchSummary"]["skipPrompt"] != true
+                    {
+                        view.picker = Some(tree_summary_picker(record));
+                        self.tree_before_summary = Some(picker);
+                        return Ok(true);
                     } else {
-                        let command = match self.tree_action {
-                            TreeAction::Checkout => "navigate_entry",
-                            TreeAction::Fork => "fork_at_entry",
-                        };
-                        worker.send(json!({"type":command,"entryId":row.id}))?;
-                        self.navigation_pending = true;
+                        self.navigate(worker, row.id, false, None, args)?;
                     }
                 }
+            }
+            Input::Select(
+                Selection::CheckoutWithoutSummary(record) | Selection::CheckoutWithSummary(record),
+            ) => {
+                let summarize = matches!(input, Input::Select(Selection::CheckoutWithSummary(_)));
+                if let Some(row) = tree.row(record) {
+                    self.navigate(worker, row.id, summarize, None, args)?;
+                }
+                view.picker = self.tree_before_summary.take();
+                if self.summary_pending
+                    && let Some(picker) = &mut view.picker
+                {
+                    picker.show_feedback(Ok("Summarizing branch".into()));
+                }
+                return Ok(true);
+            }
+            Input::Select(Selection::EditBranchSummary(record)) => {
+                view.local_editor = Some((
+                    LocalEditor::BranchSummary(record),
+                    crate::ui::dialog::Dialog::new(
+                        Uuid::new_v4(),
+                        pi_rs::UiRequest::Editor {
+                            title: "Custom summarization instructions".into(),
+                            initial_value: None,
+                            timeout: None,
+                        },
+                    ),
+                ));
+                return Ok(true);
             }
             Input::CopyTreeRecord(record) => {
                 if let Some(row) = tree.row(record) {
@@ -396,6 +441,27 @@ impl Conversation {
         }
         view.picker = Some(picker);
         Ok(true)
+    }
+
+    fn navigate(
+        &mut self,
+        worker: &mut Companion,
+        entry: Uuid,
+        summarize: bool,
+        instructions: Option<String>,
+        args: &Cli,
+    ) -> Result<()> {
+        let command = match self.tree_action {
+            TreeAction::Checkout => "navigate_entry",
+            TreeAction::Fork => "fork_at_entry",
+        };
+        worker.send(json!({
+            "type":command, "entryId":entry, "summarize":summarize,
+            "instructions":instructions, "reserve_tokens":branch_summary_reserve(args),
+        }))?;
+        self.navigation_pending = true;
+        self.summary_pending = summarize;
+        Ok(())
     }
 }
 
@@ -469,6 +535,12 @@ impl TerminalTree {
                 Some("compaction") => (
                     TreeEntryKind::Message,
                     "[compaction]: ".into(),
+                    "borderAccent",
+                    entry["summary"].as_str().unwrap_or_default().to_owned(),
+                ),
+                Some("branch_summary") => (
+                    TreeEntryKind::Message,
+                    "[branch summary]: ".into(),
                     "borderAccent",
                     entry["summary"].as_str().unwrap_or_default().to_owned(),
                 ),
@@ -560,6 +632,12 @@ fn message_text(message: &Value) -> String {
 fn append_message(view: &mut View, message: &Value) {
     let text = message_text(message);
     match message["role"].as_str() {
+        Some("branchSummary") => view.append_entry(Entry::Summary {
+            id: view.lines.len() as u64 + 1,
+            kind: SummaryKind::Branch,
+            text,
+            expanded: None,
+        }),
         Some("user") => {
             view.remember_prompt(&text);
             view.append_entry(Entry::User(text.into()));
@@ -792,10 +870,38 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
         dirty = true;
         match input.next(Duration::from_millis(32))? {
             Some(InputEvent::Event(Event::Key(key))) if key.kind != KeyEventKind::Release => {
+                if let Some((LocalEditor::BranchSummary(record), mut dialog)) =
+                    view.local_editor.take()
+                {
+                    match dialog.input(key, &keys) {
+                        Some(pi_rs::UiResponse::Text(text)) => {
+                            if let Some(row) =
+                                conversation.tree.as_ref().and_then(|tree| tree.row(record))
+                            {
+                                conversation.navigate(
+                                    &mut worker,
+                                    row.id,
+                                    true,
+                                    Some(text),
+                                    &args,
+                                )?;
+                            }
+                            view.picker = conversation.tree_before_summary.take();
+                            if let Some(picker) = &mut view.picker {
+                                picker.show_feedback(Ok("Summarizing branch".into()));
+                            }
+                        }
+                        Some(_) => view.picker = Some(tree_summary_picker(record)),
+                        None => {
+                            view.local_editor = Some((LocalEditor::BranchSummary(record), dialog))
+                        }
+                    }
+                    continue;
+                }
                 if key.code == KeyCode::Esc && conversation.tree_request.take().is_some() {
                     continue;
                 }
-                if conversation.pick_tree(&mut view, &mut worker, Some(key), &keys)? {
+                if conversation.pick_tree(&mut view, &mut worker, &args, Some(key), &keys)? {
                     continue;
                 }
                 if let Some(action) = keys.viewport_action(key) {
@@ -875,7 +981,7 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                         usize::from(mouse.row).checked_sub(view.fullscreen_header_rows)
                 {
                     if matches!(picker.mouse(mouse.kind, row), MouseInput::Activate) {
-                        conversation.pick_tree(&mut view, &mut worker, None, &keys)?;
+                        conversation.pick_tree(&mut view, &mut worker, &args, None, &keys)?;
                     }
                 } else {
                     picker.clear_mouse_press();
@@ -887,7 +993,9 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                 dirty = view.fullscreen_mouse(mouse, &args);
             }
             Some(InputEvent::Event(Event::Paste(text))) => {
-                if let Some(picker) = &mut view.picker {
+                if let Some((_, dialog)) = &mut view.local_editor {
+                    dialog.paste(&text);
+                } else if let Some(picker) = &mut view.picker {
                     picker.paste(&text);
                 } else {
                     view.paste_editor_text(&text);

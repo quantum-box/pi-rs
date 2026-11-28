@@ -9676,7 +9676,11 @@ fn reopen_tree(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
 
 fn confirm_tree(view: &mut View, id: u64) {
     view.tree_confirmation = Some(id);
-    view.picker = Some(Picker::new(
+    view.picker = Some(tree_summary_picker(id));
+}
+
+fn tree_summary_picker(id: u64) -> Picker {
+    Picker::new(
         "Summarize branch?",
         [
             ("No summary", Selection::CheckoutWithoutSummary(id)),
@@ -9692,7 +9696,7 @@ fn confirm_tree(view: &mut View, id: u64) {
             selection,
         })
         .collect(),
-    ));
+    )
 }
 
 fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
@@ -9757,11 +9761,7 @@ fn start_tree_navigation(
             return Ok(());
         }
     }
-    let configured_reserve = &args.settings.value()["branchSummary"]["reserveTokens"];
-    let reserve_tokens = configured_reserve
-        .as_u64()
-        .or_else(|| configured_reserve.as_f64().map(|tokens| tokens as u64))
-        .unwrap_or(16_384);
+    let reserve_tokens = branch_summary_reserve(args);
     start_request(
         args,
         json!({
@@ -9772,6 +9772,14 @@ fn start_tree_navigation(
     view.branch_error = None;
     view.tree_navigation = Some((id, summarize));
     Ok(())
+}
+
+fn branch_summary_reserve(args: &Cli) -> u64 {
+    let value = &args.settings.value()["branchSummary"]["reserveTokens"];
+    value
+        .as_u64()
+        .or_else(|| value.as_f64().map(|tokens| tokens as u64))
+        .unwrap_or(16_384)
 }
 
 impl ThemeSettings {

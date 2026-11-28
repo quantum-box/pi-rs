@@ -1293,6 +1293,90 @@ fn session_checkout_projects_an_interior_append_and_keeps_the_old_path() {
 }
 
 #[test]
+fn session_branch_summary_reopens_at_proven_interior_cut_and_fences_stale_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.extend(
+        ["shared", "edit me", "abandoned"].map(|content| Message::User {
+            content: content.into(),
+        }),
+    );
+    h.save(&state, Expected::Version(version)).unwrap();
+
+    let tree = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap();
+    let [shared, target, original] = tree
+        .entries
+        .iter()
+        .map(|node| node.entry.id())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let plan = h.plan_session_branch_summary(id, target).unwrap();
+    assert_eq!(plan.messages().len(), 1);
+    assert_eq!(plan.messages()[0].history.id, original);
+    h.set_session_name(id, "new name").unwrap();
+    assert!(
+        h.finish_session_branch_summary(plan, Some("stale".into()))
+            .is_err()
+    );
+    assert_eq!(h.conversation(id).unwrap().messages.len(), 3);
+
+    let plan = h.plan_session_branch_summary(id, target).unwrap();
+    let draft = h
+        .finish_session_branch_summary(plan, Some("Useful details".into()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(draft.history.id, target);
+    drop(h);
+
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let tree = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap();
+    let summary_node = tree
+        .entries
+        .iter()
+        .find(|node| Some(node.entry.id()) == tree.leaf_id)
+        .unwrap();
+    let SessionEntry::Message(entry) = &summary_node.entry else {
+        panic!("expected a summary message");
+    };
+    let summary = entry.branch_summary.as_ref().unwrap();
+    let summary_id = summary.id;
+    assert_eq!(summary_node.parent_id, Some(shared));
+    assert_eq!(summary.summary, "Useful details");
+    assert_eq!(
+        h.conversation(id).unwrap().messages,
+        [
+            Message::User {
+                content: "shared".into()
+            },
+            summary.message(),
+        ]
+    );
+    h.checkout_session_entry(id, original).unwrap();
+    assert_eq!(h.conversation(id).unwrap().messages.len(), 3);
+    let fork = h.fork_by_entry_id(id, summary_id).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().messages.last(),
+        Some(&summary.message())
+    );
+    assert!(h.navigate_session_entry(id, summary_id).unwrap().is_none());
+    assert_eq!(h.conversation(id).unwrap().messages.len(), 2);
+}
+
+#[test]
 fn interrupted_recovery_retries_racing_stream_append() {
     for initial in [None, Some("first")] {
         let dir = tempfile::tempdir().unwrap();

@@ -1378,6 +1378,8 @@ pub struct Conversation {
     forked_session_labels: Vec<SessionLabelEntry>,
     #[serde(skip)]
     session_checkout: Option<SessionCheckout>,
+    #[serde(skip)]
+    session_branch_summary: Option<SessionBranchSummary>,
     #[serde(default)]
     pub queue_modes: QueueModes,
     #[serde(default)]
@@ -2814,6 +2816,47 @@ pub struct SessionMessageEntry {
     pub context_replacement: bool,
     /// The summary and first retained identity for a recorded compaction.
     pub compaction: Option<SessionCompaction>,
+    /// Present when this model-context message represents an archived branch.
+    pub branch_summary: Option<Box<SessionBranchSummary>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBranchSummary {
+    pub id: Uuid,
+    pub from_id: Uuid,
+    pub summary: String,
+}
+
+impl SessionBranchSummary {
+    const PREFIX: &str =
+        "The user navigated away from the following branch. Summary of the abandoned branch:\n\n";
+
+    fn message(&self) -> Message {
+        Message::User {
+            content: format!("{}{}", Self::PREFIX, self.summary),
+        }
+    }
+}
+
+/// A snapshot of the abandoned entries and the session version they came from.
+/// A host may generate a summary without holding the session's writer gate.
+pub struct SessionBranchSummaryPlan {
+    conversation: Uuid,
+    target: Uuid,
+    version: u64,
+    leaf: Option<Uuid>,
+    config: Config,
+    messages: Vec<SessionMessageEntry>,
+}
+
+impl SessionBranchSummaryPlan {
+    pub fn messages(&self) -> &[SessionMessageEntry] {
+        &self.messages
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7654,6 +7697,7 @@ impl Harness {
                 })?;
         let mut state = state.clone();
         let checkout = state.session_checkout.take();
+        let branch_summary = state.session_branch_summary.take();
         validate_pending_reset_blocks(&state)?;
         let key = Self::key(state.id);
         let base = self
@@ -8072,7 +8116,57 @@ impl Harness {
             }
         }
         let mut atomic_evidence: Option<(u64, Vec<Check>, Vec<Mutation>)> = None;
-        let prepared = if let Some(plan) = atomic_resets {
+        let prepared = if let Some(summary) = &branch_summary {
+            let previous = old
+                .and_then(|prior| prior.transcript.as_ref())
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let mut records = Vec::new();
+            let (source, change) = match checkout.as_ref() {
+                Some(SessionCheckout::Root) => (
+                    previous,
+                    TranscriptChange::ReplaceV2 {
+                        messages: vec![summary.message()],
+                        ids: vec![summary.id],
+                        commit,
+                        origin: state.id,
+                    },
+                ),
+                Some(SessionCheckout::Entry {
+                    source,
+                    prefix_histories,
+                    ..
+                }) => {
+                    if let Some(histories) = prefix_histories {
+                        let cut = TranscriptChange::ForkCut {
+                            messages: state.messages[..state.messages.len() - 1].to_vec(),
+                            histories: histories.clone(),
+                            commit,
+                            origin: state.id,
+                        };
+                        let blocks: Vec<_> = state.content_blocks.values().cloned().collect();
+                        records.push((
+                            serde_json::to_value(cut)?,
+                            (!blocks.is_empty()).then_some(blocks),
+                        ));
+                    }
+                    (
+                        source,
+                        TranscriptChange::AppendV2 {
+                            messages: vec![summary.message()],
+                            ids: vec![summary.id],
+                            commit,
+                            origin: state.id,
+                        },
+                    )
+                }
+                None => return Err(crate::fork::Error::InvalidSnapshot.into()),
+            };
+            records.push((serde_json::to_value(change)?, None));
+            let (batch, cursor) = crate::transcript::Transcript::new(self.owner.store(), state.id)
+                .prepare_checkout_append(previous, source, &records)?;
+            state.transcript = Some(cursor);
+            Some(batch)
+        } else if let Some(plan) = atomic_resets {
             let steps = plan.steps;
             use crate::reset_manifest::{ExpectedBinding, ManifestCursor, ResetCut, ResetManifest};
             if steps.len() < 2 {
@@ -8477,6 +8571,9 @@ impl Harness {
                 SessionCheckout::Root => serde_json::Value::Null,
                 SessionCheckout::Entry { id, .. } => serde_json::to_value(id)?,
             };
+            if let Some(summary) = branch_summary {
+                event["session_branch_summary"] = serde_json::to_value(summary)?;
+            }
         } else if let Some(info) = state.session_info.as_ref()
             && old.is_some_and(|old| old.session_info.as_ref() != Some(info))
         {
@@ -9164,6 +9261,7 @@ impl Harness {
             has_session_labels: false,
             forked_session_labels: Vec::new(),
             session_checkout: None,
+            session_branch_summary: None,
             queue_modes: QueueModes::default(),
             after_failed_run: AfterFailedRun::default(),
             extensions: vec![],
@@ -9740,6 +9838,7 @@ impl Harness {
             has_session_labels,
             forked_session_labels,
             session_checkout: None,
+            session_branch_summary: None,
             config: point.config,
             queue_modes: point
                 .documents
@@ -10908,7 +11007,8 @@ impl Harness {
     /// Move a settled session to the inclusive context of a recorded entry.
     /// The previous branch remains in the session tree and can be revisited.
     pub fn checkout_session_entry(&mut self, id: Uuid, entry_id: Uuid) -> Result<(), Error> {
-        self.move_session_entry(id, entry_id, false).map(|_| ())
+        self.move_session_entry(id, entry_id, false, None)
+            .map(|_| ())
     }
 
     /// Move to a recorded entry, or to the parent of a user input and return
@@ -10918,18 +11018,111 @@ impl Harness {
         id: Uuid,
         entry_id: Uuid,
     ) -> Result<Option<SessionMessageEntry>, Error> {
-        self.move_session_entry(id, entry_id, true)
+        self.move_session_entry(id, entry_id, true, None)
     }
 
-    fn move_session_entry(
-        &mut self,
+    pub fn plan_session_branch_summary(
+        &self,
         id: Uuid,
         entry_id: Uuid,
-        reedit_user: bool,
-    ) -> Result<Option<SessionMessageEntry>, Error> {
-        use crate::fork::Error::{InvalidCursor, InvalidSnapshot, Unsettled};
+    ) -> Result<SessionBranchSummaryPlan, Error> {
+        use crate::fork::Error::InvalidCursor;
 
-        let (mut state, version) = self.load(id)?;
+        let (state, version) = self.load(id)?;
+        Self::ensure_session_can_checkout(&state)?;
+        let tree = self.session_tree(&self.session_entries_start(id)?)?;
+        let nodes: HashMap<_, _> = tree
+            .entries
+            .iter()
+            .map(|node| (node.entry.id(), node))
+            .collect();
+        let mut selected_path = HashSet::new();
+        let mut current = Some(entry_id);
+        while let Some(entry) = current {
+            selected_path.insert(entry);
+            current = nodes.get(&entry).ok_or(InvalidCursor)?.parent_id;
+        }
+        current = tree.leaf_id;
+        let mut messages = Vec::new();
+        while let Some(entry) = current.filter(|entry| !selected_path.contains(entry)) {
+            let node = nodes.get(&entry).ok_or(InvalidCursor)?;
+            if let SessionEntry::Message(message) = &node.entry
+                && !matches!(message.message, Message::Tool { .. })
+            {
+                messages.push(message.clone());
+            }
+            current = node.parent_id;
+        }
+        messages.reverse();
+        Ok(SessionBranchSummaryPlan {
+            conversation: id,
+            target: entry_id,
+            version,
+            leaf: tree.leaf_id,
+            config: state.config,
+            messages,
+        })
+    }
+
+    pub fn finish_session_branch_summary(
+        &mut self,
+        plan: SessionBranchSummaryPlan,
+        summary: Option<String>,
+    ) -> Result<Option<SessionMessageEntry>, Error> {
+        let summary = match (plan.leaf, summary, plan.messages.is_empty()) {
+            (Some(from_id), Some(summary), false)
+                if !summary.trim().is_empty() && summary.len() <= 256 * 1024 =>
+            {
+                Some(SessionBranchSummary {
+                    id: Uuid::new_v4(),
+                    from_id,
+                    summary,
+                })
+            }
+            (_, None, true) => None,
+            _ => return Err(Error::Invalid("Invalid branch summary".into())),
+        };
+        self.move_session_entry(
+            plan.conversation,
+            plan.target,
+            true,
+            Some((plan.version, summary)),
+        )
+    }
+
+    fn active_branch_summaries(
+        &self,
+        state: &Conversation,
+    ) -> Result<std::collections::BTreeMap<usize, SessionBranchSummary>, Error> {
+        let mut summaries = std::collections::BTreeMap::new();
+        let is_candidate = |message: &Message| matches!(message, Message::User { content } if content.starts_with(SessionBranchSummary::PREFIX));
+        if !state.messages.iter().any(is_candidate) {
+            return Ok(summaries);
+        }
+        let Some(cursor) = &state.transcript else {
+            return Ok(summaries);
+        };
+        for (index, (message, history)) in self
+            .resolved_occurrences(state.id, cursor.clone())?
+            .into_iter()
+            .enumerate()
+        {
+            let Some(history) = history.filter(|_| is_candidate(&message)) else {
+                continue;
+            };
+            let observation = self.session_observation(history.origin, history.commit)?;
+            if let Some(summary) = observation.value.get("session_branch_summary") {
+                self.authenticate_fork_anchor(history.origin, history.commit)?;
+                let summary: SessionBranchSummary = serde_json::from_value(summary.clone())?;
+                if summary.id == history.id && summary.message() == message {
+                    summaries.insert(index, summary);
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn ensure_session_can_checkout(state: &Conversation) -> Result<(), Error> {
         if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
             || state.input_run_active()
             || state.abort_requested
@@ -10949,8 +11142,31 @@ impl Harness {
                 .iter()
                 .any(|write| !write.placed && !write.withdrawn)
         {
-            return Err(Unsettled.into());
+            return Err(crate::fork::Error::Unsettled.into());
         }
+        Ok(())
+    }
+
+    fn move_session_entry(
+        &mut self,
+        id: Uuid,
+        entry_id: Uuid,
+        reedit_user: bool,
+        summary_plan: Option<(u64, Option<SessionBranchSummary>)>,
+    ) -> Result<Option<SessionMessageEntry>, Error> {
+        use crate::fork::Error::{InvalidCursor, InvalidSnapshot};
+
+        let (mut state, version) = self.load(id)?;
+        Self::ensure_session_can_checkout(&state)?;
+        let summary = match summary_plan {
+            Some((expected, summary)) if expected == version => summary,
+            Some(_) => {
+                return Err(Error::Invalid(
+                    "Session changed during branch summarization".into(),
+                ));
+            }
+            None => None,
+        };
         let tree = self.session_tree(&self.session_entries_start(id)?)?;
         let selected = tree
             .entries
@@ -10961,6 +11177,7 @@ impl Harness {
             SessionEntry::Message(message)
                 if reedit_user
                     && message.compaction.is_none()
+                    && message.branch_summary.is_none()
                     && matches!(
                         message.message,
                         Message::User { .. } | Message::UserWithImages { .. }
@@ -10975,7 +11192,7 @@ impl Harness {
         } else {
             Some(entry_id)
         };
-        if tree.leaf_id == target {
+        if tree.leaf_id == target && summary.is_none() {
             return Ok(draft);
         }
         let checks = if let Some(target) = target {
@@ -10998,6 +11215,10 @@ impl Harness {
         state.phase = Phase::Idle;
         state.run_failure = None;
         state.context_generation = Some(Uuid::new_v4());
+        if let Some(summary) = summary {
+            state.messages.push(summary.message());
+            state.session_branch_summary = Some(summary);
+        }
         let evidence = crate::task_store::OwnedBatch {
             checks,
             mutations: Vec::new(),
@@ -11738,6 +11959,13 @@ impl Harness {
         record: &crate::observer::Record,
     ) -> Result<Vec<SessionMessageBatch>, Error> {
         let observation = record.cursor.0;
+        let summary: Option<SessionBranchSummary> = serde_json::from_value(
+            record
+                .value
+                .get("session_branch_summary")
+                .cloned()
+                .unwrap_or_default(),
+        )?;
         let Some(mut position): Option<crate::transcript::Cursor> =
             serde_json::from_value(record.value.get("_transcript").cloned().unwrap_or_default())?
         else {
@@ -11796,6 +12024,7 @@ impl Harness {
                             .and_then(Option::as_ref)
                             .map(|history| history.id),
                     }),
+                    branch_summary: None,
                 }]
             } else {
                 let (messages, base, metadata) = change.parts()?;
@@ -11810,19 +12039,26 @@ impl Harness {
                     .into_iter()
                     .zip(ids)
                     .enumerate()
-                    .map(|(index, (message, id))| SessionMessageEntry {
-                        history: MessageHistory {
-                            id,
-                            commit,
-                            origin,
-                            commit_boundary: index + 1 == len,
-                        },
-                        message,
-                        blocks: blocks_for(id),
-                        context_replacement: base,
-                        compaction: None,
+                    .map(|(index, (message, id))| {
+                        let branch_summary = summary.as_ref().filter(|summary| summary.id == id);
+                        if branch_summary.is_some_and(|summary| summary.message() != message) {
+                            return Err(crate::fork::Error::InvalidSnapshot);
+                        }
+                        Ok(SessionMessageEntry {
+                            history: MessageHistory {
+                                id,
+                                commit,
+                                origin,
+                                commit_boundary: index + 1 == len,
+                            },
+                            message,
+                            blocks: blocks_for(id),
+                            context_replacement: base,
+                            compaction: None,
+                            branch_summary: branch_summary.cloned().map(Box::new),
+                        })
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>, _>>()?
             };
             batches.push(SessionMessageBatch {
                 starts_context,
@@ -11835,6 +12071,14 @@ impl Harness {
         }
         if !batches.is_empty() {
             self.authenticate_fork_anchor(source, observation)?;
+        }
+        if summary.is_some()
+            && !batches
+                .iter()
+                .flat_map(|batch| &batch.entries)
+                .any(|entry| entry.branch_summary.is_some())
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
         }
         batches.reverse();
         Ok(batches)
@@ -11870,7 +12114,15 @@ impl Harness {
                 }
                 last_reference = Some(reference.clone());
                 if record.value.get("session_checkout").is_some() {
-                    continue;
+                    // A normal checkout reuses another observation's transcript.
+                    // A summary checkout publishes one new, addressable occurrence.
+                    let Some(summary) = record.value.get("session_branch_summary") else {
+                        continue;
+                    };
+                    let summary: SessionBranchSummary = serde_json::from_value(summary.clone())?;
+                    if summary.id != entry_id {
+                        continue;
+                    }
                 }
                 let batch = transcript.read_with_blocks(&reference, std::num::NonZeroUsize::MIN)?;
                 let Some(batch) = batch.records.first() else {
@@ -13892,12 +14144,33 @@ impl Harness {
         {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
-        let mut rebound = serde_json::to_value(source)?;
+        let mut rebound = serde_json::to_value(&source)?;
         rebound["transcript"] = serde_json::to_value(transcript_id)?;
         if serde_json::from_value::<crate::transcript::Cursor>(rebound)? != *position {
             let mut original = serde_json::to_value(position)?;
             original["transcript"] = serde_json::to_value(origin)?;
             let original = serde_json::from_value(original)?;
+            if record.value.get("session_branch_summary").is_some() {
+                let transcript = crate::transcript::Transcript::new(self.owner.store(), origin);
+                let appended = transcript.read_with_blocks(&source, std::num::NonZeroUsize::MIN)?;
+                if appended.has_more && appended.next == original {
+                    let cut =
+                        transcript.read_with_blocks(&original, std::num::NonZeroUsize::MIN)?;
+                    if cut.has_more
+                        && cut
+                            .records
+                            .first()
+                            .is_some_and(|entry| entry.value.get("ForkCut").is_some())
+                    {
+                        transcript.verify_atomic_append(
+                            key.as_bytes(),
+                            &cut.next,
+                            &[original, source],
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
             self.verify_failure_reset_cut(origin, &original, commit)?;
         }
         Ok(())
@@ -25830,6 +26103,29 @@ impl Scheduler {
         self.harness.navigate_session_entry(id, entry_id)
     }
 
+    pub fn plan_session_branch_summary(
+        &self,
+        id: Uuid,
+        entry_id: Uuid,
+    ) -> Result<SessionBranchSummaryPlan, Error> {
+        self.harness.plan_session_branch_summary(id, entry_id)
+    }
+
+    pub fn finish_session_branch_summary(
+        &mut self,
+        plan: SessionBranchSummaryPlan,
+        summary: Option<String>,
+    ) -> Result<Option<SessionMessageEntry>, Error> {
+        self.harness.finish_session_branch_summary(plan, summary)
+    }
+
+    pub fn active_branch_summaries(
+        &self,
+        state: &Conversation,
+    ) -> Result<std::collections::BTreeMap<usize, SessionBranchSummary>, Error> {
+        self.harness.active_branch_summaries(state)
+    }
+
     pub fn session_entries(
         &self,
         cursor: &SessionEntryCursor,
@@ -36824,6 +37120,7 @@ mod scheduler_tests {
             has_session_labels: false,
             forked_session_labels: Vec::new(),
             session_checkout: None,
+            session_branch_summary: None,
             queue_modes: QueueModes::default(),
             after_failed_run: AfterFailedRun::default(),
             extensions: vec![],
