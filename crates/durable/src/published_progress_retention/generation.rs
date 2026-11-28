@@ -1,5 +1,7 @@
 //! Expiry for published running model partials. The terminal checkpoint is
 //! retained as the writer fence and as evidence for expiry.
+pub(crate) mod inline;
+
 use super::{PAGE_ROWS, enable_at, enabled_at, parse_payload_key, payload_key, read_payload};
 use crate::{
     observer::{Append, Cursor, Observer},
@@ -135,22 +137,11 @@ fn expire_one(
     {
         return Err(invalid());
     }
-    let terminal_key = progress::key(reference.request_id);
-    let Some(terminal) = store.get_bounded(&terminal_key, MAX_PROGRESS_BYTES)? else {
+    let Some((terminal_key, terminal)) =
+        terminal_for_publication(store, reference.request_id, original_commit)?
+    else {
         return Ok(());
     };
-    if matches!(
-        serde_json::from_slice::<State>(&terminal.value)?,
-        State::Running(_)
-    ) {
-        return Ok(());
-    }
-    if store
-        .commit_for_version(&terminal_key, terminal.version)?
-        .is_none_or(|sequence| sequence <= original_commit)
-    {
-        return Err(invalid());
-    }
     let marker = payload_key(EXPIRED, conversation, position);
     expire_after_terminal(
         store,
@@ -177,6 +168,27 @@ fn expire_one(
         now_ms,
         retain_ms,
     )
+}
+
+fn terminal_for_publication(
+    store: &Store,
+    request_id: Uuid,
+    original_commit: u64,
+) -> Result<Option<(Vec<u8>, Entry)>, Error> {
+    let key = progress::key(request_id);
+    let Some(terminal) = store.get_bounded(&key, MAX_PROGRESS_BYTES)? else {
+        return Ok(None);
+    };
+    if matches!(
+        serde_json::from_slice::<State>(&terminal.value)?,
+        State::Running(_)
+    ) || store
+        .commit_for_version(&key, terminal.version)?
+        .is_none_or(|commit| commit <= original_commit)
+    {
+        return Ok(None);
+    }
+    Ok(Some((key, terminal)))
 }
 
 #[cfg(test)]
@@ -228,6 +240,11 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_expires_a_real_model_partial_and_keeps_the_settled_reply() {
+        verify_scheduler_retention(false).await;
+        verify_scheduler_retention(true).await;
+    }
+
+    async fn verify_scheduler_retention(inline_history: bool) {
         let dir = tempfile::tempdir().unwrap();
         let mut scheduler = Scheduler::open(
             dir.path().join("db"),
@@ -237,12 +254,17 @@ mod tests {
             },
         )
         .unwrap();
-        scheduler
-            .start_published_generation_retention(
-                Duration::from_millis(10),
-                Duration::from_millis(5),
-            )
-            .unwrap();
+        let retain_for = Duration::from_millis(10);
+        let interval = Duration::from_millis(5);
+        if inline_history {
+            scheduler
+                .start_inline_generation_retention(retain_for, interval)
+                .unwrap();
+        } else {
+            scheduler
+                .start_published_generation_retention(retain_for, interval)
+                .unwrap();
+        }
         let id = scheduler
             .create_conversation(Config {
                 model: "test".into(),
@@ -351,8 +373,18 @@ mod tests {
             .unwrap();
         let published_frame = &partials.records[1];
         let payload = payload_key(PREFIX, id, published_frame.cursor.position);
+        let inline_key = Observer::progress_history(store, id)
+            .record_key(Cursor(partials.records[0].cursor.position));
+        let mut after_inline = Vec::new();
         let mut after = Vec::new();
         sweep(store, &mut after, 1_000, 20).unwrap();
+        inline::sweep(store, &mut after_inline, 1_000, 20).unwrap();
+        assert!(
+            store
+                .get(&crate::progress_retention::observation_key(&inline_key))
+                .unwrap()
+                .is_none()
+        );
         assert!(store.get(&payload).unwrap().is_some());
         assert!(
             store
@@ -374,7 +406,7 @@ mod tests {
         let fork = harness.fork(id).unwrap();
         let capture = harness.unified_history_start(id, false).unwrap();
         drop(harness);
-        let harness = Harness::open_paused(path, options()).unwrap();
+        let harness = Harness::open_paused(&path, options()).unwrap();
         let store = harness.owner.store();
         sweep(store, &mut after, 2_019, 20).unwrap();
         assert!(store.get(&payload).unwrap().is_some());
@@ -421,6 +453,66 @@ mod tests {
         assert_eq!(
             harness.conversation(fork).unwrap().config.system_prompt,
             "retained context"
+        );
+
+        let first = &history.records[0];
+        let original = store.get(&inline_key).unwrap().unwrap();
+        let terminal = history.records[2].clone();
+        inline::sweep(store, &mut after_inline, 3_000, 20).unwrap();
+        drop(harness);
+        let harness = Harness::open_paused(path, options()).unwrap();
+        let store = harness.owner.store();
+        inline::sweep(store, &mut after_inline, 3_019, 20).unwrap();
+        assert_eq!(store.get(&inline_key).unwrap().unwrap(), original);
+        inline::sweep(store, &mut after_inline, 3_020, 20).unwrap();
+        let replacement = store.get(&inline_key).unwrap().unwrap();
+        assert_eq!(replacement.version, original.version);
+        assert!(replacement.value.len() < original.value.len());
+        let terminal_entry = store.get(&progress::key(request_id)).unwrap().unwrap();
+        assert!(matches!(
+            store.observe_inline_generation_progress(
+                &inline_key,
+                &original,
+                &terminal_entry,
+                None,
+                3_021
+            ),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            store
+                .get(&crate::progress_retention::observation_key(&inline_key))
+                .unwrap()
+                .is_none()
+        );
+
+        let history = harness
+            .progress_history(&start, NonZeroUsize::new(3).unwrap())
+            .unwrap();
+        let retired = &history.records[0];
+        assert_eq!(retired.cursor, first.cursor);
+        assert_eq!(retired.commit_sequence, first.commit_sequence);
+        assert_eq!(
+            retired.changes,
+            [ProgressHistoryChange::ExpiredGeneration { request_id }]
+        );
+        assert_eq!(history.records[2], terminal);
+        assert!(
+            harness
+                .merged_progress(&merged_start, NonZeroUsize::new(16).unwrap())
+                .unwrap()
+                .frames
+                .iter()
+                .any(|frame| frame.progress.as_ref() == Some(retired))
+        );
+        assert!(
+            harness
+                .unified_history(&capture, NonZeroUsize::new(16).unwrap())
+                .unwrap()
+                .commits
+                .iter()
+                .flat_map(|commit| &commit.progress)
+                .any(|frame| frame == retired)
         );
     }
 }

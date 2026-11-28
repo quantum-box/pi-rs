@@ -3339,6 +3339,21 @@ impl ProgressHistoryRecord {
             })
             .ok_or_else(|| Error::Invalid("invalid generation progress history record".into()))
     }
+
+    pub(crate) fn inline_running_request(&self, conversation: Uuid) -> Option<Uuid> {
+        if self.version == 1
+            && self.conversation == conversation
+            && self.checkpointable.is_none()
+            && self.generation.is_none()
+            && let [ProgressHistoryChange::Generation { request_id, state }] =
+                self.changes.as_slice()
+            && !request_id.is_nil()
+            && matches!(state.as_ref(), crate::progress::State::Running(_))
+        {
+            return Some(*request_id);
+        }
+        None
+    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProgressHistoryFrame {
@@ -3405,6 +3420,12 @@ fn decode_progress_history_frame(
                 },
                 None => ProgressHistoryChange::ExpiredGeneration { request_id },
             }]
+        }
+        4 if event.checkpointable.is_none()
+            && event.generation.is_none()
+            && matches!(event.changes.as_slice(), [ProgressHistoryChange::ExpiredGeneration { request_id }] if !request_id.is_nil()) =>
+        {
+            event.changes
         }
         _ => return Err(Error::Invalid("invalid progress history record".into())),
     };
@@ -3815,7 +3836,7 @@ impl MergedProgressListener {
     }
 }
 
-const MAX_PROGRESS_HISTORY_BYTES: usize = 2 * 1024 * 1024 + 8192;
+pub(crate) const MAX_PROGRESS_HISTORY_BYTES: usize = 2 * 1024 * 1024 + 8192;
 pub(crate) fn prepare_progress_history(
     store: &durable_store::Store,
     conversation: Uuid,
@@ -23334,6 +23355,7 @@ pub struct Scheduler {
     progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     published_progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     published_generation_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
+    inline_generation_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
     worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
     summary_tasks: HashMap<Uuid, SummaryTask>,
@@ -24161,6 +24183,7 @@ impl Scheduler {
             progress_retention: None,
             published_progress_retention: None,
             published_generation_retention: None,
+            inline_generation_retention: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -25883,6 +25906,44 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Retire old inline model partials after observing their terminal state.
+    /// The worker is opt-in and the age observations survive reopen. After
+    /// retirement, history readers must support the inline expiration record.
+    pub fn start_inline_generation_retention(
+        &mut self,
+        retain_for: Duration,
+        interval: Duration,
+    ) -> Result<(), Error> {
+        let retain_ms = u64::try_from(retain_for.as_millis())
+            .ok()
+            .filter(|time| *time > 0)
+            .ok_or_else(|| Error::Invalid("invalid inline generation retention".into()))?;
+        if interval.is_zero() || self.inline_generation_retention.is_some() {
+            return Err(Error::Invalid(
+                "inline generation retention needs a nonzero interval and one worker".into(),
+            ));
+        }
+        let reader = self.harness.worker();
+        let cancel = self.reporter_cancel.clone();
+        self.inline_generation_retention = Some(tokio::spawn(async move {
+            let mut after = Vec::new();
+            while !cancel.is_cancelled() {
+                crate::published_progress_retention::generation::inline::sweep(
+                    reader.owner.store(),
+                    &mut after,
+                    unix_ms(),
+                    retain_ms,
+                )?;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => (),
+                }
+            }
+            Ok(())
+        }));
+        Ok(())
+    }
+
     /// Most recent background reporter failure, if any. Reopen after storage errors.
     pub fn reporter_error(&self) -> Option<String> {
         self.reporter_error
@@ -26173,6 +26234,7 @@ impl Scheduler {
             self.progress_retention.take(),
             self.published_progress_retention.take(),
             self.published_generation_retention.take(),
+            self.inline_generation_retention.take(),
         ]
         .into_iter()
         .flatten()

@@ -28,6 +28,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 const PREFIX: &[u8] = b"durable/observer/";
+pub(crate) const PROGRESS_HISTORY_PREFIX: &[u8] = b"durable/progress-history/";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -121,7 +122,7 @@ impl<'a> Observer<'a> {
         Self {
             store,
             stream: conversation,
-            prefix: b"durable/progress-history/",
+            prefix: PROGRESS_HISTORY_PREFIX,
         }
     }
 

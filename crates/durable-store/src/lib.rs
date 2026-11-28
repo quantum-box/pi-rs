@@ -32,6 +32,12 @@ type BoundedHistoryRow = (Option<Vec<u8>>, Option<u64>, Option<u64>);
 type BoundedChangeRow = (u64, Option<Vec<u8>>, Option<u64>, Option<u64>);
 type ReadLimit = (std::rc::Rc<()>, Vec<Vec<u8>>, usize);
 
+struct InlineGenerationExpiry<'a> {
+    key: &'a [u8],
+    frame: &'a Entry,
+    replacement: Option<Vec<u8>>,
+}
+
 thread_local! {
     static READ_LIMITS: std::cell::RefCell<Vec<ReadLimit>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -2491,7 +2497,148 @@ impl Store {
     /// All checks are evaluated against the pre-commit state; mutations apply
     /// in order. A failed check rolls back the complete batch.
     pub fn commit(&self, checks: &[Check], mutations: &[Mutation]) -> Result<(), Error> {
-        self.commit_inner(checks, mutations, &[], None)
+        self.commit_inner(checks, mutations, &[], None, None)
+    }
+
+    /// Replace an eligible inline running model partial with its expiration
+    /// record. The original frame version and commit remain the cursor anchor.
+    /// The caller owns the clock policy and must supply its observed expiry row.
+    pub fn expire_inline_generation_progress(
+        &self,
+        key: &[u8],
+        frame: &Entry,
+        terminal: &Entry,
+        observation_version: u64,
+    ) -> Result<(), Error> {
+        self.change_inline_generation_progress(
+            key,
+            frame,
+            terminal,
+            Expected::Version(observation_version),
+            None,
+        )
+    }
+
+    /// Persist the first observation of a terminal request for this inline
+    /// partial. The raw-frame fence also detects a concurrent retirement that
+    /// preserved the frame's original store version.
+    pub fn observe_inline_generation_progress(
+        &self,
+        key: &[u8],
+        frame: &Entry,
+        terminal: &Entry,
+        previous_observation: Option<u64>,
+        observed_ms: u64,
+    ) -> Result<(), Error> {
+        self.change_inline_generation_progress(
+            key,
+            frame,
+            terminal,
+            previous_observation.map_or(Expected::Missing, Expected::Version),
+            Some(observed_ms),
+        )
+    }
+
+    fn change_inline_generation_progress(
+        &self,
+        key: &[u8],
+        frame: &Entry,
+        terminal: &Entry,
+        expected_observation: Expected,
+        observed_ms: Option<u64>,
+    ) -> Result<(), Error> {
+        let suffix = key
+            .strip_prefix(b"durable/progress-history/")
+            .filter(|suffix| suffix.len() == 26 && suffix[16..18] == *b"/r")
+            .ok_or(Error::InvalidSnapshot)?;
+        let conversation =
+            uuid::Uuid::from_slice(&suffix[..16]).map_err(|_| Error::InvalidSnapshot)?;
+        if conversation.is_nil() || suffix[18..].iter().all(|byte| *byte == 0) {
+            return Err(Error::InvalidSnapshot);
+        }
+        let original: serde_json::Value =
+            serde_json::from_slice(&frame.value).map_err(|_| Error::InvalidSnapshot)?;
+        let change = original["changes"]
+            .as_array()
+            .filter(|changes| changes.len() == 1)
+            .map(|changes| &changes[0])
+            .filter(|change| {
+                change["kind"] == "generation" && change["state"]["state"] == "running"
+            })
+            .ok_or(Error::InvalidSnapshot)?;
+        if original["version"] != 1
+            || original["conversation"] != conversation.to_string()
+            || !original["generation"].is_null()
+            || !original["checkpointable"].is_null()
+        {
+            return Err(Error::InvalidSnapshot);
+        }
+        let request = change["request_id"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .filter(|id| !id.is_nil())
+            .ok_or(Error::InvalidSnapshot)?;
+        let terminal_key = format!("durable/generation-progress/{request}").into_bytes();
+        let terminal_state: serde_json::Value =
+            serde_json::from_slice(&terminal.value).map_err(|_| Error::InvalidSnapshot)?;
+        if self.get_bounded(&terminal_key, 1024 * 1024)?.as_ref() != Some(terminal) {
+            return Err(Error::Conflict { key: terminal_key });
+        }
+        let original_commit = self
+            .commit_for_version(key, frame.version)?
+            .ok_or(Error::InvalidSnapshot)?;
+        if !matches!(
+            terminal_state["state"].as_str(),
+            Some("completed" | "aborted")
+        ) || self
+            .commit_for_version(&terminal_key, terminal.version)?
+            .is_none_or(|commit| commit <= original_commit)
+        {
+            return Err(Error::InvalidSnapshot);
+        }
+        let marker = [b"runtime/retention/".as_slice(), key].concat();
+        let checks = [
+            Check {
+                key: key.to_vec(),
+                expected: Expected::Version(frame.version),
+            },
+            Check {
+                key: terminal_key,
+                expected: Expected::Version(terminal.version),
+            },
+            Check {
+                key: marker.clone(),
+                expected: expected_observation,
+            },
+        ];
+        let (mutation, replacement) = if let Some(observed_ms) = observed_ms {
+            let value = serde_json::to_vec(&serde_json::json!({
+                "task_version": terminal.version,
+                "progress_version": frame.version,
+                "observed_ms": observed_ms,
+            }))
+            .map_err(|_| Error::InvalidSnapshot)?;
+            (Mutation::Put { key: marker, value }, None)
+        } else {
+            let expiration = serde_json::to_vec(&serde_json::json!({
+                "version": 4,
+                "conversation": conversation,
+                "changes": [{"kind":"expired_generation", "request_id": request}]
+            }))
+            .map_err(|_| Error::InvalidSnapshot)?;
+            (Mutation::Delete { key: marker }, Some(expiration))
+        };
+        self.commit_inner(
+            &checks,
+            &[mutation],
+            &[],
+            None,
+            Some(InlineGenerationExpiry {
+                key,
+                frame,
+                replacement,
+            }),
+        )
     }
 
     /// Commit the original atomic batch only if no put under the supplied
@@ -2504,7 +2651,7 @@ impl Store {
         prefixes: &[&[u8]],
         boundary: u64,
     ) -> Result<(), Error> {
-        self.commit_inner(checks, mutations, &[], Some((prefixes, boundary)))
+        self.commit_inner(checks, mutations, &[], Some((prefixes, boundary)), None)
     }
 
     /// Commit explicit document acquisitions with ordinary checked mutations.
@@ -2514,7 +2661,7 @@ impl Store {
         mutations: &[Mutation],
         acquisitions: &[TaskDocumentAcquisition],
     ) -> Result<(), Error> {
-        self.commit_inner(checks, mutations, acquisitions, None)
+        self.commit_inner(checks, mutations, acquisitions, None, None)
     }
     /// As above, with a graph put fence for scheduler finalization.
     pub fn commit_task_documents_with_prefix_put_fence(
@@ -2525,7 +2672,13 @@ impl Store {
         prefixes: &[&[u8]],
         boundary: u64,
     ) -> Result<(), Error> {
-        self.commit_inner(checks, mutations, acquisitions, Some((prefixes, boundary)))
+        self.commit_inner(
+            checks,
+            mutations,
+            acquisitions,
+            Some((prefixes, boundary)),
+            None,
+        )
     }
 
     fn commit_inner(
@@ -2534,6 +2687,7 @@ impl Store {
         mutations: &[Mutation],
         acquisitions: &[TaskDocumentAcquisition],
         prefix_fence: Option<(&[&[u8]], u64)>,
+        inline_generation_expiry: Option<InlineGenerationExpiry<'_>>,
     ) -> Result<(), Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         #[cfg(feature = "experimental-graph-revision")]
@@ -3055,6 +3209,25 @@ impl Store {
                         tx.execute("INSERT OR IGNORE INTO durable_document_fence_versions(key,version,revision) SELECT ?1,version,?2 FROM durable_store_entries WHERE key=?1", params![key, revision])?;
                     }
                 }
+            }
+        }
+        if let Some(expiry) = inline_generation_expiry {
+            let current: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_store_entries
+                 WHERE key=?1 AND version=?2 AND value=?3)",
+                params![expiry.key, expiry.frame.version, expiry.frame.value],
+                |row| row.get(0),
+            )?;
+            if !current {
+                return Err(Error::Conflict {
+                    key: expiry.key.to_vec(),
+                });
+            }
+            if let Some(replacement) = expiry.replacement {
+                tx.execute(
+                    "UPDATE durable_store_entries SET value=?1 WHERE key=?2",
+                    params![replacement, expiry.key],
+                )?;
             }
         }
         // Recheck time after assembling writes, while still holding the write lock.
