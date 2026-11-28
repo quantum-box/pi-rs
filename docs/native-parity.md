@@ -1795,12 +1795,13 @@ returns an exact client, a different provider/model client, or unavailable.
 For a fallback the SDK commits the chosen identity, clears the thinking level,
 and exposes both identities through `AgentSession::model_fallback`. The SDK
 rejects a fallback before committing if that provider/model already has a
-different client; an existing matching client must be the same `Arc`. A host
-revocation during the write prevents the entire staged client set from being
-installed, and conflicting in-flight registrations are rejected before the
-journal write.
-The durable selection can then exist without a client and requires a new
-authorized registration before dispatch. The SDK cannot verify an opaque
+different client. An existing matching client must be the same `Arc`. A
+revocation during startup resolution aborts construction before the journal
+records a replacement selection. A revocation during the write fails
+construction and blocks publication of the entire staged client set. A
+selection already written to disk requires a new authorized registration
+before dispatch. Conflicting in-flight registrations are rejected before the
+journal write. The SDK cannot verify an opaque
 client's endpoint; the host must enforce endpoint-bound
 credentials. Unqualified legacy selections never invoke the resolver, and
 existing exact registrations take precedence. The resolver runs on session
@@ -2125,6 +2126,31 @@ discovered from the active account's gateway configuration during available-mode
 lookups and explicit resolution. Unfiltered and offline lists use the matching
 cached catalog when the current account can be identified without running a
 credential command.
+
+Codemode also accepts explicitly configured `pi-decision` classifiers with a
+provider or model `baseUrl`. This API posts the model and classifier context to
+`<baseUrl>/decision` and preserves typed answers, usage, and an optional response
+ID. Terminal HTTP errors include bounded diagnostics from the decision error
+envelope with echoed request credentials redacted. With cookies, non-Bearer
+authorization, or sensitive custom headers, diagnostics retain the HTTP status
+and recognized error codes. When a server requests a retry delay above the
+60-second cap, the terminal error includes the delay rejection and the same
+sanitized HTTP diagnostic.
+Cancellation covers credential loading and the HTTP operation.
+Provider-level `api: "pi-decision"` and profiles
+that only declare operations with a model-level `pi-decision` keep their defaults
+off bundled chat and the remaining bundled operations. A mixed profile with a
+provider-level `pi-decision` requires each chat model to declare a supported chat
+API and its own `baseUrl`. Without a provider discovery endpoint, the catalog
+lists model-scoped chat routes, including Azure, and omits bundled models with
+no route.
+Azure environment defaults apply to chat. The decision profile's
+credentials and headers stay on its operation routes.
+The legacy `pi-classifier` API and automatic Radius discovery keep their
+`/classify` route. Pi Decision uses the existing endpoint-bound credentials
+and headers, HTTP limits, and classifier retry policy. A built-in provider name
+supplies neither an implicit decision URL nor ambient credentials for it.
+[Pinned Pi Decision protocol](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/src/api/pi-decision.ts#L16-L46)
 
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
@@ -4232,6 +4258,13 @@ measured response is available. Unknown cost is returned as null; preservation o
 below. Live statistics are covered below. Complete message-variant counting and
 provider pricing remain open.
 
+Interactive restore skips the transcript card and cost notice for an imported
+Pi `branch_summary` with an empty string. The original entry, its branch
+position and billed usage remain in the journal. This also applies after a
+native export and reopen.
+[Pinned Pi summary projection](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/session-manager.ts#L458-L460)
+[Pinned Pi transcript restore](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L4371-L4383)
+
 Tests cover an imported multi-branch session with assistant, tool-result,
 standalone and summary usage. A loopback RPC test covers message and tool counts,
 cache accounting, summary usage deduplication and unknown post-compaction context.
@@ -4260,6 +4293,11 @@ Legacy `custom` and `hookMessage` message records likewise retain their display
 metadata and enter model context without being rendered as user prompts.
 Imported message-form branch summaries use Pi's summary context framing while
 retaining their original RPC representation and branch reference.
+When checkout or a branch summary inherits a valid SDK-cycled selection,
+Workbench restores its recorded thinking level and emits it as a
+`thinking_level_change` entry in RPC history and Pi-format JSONL exports.
+Missing or malformed bindings use the branch default on restore and emit
+`off` in RPC history and Pi-format exports.
 Message-form compaction summaries are displayed as summaries and framed for
 model context without performing another compaction or removing earlier entries.
 
@@ -4287,8 +4325,11 @@ catalogs, automatic native pricing and detailed cost provenance remain open.
 
 Session and owned SDK name reads trim ECMAScript whitespace from the latest
 stored name, as Pi does, including names imported from external JSONL. A
-whitespace-only name clears the title without falling back to an older name;
-reading preserves internal line breaks and does not rewrite the journal.
+whitespace-only name clears the title. The latest imported Pi `session_info`
+also clears the title when it omits `name`, even after checkout to an earlier
+branch. Native working-directory updates leave the title in place. Name reads
+preserve internal line breaks and leave the journal intact.
+[Pinned Pi session name lookup](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/session-manager.ts#L1339-L1350)
 
 ### SDK model-facing tool selection
 
@@ -7520,6 +7561,32 @@ external ID distinct from the native journal UUID. Forks receive their own ID.
 The file getter reports paths managed by the SDK. Hosts that supply their own
 journal store retain responsibility for its location. ID and name reads return
 an error while the journal is locked.
+
+`AgentSession::get_last_assistant_text()` and native RPC
+`get_last_assistant_text` select from the active branch after compaction and
+context edits. They concatenate text and trim ECMAScript whitespace. An empty
+normal reply ends the search, while an omitted reply or a non-normal reply
+without text lets it continue. RPC `get_messages` keeps an edited reply's
+original stop reason, even if the edit removes all its text or calls. For
+native completions without a recognized length limit or recorded failure, the
+original presence of tool calls distinguishes `toolUse` from `stop`. Pi
+imports keep their original stop reasons. Marked failed and cancelled turn
+partials can provide display text without entering model context. A durable
+retry or overflow marker omits the superseded partial on its branch, including
+after cancelling backoff or resuming overflow recovery from a saved failure.
+The raw attempt and its usage remain in the journal. Earlier native journals
+that recorded the omission as a context edit still hide that partial. Edits
+to display-only completions leave measured usage and model projection intact.
+Pi-compatible export includes an advisory flag on generated omission edits.
+On import, the flag keeps the edit display-only when its target matches the
+nearest failed completion on that branch. Other edits retain their ordinary
+semantics.
+Older readers can open journals containing the retry marker and may display
+the superseded partial.
+Older unmarked failures and summary partials remain excluded. RPC keeps
+unmodified imported blocks, including signed thinking, when restoring an empty
+normal reply after tool-call repair.
+[Pinned Pi assistant text selection](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4522-L4549)
 
 ### SDK skill commands
 

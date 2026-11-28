@@ -16,7 +16,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::{Cli, observe, output, runtime};
+use super::{Cli, observe, output, rpc_messages::MetadataSource, runtime};
 
 mod queue;
 
@@ -307,7 +307,7 @@ impl SessionSnapshot {
                 _ => cursor.invalidate(),
             }
             let _ = replay.take_new_counts();
-            cursor.advance(&records);
+            cursor.advance(&records, None);
         }
         let share_records = records.iter().cloned().map(Arc::new).collect();
         Self {
@@ -440,7 +440,10 @@ impl SessionSnapshot {
                 Err(_) => cursor.invalidate(),
             }
             let _ = snapshot.replay.take_new_counts();
-            cursor.advance(&snapshot.records);
+            cursor.advance(
+                &snapshot.records,
+                Some(MetadataSource::Snapshot(&snapshot.record_metadata)),
+            );
             snapshot.entries = Some(cursor);
         }
         snapshot
@@ -557,7 +560,10 @@ impl SessionSnapshot {
                 *cursor = super::rpc_entries::Cursor::default();
                 cursor.set_verified_counts(self.replay.counts());
                 let _ = self.replay.take_new_counts();
-                cursor.advance(&self.records[..start]);
+                cursor.advance(
+                    &self.records[..start],
+                    Some(MetadataSource::Snapshot(&self.record_metadata)),
+                );
             }
             if (self.records.len() as u64) < end {
                 if !prefix_metadata_same {
@@ -615,7 +621,10 @@ impl SessionSnapshot {
                 Err(_) => cursor.invalidate(),
             }
             let _ = self.replay.take_new_counts();
-            cursor.advance(&self.records);
+            cursor.advance(
+                &self.records,
+                Some(MetadataSource::Snapshot(&self.record_metadata)),
+            );
         }
         Vec::new()
     }
@@ -740,7 +749,10 @@ impl SessionSnapshot {
             }
         }
         if changed {
-            cursor.advance(&self.records[..start]);
+            cursor.advance(
+                &self.records[..start],
+                Some(MetadataSource::Snapshot(&self.record_metadata)),
+            );
             self.verified_metadata = self.record_metadata.clone();
         }
         let mut emitted = Vec::new();

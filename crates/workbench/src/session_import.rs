@@ -75,7 +75,12 @@ pub(super) fn branch_selection(
             | Event::BranchSummary {
                 fallback_model: Some(_),
                 ..
-            } => Some(None),
+            } => Some(
+                session
+                    .record_metadata(record.id)
+                    .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
+                    .map(str::to_owned),
+            ),
             Event::SourceEntry { format, entry }
                 if format == "pi" && entry["type"] == "thinking_level_change" =>
             {
@@ -1213,10 +1218,15 @@ mod tests {
         assert!(changes.iter().any(|entry| entry["type"] == "model_change"));
         let mut cursor = super::super::rpc_entries::Cursor::default();
         cursor.set_verified_counts(&session.validated_pi_conversion_counts().unwrap());
-        cursor.advance(&session.records()[..(native - 1) as usize]);
+        cursor.advance(
+            &session.records()[..(native - 1) as usize],
+            Some(super::super::rpc_messages::MetadataSource::Session(
+                &session,
+            )),
+        );
         let live = cursor.appended(
             session.records(),
-            session.records().len() - 1,
+            native as usize - 1,
             None,
             &Default::default(),
         );
@@ -1634,7 +1644,15 @@ mod tests {
                 json!({"type":"context_edit","id":"eu","parentId":"a","targetId":"u","replacement":null}),
             ];
             let session = import_pi(entries.clone()).unwrap();
-            assert!(super::super::rpc_messages::snapshot(&session).0.is_empty());
+            let (visible, native) = super::super::rpc_messages::snapshot(&session);
+            assert!(native.is_empty());
+            if reason == "stop" {
+                assert_eq!(visible.len(), 1);
+                assert_eq!(visible[0]["stopReason"], "stop");
+                assert_eq!(visible[0]["content"], json!([]));
+            } else {
+                assert!(visible.is_empty());
+            }
             assert!(
                 super::super::rpc_entries::Entries::new(&session)
                     .has_session_context()
@@ -3479,6 +3497,40 @@ mod tests {
         );
         assert_eq!(checkpoint.2[0].name, "read");
         assert_eq!(checkpoint.3, &["old"]);
+    }
+
+    #[test]
+    fn omitted_pi_session_name_clears_title_across_checkout_and_reopen() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"session_info","id":"named","parentId":null,"name":"Planning"}),
+            json!({"type":"message","id":"work","parentId":"named","message":{"role":"user","content":"work"}}),
+            json!({"type":"session_info","id":"clear","parentId":"named"}),
+        ])
+        .unwrap();
+        assert_eq!(session.name(), None);
+        let work = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::User { .. }))
+            .unwrap()
+            .id;
+        session.checkout(work).unwrap();
+        assert_eq!(session.name(), None, "title follows file order");
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.name(), None);
+        let source = reopened.records().iter().find(|record| {
+            matches!(&record.event, Event::SourceEntry { format, entry }
+                if format == "pi" && entry["id"] == "clear" && entry.get("name").is_none())
+        });
+        assert!(source.is_some(), "the original entry stays unnamed");
+        reopened.set_name("Native rename").unwrap();
+        reopened.set_working_directory(directory.path()).unwrap();
+        assert_eq!(reopened.name(), Some("Native rename"));
     }
 
     #[test]

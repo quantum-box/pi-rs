@@ -304,7 +304,9 @@ pub(super) fn usage(entry: &Entry, raw: &Value) -> Option<Value> {
     };
     let (input, output, cache_read, cache_write) = match entry.api {
         Api::LlamaCppClassifier => return None,
-        Api::PiClassifier => return super::pi_classifier::usage(&entry.model.cost, raw),
+        Api::PiClassifier | Api::PiDecision => {
+            return super::pi_classifier::usage(&entry.model.cost, raw);
+        }
         Api::SystemOne | Api::WorkersAiSystemOne | Api::OpenAiDecisions => {
             if !value.contains_key("input_tokens") && !value.contains_key("output_tokens") {
                 return None;

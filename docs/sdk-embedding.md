@@ -157,6 +157,48 @@ workbench RPC counts Pi-projected message entries and adds usage from its
 native model operations, so message counts and usage totals can differ from
 the SDK snapshot.
 
+## Model cycling
+
+Call `AgentSession::cycle_model` with the current ordered snapshot of models
+your host authorizes and, optionally, its ordered scope. A nonempty scope is
+filtered by exact, case-sensitive provider and model pairs. It stays in effect
+even if every scoped entry is unavailable. An empty scope uses snapshot order.
+Cycling wraps in either direction. If the current model is absent, forward
+selects the first eligible model and backward selects the last, even when only
+one is eligible. The active journal selection supplies the current identity.
+An empty list or a lone current model returns `Ok(None)` without binding a
+client, writing a selection, or running selection hooks.
+
+The SDK asks the host to bind only the chosen model. It passes the requested
+thinking level with the explicit scoped level first, followed by the snapshot's
+per-model default, the host global default, and the current session level. The
+SDK uses its implicit `off` when none is set. The binding callback should return
+a client configured for the effective level and that level after applying
+provider capabilities. A host can use
+`ModelCatalog::get` for a prebuilt client. Hosts that use the native workbench
+factory can prepare clients using `ModelClientFactory` before passing the
+snapshot. The SDK performs no discovery or credential lookup during selection.
+Each cycled journal selection retains its own client binding, including across
+in-process forks and checkouts. Native journal records carry a binding marker,
+so cycling requires a session store with atomic record metadata. When reopening
+a native journal, use `SessionBuilder::cycled_model_resolver` to resolve the
+exact provider, model, and recorded thinking level. The host applies its normal
+credential and capability policy. If it cannot supply that exact client, the
+SDK leaves the selection unresolved and cannot dispatch requests with it.
+On reopen, a configured cycle resolver reauthorizes the active SDK binding,
+even when the supplied registry has cached clients for the journal. It also
+reauthorizes the bindings needed to resume pending tree triggers. Other cycled
+bindings are resolved when their branches are selected. A malformed or
+incomplete SDK binding on the active selection causes reopen to fail.
+Explicit SDK model setters keep their existing identity-based behavior.
+
+The SDK records the chosen model and effective thinking level together in the
+session journal, then delivers selection hooks with source `cycle`. A host owns
+the scope and any application-wide defaults, including whether to persist the
+new model to settings. See the
+[pinned upstream cycling implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2701-L2774)
+for the reference ordering and scope behavior.
+
 ## Native state and Tauri
 
 The [native host example](../examples/native_sdk_host.rs) demonstrates shared
