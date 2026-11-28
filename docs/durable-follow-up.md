@@ -27,7 +27,7 @@ cargo run -p pi-rs-durable --features text-cli --bin pi-rs-durable -- \
 
 続けるには、同じデータベースと送信先を指定し、`--model MODEL` を最初に表示された `--conversation UUID` に置き換える。同じ入力を再送する場合は同じ `--request-id` を使う。`--json` は会話 ID、保存済みのテキスト進捗、確定結果を1行ずつ出力する。
 
-テキスト RPC は `--json` とコマンド末尾のメッセージを `--rpc` に置き換えて起動する。標準入力から1行ごとに `prompt`、`abort`、`get_state`、`get_messages` を受け取る。HTTPS または数値ループバックの HTTP で OpenAI Responses に接続する場合は、`prompt`、`steer`、`follow_up` の `images` に `type: "image"`、`mimeType`、base64 の `data` を持つ画像を追加できる。画像は送信するモデル向けに調整した状態で保存する。実行中は `steer`、`follow_up`、または `streamingBehavior` 付きの `prompt` で追加入力を積む。`clear_queue` は未処理の入力をまとめて取り消し、種別ごとのテキストを返す。確定した途中出力は `message_update` イベントで返す。生成を再試行した場合は別のアシスタントメッセージを開始し、失敗時はその試行で保存した途中出力を返す。`abort` は実行中のターンが終了してから応答する。残っているキューは次の入力が来るまで保存する。
+テキスト RPC は `--json` とコマンド末尾のメッセージを `--rpc` に置き換えて起動する。標準入力から1行ごとに `prompt`、`abort`、`get_state`、`get_messages` を受け取る。HTTPS または数値ループバックの HTTP で OpenAI Responses に接続する場合は、`prompt`、`steer`、`follow_up` の `images` に `type: "image"`、`mimeType`、base64 の `data` を持つ画像を追加できる。画像は送信するモデル向けに調整した状態で保存する。実行中は `steer`、`follow_up`、または `streamingBehavior` 付きの `prompt` で追加入力を積む。`clear_queue` は未処理の入力をまとめて取り消し、種別ごとのテキストを返す。確定した途中出力は `message_update` イベントで返す。生成を再試行した場合は別のアシスタントメッセージを開始し、失敗時はその試行で保存した途中出力を返す。`abort` は実行中のターンが終了してから応答する。残っているキューは次の入力が来るまで保存する。 Responses の要求サイズには、すでに保存された履歴と保留キューも含まれる。上限を超える画像入力は保存前に拒否される。
 
 ## 運用・検証
 
