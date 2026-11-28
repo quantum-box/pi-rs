@@ -201,6 +201,37 @@ mod task_record {
         Some(task.state.is_terminal_state())
     }
 
+    pub(super) fn conversation(
+        conn: &rusqlite::Connection,
+        mut id: Uuid,
+    ) -> rusqlite::Result<Option<Uuid>> {
+        use rusqlite::OptionalExtension;
+
+        let mut visited = std::collections::HashSet::new();
+        while visited.insert(id) {
+            let key = [b"durable/task/".as_slice(), id.as_bytes()].concat();
+            let value: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT value FROM durable_store_entries WHERE key=?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(task) = value
+                .as_deref()
+                .and_then(|value| serde_json::from_slice::<Task>(value).ok())
+                .filter(|task| task.id == id)
+            else {
+                break;
+            };
+            match task.owner {
+                TaskOwner::Conversation(conversation) => return Ok(Some(conversation)),
+                TaskOwner::Task(parent) => id = parent,
+            }
+        }
+        Ok(None)
+    }
+
     #[cfg(feature = "experimental-graph-revision")]
     pub(super) fn is_owned_reservation(
         before: &[u8],
@@ -1357,6 +1388,12 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_document_history_meta (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision>=0));
             CREATE TABLE IF NOT EXISTS durable_document_history (key BLOB NOT NULL, revision INTEGER NOT NULL, value BLOB, version INTEGER, PRIMARY KEY(key, revision)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS durable_document_history_by_revision ON durable_document_history(revision, key);
+            CREATE TABLE IF NOT EXISTS durable_task_document_history_routes (
+                conversation BLOB NOT NULL, revision INTEGER NOT NULL, key BLOB NOT NULL,
+                PRIMARY KEY(conversation,revision,key)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS durable_task_document_history_by_change
+                ON durable_task_document_history_routes(revision,key);
             CREATE TABLE IF NOT EXISTS durable_document_cuts (key BLOB PRIMARY KEY NOT NULL, revision INTEGER NOT NULL) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS durable_document_cut_versions (key BLOB NOT NULL, version INTEGER NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,version)) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS durable_document_fence_versions (key BLOB NOT NULL, version INTEGER NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,version)) WITHOUT ROWID;
@@ -1644,6 +1681,16 @@ impl Store {
         prefix: &[u8],
         after: u64,
     ) -> Result<Option<ScopedDocumentCommit>, Error> {
+        self.next_conversation_document_commit(prefix, None, after)
+    }
+
+    /// Include task document changes attributed to this conversation at commit time.
+    pub fn next_conversation_document_commit(
+        &self,
+        prefix: &[u8],
+        conversation: Option<uuid::Uuid>,
+        after: u64,
+    ) -> Result<Option<ScopedDocumentCommit>, Error> {
         if !prefix.starts_with(b"durable/document/") || after > i64::MAX as u64 {
             return Err(Error::InvalidSnapshot);
         }
@@ -1656,7 +1703,27 @@ impl Store {
         if after > current {
             return Err(Error::InvalidSnapshot);
         }
-        let revision: Option<u64> = conn.query_row("SELECT MIN(revision) FROM durable_document_history WHERE substr(key,1,?1)=?2 AND revision>?3", params![prefix.len() as i64, prefix, after], |r| r.get(0))?;
+        let end = prefix_end(prefix).ok_or(Error::InvalidSnapshot)?;
+        let revision: Option<u64> = conn.query_row(
+            "SELECT MIN(revision) FROM (
+                SELECT MIN(revision) AS revision FROM durable_document_history h
+                WHERE key >= ?1 AND key < ?2 AND revision > ?3
+                AND (?4 IS NULL OR NOT EXISTS (
+                    SELECT 1 FROM durable_task_document_history_routes t
+                    WHERE t.revision = h.revision AND t.key = h.key
+                ))
+                UNION ALL
+                SELECT MIN(revision) FROM durable_task_document_history_routes
+                WHERE conversation = ?4 AND revision > ?3
+            )",
+            params![
+                prefix,
+                end,
+                after,
+                conversation.as_ref().map(|id| id.as_bytes())
+            ],
+            |r| r.get(0),
+        )?;
         let Some(revision) = revision else {
             return Ok(None);
         };
@@ -1668,7 +1735,8 @@ impl Store {
             )
             .optional()?
             .ok_or(Error::InvalidSnapshot)?;
-        let changes = Self::scoped_document_changes(&conn, prefix, revision, sequence)?;
+        let changes =
+            Self::scoped_document_changes(&conn, prefix, conversation, revision, sequence)?;
         Ok(Some((revision, sequence, changes)))
     }
 
@@ -1677,6 +1745,18 @@ impl Store {
     pub fn scoped_document_commit_positions(
         &self,
         prefix: &[u8],
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64)>, Error> {
+        self.conversation_document_commit_positions(prefix, None, after, through, limit)
+    }
+
+    /// Locate complete document commits, including the optional task document stream.
+    pub fn conversation_document_commit_positions(
+        &self,
+        prefix: &[u8],
+        conversation: Option<uuid::Uuid>,
         after: u64,
         through: u64,
         limit: usize,
@@ -1702,12 +1782,28 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT s.sequence, s.revision FROM durable_document_commit_sequences s
              WHERE s.sequence > ?1 AND s.sequence <= ?2
-             AND EXISTS (
-                 SELECT 1 FROM durable_document_history h
-                 WHERE h.revision = s.revision AND h.key >= ?3 AND h.key < ?4
+             AND (
+                 EXISTS (
+                     SELECT 1 FROM durable_document_history h
+                     WHERE h.revision = s.revision AND h.key >= ?3 AND h.key < ?4
+                     AND (?6 IS NULL OR NOT EXISTS (
+                         SELECT 1 FROM durable_task_document_history_routes t
+                         WHERE t.revision = h.revision AND t.key = h.key
+                     ))
+                 ) OR EXISTS (
+                     SELECT 1 FROM durable_task_document_history_routes t
+                     WHERE t.conversation = ?6 AND t.revision = s.revision
+                 )
              ) ORDER BY s.sequence LIMIT ?5",
         )?;
-        let mut rows = stmt.query(params![after, through, prefix, end, limit as i64])?;
+        let mut rows = stmt.query(params![
+            after,
+            through,
+            prefix,
+            end,
+            limit as i64,
+            conversation.as_ref().map(|id| id.as_bytes()),
+        ])?;
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
             result.push((row.get(0)?, row.get(1)?));
@@ -1719,6 +1815,16 @@ impl Store {
     pub fn scoped_document_changes_at_commit(
         &self,
         prefix: &[u8],
+        revision: u64,
+        sequence: u64,
+    ) -> Result<Vec<DocumentChange>, Error> {
+        self.conversation_document_changes_at_commit(prefix, None, revision, sequence)
+    }
+
+    pub fn conversation_document_changes_at_commit(
+        &self,
+        prefix: &[u8],
+        conversation: Option<uuid::Uuid>,
         revision: u64,
         sequence: u64,
     ) -> Result<Vec<DocumentChange>, Error> {
@@ -1736,7 +1842,8 @@ impl Store {
         if recorded != Some(sequence) {
             return Err(Error::InvalidSnapshot);
         }
-        let changes = Self::scoped_document_changes(&conn, prefix, revision, sequence)?;
+        let changes =
+            Self::scoped_document_changes(&conn, prefix, conversation, revision, sequence)?;
         if changes.is_empty() {
             return Err(Error::InvalidSnapshot);
         }
@@ -1746,16 +1853,30 @@ impl Store {
     fn scoped_document_changes(
         conn: &Connection,
         prefix: &[u8],
+        conversation: Option<uuid::Uuid>,
         revision: u64,
         sequence: u64,
     ) -> Result<Vec<DocumentChange>, Error> {
         let end = prefix_end(prefix).ok_or(Error::InvalidSnapshot)?;
         let mut stmt = conn.prepare(
             "SELECT key, value, version, length(key), coalesce(length(value), 0)
-             FROM durable_document_history
-             WHERE revision = ?1 AND key >= ?2 AND key < ?3 ORDER BY key LIMIT 257",
+             FROM durable_document_history h
+             WHERE revision = ?1 AND (
+                 (key >= ?2 AND key < ?3 AND (?4 IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM durable_task_document_history_routes t
+                     WHERE t.revision = h.revision AND t.key = h.key
+                 ))) OR EXISTS (
+                     SELECT 1 FROM durable_task_document_history_routes t
+                     WHERE t.conversation = ?4 AND t.revision = h.revision AND t.key = h.key
+                 )
+             ) ORDER BY key LIMIT 257",
         )?;
-        let mut rows = stmt.query(params![revision, prefix, end])?;
+        let mut rows = stmt.query(params![
+            revision,
+            prefix,
+            end,
+            conversation.as_ref().map(|id| id.as_bytes()),
+        ])?;
         let mut changes = Vec::new();
         let mut bytes = 0usize;
         while let Some(row) = rows.next()? {
@@ -3135,6 +3256,34 @@ impl Store {
                 // Upsert accommodates raw batches that mutate the same key more
                 // than once: the snapshot represents the final committed state.
                 tx.execute("INSERT INTO durable_document_history(key,revision,value,version) VALUES(?1,?2,(SELECT value FROM durable_store_entries WHERE key=?1),(SELECT version FROM durable_store_entries WHERE key=?1)) ON CONFLICT(key,revision) DO UPDATE SET value=excluded.value,version=excluded.version", params![key, revision])?;
+            }
+        }
+        if let Some(revision) = revision {
+            // A task's final state and all of its ancestors' writes are visible
+            // here, even when creation and the first document share one commit.
+            let mut conversations = std::collections::HashMap::new();
+            for mutation in mutations {
+                let key = match mutation {
+                    Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+                };
+                let Some(owner) = owners.get(key) else {
+                    continue;
+                };
+                let conversation = match conversations.entry(owner) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let id =
+                            uuid::Uuid::from_slice(owner).map_err(|_| Error::InvalidSnapshot)?;
+                        *entry.insert(task_record::conversation(&tx, id)?)
+                    }
+                };
+                if let Some(conversation) = conversation {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO durable_task_document_history_routes(conversation,revision,key)
+                         VALUES(?1,?2,?3)",
+                        params![conversation.as_bytes(), revision, key],
+                    )?;
+                }
             }
         }
         // Capture the post-mutation revision in the same transaction as every

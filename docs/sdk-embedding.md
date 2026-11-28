@@ -32,6 +32,28 @@ of [Pi's available thinking levels](https://github.com/earendil-works/pi/blob/db
 The list describes capability metadata. The host still chooses a client
 configured for the selected level.
 
+For native hosts, `ModelFileReadGrants::load` and `load_with_api_keys`
+populate those choices from an explicit `thinkingLevelMap` on an exactly
+granted chat declaration. A `modelOverrides` map replaces only the keys it
+specifies. For reasoning models, `null` disables a choice, omitted ordinary
+levels stay available, and `xhigh` and `max` require a non-null mapping. An
+explicit map on a non-reasoning model yields only `off`. A declaration with
+no map retains `None`.
+
+The granted file loader binds the default `ModelClientFactory::client` for
+each route and shares that client across its model declarations. It publishes
+the selectable levels without passing the provider effort strings to the
+client. A host that owns the effort mapping and credentials can obtain a
+typed `chat_client` and call `with_mapped_reasoning_effort`, or obtain a
+typed Responses client and call `with_mapped_thinking`. The binding callbacks
+for [model cycling](https://github.com/quantum-box/pi-rs/pull/833) and
+[thinking selection](https://github.com/quantum-box/pi-rs/pull/846) take the
+configured client from the host. For historical branches the host supplies
+it through `cycled_model_resolver`. Automatic dispatch from a granted file
+would need to retain the merged effort map per exact model and build those
+level-specific clients through the same authorized route and credential
+resolution. The browser WASM SDK does not read native model files.
+
 For older journals that recorded a model name without its provider, the host
 may explicitly authorize that name with `session_builder_with_legacy_model`.
 Use this only when the host knows which provider the old name represents; the

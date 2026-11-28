@@ -3,7 +3,7 @@ use pi_rs::{Error, Result, Session};
 
 use super::Cli;
 
-pub(super) const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+pub(super) use super::model_thinking_levels::LEVELS;
 
 pub(super) fn reported(args: &Cli) -> Option<&[String]> {
     args.thinking_profile

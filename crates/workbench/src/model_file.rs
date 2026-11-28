@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::auth_factory::{MAX_API_KEY_BYTES, expand_config_value, valid_api_key};
 use crate::model_factory::{ModelClientFactory, NativeModelApi};
+use crate::model_thinking_levels::mapped_levels;
 
 /// Authorize one model-file route. Route fields use exact, case-sensitive
 /// matches. The declared base URL identifies a file entry; only the host's
@@ -38,6 +39,7 @@ impl ModelFileReadGrants {
     /// and base URL when that combination is also granted. The file does not
     /// supply credentials, request headers or provider compatibility options
     /// to clients. There is no built-in lookup or network discovery.
+    /// An explicit thinking-level map supplies catalog choices only.
     pub fn load(&self, factory: &ModelClientFactory) -> Result<ModelCatalog> {
         self.load_with_api_keys(factory, &[], |_, _| None)
     }
@@ -158,6 +160,7 @@ impl ModelFileReadGrants {
                         .map_err(|_| invalid_provider(provider))?;
                     metadata.apply_overrides(overrides);
                 }
+                let levels = metadata.thinking_levels();
                 let info = metadata.into_catalog_info(id, api_name(grant.api));
                 if info.context_window == Some(0) || info.max_output_tokens == Some(0) {
                     return Err(invalid_provider(provider));
@@ -173,6 +176,9 @@ impl ModelFileReadGrants {
                     )?),
                 };
                 catalog.register_with_info(provider, id, client.clone(), info)?;
+                if let Some(levels) = levels {
+                    catalog.set_thinking_levels(provider, id, levels)?;
+                }
             }
         }
         Ok(catalog.build())
@@ -267,6 +273,7 @@ struct DisplayMetadata {
     context_window: Option<u32>,
     max_tokens: Option<u32>,
     reasoning: Option<bool>,
+    thinking_level_map: Option<BTreeMap<String, Option<String>>>,
     input: Option<Vec<String>>,
     cost: Option<CatalogModelCost>,
 }
@@ -277,6 +284,11 @@ impl DisplayMetadata {
         self.context_window = overrides.context_window.or(self.context_window);
         self.max_tokens = overrides.max_tokens.or(self.max_tokens);
         self.reasoning = overrides.reasoning.or(self.reasoning);
+        if let Some(map) = overrides.thinking_level_map {
+            self.thinking_level_map
+                .get_or_insert_with(BTreeMap::new)
+                .extend(map);
+        }
         self.input = overrides.input.or(self.input.take());
         if let Some(cost) = overrides.cost {
             let base = self.cost.get_or_insert_with(CatalogModelCost::default);
@@ -285,6 +297,15 @@ impl DisplayMetadata {
             base.cache_read = cost.cache_read.or(base.cache_read.take());
             base.cache_write = cost.cache_write.or(base.cache_write.take());
         }
+    }
+
+    fn thinking_levels(&self) -> Option<Vec<String>> {
+        let map = self.thinking_level_map.as_ref()?;
+        Some(if self.reasoning == Some(true) {
+            mapped_levels(map)
+        } else {
+            vec!["off".into()]
+        })
     }
 
     fn into_catalog_info(self, id: &str, api: &str) -> CatalogModelInfo {

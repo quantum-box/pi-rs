@@ -567,18 +567,9 @@ impl ModelMetadata {
         {
             return None;
         }
-        Some(
-            super::thinking::LEVELS
-                .iter()
-                .copied()
-                .filter(|level| {
-                    self.thinking_level_map
-                        .get(*level)
-                        .map_or(!matches!(*level, "xhigh" | "max"), Option::is_some)
-                })
-                .map(str::to_owned)
-                .collect(),
-        )
+        Some(super::model_thinking_levels::mapped_levels(
+            &self.thinking_level_map,
+        ))
     }
 
     pub fn apply_catalog_metadata(&self, model: &mut Value) {
