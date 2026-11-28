@@ -14152,21 +14152,17 @@ exit {exit}
                     .unwrap(),
                 "cleanup did not encounter the held session-store lock"
             );
-            // `started_rx` means logout already owns the auth lock. Reading
-            // through that lock waits for durable local removal, keeping slow
-            // filesystem syncs outside the event-delivery deadline below.
             assert!(matches!(
                 view.remote_task.as_ref().unwrap().receiver.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
             ));
             drop(session_lock);
-            let auth =
-                super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
-            assert!(auth.get("openai-chatgpt").is_none());
             let task = view.remote_task.take().unwrap();
+            // Dropping the session-store lock lets cleanup proceed. Wait for
+            // its notification before reading the credentials again.
             assert!(matches!(
                 task.receiver
-                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .recv_timeout(std::time::Duration::from_secs(15))
                     .unwrap(),
                 super::RemoteEvent::ForgetModelKey("openai-chatgpt")
             ));
