@@ -6341,8 +6341,9 @@ existing retired-model fallback. Custom endpoints without a loaded catalog
 retain saved IDs. Switching to a different workspace refreshes the custom
 catalog for a saved retired default when endpoint probes are allowed. A replacement
 from that catalog can become the new workspace default even when the launch
-workspace used another provider. Only advertised and explicitly configured models
-whose effective route matches that endpoint are eligible for its fallback. The
+workspace used another provider. Advertised, explicitly configured, and bundled
+models whose effective route matches that endpoint are eligible for its fallback;
+configured and advertised models retain preference over other bundled entries. The
 automatic workspace refresh connects directly to a loopback relay in offline
 mode. Ordinary inference and user-requested discovery honor proxy settings in
 both modes. The fallback applies to

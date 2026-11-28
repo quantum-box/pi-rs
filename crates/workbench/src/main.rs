@@ -962,17 +962,25 @@ impl Cli {
             .any(|(id, discovered)| id == provider.id() && model.eq_ignore_ascii_case(discovered))
     }
 
-    fn custom_together_fallback_models(&self, provider: &Provider) -> Option<Vec<String>> {
+    fn custom_together_fallback_models(
+        &self,
+        provider: &Provider,
+        include_bundled: bool,
+    ) -> Option<Vec<String>> {
         if !self.custom_together_endpoint(provider) {
             return None;
         }
         let advertised = self.advertised_models(provider)?;
         let endpoint = self.endpoint_for(provider);
         let mut models: Vec<String> = Vec::new();
+        let bundled = include_bundled
+            .then(|| self.model_profiles.model_ids(provider))
+            .unwrap_or_default();
         for id in self
             .model_profiles
             .configured_model_ids(provider)
             .chain(advertised.iter().map(String::as_str))
+            .chain(bundled.iter().map(String::as_str))
         {
             if self.model_endpoint_for(provider, Some(id)) == endpoint
                 && !models.iter().any(|model| model.eq_ignore_ascii_case(id))
@@ -1315,8 +1323,12 @@ impl Cli {
         let missing_retired_default =
             configured_model.is_some_and(|model| self.retired_model_is_missing(&provider, model));
         let custom_fallback = missing_retired_default
-            .then(|| self.custom_together_fallback_models(&provider))
+            .then(|| self.custom_together_fallback_models(&provider, true))
             .flatten();
+        let preferred_fallback = custom_fallback.as_ref().and_then(|_| {
+            self.custom_together_fallback_models(&provider, false)
+                .filter(|models| !models.is_empty())
+        });
         let requested_provider = &provider;
         let eligible = |provider: &Provider, model: &str| {
             provider != requested_provider
@@ -1348,8 +1360,9 @@ impl Cli {
             .map(str::to_owned)
             .or_else(|| keep_fallback.then(|| fallback.model.clone()))
             .or_else(|| {
-                let models = custom_fallback
+                let models = preferred_fallback
                     .as_deref()
+                    .or(custom_fallback.as_deref())
                     .filter(|_| &provider == requested_provider)
                     .or_else(|| {
                         catalogs
@@ -2214,8 +2227,12 @@ async fn execute(
     let missing_retired_default =
         retired_default && args.retired_model_is_missing(&args.provider, saved_model);
     let custom_fallback = missing_retired_default
-        .then(|| args.custom_together_fallback_models(&args.provider))
+        .then(|| args.custom_together_fallback_models(&args.provider, true))
         .flatten();
+    let preferred_fallback = custom_fallback.as_ref().and_then(|_| {
+        args.custom_together_fallback_models(&args.provider, false)
+            .filter(|models| !models.is_empty())
+    });
     if missing_retired_default {
         args.model.clear();
     }
@@ -2261,7 +2278,11 @@ async fn execute(
                 || (args.settings.string("defaultProvider").is_none()
                     && args.settings.string("defaultModel").is_none()))
         {
-            model_selection::automatic_startup_model(&args, custom_fallback.as_deref()).await
+            model_selection::automatic_startup_model(
+                &args,
+                preferred_fallback.as_deref().or(custom_fallback.as_deref()),
+            )
+            .await
         } else {
             selected
         };
@@ -2283,7 +2304,10 @@ async fn execute(
         }
         args.model = model_selection::default_for_provider(
             &args.provider,
-            custom_fallback.as_deref().unwrap_or(available),
+            preferred_fallback
+                .as_deref()
+                .or(custom_fallback.as_deref())
+                .unwrap_or(available),
         )
         .cloned()
         .ok_or_else(|| {

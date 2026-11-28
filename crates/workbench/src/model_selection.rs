@@ -1417,6 +1417,55 @@ mod tests {
     }
 
     #[test]
+    fn together_relay_fallback_keeps_merged_models_on_the_relay_route() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.model_profiles = crate::model_profiles::Profiles::parse(&json!({
+            "providers":{"together":{
+                "baseUrl":"https://relay.example/v1",
+                "models":[
+                    {"id":"separate", "baseUrl":"https://other.example/v1"},
+                    {"id":"Qwen/Qwen4-Max", "baseUrl":"https://other.example/v1"}
+                ]
+            }}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("together").unwrap();
+        args.endpoint = args.model_profiles.endpoint(&args.provider).to_owned();
+        for advertised in [
+            vec![],
+            vec![
+                "relay-only".into(),
+                "separate".into(),
+                "Qwen/Qwen4-Max".into(),
+            ],
+        ] {
+            args.complete_catalogs =
+                vec![("together".into(), args.endpoint.clone(), advertised.clone())];
+            let models = args
+                .custom_together_fallback_models(&args.provider, true)
+                .unwrap();
+            assert!(models.iter().any(|id| id == "moonshotai/Kimi-K3"));
+            assert_eq!(
+                models.iter().any(|id| id == "relay-only"),
+                !advertised.is_empty()
+            );
+            assert!(
+                !models
+                    .iter()
+                    .any(|id| id == "separate" || id == "Qwen/Qwen4-Max")
+            );
+        }
+        args.complete_catalogs.clear();
+        assert!(
+            args.custom_together_fallback_models(&args.provider, true)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn retired_together_resume_requires_catalog_authority_for_its_endpoint() {
         use clap::Parser;
         use serde_json::json;

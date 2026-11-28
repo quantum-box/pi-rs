@@ -9128,7 +9128,13 @@ fn together_retired_fallback_uses_the_relay_catalog_across_workspace_restore() {
             true,
             Some(("together", "configured-model")),
         ),
-        (Some(vec![]), None, true, true, None),
+        (
+            Some(vec![]),
+            None,
+            true,
+            true,
+            Some(("together", "moonshotai/Kimi-K3")),
+        ),
         (
             None,
             None,
