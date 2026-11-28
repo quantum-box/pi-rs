@@ -932,6 +932,14 @@ changes rerender the active presentation with the host theme. Live tool
 calls render progressively parsed arguments and execution updates render
 partial content before the committed result.
 
+Rust SDK hosts can opt in to live `tool_execution_update` payloads with
+`AgentSession::subscribe_tool_progress()`. Direct and control-triggered runs
+forward the scheduler's partial results, including parent call IDs for nested
+tools. The bounded stream reports lag and closes with the session. Final tool
+results stay on the existing record stream. The JavaScript browser wrapper
+continues to return completed prompt and resume results.
+[Pinned Pi event dispatch](https://github.com/earendil-works/pi/blob/bf3f6a2228710cf457604f74b0aceb7bcc8a6b9e/packages/coding-agent/src/core/agent-session.ts#L1209-L1213)
+
 ### Executable cross-tool renderers
 
 Executable extensions advertise ordered exact and prefix matches for tool
@@ -1675,6 +1683,14 @@ off the UI thread. Unresolved variable or command references and OAuth entries
 leave the route unconfigured. The SDK host controls ambient environment access,
 OAuth, and any credential writes.
 
+For SDK reloads, the host loads one immutable credential snapshot and builds a
+complete replacement with `ModelClientFactory::catalog` before publishing it.
+This preserves the last valid catalog on a read or build failure, following
+Pi's snapshot retention on auth reload errors. A replacement changes future
+lookups. Retained clients keep their original credentials and exact routes.
+The SDK rebuild is explicit and performs no provider discovery or OAuth
+refresh. See [the embedding guide](sdk-embedding.md#reload-saved-keys-and-model-routes).
+
 ### Native SDK model file catalogs
 
 Embedded hosts can build an immutable catalog with
@@ -2172,6 +2188,24 @@ their existing scheduler deadlines.
 [Pinned Codemode worker deadline](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/codemode/src/runtime/execution.ts)
 [Pinned coding-agent result formatting](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/extensions/codemode/execute.ts)
 
+Native Codemode publishes an empty parent progress snapshot at startup, then
+reports nested tool calls in dispatch order with stable script-local IDs,
+bounded argument and error previews, and durations on completion. Parallel
+calls update their original positions. The first 64 calls are tracked, and
+further calls are counted without changing dispatch. Script return, timeout,
+and caller abort mark still-running calls cancelled in the settlement snapshot.
+The terminal shows recent call states. RPC and JSON attach the snapshot as
+`codemodeProgress` on the parent's `tool_execution_end` event. The snapshot
+is transient and leaves tool-result messages, journal records, model output,
+and the store transaction intact. The scheduler bounds complete progress
+events and omits large parent arguments. Codemode gives extension observers a
+single 250 ms maximum budget and stops those callbacks when the tool returns.
+Ordinary tools still drain accepted updates. Queued Codemode events reach
+presentation consumers, and caller abort preserves the latest omission count
+even if the script cannot publish its final snapshot. The snapshot covers
+`tools.*` calls. `models.*` calls remain outside it.
+[Pinned Codemode nested tool lifecycle](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/extensions/codemode/execute.ts#L514-L550)
+
 `PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
 running. Positive integer values accept Pi's numeric forms, including
@@ -2298,10 +2332,21 @@ A source entry with a missing parent is recovered as a separate native branch;
 its original parent ID remains in the retained source entry, while RPC presents
 it as a root. Missing ancestors may contain unrecoverable state or tool calls;
 orphan tool results and compactions involving orphaned branches are still rejected.
-Forward parent references and compaction boundaries on a different branch are
-also rejected. Pi instead drops a retained boundary that is not on the current
-path; native import rejects it rather than silently retaining unrelated history.
+Forward parent references and missing or forward compaction boundary IDs are
+also rejected. Pi v1 keeps its positional boundary migration, and RPC exposes
+the verified boundary as a projected entry ID. When a compaction names an
+earlier boundary on a complete sibling branch, Pi restores its system
+checkpoint, summary and descendants with no pre-compaction messages. Native
+import does the same and retains the original
+boundary and usage in a full export. A fork or Pi RPC projection uses the
+compaction's own ID as the boundary, so the result is independent of the
+sibling branch.
 
+Pi labels and context edits whose target IDs are absent from the whole source
+remain inert. The original source nodes are preserved in the native journal,
+and the RPC projection keeps their target IDs unbound. Branch forks retain
+these context edits and rebuild labels only for retained targets. Forward
+references and context edits that target another branch are rejected.
 Context edits are projected onto future model context while the imported raw
 entries remain available. Imported system messages appear as `[system]` in the
 default session tree, where their text can be searched and copied.
@@ -4169,6 +4214,16 @@ standalone and summary usage. A loopback RPC test covers message and tool counts
 cache accounting, summary usage deduplication and unknown post-compaction context.
 The complete workspace tests and all-target Clippy pass.
 
+### Rust SDK session statistics
+
+`AgentSession::session_stats()` follows Pi's `getSessionStats()` by combining
+the external session ID, SDK-managed file path, durable totals across the
+session, and context usage for the current branch. The SDK uses the host's
+configured context window and reads the journal once without contacting a
+provider. Its totals retain the native UUID and journal accounting. Workbench
+RPC uses projected Pi message counts and adds usage from native model
+operations. [Pinned Pi implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4363-L4415)
+
 
 ### Imported extension entries
 
@@ -4211,6 +4266,22 @@ Session and owned SDK name reads trim ECMAScript whitespace from the latest
 stored name, as Pi does, including names imported from external JSONL. A
 whitespace-only name clears the title without falling back to an older name;
 reading preserves internal line breaks and does not rewrite the journal.
+
+### SDK model-facing tool selection
+
+An owned Rust session exposes `active_tool_names` and `set_active_tools` for
+the configured model-facing tool selection. Native branch checkpoints preserve
+their recorded loadout. The runtime intersects that loadout with the selected
+registry tools and uses current schemas. A selected tool can therefore be absent
+from a request on a restored branch. Request-time registry hooks can also
+change the advertised list.
+
+The setter requires mutable ownership and an available journal, so hosts apply
+it to future runs. Pi can apply a selection on the next turn of an active run.
+Native registry validation rejects unknown names without replacing the previous
+selection. Native nested orchestration can call registered tools regardless of
+selection. In Pi, inactive callable tools must have `codemode` or `deferred`
+exposure.
 
 ### SDK queued input inspection
 
