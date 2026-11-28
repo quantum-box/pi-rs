@@ -8927,14 +8927,31 @@ pub(super) async fn run(
     {
         view.replay_transcript(&args, &theme)?;
     }
-    if !args.no_session && args.session.is_file() {
+    if !args.no_session
+        && args.session.is_file()
+        && let Ok(profile) = &args.resume_agent_dir
+        && profile
+            .as_deref()
+            .is_none_or(|path| path.to_str().is_some())
+    {
         let path = args.session.to_string_lossy();
         let path = if cfg!(windows) {
             format!("'{}'", path.replace('\'', "''"))
         } else {
             shell_words::quote(&path).into_owned()
         };
-        println!("Resume this session with pi --session {path}");
+        let profile = profile
+            .as_deref()
+            .and_then(std::path::Path::to_str)
+            .map(|directory| {
+                if cfg!(windows) {
+                    format!(" --agent-dir '{}'", directory.replace('\'', "''"))
+                } else {
+                    format!(" --agent-dir {}", shell_words::quote(directory))
+                }
+            })
+            .unwrap_or_default();
+        println!("Resume this session with pi{profile} --session {path}");
     }
     if interrupted || super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
     {
