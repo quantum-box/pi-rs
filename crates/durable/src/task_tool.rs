@@ -364,6 +364,9 @@ pub(crate) struct Identity {
     conversation_selection: Option<crate::extension::StableExtensionSelection>,
 }
 impl Identity {
+    pub(crate) fn direct_binding(&self) -> Option<&Value> {
+        self.direct_binding.as_ref()
+    }
     pub(crate) fn tool_name(&self) -> &str {
         &self.spec.name
     }

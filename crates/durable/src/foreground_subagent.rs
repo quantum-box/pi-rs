@@ -1,5 +1,8 @@
 //! Parent-bound foreground delegation backed by a durable tool task.
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use pi_rs_core::ToolSpec;
 use serde_json::{Value, json};
@@ -60,21 +63,28 @@ pub(crate) fn waiting_child(
     .map(Some)
 }
 
-pub(crate) fn extension(
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Binding {
+    pub(crate) parent: Uuid,
+    pub(crate) config: Config,
+    pub(crate) allowed_tools: Option<Vec<String>>,
+}
+
+pub(crate) fn handler(
     harness: Harness,
-    parent: Uuid,
-    config: Config,
-    allowed_tools: Option<Vec<String>>,
+    bindings: HashMap<Uuid, Binding>,
+    active_parent: Option<Uuid>,
     schedule: tokio::sync::mpsc::UnboundedSender<Uuid>,
-) -> (Extension, Arc<dyn Handler>) {
-    let binding = json!({"parent": parent, "config": config, "allowed_tools": allowed_tools});
-    let handler: Arc<dyn Handler> = Arc::new(Foreground {
+) -> Arc<dyn Handler> {
+    Arc::new(Foreground {
         harness: Mutex::new(harness),
-        parent,
-        config,
-        allowed_tools,
+        bindings,
+        active_parent,
         schedule,
-    });
+    })
+}
+
+pub(crate) fn extension(binding: &Binding, handler: Arc<dyn Handler>) -> Extension {
     let adapter = Arc::new(
         TaskTool::new(
             ToolSpec {
@@ -88,33 +98,33 @@ pub(crate) fn extension(
             KIND,
             true,
             1,
-            handler.clone(),
+            handler,
         )
-        .with_direct_binding(binding),
+        .with_direct_binding(json!(binding)),
     );
-    (
-        Extension {
-            name: extension_name(parent),
-            tools: vec![adapter.register().tool],
-            ..Extension::default()
-        },
-        handler,
-    )
+    Extension {
+        name: extension_name(binding.parent),
+        tools: vec![adapter.register().tool],
+        ..Extension::default()
+    }
 }
 
 struct Foreground {
     harness: Mutex<Harness>,
-    parent: Uuid,
-    config: Config,
-    allowed_tools: Option<Vec<String>>,
+    bindings: HashMap<Uuid, Binding>,
+    active_parent: Option<Uuid>,
     schedule: tokio::sync::mpsc::UnboundedSender<Uuid>,
 }
 
 impl Handler for Foreground {
     fn run(&self, task: &Task) -> Result<Step, String> {
-        if task.owner() != &TaskOwner::Conversation(self.parent) {
+        let TaskOwner::Conversation(parent) = task.owner() else {
             return Err("foreground subagent task has a different owner".into());
-        }
+        };
+        let binding = self
+            .bindings
+            .get(parent)
+            .ok_or("foreground subagent owner is not registered")?;
         let content = task
             .input()
             .get("task")
@@ -133,9 +143,9 @@ impl Handler for Foreground {
             task.id(),
             task.owner().clone(),
             CHILD_KEY,
-            self.config.clone(),
+            binding.config.clone(),
             content.into(),
-            self.allowed_tools.clone(),
+            binding.allowed_tools.clone(),
             SIGNAL.into(),
         ) {
             Ok(admission) => admission,
@@ -176,9 +186,11 @@ impl Handler for Foreground {
                 json!({"foreground_error": format!("Subagent ended: {}", receipt["status"].as_str().unwrap_or("unknown"))}),
             ));
         }
-        self.schedule
-            .send(admission.child)
-            .map_err(|_| "foreground scheduler stopped")?;
+        if self.active_parent.is_none_or(|active| active == *parent) {
+            self.schedule
+                .send(admission.child)
+                .map_err(|_| "foreground scheduler stopped")?;
+        }
         Ok(Step::Wait {
             checkpoint: Checkpoint {
                 phase: "waiting".into(),

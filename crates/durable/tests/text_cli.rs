@@ -466,7 +466,25 @@ fn foreground_rpc_round_trip(kill_during_child: bool) {
     let provider = thread::spawn(move || {
         let parent_answer = if kill_during_child { 3 } else { 2 };
         for index in 0..=parent_answer + 1 {
-            let (mut socket, request) = read_fixture_request(&listener, Duration::from_secs(20));
+            let (mut socket, mut request) =
+                read_fixture_request(&listener, Duration::from_secs(20));
+            if kill_during_child && index == 2 {
+                assert!(request["input"].to_string().contains("unrelated prompt"));
+                assert_eq!(request["model"], "unrelated-fixture");
+                assert!(
+                    request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool["name"] == "subagent")
+                );
+                let output = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"unrelated answer"}]});
+                let complete = json!({"type":"response.completed","response":{"status":"completed","output":[output]}});
+                let delta = json!({"type":"response.output_text.delta","output_index":0,"delta":"unrelated answer"});
+                let body = format!("data: {delta}\n\ndata: {complete}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                (socket, request) = read_fixture_request(&listener, Duration::from_secs(20));
+            }
             let tools = request["tools"].as_array();
             if (1..parent_answer).contains(&index) {
                 assert!(tools.is_none_or(Vec::is_empty));
@@ -628,9 +646,37 @@ fn foreground_rpc_round_trip(kill_during_child: bool) {
         assert!(!rpc.wait().unwrap().success());
         drop(stdin);
         reader.join().unwrap();
+        release.send(()).unwrap();
+        let unrelated = command(&[
+            "--model",
+            "unrelated-fixture",
+            "--foreground-subagent",
+            "unrelated prompt",
+        ])
+        .output()
+        .unwrap();
+        assert!(
+            unrelated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&unrelated.stderr)
+        );
+        assert!(String::from_utf8_lossy(&unrelated.stdout).contains("unrelated answer"));
+        let store = durable_store::Store::open(&db).unwrap();
+        assert!(
+            TaskStore::new(&store).list().unwrap().iter().any(|stored| {
+                stored.task.kind() == Some("pi-rs.foreground-subagent")
+                    && matches!(
+                        stored.task.state(),
+                        TaskState::Waiting(WaitFor::TypedSignal(_))
+                    )
+            }),
+            "unrelated CLI session must leave the first foreground task parked"
+        );
+        drop(store);
         (rpc, stdin, receive, reader) = start_rpc(&["--conversation", &root, "--rpc"]);
+    } else {
+        release.send(()).unwrap();
     }
-    release.send(()).unwrap();
     loop {
         let frame = next(&mut rpc, &receive);
         if frame["type"] == "agent_end" {
