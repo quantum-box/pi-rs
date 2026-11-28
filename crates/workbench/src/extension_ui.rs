@@ -1,10 +1,12 @@
 //! Correlated extension interactions between the worker and its frontend.
 use futures_util::FutureExt;
 use pi_rs::{
-    CancellationToken, ExtensionResult, ExtensionUi, HeaderRenderContext, HeaderRenderer,
-    RenderedExtensionRows, UiRequest, UiResponse, UiThemePalette, UiThemeSelection,
+    CancellationToken, ExtensionResult, ExtensionUi, FooterRenderContext, FooterRenderer,
+    HeaderRenderContext, HeaderRenderer, RenderedExtensionRows, UiRequest, UiResponse,
+    UiThemePalette, UiThemeSelection,
 };
 use pi_rs_workbench::theme_resources::{ExtensionThemeSnapshot, extension_theme_snapshot};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -59,17 +61,78 @@ pub(super) enum PreparedTheme {
 pub struct Broker {
     pending: PendingRequests,
     themes: Option<Mutex<ExtensionResult<ExtensionThemeSnapshot>>>,
-    header: Mutex<Option<MountedHeader>>,
-    header_render: Arc<tokio::sync::Mutex<()>>,
+    chrome: [ChromeSlot; 2],
 }
-struct MountedHeader {
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ChromeSection {
+    Header,
+    Footer,
+}
+
+impl ChromeSection {
+    pub(super) const ALL: [Self; 2] = [Self::Header, Self::Footer];
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "section", content = "layout", rename_all = "snake_case")]
+pub(super) enum ChromeRenderContext {
+    Header(HeaderRenderContext),
+    Footer(FooterRenderContext),
+}
+
+impl ChromeRenderContext {
+    pub(super) fn section(&self) -> ChromeSection {
+        match self {
+            Self::Header(_) => ChromeSection::Header,
+            Self::Footer(_) => ChromeSection::Footer,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ChromeRenderer {
+    Header(Arc<dyn HeaderRenderer>),
+    Footer(Arc<dyn FooterRenderer>),
+}
+
+impl ChromeRenderer {
+    async fn render_with_cancellation(
+        &self,
+        context: &ChromeRenderContext,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        match (self, context) {
+            (Self::Header(renderer), ChromeRenderContext::Header(context)) => {
+                renderer
+                    .render_with_cancellation(context, cancellation)
+                    .await
+            }
+            (Self::Footer(renderer), ChromeRenderContext::Footer(context)) => {
+                renderer
+                    .render_with_cancellation(context, cancellation)
+                    .await
+            }
+            _ => Err("extension renderer does not match the requested section".into()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ChromeSlot {
+    mounted: Mutex<Option<MountedChrome>>,
+    rendering: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct MountedChrome {
     id: Uuid,
     owner: String,
-    renderer: Arc<dyn HeaderRenderer>,
+    renderer: ChromeRenderer,
     cancellation: CancellationToken,
 }
 
-impl Drop for MountedHeader {
+impl Drop for MountedChrome {
     fn drop(&mut self) {
         self.cancellation.cancel();
     }
@@ -113,30 +176,80 @@ impl Broker {
         }
     }
 
-    pub fn admit_header_render(
+    fn slot(&self, section: ChromeSection) -> &ChromeSlot {
+        &self.chrome[section as usize]
+    }
+
+    fn mount(
+        &self,
+        section: ChromeSection,
+        owner: &str,
+        renderer: Option<ChromeRenderer>,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        let mut mounted = self.slot(section).mounted.lock().expect("extension chrome");
+        if cancellation.is_cancelled() {
+            return Err("extension UI cancelled".into());
+        }
+        if self.themes.is_none() {
+            return Ok(());
+        }
+        *mounted = renderer.map(|renderer| MountedChrome {
+            id: Uuid::new_v4(),
+            owner: owner.into(),
+            renderer,
+            cancellation: CancellationToken::new(),
+        });
+        let renderer = mounted.as_ref().map(|mount| mount.id);
+        super::output(
+            json!({"type":"chrome_renderer_changed","section":section,"renderer":renderer}),
+        );
+        Ok(())
+    }
+
+    fn invalidate(
+        &self,
+        section: ChromeSection,
+        owner: &str,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        let mounted = self.slot(section).mounted.lock().expect("extension chrome");
+        if cancellation.is_cancelled() {
+            return Err("extension UI cancelled".into());
+        }
+        if let Some(mount) = mounted.as_ref().filter(|mount| mount.owner == owner) {
+            super::output(
+                json!({"type":"chrome_renderer_invalidated","section":section,"renderer":mount.id}),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn admit_chrome_render(
         &self,
         id: Uuid,
-        context: HeaderRenderContext,
+        context: ChromeRenderContext,
     ) -> Option<impl Future<Output = Option<RenderedExtensionRows>> + Send + use<>> {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        let slot = self.header_render.clone().try_lock_owned().ok()?;
+        let section = self.slot(context.section());
+        let slot = section.rendering.clone().try_lock_owned().ok()?;
         let (renderer, cancellation) = {
-            let header = self.header.lock().expect("extension header");
-            let header = header.as_ref().filter(|header| header.id == id)?;
-            (header.renderer.clone(), header.cancellation.child_token())
+            let mounted = section.mounted.lock().expect("extension chrome");
+            let mount = mounted.as_ref().filter(|mount| mount.id == id)?;
+            (mount.renderer.clone(), mount.cancellation.child_token())
         };
         Some(async move {
             let _slot = slot;
             let rows = {
-                let render = AssertUnwindSafe(async {
+                let render = async {
                     if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
                         return Ok(None);
                     }
                     renderer
                         .render_with_cancellation(&context, &cancellation)
                         .await
-                })
-                .catch_unwind();
+                };
+                let render = AssertUnwindSafe(render).catch_unwind();
                 tokio::pin!(render);
                 let result = tokio::select! {
                     biased;
@@ -145,16 +258,15 @@ impl Broker {
                     rows = &mut render => Some(rows),
                 };
                 match result {
-                    Some(Ok(Ok(rows))) => rows.filter(|rows| {
+                    Some(Ok(rows)) => rows.ok().flatten().filter(|rows| {
                         !cancellation.is_cancelled()
                             && tokio::time::Instant::now() < deadline
-                            && rows.within_header_limits()
+                            && rows.within_chrome_limits()
                     }),
-                    Some(Err(_)) => {
+                    Some(Err(_panic)) => {
                         cancellation.cancel();
                         None
                     }
-                    Some(Ok(Err(_))) => None,
                     None => {
                         cancellation.cancel();
                         // Keep the slot until any background work has been reaped.
@@ -168,15 +280,19 @@ impl Broker {
         })
     }
 
-    pub async fn clear_header_renderer(&self) {
-        {
-            let mut header = self.header.lock().expect("extension header");
-            if header.take().is_some() {
-                super::output(json!({"type":"header_renderer_changed","renderer":null}));
+    pub async fn clear_chrome_renderers(&self) {
+        for section in ChromeSection::ALL {
+            let mut mounted = self.slot(section).mounted.lock().expect("extension chrome");
+            if mounted.take().is_some() {
+                super::output(
+                    json!({"type":"chrome_renderer_changed","section":section,"renderer":null}),
+                );
             }
         }
         // Finish render cleanup before extension shutdown.
-        let _slot = self.header_render.lock().await;
+        for slot in &self.chrome {
+            let _rendering = slot.rendering.lock().await;
+        }
     }
 
     fn theme_response(&self, request: &UiRequest) -> ExtensionResult<Option<UiResponse>> {
@@ -271,22 +387,12 @@ impl ExtensionUi for Broker {
         renderer: Option<Arc<dyn HeaderRenderer>>,
         cancellation: &CancellationToken,
     ) -> ExtensionResult<()> {
-        let mut header = self.header.lock().expect("extension header");
-        if cancellation.is_cancelled() {
-            return Err("extension UI cancelled".into());
-        }
-        if self.themes.is_none() {
-            return Ok(());
-        }
-        *header = renderer.map(|renderer| MountedHeader {
-            id: Uuid::new_v4(),
-            owner: owner.into(),
-            renderer,
-            cancellation: CancellationToken::new(),
-        });
-        let renderer = header.as_ref().map(|header| header.id);
-        super::output(json!({"type":"header_renderer_changed","renderer":renderer}));
-        Ok(())
+        self.mount(
+            ChromeSection::Header,
+            owner,
+            renderer.map(ChromeRenderer::Header),
+            cancellation,
+        )
     }
 
     fn invalidate_header_renderer(
@@ -294,14 +400,29 @@ impl ExtensionUi for Broker {
         owner: &str,
         cancellation: &CancellationToken,
     ) -> ExtensionResult<()> {
-        let header = self.header.lock().expect("extension header");
-        if cancellation.is_cancelled() {
-            return Err("extension UI cancelled".into());
-        }
-        if let Some(header) = header.as_ref().filter(|header| header.owner == owner) {
-            super::output(json!({"type":"header_renderer_invalidated","renderer":header.id}));
-        }
-        Ok(())
+        self.invalidate(ChromeSection::Header, owner, cancellation)
+    }
+
+    fn set_footer_renderer(
+        &self,
+        owner: &str,
+        renderer: Option<Arc<dyn FooterRenderer>>,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        self.mount(
+            ChromeSection::Footer,
+            owner,
+            renderer.map(ChromeRenderer::Footer),
+            cancellation,
+        )
+    }
+
+    fn invalidate_footer_renderer(
+        &self,
+        owner: &str,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        self.invalidate(ChromeSection::Footer, owner, cancellation)
     }
 
     async fn request(
@@ -320,10 +441,14 @@ impl ExtensionUi for Broker {
         }
         if matches!(
             request,
-            UiRequest::SetHeaderRenderer { .. } | UiRequest::InvalidateHeaderRenderer
+            UiRequest::SetHeaderRenderer { .. }
+                | UiRequest::InvalidateHeaderRenderer
+                | UiRequest::SetFooterRenderer { .. }
+                | UiRequest::InvalidateFooterRenderer
         ) {
             return Err(
-                "dynamic headers require an extension presentation lifecycle callback".into(),
+                "dynamic headers and footers require an extension presentation lifecycle callback"
+                    .into(),
             );
         }
         if matches!(
@@ -377,12 +502,17 @@ impl ExtensionUi for Broker {
         let mut event = serde_json::to_value(&request).map_err(|error| error.to_string())?;
         event["type"] = serde_json::json!("extension_ui_request");
         event["id"] = serde_json::json!(id);
-        if matches!(request, UiRequest::SetHeader { .. }) {
-            let mut header = self.header.lock().expect("extension header");
+        let static_section = match request {
+            UiRequest::SetHeader { .. } => Some(ChromeSection::Header),
+            UiRequest::SetFooter { .. } => Some(ChromeSection::Footer),
+            _ => None,
+        };
+        if let Some(section) = static_section {
+            let mut mounted = self.slot(section).mounted.lock().expect("extension chrome");
             if cancellation.is_cancelled() {
                 return Err("extension UI cancelled".into());
             }
-            header.take();
+            mounted.take();
             super::output(event);
         } else {
             super::output(event);
@@ -646,23 +776,26 @@ else:
         // The worker calls the same snapshot presentation path on session start.
         mount().await;
         let header = || {
-            let lock = ui.header.lock().unwrap();
+            let lock = ui.slot(ChromeSection::Header).mounted.lock().unwrap();
             let header = lock.as_ref().unwrap();
             assert_eq!(header.owner, "header-test");
-            (header.id, Arc::downgrade(&header.renderer))
+            let ChromeRenderer::Header(renderer) = &header.renderer else {
+                panic!("expected a header")
+            };
+            (header.id, Arc::downgrade(renderer))
         };
         let (first, renderer) = header();
-        let context = HeaderRenderContext {
+        let context = ChromeRenderContext::Header(HeaderRenderContext {
             width: 72,
             theme: crate::ui::theme::Theme::system().extension_render_theme(),
-        };
-        let render = ui.admit_header_render(first, context.clone()).unwrap();
+        });
+        let render = ui.admit_chrome_render(first, context.clone()).unwrap();
         let (rendered, ()) = tokio::join!(render, async {
             entered.notified().await;
             mount().await;
             let (replacement, _) = header();
             assert!(
-                ui.admit_header_render(replacement, context.clone())
+                ui.admit_chrome_render(replacement, context.clone())
                     .is_none()
             );
         });
@@ -670,7 +803,7 @@ else:
         assert!(renderer.upgrade().is_none());
         let (second, renderer) = header();
         assert_ne!(first, second);
-        assert!(ui.admit_header_render(first, context).is_none());
+        assert!(ui.admit_chrome_render(first, context).is_none());
 
         ui.request(
             UiRequest::SetHeader {
@@ -681,112 +814,39 @@ else:
         .await
         .unwrap();
         assert!(renderer.upgrade().is_none());
-        assert!(ui.header.lock().unwrap().is_none());
+        assert!(
+            ui.slot(ChromeSection::Header)
+                .mounted
+                .lock()
+                .unwrap()
+                .is_none()
+        );
         mount().await;
         let (_, renderer) = header();
-        ui.clear_header_renderer().await;
+        ui.clear_chrome_renderers().await;
         assert!(renderer.upgrade().is_none());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn dynamic_header_panic_completes_with_fallback_and_allows_replacement() {
-        struct PanickingRenderer {
-            entered: Option<Arc<tokio::sync::Notify>>,
-            request_token: Arc<Mutex<Option<CancellationToken>>>,
-        }
-
-        #[async_trait::async_trait]
-        impl HeaderRenderer for PanickingRenderer {
-            async fn render(
-                &self,
-                _: &HeaderRenderContext,
-            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
-                panic!("in-process header renderer failed");
-            }
-
-            async fn render_with_cancellation(
-                &self,
-                context: &HeaderRenderContext,
-                cancellation: &CancellationToken,
-            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
-                *self.request_token.lock().unwrap() = Some(cancellation.clone());
-                if let Some(entered) = &self.entered {
-                    entered.notify_one();
-                    cancellation.cancelled().await;
-                }
-                self.render(context).await
-            }
-        }
-
-        struct GoodRenderer;
-
-        #[async_trait::async_trait]
-        impl HeaderRenderer for GoodRenderer {
-            async fn render(
-                &self,
-                context: &HeaderRenderContext,
-            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
-                Ok(Some(RenderedExtensionRows {
-                    lines: vec![vec![pi_rs::UiComponentSpan {
-                        text: format!("replacement at {}", context.width),
-                        ..Default::default()
-                    }]],
-                    ..Default::default()
-                }))
-            }
-        }
-
-        let ui = Broker::new(true);
-        let context = HeaderRenderContext {
-            width: 72,
-            theme: crate::ui::theme::Theme::system().extension_render_theme(),
-        };
-        let mount = |renderer: Arc<dyn HeaderRenderer>| {
-            ui.set_header_renderer("test", Some(renderer), &CancellationToken::new())
-                .unwrap();
-            ui.header.lock().unwrap().as_ref().unwrap().id
-        };
-
-        for entered in [None, Some(Arc::new(tokio::sync::Notify::new()))] {
-            let request_token = Arc::new(Mutex::new(None));
-            let id = mount(Arc::new(PanickingRenderer {
-                entered: entered.clone(),
-                request_token: request_token.clone(),
-            }));
-            // As in the worker, a successful join lets the caller report completion.
-            let running = tokio::spawn(ui.admit_header_render(id, context.clone()).unwrap());
-            let replacement = if let Some(entered) = entered {
-                entered.notified().await;
-                Some(mount(Arc::new(GoodRenderer)))
-            } else {
-                None
-            };
-            assert!(running.await.unwrap().is_none());
-            assert!(
-                request_token
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .is_cancelled()
-            );
-            let replacement = replacement.unwrap_or_else(|| mount(Arc::new(GoodRenderer)));
-            let rows = ui
-                .admit_header_render(replacement, context.clone())
-                .unwrap()
-                .await
-                .unwrap();
-            assert_eq!(rows.lines[0][0].text, "replacement at 72");
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn dynamic_header_deadline_includes_scheduling_and_clear_waits_for_cleanup() {
+    async fn dynamic_chrome_deadline_includes_scheduling_and_clear_waits_for_cleanup() {
         #[derive(Default)]
         struct Renderer {
             entered: tokio::sync::Notify,
             cancelled: tokio::sync::Notify,
             finish_cleanup: tokio::sync::Notify,
+        }
+
+        impl Renderer {
+            async fn run(
+                &self,
+                cancellation: &CancellationToken,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                self.entered.notify_one();
+                cancellation.cancelled().await;
+                self.cancelled.notify_one();
+                self.finish_cleanup.notified().await;
+                Ok(Some(RenderedExtensionRows::default()))
+            }
         }
 
         #[async_trait::async_trait]
@@ -803,50 +863,271 @@ else:
                 _: &HeaderRenderContext,
                 cancellation: &CancellationToken,
             ) -> ExtensionResult<Option<RenderedExtensionRows>> {
-                self.entered.notify_one();
-                cancellation.cancelled().await;
-                self.cancelled.notify_one();
-                self.finish_cleanup.notified().await;
+                self.run(cancellation).await
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl FooterRenderer for Renderer {
+            async fn render(
+                &self,
+                _: &FooterRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                panic!("the broker must pass a cancellation token");
+            }
+
+            async fn render_with_cancellation(
+                &self,
+                _: &FooterRenderContext,
+                cancellation: &CancellationToken,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                self.run(cancellation).await
+            }
+        }
+
+        for section in ChromeSection::ALL {
+            let ui = Broker::new(true);
+            let renderer = Arc::new(Renderer::default());
+            let theme = crate::ui::theme::Theme::system().extension_render_theme();
+            let context = match section {
+                ChromeSection::Header => {
+                    ChromeRenderContext::Header(HeaderRenderContext { width: 72, theme })
+                }
+                ChromeSection::Footer => ChromeRenderContext::Footer(FooterRenderContext {
+                    width: 72,
+                    theme,
+                    data: Default::default(),
+                }),
+            };
+            let mount = || {
+                let token = CancellationToken::new();
+                match section {
+                    ChromeSection::Header => {
+                        ui.set_header_renderer("test", Some(renderer.clone()), &token)
+                    }
+                    ChromeSection::Footer => {
+                        ui.set_footer_renderer("test", Some(renderer.clone()), &token)
+                    }
+                }
+                .unwrap();
+                ui.slot(section)
+                    .mounted
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .id
+            };
+
+            let id = mount();
+            let delayed = ui.admit_chrome_render(id, context.clone()).unwrap();
+            assert!(ui.admit_chrome_render(id, context.clone()).is_none());
+            tokio::time::advance(Duration::from_millis(500)).await;
+            assert!(delayed.await.is_none());
+            assert!(futures_util::poll!(std::pin::pin!(renderer.entered.notified())).is_pending());
+
+            for expires in [true, false] {
+                let id = mount();
+                let running = tokio::spawn(ui.admit_chrome_render(id, context.clone()).unwrap());
+                renderer.entered.notified().await;
+                let mut clear = std::pin::pin!(ui.clear_chrome_renderers());
+                if expires {
+                    tokio::time::advance(Duration::from_millis(500)).await;
+                } else {
+                    assert!(futures_util::poll!(&mut clear).is_pending());
+                }
+                renderer.cancelled.notified().await;
+                assert!(futures_util::poll!(&mut clear).is_pending());
+                assert!(!running.is_finished());
+                renderer.finish_cleanup.notify_one();
+                clear.await;
+                assert!(running.await.unwrap().is_none());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_chrome_panic_returns_fallback_and_allows_replacement() {
+        struct Renderer {
+            should_panic: bool,
+            entered: Option<Arc<tokio::sync::Notify>>,
+            request_token: Arc<Mutex<Option<CancellationToken>>>,
+        }
+
+        impl Renderer {
+            async fn run(
+                &self,
+                cancellation: &CancellationToken,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                *self.request_token.lock().unwrap() = Some(cancellation.clone());
+                if let Some(entered) = &self.entered {
+                    entered.notify_one();
+                    cancellation.cancelled().await;
+                }
+                assert!(!self.should_panic, "test renderer panic");
+                Ok(Some(RenderedExtensionRows::default()))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl HeaderRenderer for Renderer {
+            async fn render(
+                &self,
+                _: &HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                panic!("the broker must pass a cancellation token");
+            }
+
+            async fn render_with_cancellation(
+                &self,
+                _: &HeaderRenderContext,
+                cancellation: &CancellationToken,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                self.run(cancellation).await
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl FooterRenderer for Renderer {
+            async fn render(
+                &self,
+                _: &FooterRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                panic!("the broker must pass a cancellation token");
+            }
+
+            async fn render_with_cancellation(
+                &self,
+                _: &FooterRenderContext,
+                cancellation: &CancellationToken,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                self.run(cancellation).await
+            }
+        }
+
+        for section in ChromeSection::ALL {
+            let ui = Broker::new(true);
+            let theme = crate::ui::theme::Theme::system().extension_render_theme();
+            let context = match section {
+                ChromeSection::Header => {
+                    ChromeRenderContext::Header(HeaderRenderContext { width: 72, theme })
+                }
+                ChromeSection::Footer => ChromeRenderContext::Footer(FooterRenderContext {
+                    width: 72,
+                    theme,
+                    data: Default::default(),
+                }),
+            };
+            let request_token = Arc::new(Mutex::new(None));
+            let mount = |should_panic, entered| {
+                let renderer = Arc::new(Renderer {
+                    should_panic,
+                    entered,
+                    request_token: request_token.clone(),
+                });
+                let renderer = match section {
+                    ChromeSection::Header => ChromeRenderer::Header(renderer),
+                    ChromeSection::Footer => ChromeRenderer::Footer(renderer),
+                };
+                ui.mount(section, "test", Some(renderer), &CancellationToken::new())
+                    .unwrap();
+                ui.slot(section)
+                    .mounted
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .id
+            };
+            let render = |id| tokio::spawn(ui.admit_chrome_render(id, context.clone()).unwrap());
+
+            for entered in [None, Some(Arc::new(tokio::sync::Notify::new()))] {
+                let running = render(mount(true, entered.clone()));
+                let replacement = if let Some(entered) = entered {
+                    entered.notified().await;
+                    Some(mount(false, None))
+                } else {
+                    None
+                };
+                assert!(running.await.unwrap().is_none());
+                assert!(
+                    request_token
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .is_cancelled()
+                );
+                let replacement = replacement.unwrap_or_else(|| mount(false, None));
+                assert_eq!(
+                    render(replacement).await.unwrap(),
+                    Some(RenderedExtensionRows::default())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_footer_disposes_only_its_mount_on_static_replacement() {
+        struct Footer(Arc<tokio::sync::Notify>);
+
+        #[async_trait::async_trait]
+        impl FooterRenderer for Footer {
+            async fn render(
+                &self,
+                _: &FooterRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        struct Header;
+        #[async_trait::async_trait]
+        impl HeaderRenderer for Header {
+            async fn render(
+                &self,
+                _: &HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
                 Ok(Some(RenderedExtensionRows::default()))
             }
         }
 
         let ui = Broker::new(true);
-        let renderer = Arc::new(Renderer::default());
-        let context = HeaderRenderContext {
-            width: 72,
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let header: Arc<dyn HeaderRenderer> = Arc::new(Header);
+        let footer: Arc<dyn FooterRenderer> = Arc::new(Footer(entered.clone()));
+        let header_reference = Arc::downgrade(&header);
+        let footer_reference = Arc::downgrade(&footer);
+        let token = CancellationToken::new();
+        ui.set_header_renderer("header", Some(header), &token)
+            .unwrap();
+        ui.set_footer_renderer("footer", Some(footer), &token)
+            .unwrap();
+        let mount = ui
+            .slot(ChromeSection::Footer)
+            .mounted
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .id;
+        let context = ChromeRenderContext::Footer(FooterRenderContext {
+            width: 40,
             theme: crate::ui::theme::Theme::system().extension_render_theme(),
-        };
-        let mount = || {
-            ui.set_header_renderer("test", Some(renderer.clone()), &CancellationToken::new())
+            data: Default::default(),
+        });
+        let (rows, ()) = tokio::join!(ui.admit_chrome_render(mount, context).unwrap(), async {
+            entered.notified().await;
+            ui.request(UiRequest::SetFooter { lines: None }, token.clone())
+                .await
                 .unwrap();
-            ui.header.lock().unwrap().as_ref().unwrap().id
-        };
-
-        let id = mount();
-        let delayed = ui.admit_header_render(id, context.clone()).unwrap();
-        assert!(ui.admit_header_render(id, context.clone()).is_none());
-        tokio::time::advance(Duration::from_millis(500)).await;
-        assert!(delayed.await.is_none());
-        assert!(futures_util::poll!(std::pin::pin!(renderer.entered.notified())).is_pending());
-
-        for expires in [true, false] {
-            let id = mount();
-            let running = tokio::spawn(ui.admit_header_render(id, context.clone()).unwrap());
-            renderer.entered.notified().await;
-            let mut clear = std::pin::pin!(ui.clear_header_renderer());
-            if expires {
-                tokio::time::advance(Duration::from_millis(500)).await;
-            } else {
-                assert!(futures_util::poll!(&mut clear).is_pending());
-            }
-            renderer.cancelled.notified().await;
-            assert!(futures_util::poll!(&mut clear).is_pending());
-            assert!(!running.is_finished());
-            renderer.finish_cleanup.notify_one();
-            clear.await;
-            assert!(running.await.unwrap().is_none());
-        }
+        });
+        assert!(rows.is_none());
+        assert!(footer_reference.upgrade().is_none());
+        assert!(header_reference.upgrade().is_some());
+        ui.clear_chrome_renderers().await;
+        assert!(header_reference.upgrade().is_none());
     }
 
     #[tokio::test]

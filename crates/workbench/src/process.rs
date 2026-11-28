@@ -173,8 +173,8 @@ pub(super) struct Worker {
     refresh_barrier: tempfile::NamedTempFile,
     events: Receiver<Value>,
     pending_events: Vec<Value>,
-    pub(super) header_renderer: Option<uuid::Uuid>,
-    pub(super) pending_header_render: Option<uuid::Uuid>,
+    pub(super) chrome_renderers: [Option<uuid::Uuid>; 2],
+    pub(super) pending_chrome_renders: [Option<uuid::Uuid>; 2],
     pub(super) pending_theme_requests: std::collections::BTreeSet<Uuid>,
     extension_sources: std::collections::BTreeMap<String, Value>,
     pub(super) message_renderer_types: std::collections::BTreeSet<String>,
@@ -473,8 +473,8 @@ impl Worker {
             refresh_barrier,
             events,
             pending_events: startup_warnings,
-            header_renderer: None,
-            pending_header_render: None,
+            chrome_renderers: [None; 2],
+            pending_chrome_renders: [None; 2],
             pending_theme_requests: Default::default(),
             extension_sources: Default::default(),
             message_renderer_types: Default::default(),
@@ -889,8 +889,12 @@ impl Worker {
         events.retain(|event| {
             !(matches!(
                 event["type"].as_str(),
-                Some("header_renderer_changed" | "header_renderer_invalidated" | "header_rendered")
-            ) || event["type"] == "extension_ui_request" && event["method"] == "setHeader")
+                Some("chrome_renderer_changed" | "chrome_renderer_invalidated" | "chrome_rendered")
+            ) || event["type"] == "extension_ui_request"
+                && matches!(
+                    event["method"].as_str(),
+                    Some("setHeader" | "setFooter" | "setStatus")
+                ))
         });
         events
     }
@@ -1125,8 +1129,8 @@ mod tests {
             stdin,
             events,
             pending_events: Vec::new(),
-            header_renderer: None,
-            pending_header_render: None,
+            chrome_renderers: [None; 2],
+            pending_chrome_renders: [None; 2],
             pending_theme_requests: Default::default(),
             extension_sources: Default::default(),
             message_renderer_types: Default::default(),

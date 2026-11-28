@@ -46,10 +46,10 @@ enum Request {
     },
     CacheWarmingChanged,
     TransportChanged,
-    RenderHeader {
+    RenderChrome {
         id: Uuid,
         renderer: Uuid,
-        context: pi_rs::HeaderRenderContext,
+        context: super::extension_ui::ChromeRenderContext,
     },
     RenderTool {
         id: Uuid,
@@ -1333,7 +1333,7 @@ async fn run_worker(
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
-                ui.clear_header_renderer().await;
+                ui.clear_chrome_renderers().await;
                 share_ready.send_replace(false);
                 if runtime.registry.has_resource_discovery_hooks() {
                     resources_ready.send_replace(false);
@@ -2040,7 +2040,7 @@ async fn run_worker(
                 .await;
         }
     }
-    ui.clear_header_renderer().await;
+    ui.clear_chrome_renderers().await;
     cancel_active(&active);
     let shell_pending = active.lock().expect("worker control").shell.is_some();
     if shell_pending && let Some(shell) = shell_results.recv().await {
@@ -2370,7 +2370,7 @@ fn read_requests(
                 }
             };
             match request {
-                Request::RenderHeader {
+                Request::RenderChrome {
                     id,
                     renderer,
                     context,
@@ -2378,13 +2378,16 @@ fn read_requests(
                     if !terminal_managed {
                         continue;
                     }
-                    if let Some(render) = ui.admit_header_render(renderer, context) {
+                    let section = context.section();
+                    if let Some(render) = ui.admit_chrome_render(renderer, context) {
                         runtime.spawn(async move {
                             let rendered = render.await;
-                            output(json!({"type":"header_rendered","id":id,"rendered":rendered}));
+                            output(json!({"type":"chrome_rendered","section":section,"id":id,"rendered":rendered}));
                         });
                     } else {
-                        output(json!({"type":"header_rendered","id":id,"rendered":null}));
+                        output(
+                            json!({"type":"chrome_rendered","section":section,"id":id,"rendered":null}),
+                        );
                     }
                 }
                 Request::RenderTool {

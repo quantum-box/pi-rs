@@ -764,8 +764,13 @@ enum ModelListIntent {
     ThinkingSettings,
 }
 
+struct DiscoveredModelNames {
+    models: Vec<String>,
+    provider_count: Option<usize>,
+}
+
 struct ModelDiscovery {
-    receiver: std::sync::mpsc::Receiver<Result<Vec<String>>>,
+    receiver: std::sync::mpsc::Receiver<Result<DiscoveredModelNames>>,
     intent: ModelListIntent,
 }
 
@@ -1218,6 +1223,8 @@ struct LiveModelChoice {
     persist: Option<SelectionDefault>,
 }
 
+use super::extension_ui::{ChromeRenderContext, ChromeSection};
+
 enum SelectionDefault {
     Model,
     Thinking(String),
@@ -1226,43 +1233,60 @@ enum SelectionDefault {
 #[derive(Default)]
 struct ExtensionChrome {
     header: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
-    dynamic_header: Option<DynamicHeader>,
+    dynamic: [Option<DynamicChrome>; 2],
     footer: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
     working: ExtensionWorkingStatus,
     hidden_thinking_label: Option<String>,
     editor: Option<crate::ui::editor::ExtensionEditor>,
 }
 
-struct DynamicHeader {
+struct DynamicChrome {
     renderer: uuid::Uuid,
     rows: Option<pi_rs::RenderedExtensionRows>,
-    attempted: Option<(u16, Theme)>,
+    attempted: Option<(u16, Theme, Option<pi_rs::FooterRenderData>)>,
     pending: Option<uuid::Uuid>,
 }
 
-impl DynamicHeader {
-    fn request(&mut self, width: u16, theme: &Theme) -> Option<(uuid::Uuid, Value)> {
-        if self.pending.is_some() || self.was_requested(width, theme) {
+impl DynamicChrome {
+    fn request(
+        &mut self,
+        width: u16,
+        theme: &Theme,
+        data: Option<&pi_rs::FooterRenderData>,
+    ) -> Option<(uuid::Uuid, Value)> {
+        if self.pending.is_some() || self.was_requested(width, theme, data) {
             return None;
         }
         let id = uuid::Uuid::new_v4();
         self.pending = Some(id);
         self.rows = None;
-        self.attempted = Some((width, theme.clone()));
-        let context = pi_rs::HeaderRenderContext {
-            width,
-            theme: theme.extension_render_theme(),
+        self.attempted = Some((width, theme.clone(), data.cloned()));
+        let theme = theme.extension_render_theme();
+        let context = match data {
+            None => ChromeRenderContext::Header(pi_rs::HeaderRenderContext { width, theme }),
+            Some(data) => ChromeRenderContext::Footer(pi_rs::FooterRenderContext {
+                width,
+                theme,
+                data: data.clone(),
+            }),
         };
         Some((
             id,
-            json!({"type":"render_header","id":id,"renderer":self.renderer,"context":context}),
+            json!({"type":"render_chrome","id":id,"renderer":self.renderer,"context":context}),
         ))
     }
 
-    fn was_requested(&self, width: u16, theme: &Theme) -> bool {
+    fn was_requested(
+        &self,
+        width: u16,
+        theme: &Theme,
+        data: Option<&pi_rs::FooterRenderData>,
+    ) -> bool {
         self.attempted
             .as_ref()
-            .is_some_and(|(columns, palette)| *columns == width && palette == theme)
+            .is_some_and(|(columns, palette, snapshot)| {
+                *columns == width && palette == theme && snapshot.as_ref() == data
+            })
     }
 
     fn invalidate(&mut self) -> bool {
@@ -1272,19 +1296,25 @@ impl DynamicHeader {
         self.rows.take().is_some()
     }
 
-    fn receive(&mut self, event: &Value, width: u16, theme: &Theme) -> bool {
+    fn receive(
+        &mut self,
+        event: &Value,
+        width: u16,
+        theme: &Theme,
+        data: Option<&pi_rs::FooterRenderData>,
+    ) -> bool {
         if self.pending.is_none_or(|id| event["id"] != json!(id)) {
             return false;
         }
         self.pending = None;
-        if !self.was_requested(width, theme) {
+        if !self.was_requested(width, theme, data) {
             self.attempted = None;
             return false;
         }
         let rows =
             serde_json::from_value::<pi_rs::RenderedExtensionRows>(event["rendered"].clone())
                 .ok()
-                .filter(pi_rs::RenderedExtensionRows::within_header_limits);
+                .filter(pi_rs::RenderedExtensionRows::within_chrome_limits);
         if self.rows == rows {
             return false;
         }
@@ -1429,6 +1459,7 @@ struct View {
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
     extension_chrome: ExtensionChrome,
+    footer_data: footer::FooterData,
     lines: Vec<Entry>,
     custom_entry_count: usize,
     custom_render_options: Option<pi_rs::CustomMessageRenderOptions>,
@@ -1529,6 +1560,7 @@ fn append_indexed(
 impl View {
     fn invalidate_model_catalog(&mut self) {
         self.available_models.clear();
+        self.footer_data.catalog_provider_count = None;
         self.model_list = None;
         if self.thinking_settings.take().is_some()
             || self.picker.as_ref().is_some_and(|picker| {
@@ -1723,6 +1755,7 @@ impl View {
                 } else {
                     self.ui_status.remove(&key);
                 }
+                self.footer_data.update_statuses(&self.ui_status);
             }
             pi_rs::UiRequest::SetWidget {
                 key,
@@ -1741,14 +1774,20 @@ impl View {
                 }
             }
             pi_rs::UiRequest::SetHeader { lines } => {
-                if self.extension_chrome.dynamic_header.take().is_some()
+                if self.extension_chrome.dynamic[ChromeSection::Header as usize]
+                    .take()
+                    .is_some()
                     || self.extension_chrome.header != lines
                 {
                     self.extension_chrome.header = lines;
                     self.regular.redraw = true;
                 }
             }
-            pi_rs::UiRequest::SetFooter { lines } => self.extension_chrome.footer = lines,
+            pi_rs::UiRequest::SetFooter { lines } => {
+                self.extension_chrome.dynamic[ChromeSection::Footer as usize].take();
+                self.footer_data.stop_branch_probe();
+                self.extension_chrome.footer = lines;
+            }
             pi_rs::UiRequest::SetWorkingMessage { message } => {
                 self.extension_chrome.working.message = message;
             }
@@ -1822,20 +1861,121 @@ impl View {
         }
         Ok(None)
     }
-    fn mount_header_renderer(&mut self, renderer: Option<uuid::Uuid>) {
-        self.extension_chrome.header = None;
-        self.extension_chrome.dynamic_header = renderer.map(|renderer| DynamicHeader {
+    fn mount_chrome_renderer(&mut self, section: ChromeSection, renderer: Option<uuid::Uuid>) {
+        match section {
+            ChromeSection::Header => self.extension_chrome.header = None,
+            ChromeSection::Footer => {
+                self.extension_chrome.footer = None;
+                if renderer.is_none() {
+                    self.footer_data.stop_branch_probe();
+                }
+            }
+        }
+        self.extension_chrome.dynamic[section as usize] = renderer.map(|renderer| DynamicChrome {
             renderer,
             rows: None,
             attempted: None,
             pending: None,
         });
-        self.regular.redraw = true;
+        self.regular.redraw |= section == ChromeSection::Header;
+    }
+
+    fn prepare_chrome_render(&mut self, worker: &mut Worker, args: &Cli, theme: &Theme) -> bool {
+        let footer_mounted =
+            self.extension_chrome.dynamic[ChromeSection::Footer as usize].is_some();
+        if footer_mounted {
+            self.footer_data.refresh_branch(&args.workspace);
+        }
+        if self.extension_chrome.dynamic.iter().all(Option::is_none) {
+            return false;
+        }
+        let Ok((width, _)) = terminal::size() else {
+            return false;
+        };
+        let data = footer_mounted.then(|| self.footer_data.snapshot(args));
+        let mut changed = false;
+        for section in ChromeSection::ALL {
+            let index = section as usize;
+            // Keep the request slot across mounts until the old render has cancelled.
+            if worker.pending_chrome_renders[index].is_some() {
+                continue;
+            }
+            let footer = if section == ChromeSection::Footer {
+                data
+            } else {
+                None
+            };
+            if let Some(chrome) = &mut self.extension_chrome.dynamic[index] {
+                let had_rows = chrome.rows.is_some();
+                if let Some((id, request)) = chrome.request(width.max(1), theme, footer) {
+                    changed |= had_rows;
+                    self.regular.redraw |= had_rows && section == ChromeSection::Header;
+                    if worker.send(request).is_ok() {
+                        worker.pending_chrome_renders[index] = Some(id);
+                    } else {
+                        chrome.pending = None;
+                        chrome.attempted = None;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn receive_chrome_event(
+        &mut self,
+        worker: &mut Worker,
+        event: &Value,
+        args: &Cli,
+        theme: &Theme,
+    ) -> bool {
+        let Ok(section) = serde_json::from_value::<ChromeSection>(event["section"].clone()) else {
+            return false;
+        };
+        let index = section as usize;
+        let changed = match event["type"].as_str() {
+            Some("chrome_renderer_changed") => {
+                worker.chrome_renderers[index] =
+                    serde_json::from_value(event["renderer"].clone()).ok();
+                self.mount_chrome_renderer(section, worker.chrome_renderers[index]);
+                true
+            }
+            Some("chrome_renderer_invalidated") => self.extension_chrome.dynamic[index]
+                .as_mut()
+                .is_some_and(|chrome| {
+                    event["renderer"] == json!(chrome.renderer) && chrome.invalidate()
+                }),
+            Some("chrome_rendered") => {
+                if worker.pending_chrome_renders[index].is_none_or(|id| event["id"] != json!(id)) {
+                    return false;
+                }
+                worker.pending_chrome_renders[index] = None;
+                let Some(chrome) = &mut self.extension_chrome.dynamic[index] else {
+                    return false;
+                };
+                let data = (section == ChromeSection::Footer).then(|| {
+                    self.footer_data.refresh_branch(&args.workspace);
+                    self.footer_data.snapshot(args)
+                });
+                let width = terminal::size().map_or(0, |(width, _)| width.max(1));
+                chrome.receive(event, width, theme, data)
+            }
+            _ => false,
+        };
+        self.regular.redraw |= changed && section == ChromeSection::Header;
+        changed
     }
 
     fn clear_extension_chrome(&mut self) -> bool {
         let static_header = self.extension_chrome.header.take().is_some();
-        let header_changed = self.extension_chrome.dynamic_header.take().is_some() || static_header;
+        let header_changed = self.extension_chrome.dynamic[ChromeSection::Header as usize]
+            .take()
+            .is_some()
+            || static_header;
+        let dynamic_footer = self.extension_chrome.dynamic[ChromeSection::Footer as usize]
+            .take()
+            .is_some();
+        self.footer_data.stop_branch_probe();
         let label_changed = self.extension_chrome.hidden_thinking_label.take().is_some();
         let editor_changed = self.extension_chrome.editor.take().is_some();
         self.regular.redraw |= header_changed || label_changed;
@@ -1844,6 +1984,7 @@ impl View {
         }
         let working = std::mem::take(&mut self.extension_chrome.working);
         self.extension_chrome.footer.take().is_some()
+            || dynamic_footer
             || header_changed
             || label_changed
             || editor_changed
@@ -1863,12 +2004,10 @@ impl View {
         if let Some(lines) = &self.extension_chrome.header {
             return crate::ui::render::component_lines_bounded(lines, theme, width, max.min(16));
         }
-        if let Some(rows) = self
-            .extension_chrome
-            .dynamic_header
+        if let Some(rows) = self.extension_chrome.dynamic[ChromeSection::Header as usize]
             .as_ref()
             .filter(|header| {
-                u16::try_from(width).is_ok_and(|width| header.was_requested(width, theme))
+                u16::try_from(width).is_ok_and(|width| header.was_requested(width, theme, None))
             })
             .and_then(|header| header.rows.as_ref())
         {
@@ -1899,6 +2038,17 @@ impl View {
     ) -> Vec<Line> {
         if let Some(lines) = &self.extension_chrome.footer {
             return crate::ui::render::component_lines_bounded(lines, theme, width, max.min(16));
+        }
+        if let Some(rows) = self.extension_chrome.dynamic[ChromeSection::Footer as usize]
+            .as_ref()
+            .filter(|footer| {
+                u16::try_from(width).is_ok_and(|width| {
+                    footer.was_requested(width, theme, Some(self.footer_data.current()))
+                })
+            })
+            .and_then(|footer| footer.rows.as_ref())
+        {
+            return crate::ui::render::extension_rows_bounded(rows, theme, width, max.min(16));
         }
         let model = self.model_display(args);
         let usage = if fullscreen {
@@ -3487,6 +3637,7 @@ impl View {
         self.tree_confirmation = None;
         self.queue_restores.clear();
         self.ui_status.clear();
+        self.footer_data.update_statuses(&self.ui_status);
         self.widgets.clear();
         self.history_index = None;
         self.tokens = 0;
@@ -6779,8 +6930,14 @@ pub(super) async fn run(
         {
             let intent = discovery.intent.clone();
             match discovery.receiver.try_recv() {
-                Ok(Ok(models)) => {
+                Ok(Ok(DiscoveredModelNames {
+                    models,
+                    provider_count,
+                })) => {
                     view.model_list = None;
+                    if provider_count.is_some() {
+                        view.footer_data.catalog_provider_count = provider_count;
+                    }
                     if models.is_empty() {
                         if let Some(mut state) = view.thinking_settings.take() {
                             state
@@ -6926,14 +7083,15 @@ pub(super) async fn run(
             }
         }
         if let Some(active) = &mut worker {
-            if view
-                .extension_chrome
-                .dynamic_header
-                .as_ref()
-                .is_some_and(|header| Some(header.renderer) != active.header_renderer)
-            {
-                view.mount_header_renderer(None);
-                dirty = true;
+            for section in ChromeSection::ALL {
+                let index = section as usize;
+                if view.extension_chrome.dynamic[index]
+                    .as_ref()
+                    .is_some_and(|chrome| Some(chrome.renderer) != active.chrome_renderers[index])
+                {
+                    view.mount_chrome_renderer(section, None);
+                    dirty = true;
+                }
             }
             if (active.busy || active.bashing) && view.request_started.is_none() {
                 view.request_started = Some(Instant::now());
@@ -6966,40 +7124,15 @@ pub(super) async fn run(
                     view.tool_preview_pending = None;
                     dirty |= view.invalidate_tool_renderings();
                 }
-                if value["type"] == "header_renderer_changed" {
-                    active.header_renderer = serde_json::from_value(value["renderer"].clone()).ok();
-                    view.mount_header_renderer(active.header_renderer);
-                    dirty = true;
-                    continue;
-                }
-                if value["type"] == "header_renderer_invalidated" {
-                    if let Some(header) = &mut view.extension_chrome.dynamic_header
-                        && value["renderer"] == json!(header.renderer)
-                        && header.invalidate()
-                    {
-                        view.regular.redraw = true;
-                        dirty = true;
-                    }
-                    continue;
-                }
-                if value["type"] == "header_rendered" {
-                    if active
-                        .pending_header_render
-                        .is_none_or(|id| value["id"] != json!(id))
-                    {
-                        continue;
-                    }
-                    active.pending_header_render = None;
-                    if let Some(header) = &mut view.extension_chrome.dynamic_header
-                        && header.receive(
-                            &value,
-                            terminal::size().map_or(0, |(width, _)| width.max(1)),
-                            &theme,
-                        )
-                    {
-                        view.regular.redraw = true;
-                        dirty = true;
-                    }
+                if matches!(
+                    value["type"].as_str(),
+                    Some(
+                        "chrome_renderer_changed"
+                            | "chrome_renderer_invalidated"
+                            | "chrome_rendered"
+                    )
+                ) {
+                    dirty |= view.receive_chrome_event(active, &value, &args, &theme);
                     continue;
                 }
                 if value["type"] == "tool_rendered" {
@@ -7030,11 +7163,15 @@ pub(super) async fn run(
                     match view.ui_request(&value) {
                         Ok(Some((id, value))) => active
                             .send(json!({"type":"extension_ui_response","id":id,"value":value}))?,
-                        Ok(None) => {
-                            if value["method"] == "setHeader" {
-                                active.header_renderer = None;
+                        Ok(None) => match value["method"].as_str() {
+                            Some("setHeader") => {
+                                active.chrome_renderers[ChromeSection::Header as usize] = None
                             }
-                        }
+                            Some("setFooter") => {
+                                active.chrome_renderers[ChromeSection::Footer as usize] = None
+                            }
+                            _ => {}
+                        },
                         Err(error) => {
                             view.append(&error.to_string());
                             active.send(json!({"type":"extension_ui_response","id":value["id"],"value":null}))?;
@@ -7170,19 +7307,7 @@ pub(super) async fn run(
                 }
                 dirty = true;
             }
-            // The worker slot remains occupied across replacement mounts
-            // until the old renderer has finished cancelling.
-            if active.pending_header_render.is_none()
-                && let Some(header) = &mut view.extension_chrome.dynamic_header
-                && let Ok((width, _)) = terminal::size()
-                && let Some((id, request)) = header.request(width.max(1), &theme)
-            {
-                if active.send(request).is_ok() {
-                    active.pending_header_render = Some(id);
-                } else {
-                    header.pending = None;
-                }
-            }
+            dirty |= view.prepare_chrome_render(active, &args, &theme);
             dirty |= view.prepare_transcript_extension_render(active, &args);
             dirty |= view.prepare_tool_render(active, &args);
             view.prepare_markdown_transform(active, &args);
@@ -8736,6 +8861,7 @@ pub(super) async fn run(
                             view.cache_warming_status = None;
                             view.dialogs.clear();
                             view.ui_status.clear();
+                            view.footer_data.update_statuses(&view.ui_status);
                             view.widgets.clear();
                             view.clear_extension_chrome();
                             args.settings =
@@ -8751,6 +8877,7 @@ pub(super) async fn run(
                                 Some(AuthReload::start(args.model_keys.revision().to_owned()));
                             view.append("Reloading provider credentials (Esc to cancel)");
                             args.reload_model_profiles()?;
+                            view.footer_data.catalog_provider_count = None;
                             {
                                 let preparation = super::packages::prepare(&args);
                                 tokio::pin!(preparation);
@@ -9870,11 +9997,16 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let catalogs = match runtime.block_on(super::model_selection::catalogs(&args, false)) {
-                Ok(catalogs) => catalogs,
-                Err(_) if thinking => Vec::new(),
-                Err(error) => return Err(error),
-            };
+            let (catalogs, provider_count) =
+                match runtime.block_on(super::model_selection::catalogs(&args, false)) {
+                    Ok(catalogs) => {
+                        let provider_count =
+                            super::model_selection::available_provider_count(&catalogs);
+                        (catalogs, Some(provider_count))
+                    }
+                    Err(_) if thinking => (Vec::new(), None),
+                    Err(error) => return Err(error),
+                };
             let mut models: Vec<_> = catalogs
                 .into_iter()
                 .flat_map(|catalog| {
@@ -9889,7 +10021,10 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
                 models.retain(|model| model != &current);
                 models.insert(0, current);
             }
-            Ok(models)
+            Ok(DiscoveredModelNames {
+                models,
+                provider_count,
+            })
         })();
         let _ = sender.send(result);
     });
@@ -11168,6 +11303,9 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
     }
     view.restore(&next)?;
     view.clear_extension_chrome();
+    if args.workspace != next.workspace {
+        view.invalidate_model_catalog();
+    }
     for warning in next.settings.diagnostics() {
         view.append(warning);
     }
@@ -11278,6 +11416,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
 
 #[cfg(unix)]
 mod editor_pty;
+mod footer;
 mod session_tree;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15423,7 +15562,14 @@ exit {exit}
         assert!(view.available_models.is_empty());
         assert!(view.model_list.is_none());
         assert!(view.picker.is_none());
-        assert!(sender.send(Ok(vec!["stale".into()])).is_err());
+        assert!(
+            sender
+                .send(Ok(super::DiscoveredModelNames {
+                    models: vec!["stale".into()],
+                    provider_count: Some(1),
+                }))
+                .is_err()
+        );
     }
 
     #[test]
@@ -15701,23 +15847,25 @@ exit {exit}
         let light = Theme::load("light", &[], &args.workspace, false, false).unwrap();
         let mut view = View::default();
         let renderer = uuid::Uuid::new_v4();
-        view.mount_header_renderer(Some(renderer));
-        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
-        let (_, first) = header.request(80, &dark).unwrap();
-        assert_eq!(first["context"]["width"], 80);
-        assert_eq!(first["context"]["theme"]["name"], "dark");
-        assert!(first["context"]["theme"]["colors"]["accent"].is_string());
-        assert!(header.request(80, &dark).is_none());
+        view.mount_chrome_renderer(ChromeSection::Header, Some(renderer));
+        let header = view.extension_chrome.dynamic[ChromeSection::Header as usize]
+            .as_mut()
+            .unwrap();
+        let (_, first) = header.request(80, &dark, None).unwrap();
+        assert_eq!(first["context"]["layout"]["width"], 80);
+        assert_eq!(first["context"]["layout"]["theme"]["name"], "dark");
+        assert!(first["context"]["layout"]["theme"]["colors"]["accent"].is_string());
+        assert!(header.request(80, &dark, None).is_none());
 
         let response = |request: &Value, text| {
             json!({
                 "id": request["id"], "rendered":{"lines":[[{"text":text,"color":"accent"}]]}
             })
         };
-        assert!(!header.receive(&response(&first, "stale"), 66, &dark));
-        let (_, resized) = header.request(66, &dark).unwrap();
-        assert_eq!(resized["context"]["width"], 66);
-        assert!(header.receive(&response(&resized, "resized"), 66, &dark));
+        assert!(!header.receive(&response(&first, "stale"), 66, &dark, None));
+        let (_, resized) = header.request(66, &dark, None).unwrap();
+        assert_eq!(resized["context"]["layout"]["width"], 66);
+        assert!(header.receive(&response(&resized, "resized"), 66, &dark, None));
 
         for fullscreen in [false, true] {
             for (width, theme) in [(80, &dark), (66, &light)] {
@@ -15729,21 +15877,25 @@ exit {exit}
                 );
             }
         }
-        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
-        let (_, themed) = header.request(66, &light).unwrap();
-        assert_eq!(themed["context"]["theme"]["name"], "light");
+        let header = view.extension_chrome.dynamic[ChromeSection::Header as usize]
+            .as_mut()
+            .unwrap();
+        let (_, themed) = header.request(66, &light, None).unwrap();
+        assert_eq!(themed["context"]["layout"]["theme"]["name"], "light");
         assert!(!header.invalidate());
-        assert!(!header.receive(&response(&themed, "old data"), 66, &light));
-        let (_, invalidated) = header.request(66, &light).unwrap();
-        assert!(header.receive(&response(&invalidated, "changed"), 66, &light));
-        assert!(header.request(66, &light).is_none());
+        assert!(!header.receive(&response(&themed, "old data"), 66, &light, None));
+        let (_, invalidated) = header.request(66, &light, None).unwrap();
+        assert!(header.receive(&response(&invalidated, "changed"), 66, &light, None));
+        assert!(header.request(66, &light, None).is_none());
 
         for fullscreen in [false, true] {
             let rows = view.header_lines(&args, &light, 66, 2, fullscreen);
             assert_eq!(rows[0].spans[0].text, "changed");
             assert_eq!(rows[0].spans[0].color, light.color("accent"));
         }
-        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
+        let header = view.extension_chrome.dynamic[ChromeSection::Header as usize]
+            .as_mut()
+            .unwrap();
         assert!(header.invalidate());
         for fullscreen in [false, true] {
             assert!(
@@ -15755,19 +15907,83 @@ exit {exit}
         }
         view.ui_request(&json!({"id":renderer,"method":"setHeader","lines":[[{"text":"static"}]]}))
             .unwrap();
-        assert!(view.extension_chrome.dynamic_header.is_none());
+        assert!(view.extension_chrome.dynamic[ChromeSection::Header as usize].is_none());
         assert_eq!(
             view.header_lines(&args, &light, 66, 2, false)[0].spans[0].text,
             "static"
         );
-        view.mount_header_renderer(Some(uuid::Uuid::new_v4()));
+        view.mount_chrome_renderer(ChromeSection::Header, Some(uuid::Uuid::new_v4()));
         assert!(view.extension_chrome.header.is_none());
-        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
-        let (_, replacement) = header.request(66, &light).unwrap();
-        assert!(!header.receive(&response(&invalidated, "previous mount"), 66, &light));
-        assert!(header.receive(&response(&replacement, "replacement"), 66, &light));
+        let header = view.extension_chrome.dynamic[ChromeSection::Header as usize]
+            .as_mut()
+            .unwrap();
+        let (_, replacement) = header.request(66, &light, None).unwrap();
+        assert!(!header.receive(&response(&invalidated, "previous mount"), 66, &light, None));
+        assert!(header.receive(&response(&replacement, "replacement"), 66, &light, None));
         assert!(view.clear_extension_chrome());
-        assert!(view.extension_chrome.dynamic_header.is_none());
+        assert!(view.extension_chrome.dynamic[ChromeSection::Header as usize].is_none());
+    }
+
+    #[test]
+    fn dynamic_footer_renders_data_changes_and_preserves_the_header_slot() {
+        use clap::Parser;
+        let args = super::Cli::parse_from(["pi"]);
+        let theme = Theme::load("dark", &[], &args.workspace, false, false).unwrap();
+        let mut view = View::default();
+        let id = uuid::Uuid::new_v4();
+        view.mount_chrome_renderer(ChromeSection::Header, Some(uuid::Uuid::new_v4()));
+        view.mount_chrome_renderer(ChromeSection::Footer, Some(id));
+        view.footer_data.catalog_provider_count = Some(3);
+        let layout = view.footer_data.snapshot(&args).clone();
+        let footer = view.extension_chrome.dynamic[ChromeSection::Footer as usize]
+            .as_mut()
+            .unwrap();
+        let (_, first) = footer.request(80, &theme, Some(&layout)).unwrap();
+        assert_eq!(first["context"]["section"], "footer");
+        assert_eq!(first["context"]["layout"]["availableProviderCount"], 3);
+
+        view.ui_request(&json!({"id":id,"method":"setStatus","key":"indexer","text":"ready"}))
+            .unwrap();
+        let changed = view.footer_data.snapshot(&args).clone();
+        let footer = view.extension_chrome.dynamic[ChromeSection::Footer as usize]
+            .as_mut()
+            .unwrap();
+        let response = |request: &Value| json!({"id":request["id"],"rendered":{"lines":[[{"text":"footer","color":"accent"}]]}});
+        assert!(!footer.receive(&response(&first), 80, &theme, Some(&changed)));
+        let (_, next) = footer.request(80, &theme, Some(&changed)).unwrap();
+        assert_eq!(
+            next["context"]["layout"]["extensionStatuses"]["indexer"],
+            "ready"
+        );
+        assert!(footer.receive(&response(&next), 80, &theme, Some(&changed)));
+        assert!(footer.request(80, &theme, Some(&changed)).is_none());
+        for fullscreen in [false, true] {
+            let rows = view.footer_lines(&args, &theme, 80, 1, fullscreen);
+            assert_eq!(rows[0].spans[0].text, "footer");
+            assert_eq!(rows[0].spans[0].color, theme.color("accent"));
+        }
+        let light = Theme::load("light", &[], &args.workspace, false, false).unwrap();
+        for fullscreen in [false, true] {
+            for (width, theme) in [(64, &theme), (80, &light)] {
+                assert_ne!(
+                    view.footer_lines(&args, theme, width, 1, fullscreen)[0].spans[0].text,
+                    "footer"
+                );
+            }
+        }
+        view.ui_request(&json!({"id":id,"method":"setStatus","key":"indexer","text":"changed"}))
+            .unwrap();
+        for fullscreen in [false, true] {
+            assert_ne!(
+                view.footer_lines(&args, &theme, 80, 1, fullscreen)[0].spans[0].text,
+                "footer"
+            );
+        }
+
+        view.ui_request(&json!({"id":id,"method":"setFooter","lines":null}))
+            .unwrap();
+        assert!(view.extension_chrome.dynamic[ChromeSection::Footer as usize].is_none());
+        assert!(view.extension_chrome.dynamic[ChromeSection::Header as usize].is_some());
     }
 
     #[test]
@@ -16448,7 +16664,8 @@ exit {exit}
             .receiver
             .recv_timeout(std::time::Duration::from_secs(15))
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .models;
         assert_eq!(
             models.first().map(String::as_str),
             Some("ollama/offline-fixture")

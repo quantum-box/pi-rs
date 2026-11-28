@@ -1351,6 +1351,11 @@ pub trait Extension: Send + Sync {
         None
     }
 
+    /// Create the instance mounted by this extension's `SetFooterRenderer` request.
+    fn footer_renderer(&self) -> Option<Arc<dyn crate::FooterRenderer>> {
+        None
+    }
+
     fn id(&self) -> &str;
 
     fn dependencies(&self) -> &[&str] {
