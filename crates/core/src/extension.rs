@@ -3428,24 +3428,31 @@ impl Registry {
     pub fn registered_tool_info(&self) -> Vec<RegisteredToolInfo> {
         self.tools
             .iter()
-            .map(|(name, tool)| {
-                let source = self
-                    .extensions
-                    .iter()
-                    .find(|extension| extension.id() == tool.owner)
-                    .and_then(|extension| extension.command_source())
-                    .map(std::path::Path::to_path_buf);
-                RegisteredToolInfo {
-                    spec: tool.spec.clone(),
-                    extension_id: tool.owner.clone(),
-                    extension_source_path: source,
-                    active: self
-                        .active
-                        .as_ref()
-                        .is_none_or(|active| active.contains(name)),
-                }
-            })
+            .map(|(name, tool)| self.tool_info(name, tool))
             .collect()
+    }
+
+    /// Look up a configured tool by its exact registered name, including inactive tools.
+    pub fn registered_tool(&self, name: &str) -> Option<RegisteredToolInfo> {
+        self.tools.get(name).map(|tool| self.tool_info(name, tool))
+    }
+
+    fn tool_info(&self, name: &str, tool: &RegisteredTool) -> RegisteredToolInfo {
+        let source = self
+            .extensions
+            .iter()
+            .find(|extension| extension.id() == tool.owner)
+            .and_then(|extension| extension.command_source())
+            .map(std::path::Path::to_path_buf);
+        RegisteredToolInfo {
+            spec: tool.spec.clone(),
+            extension_id: tool.owner.clone(),
+            extension_source_path: source,
+            active: self
+                .active
+                .as_ref()
+                .is_none_or(|active| active.contains(name)),
+        }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
