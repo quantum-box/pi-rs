@@ -854,7 +854,9 @@ async fn running_tool_kill_child() {
         Arc::new(ToolState::default()),
     )
     .await;
-    std::fs::write(dir.join("ready"), format!("{id} {op} {attempt}")).unwrap();
+    let pending = dir.join("ready.tmp");
+    std::fs::write(&pending, format!("{id} {op} {attempt}")).unwrap();
+    std::fs::rename(pending, dir.join("ready")).unwrap();
     let _keep_owner = s;
     std::future::pending::<()>().await;
 }
