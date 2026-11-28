@@ -1479,6 +1479,64 @@ fn interior_append_distinguishes_earlier_document_writes_from_atomic_writes() {
 }
 
 #[test]
+fn interior_reset_checkout_rejects_document_revision_change() {
+    for write_document in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        if write_document {
+            let address = crate::document::Address {
+                scope: id.to_string(),
+                name: "checkout".into(),
+                key: "before-reset".into(),
+            };
+            let mut document = crate::document::Transaction::new();
+            document
+                .put(
+                    &address,
+                    Expected::Missing,
+                    serde_json::json!({"version":1}).as_object().unwrap(),
+                )
+                .unwrap();
+            document.commit(h.owner.store()).unwrap();
+        }
+
+        let (_, entries) = h
+            .reset_with_blocks(
+                id,
+                None,
+                vec![
+                    vec![serde_json::json!({"type":"text","text":"first"})],
+                    vec![serde_json::json!({"type":"text","text":"second"})],
+                ],
+            )
+            .unwrap();
+        let before = h.session_entries_start(id).unwrap();
+        let checkout = h.checkout_session_entry(id, entries[0]);
+        if write_document {
+            assert!(matches!(
+                checkout,
+                Err(Error::Fork(crate::fork::Error::InvalidSnapshot))
+            ));
+            assert_eq!(h.session_entries_start(id).unwrap(), before);
+        } else {
+            checkout.unwrap();
+            drop(h);
+            let h = Harness::open_paused(&path, options()).unwrap();
+            let cursor = h.session_entries_start(id).unwrap();
+            assert_eq!(h.session_tree(&cursor).unwrap().leaf_id, Some(entries[0]));
+        }
+    }
+}
+
+#[test]
 fn session_branch_summary_reopens_at_proven_interior_cut_and_fences_stale_plan() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

@@ -11502,7 +11502,7 @@ impl Harness {
             return Err(InvalidSnapshot.into());
         }
         let prefix_histories = if let Some((_, Some(count))) = position {
-            let (retain, batch_len) =
+            let (retain, batch_len, append_cut) =
                 self.checkout_prefix_len(&source, observation.0, count, &mut checks)?;
             if batch_len != messages.len()
                 || occurrences[..retain]
@@ -11514,11 +11514,12 @@ impl Harness {
             let previous = observation.0.checked_sub(1).ok_or(InvalidSnapshot)?;
             let previous_anchor = self.fork_anchor_checks(origin, previous)?;
             let revision = store.document_cut(&anchor[1].key)?.ok_or(InvalidSnapshot)?;
-            if !self.append_documents_unchanged(
-                &previous_anchor[1].key,
-                &anchor[1].key,
-                revision,
-            )? {
+            let unchanged = if append_cut {
+                self.append_documents_unchanged(&previous_anchor[1].key, &anchor[1].key, revision)?
+            } else {
+                store.document_cut(&previous_anchor[1].key)? == Some(revision)
+            };
+            if !unchanged {
                 return Err(InvalidSnapshot.into());
             }
             checks.extend(previous_anchor);
@@ -11625,14 +11626,14 @@ impl Harness {
         observation: u64,
         count: usize,
         checks: &mut Vec<Check>,
-    ) -> Result<(usize, usize), Error> {
+    ) -> Result<(usize, usize, bool), Error> {
         use crate::fork::Error::InvalidSnapshot;
 
         let transcript =
             crate::transcript::Transcript::new(self.owner.store(), source.transcript_id());
         let page = transcript.read_with_blocks(source, std::num::NonZeroUsize::MIN)?;
         let entry = page.records.into_iter().next().ok_or(InvalidSnapshot)?;
-        let (stable_prefix, appended) = match serde_json::from_value(entry.value)? {
+        let (stable_prefix, appended, append_cut) = match serde_json::from_value(entry.value)? {
             TranscriptChange::AppendV3 {
                 stable_prefix,
                 messages,
@@ -11642,13 +11643,13 @@ impl Harness {
                 stable_prefix,
                 messages,
                 ..
-            } => (stable_prefix, messages.len()),
+            } => (stable_prefix, messages.len(), true),
             TranscriptChange::ReplaceV2 { messages, .. } => {
                 let (_, evidence) = self
                     .anchored_block_reset(source.transcript_id(), observation, source)?
                     .ok_or(InvalidSnapshot)?;
                 checks.extend(evidence);
-                (0, messages.len())
+                (0, messages.len(), false)
             }
             _ => return Err(InvalidSnapshot.into()),
         };
@@ -11658,6 +11659,7 @@ impl Harness {
         Ok((
             stable_prefix.checked_add(count).ok_or(InvalidSnapshot)?,
             stable_prefix.checked_add(appended).ok_or(InvalidSnapshot)?,
+            append_cut,
         ))
     }
 
