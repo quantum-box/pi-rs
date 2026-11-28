@@ -1991,7 +1991,14 @@ impl View {
         }
     }
 
-    fn working_status(&self, busy: bool, fullscreen: bool, now: Instant, width: usize) -> String {
+    fn working_status(
+        &self,
+        busy: bool,
+        fullscreen: bool,
+        now: Instant,
+        width: usize,
+        interrupt: Option<crossterm::event::KeyEvent>,
+    ) -> String {
         if !busy {
             return String::new();
         }
@@ -2019,7 +2026,12 @@ impl View {
         };
         let separator = if frame.is_empty() { "" } else { " " };
         let mut label = format!("{frame}{separator}{message}");
-        let suffix = format!("{:.1}s · Escで取消 ", elapsed.as_secs_f32());
+        let mut suffix = format!("{:.1}s ", elapsed.as_secs_f32());
+        if let Some(key) = interrupt {
+            use std::fmt::Write;
+            let label = crate::ui::keys::binding_hint(Some(key));
+            let _ = write!(suffix, "· {label}で取消 ");
+        }
         if agent && (working.message.is_some() || working.indicator.is_some()) {
             let suffix_width = UnicodeWidthStr::width(suffix.as_str());
             if suffix_width > width {
@@ -2046,7 +2058,14 @@ impl View {
         format!("{label} {suffix}")
     }
 
-    fn border_status(&self, busy: bool, fullscreen: bool, now: Instant, width: usize) -> String {
+    fn border_status(
+        &self,
+        busy: bool,
+        fullscreen: bool,
+        now: Instant,
+        width: usize,
+        keys: &Keys,
+    ) -> String {
         let mut other = self.draft_status();
         other.push_str(&self.extension_status());
         if fullscreen && let Some((message, _)) = &self.flash {
@@ -2054,7 +2073,13 @@ impl View {
             other.push(' ');
         }
         let remaining = width.saturating_sub(UnicodeWidthStr::width(other.as_str()));
-        let working = self.working_status(busy, fullscreen, now, remaining);
+        let working = self.working_status(
+            busy,
+            fullscreen,
+            now,
+            remaining,
+            keys.first_binding("app.interrupt"),
+        );
         format!("{working}{other}")
     }
 
@@ -4623,7 +4648,7 @@ render_call_id: None,
             !cfg!(windows),
             synchronized_updates_supported(),
         )?;
-        let status = self.border_status(busy, true, Instant::now(), width);
+        let status = self.border_status(busy, true, Instant::now(), width, keys);
         queue!(out, Hide)?;
         self.graphics.clear_fullscreen_frame(&mut out)?;
         for (row, line) in header.iter().enumerate() {
@@ -5200,7 +5225,7 @@ render_call_id: None,
             )?;
             queue!(out, Print("\r\n"))?;
         }
-        let status = self.border_status(busy, false, Instant::now(), width);
+        let status = self.border_status(busy, false, Instant::now(), width, keys);
         Line::themed(
             &format!(
                 "{}{}",
@@ -15603,7 +15628,28 @@ exit {exit}
     }
 
     #[test]
+    fn shell_working_status_advertises_the_bound_interrupt_key() {
+        let view = View {
+            shell_running: true,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let interrupt = Some(crate::ui::keys::parse("ctrl+g").unwrap());
+        for fullscreen in [false, true] {
+            let status = view.working_status(true, fullscreen, now, 80, interrupt);
+            assert!(status.contains("Ctrl+Gで取消"), "{status}");
+            assert!(!status.contains("Esc"), "{status}");
+
+            let status = view.working_status(true, fullscreen, now, 80, None);
+            assert!(status.contains("コマンド実行中"), "{status}");
+            assert!(!status.contains("取消"), "{status}");
+        }
+    }
+
+    #[test]
     fn extension_working_indicator_animates_hides_and_restores_in_both_modes() {
+        let keys = Keys::default();
+        let interrupt = keys.first_binding("app.interrupt");
         let id = uuid::Uuid::new_v4();
         let mut view = View::default();
         view.ui_request(&json!({"id":id, "method":"setWorkingMessage", "message":"Reading files"}))
@@ -15624,13 +15670,14 @@ exit {exit}
                     fullscreen,
                     started + Duration::from_millis(millis),
                     80,
+                    interrupt,
                 )
             };
             assert!(status(0).starts_with("one Reading files "));
             assert!(status(150).starts_with("two Reading files "));
             assert!(status(300).starts_with("one Reading files "));
             assert!(
-                view.working_status(false, fullscreen, started, 80)
+                view.working_status(false, fullscreen, started, 80, interrupt)
                     .is_empty()
             );
         }
@@ -15639,7 +15686,7 @@ exit {exit}
         view.request_started = Some(later);
         view.sync_working_animation(true, later);
         assert!(
-            view.working_status(true, true, later, 80)
+            view.working_status(true, true, later, 80, interrupt)
                 .starts_with("two ")
         );
         assert_eq!(
@@ -15652,21 +15699,24 @@ exit {exit}
         view.ui_request(&json!({"id":id,"method":"setWorkingIndicator","options":{"frames":[]}}))
             .unwrap();
         assert!(
-            view.working_status(true, true, started, 80)
+            view.working_status(true, true, started, 80, interrupt)
                 .starts_with("Reading files ")
         );
         view.ui_request(&json!({"id":id,"method":"setWorkingVisible","visible":false}))
             .unwrap();
-        assert!(view.working_status(true, true, started, 80).is_empty());
+        assert!(
+            view.working_status(true, true, started, 80, interrupt)
+                .is_empty()
+        );
         view.phase = Some("再試行待ち");
         assert!(
-            view.working_status(true, false, started, 80)
+            view.working_status(true, false, started, 80, interrupt)
                 .starts_with("再試行待ち ")
         );
         view.phase = None;
         view.shell_running = true;
         assert!(
-            view.working_status(true, false, started, 80)
+            view.working_status(true, false, started, 80, interrupt)
                 .starts_with("コマンド実行中 ")
         );
         view.shell_running = false;
@@ -15677,18 +15727,18 @@ exit {exit}
         view.ui_status
             .insert("fixture".into(), "independent status".into());
         for fullscreen in [false, true] {
-            let status = view.border_status(true, fullscreen, later, 48);
+            let status = view.border_status(true, fullscreen, later, 48, &keys);
             assert!(status.contains("Escで取消"));
             assert!(status.contains("independent status"));
             assert!(UnicodeWidthStr::width(status.as_str()) <= 48);
         }
         assert!(view.clear_extension_chrome());
         assert!(
-            view.working_status(true, false, started, 80)
+            view.working_status(true, false, started, 80, interrupt)
                 .starts_with("処理中 ")
         );
         assert!(
-            view.working_status(true, true, started, 80)
+            view.working_status(true, true, started, 80, interrupt)
                 .starts_with("⠋ 処理中 ")
         );
     }
