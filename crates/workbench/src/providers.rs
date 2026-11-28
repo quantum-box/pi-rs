@@ -420,6 +420,7 @@ pub(super) struct Deferred {
     credential: Option<Credential>,
     headers: RequestHeaders,
     http_settings: Option<super::config::Settings>,
+    direct_http: bool,
     options: Option<(Box<Cli>, bool)>,
     probe_context: bool,
     disable_message_thread_continuation: bool,
@@ -468,7 +469,8 @@ impl Deferred {
         {
             return None;
         }
-        if let Some(settings) = &self.http_settings
+        if !self.direct_http
+            && let Some(settings) = &self.http_settings
             && !super::http_proxy::configured(settings).ok()?.is_empty()
         {
             return None;
@@ -526,7 +528,11 @@ impl Deferred {
             _ => {}
         }
         if let Some(settings) = &self.http_settings {
-            client = client.with_http_settings_and_env(settings, self.headers.environment())?;
+            client = client.with_http_settings_for_route(
+                settings,
+                self.headers.environment(),
+                self.direct_http,
+            )?;
         }
         if let Some((args, reported)) = &self.options {
             client = client.with_model_options(args, *reported)?;
@@ -804,6 +810,7 @@ impl Client {
             credential,
             headers,
             http_settings: None,
+            direct_http: false,
             options: None,
             probe_context: true,
             disable_message_thread_continuation: false,
@@ -843,16 +850,14 @@ impl Client {
         }
     }
 
-    pub fn with_http_settings(self, settings: &super::config::Settings) -> Result<Self> {
-        self.with_http_settings_and_env(settings, None)
-    }
-
-    pub fn with_http_settings_and_env(
+    pub(super) fn with_http_settings_for_route(
         self,
         settings: &super::config::Settings,
         env: Option<&serde_json::Map<String, serde_json::Value>>,
+        direct: bool,
     ) -> Result<Self> {
         let this = match self {
+            Self::Bedrock(client) if direct => return Ok(Self::Bedrock(client)),
             Self::Bedrock(client) => {
                 return Ok(match super::http_proxy::bedrock_client(settings, env)? {
                     Some((runtime, credentials)) => {
@@ -863,7 +868,11 @@ impl Client {
             }
             other => other,
         };
-        let proxies = super::http_proxy::configured(settings)?;
+        let proxies = if direct {
+            Vec::new()
+        } else {
+            super::http_proxy::configured(settings)?
+        };
         let timeout = settings.http_idle_timeout();
         let retry = settings.provider_retry();
         Ok(match this {
@@ -894,6 +903,7 @@ impl Client {
             Self::Bedrock(_) => unreachable!("Bedrock handled above"),
             Self::Deferred(mut client) => {
                 client.http_settings = Some(settings.clone());
+                client.direct_http = direct;
                 Self::Deferred(client)
             }
         })
@@ -4340,7 +4350,7 @@ mod estimation_tests {
     use clap::Parser;
 
     #[tokio::test]
-    async fn bundled_chat_models_send_model_specific_strict_field() {
+    async fn bundled_chat_models_send_model_specific_strict_and_together_thinking_fields() {
         use std::io::{Read, Write};
         for (provider, model_id, config, expected) in [
             (
@@ -4363,13 +4373,13 @@ mod estimation_tests {
             ),
             (
                 "together",
-                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                "deepseek-ai/DeepSeek-V4.1-Flash",
                 serde_json::json!({}),
                 None,
             ),
             (
                 "together",
-                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                "zai-org/GLM-5.3",
                 serde_json::json!({"providers":{"together":{"compat":{"supportsStrictMode":true}}}}),
                 Some(false),
             ),
@@ -4451,6 +4461,12 @@ mod estimation_tests {
             args.model_profiles = super::super::model_profiles::Profiles::parse(&config).unwrap();
             args.provider = args.model_profiles.provider(provider).unwrap();
             args.model = model_id.into();
+            let thinking = match (provider, model_id) {
+                ("together", "deepseek-ai/DeepSeek-V4.1-Flash") => Some("high"),
+                ("together", "zai-org/GLM-5.3") => Some("off"),
+                _ => None,
+            };
+            args.thinking = thinking.map(str::to_owned);
             let client = Client::Ollama(
                 pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
                     .unwrap()
@@ -4479,6 +4495,16 @@ mod estimation_tests {
                 expected,
                 "{provider}/{model_id}"
             );
+            if let Some(thinking) = thinking {
+                assert_eq!(
+                    body["reasoning"],
+                    serde_json::json!({"enabled": thinking == "high"})
+                );
+                assert!(body.get("reasoning_effort").is_none());
+                assert!(body.get("store").is_none());
+                assert_eq!(body["max_tokens"], 10);
+                assert!(body.get("max_completion_tokens").is_none());
+            }
         }
     }
 

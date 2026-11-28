@@ -97,19 +97,51 @@ pub(super) fn default_for_provider<'a>(
         .or_else(|| models.first())
 }
 
-pub(super) fn is_unconfigured_retired_ant_ling_model(
+pub(super) fn is_unconfigured_retired_builtin_model(
     profiles: &super::model_profiles::Profiles,
     provider: &Provider,
     id: &str,
 ) -> bool {
-    provider.id() == "ant-ling"
-        && matches!(id, "Ling-2.6-flash" | "Ling-2.6-1T" | "Ring-2.6-1T")
-        && profiles.model(provider, id).is_none()
+    retired_builtin_model_id(provider, id).is_some_and(|canonical| {
+        profiles.model(provider, id).is_none()
+            && (canonical == id || profiles.model(provider, canonical).is_none())
+    })
+}
+
+pub(super) fn configured_retired_model_id<'a>(
+    profiles: &'a super::model_profiles::Profiles,
+    provider: &Provider,
+    id: &str,
+) -> Option<&'a str> {
+    retired_builtin_model_id(provider, id)?;
+    profiles
+        .configured_model_ids(provider)
+        .filter(|configured| configured.eq_ignore_ascii_case(id))
+        .min_by_key(|configured| *configured != id)
+}
+
+fn retired_builtin_model_id(provider: &Provider, id: &str) -> Option<&'static str> {
+    let ids: &[_] = match provider.id() {
+        "ant-ling" => &["Ling-2.6-flash", "Ling-2.6-1T", "Ring-2.6-1T"],
+        "together" => &[
+            "deepseek-ai/DeepSeek-V4-Pro-0813",
+            "MiniMaxAI/MiniMax-M3",
+            "openai/gpt-oss-120b",
+            "thinkingmachines/Inkling",
+        ],
+        _ => return None,
+    };
+    ids.iter()
+        .copied()
+        .find(|known| known.eq_ignore_ascii_case(id))
 }
 
 /// Choose from known catalog entries without resolving credential commands
 /// or refreshing OAuth on startup. Native Ollama remains the local fallback.
-pub(super) async fn automatic_startup_model(args: &Cli) -> Option<ScopedChoice> {
+pub(super) async fn automatic_startup_model(
+    args: &Cli,
+    current_provider_models: Option<&[String]>,
+) -> Option<ScopedChoice> {
     use super::{model_auth::Credential, providers::Client};
 
     let profiles = &args.model_profiles;
@@ -136,7 +168,13 @@ pub(super) async fn automatic_startup_model(args: &Cli) -> Option<ScopedChoice> 
             Vec::new()
         };
         let base_endpoint = profiles.endpoint(&provider);
-        let mut models = profiles.model_ids(&provider);
+        let mut models = if provider == args.provider
+            && let Some(models) = current_provider_models
+        {
+            models.to_vec()
+        } else {
+            profiles.model_ids(&provider)
+        };
         for id in &radius {
             if !models.contains(id) {
                 models.push(id.clone());
@@ -198,7 +236,7 @@ pub struct Catalog {
     pub models: Vec<String>,
     aliases: Vec<(String, String)>,
     probe_details: bool,
-    pub complete: bool,
+    pub advertised_models: Option<Vec<String>>,
 }
 
 impl Catalog {
@@ -261,7 +299,24 @@ fn catalog_client(
 
 pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
     let mut models = args.model_profiles.model_ids(&provider);
-    let client = catalog_client(args, &provider, &mut models)?.map(|client| {
+    let client = catalog_client(args, &provider, &mut models)?;
+    catalog_with_client(args, provider, probe, models, client).await
+}
+
+pub(super) async fn workspace_relay_catalog(args: &Cli, provider: Provider) -> Result<Catalog> {
+    let models = args.model_profiles.model_ids(&provider);
+    let client = args.connect_workspace_relay_catalog(&provider)?;
+    catalog_with_client(args, provider, true, models, Some(client)).await
+}
+
+async fn catalog_with_client(
+    args: &Cli,
+    provider: Provider,
+    probe: bool,
+    mut models: Vec<String>,
+    client: Option<super::providers::Client>,
+) -> Result<Catalog> {
+    let client = client.map(|client| {
         if provider == Provider::Radius {
             client.with_context_probes(probe)
         } else {
@@ -279,15 +334,20 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
             .is_some())
         || super::builtin_chat::find(provider.id())
             .is_some_and(|builtin| builtin.is_default_endpoint(args.endpoint_for(&provider)));
-    let mut complete = false;
+    let mut advertised_models = None;
     if let Some(client) = &client
         && ((probe && !bundled) || provider == Provider::Radius)
     {
         match client.models(args.model_profiles.azure_api_version()).await {
             Ok(discovered) => {
-                complete = true;
                 let mut seen: std::collections::BTreeSet<_> = models.iter().cloned().collect();
-                models.extend(discovered.into_iter().filter(|id| seen.insert(id.clone())));
+                models.extend(
+                    discovered
+                        .iter()
+                        .filter(|id| seen.insert((*id).clone()))
+                        .cloned(),
+                );
+                advertised_models = Some(discovered);
                 probe_details = true;
             }
             Err(error) if models.is_empty() => return Err(error),
@@ -320,7 +380,7 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
         models,
         aliases,
         probe_details,
-        complete,
+        advertised_models,
     })
 }
 
@@ -402,7 +462,7 @@ pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
                 models,
                 aliases,
                 probe_details: false,
-                complete: false,
+                advertised_models: None,
             })
         })
         .collect()
@@ -730,17 +790,19 @@ fn resolve_cli_catalog_model(
         let mut matches = Vec::new();
         for (provider, models) in &catalogs {
             let explicit = named.as_ref().filter(|(named, _)| provider == named);
-            let known = models
-                .iter()
-                .find(|model| explicit.is_some_and(|(_, id)| model.eq_ignore_ascii_case(id)))
-                .or_else(|| {
-                    models
-                        .iter()
-                        .find(|model| model.eq_ignore_ascii_case(reference))
-                });
-            // Pi also treats the named provider's own full literal ID as a
-            // qualified match. A named partial match can compete with raw IDs.
-            let id = known.cloned().or_else(|| {
+            // Exact retired IDs still participate in explicit resolution and
+            // credential precedence without appearing in discovery or fuzzy matches.
+            let exact_id = |id: &str| {
+                models
+                    .iter()
+                    .find(|model| model.eq_ignore_ascii_case(id))
+                    .map(String::as_str)
+                    .or_else(|| retired_builtin_model_id(provider, id))
+            };
+            let known = explicit
+                .and_then(|(_, id)| exact_id(id))
+                .or_else(|| exact_id(reference));
+            let id = known.map(str::to_owned).or_else(|| {
                 let (_, id) = explicit?;
                 let names = aliases(profiles, provider, models);
                 let candidates = search_ids(models, &names);
@@ -855,6 +917,14 @@ pub fn split_with_profiles(
         if !ids.contains(&id) {
             ids.push(id);
         }
+    }
+    let named = unqualified(value, provider.id());
+    let id = thinking_suffix(named).map_or(named, |(id, _)| id);
+    if let Some(canonical) = retired_builtin_model_id(provider, id)
+        && !ids.iter().any(|model| model.eq_ignore_ascii_case(id))
+    {
+        // Keep an exact retired ID ahead of any successor's partial match.
+        ids.push(canonical.to_owned());
     }
     let aliases = aliases(profiles, provider, &ids);
     let mut selected = split(value, &search_ids(&ids, &aliases), provider.id())?;
@@ -1134,7 +1204,7 @@ mod tests {
         let catalog = super::catalog(&args, super::Provider::Ollama, false)
             .await
             .unwrap();
-        assert!(!catalog.complete);
+        assert!(catalog.advertised_models.is_none());
     }
 
     #[test]
@@ -1157,6 +1227,26 @@ mod tests {
             .unwrap();
         assert_eq!(catalog.models, ["routed"]);
         assert!(catalog.client.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_azure_catalog_keeps_model_specific_routes_without_provider_endpoint() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.model_profiles = crate::model_profiles::Profiles::parse_with_azure_env(
+            &json!({"providers":{"azure":{
+                "models":[{"id":"routed","api":"azure-openai-responses","baseUrl":"http://127.0.0.1:2"}]
+            }}}),
+            |_| None,
+        ).unwrap();
+        let catalog = super::catalog(&args, super::Provider::named("azure").unwrap(), true)
+            .await
+            .unwrap();
+        assert_eq!(catalog.models, ["routed"]);
+        assert!(catalog.client.is_none());
+        assert!(catalog.advertised_models.is_none());
     }
 
     #[test]
@@ -1206,7 +1296,7 @@ mod tests {
                 .to_vec(),
                 aliases: Vec::new(),
                 probe_details: false,
-                complete: false,
+                advertised_models: None,
             },
             Catalog {
                 provider: Provider::Anthropic,
@@ -1223,7 +1313,7 @@ mod tests {
                 .to_vec(),
                 aliases: vec![("exact".into(), "alias".into())],
                 probe_details: false,
-                complete: false,
+                advertised_models: None,
             },
         ];
         let (choices, warnings) = scoped_choices(
@@ -1324,6 +1414,129 @@ mod tests {
         let (choices, warnings) = scoped_choices(["widget:bad:high"], &catalogs);
         assert_eq!(choices[0].pattern(), "anthropic/widget-z");
         assert!(warnings[0].contains("Invalid thinking level \"bad\""));
+    }
+
+    #[test]
+    fn together_relay_fallback_keeps_merged_models_on_the_relay_route() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.model_profiles = crate::model_profiles::Profiles::parse(&json!({
+            "providers":{"together":{
+                "baseUrl":"https://relay.example/v1",
+                "models":[
+                    {"id":"separate", "baseUrl":"https://other.example/v1"},
+                    {"id":"Qwen/Qwen4-Max", "baseUrl":"https://other.example/v1"},
+                    {"id":"MOONSHOTAI/KIMI-K3", "baseUrl":"https://other.example/v1"},
+                    {"id":"Relay-Configured"}
+                ]
+            }}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("together").unwrap();
+        args.endpoint = args.model_profiles.endpoint(&args.provider).to_owned();
+        for advertised in [
+            vec![],
+            vec![
+                "relay-only".into(),
+                "separate".into(),
+                "Qwen/Qwen4-Max".into(),
+                "moonshotai/Kimi-K3".into(),
+                "relay-configured".into(),
+            ],
+        ] {
+            args.complete_catalogs =
+                vec![("together".into(), args.endpoint.clone(), advertised.clone())];
+            let models = args
+                .custom_together_fallback_models(&args.provider, true)
+                .unwrap();
+            assert!(
+                !models
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case("moonshotai/Kimi-K3"))
+            );
+            assert!(models.iter().any(|id| id == "Relay-Configured"));
+            assert_eq!(
+                models
+                    .iter()
+                    .filter(|id| id.eq_ignore_ascii_case("Relay-Configured"))
+                    .count(),
+                1
+            );
+            assert!(models.iter().any(|id| id == "moonshotai/Kimi-K3.1-Pro"));
+            assert_eq!(
+                models.iter().any(|id| id == "relay-only"),
+                !advertised.is_empty()
+            );
+            assert!(
+                !models
+                    .iter()
+                    .any(|id| id == "separate" || id == "Qwen/Qwen4-Max")
+            );
+            let preferred = args
+                .custom_together_fallback_models(&args.provider, false)
+                .unwrap();
+            assert!(
+                !preferred
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case("moonshotai/Kimi-K3"))
+            );
+        }
+        args.complete_catalogs.clear();
+        assert!(
+            args.custom_together_fallback_models(&args.provider, true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retired_together_resume_requires_catalog_authority_for_its_endpoint() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{"together":{"baseUrl":"https://fixture.example/v1","apiKey":"fixture"}}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("together").unwrap();
+        args.endpoint = args.model_profiles.endpoint(&args.provider).to_owned();
+        let retired = "thinkingmachines/Inkling";
+        for (catalog_endpoint, listed, expected) in [
+            (None, false, retired),
+            (
+                Some("https://other.example/v1/chat/completions"),
+                false,
+                retired,
+            ),
+            (Some(args.endpoint.as_str()), false, "moonshotai/Kimi-K3"),
+            (Some(args.endpoint.as_str()), true, retired),
+        ] {
+            let mut args = args.clone();
+            args.model = "moonshotai/Kimi-K3".into();
+            args.remember_initial_selection();
+            if let Some(endpoint) = catalog_endpoint {
+                args.complete_catalogs.push((
+                    "together".into(),
+                    endpoint.into(),
+                    if listed {
+                        vec![retired.into()]
+                    } else {
+                        Vec::new()
+                    },
+                ));
+            }
+            if listed {
+                args.discovered_models
+                    .push(("together".into(), retired.into()));
+            }
+            args.restore_branch_selection(retired.into(), None, Some("together"));
+            assert_eq!(
+                args.model, expected,
+                "{catalog_endpoint:?}, listed={listed}"
+            );
+        }
     }
 
     #[test]

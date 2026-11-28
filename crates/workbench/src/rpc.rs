@@ -2368,7 +2368,7 @@ fn available_models_at(
             } else {
                 None
             };
-            if include_details && catalog.complete {
+            if include_details && catalog.advertised_models.is_some() {
                 complete_model_catalog(&args, &catalog.provider, &catalog.models, generation);
             }
             for model in catalog.models {
@@ -2463,7 +2463,7 @@ fn prepare_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
 
 fn prepare_new_session_draft(args: &mut Cli) -> Result<()> {
     args.settings.fork_worker_history();
-    args.refresh_workspace_selection();
+    args.refresh_workspace_selection()?;
     args.session = if args.no_session {
         args.session
             .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
@@ -4391,7 +4391,8 @@ mod tests {
         args.remember_initial_selection();
         args.workspace = target.clone();
         args.settings = super::super::config::Settings::load(&target, true).unwrap();
-        args.refresh_workspace_selection_with_timeout(Duration::from_millis(100));
+        args.refresh_workspace_selection_with_timeout(Duration::from_millis(100))
+            .unwrap();
         assert_eq!(args.model, "fast");
         assert_eq!(
             args.model_scope
@@ -4402,7 +4403,8 @@ mod tests {
         );
         assert!(args.selection_discovery_pending);
         std::thread::sleep(Duration::from_millis(200));
-        args.refresh_workspace_selection_with_timeout(Duration::from_secs(2));
+        args.refresh_workspace_selection_with_timeout(Duration::from_secs(2))
+            .unwrap();
         assert!(
             args.model_scope.iter().any(|choice| choice.model == "late"),
             "catalog={:?} pending={}",
@@ -4544,7 +4546,7 @@ mod tests {
             .into();
         args.settings = super::super::config::Settings::load(&launch, true).unwrap();
         args.model = "alpha".into();
-        args.refresh_workspace_selection();
+        args.refresh_workspace_selection().unwrap();
         args.thinking = Some("low".into());
         args.remember_initial_selection();
         let mut thinking_override = args.clone();

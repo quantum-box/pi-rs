@@ -5908,19 +5908,19 @@ fn slash(
             if view.async_transitions {
                 let (sender, receiver) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let result = {
-                        next.refresh_workspace_selection();
+                    let result = (|| {
+                        next.refresh_workspace_selection()?;
                         next.session = session_path(&next.workspace, next.session_dir.as_deref());
                         next.session_transition = Some(pi_rs::SessionStartReason::New);
                         Ok(next)
-                    };
+                    })();
                     let _ = sender.send(result);
                 });
                 view.pending_transition = Some(receiver);
                 view.append("Preparing session (Esc to cancel)");
                 return Ok(None);
             }
-            next.refresh_workspace_selection();
+            next.refresh_workspace_selection()?;
             next.session = session_path(&args.workspace, args.session_dir.as_deref());
             if let Some(directory) = next.session.parent() {
                 std::fs::create_dir_all(directory)?;
@@ -11269,7 +11269,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
     args.settings = args.settings.reload_latest(&args.workspace, args.trusted)?;
-    args.refresh_workspace_selection();
+    args.refresh_workspace_selection()?;
     args.restore_session_model(&session)?;
     drop(session);
     super::thinking::adjust(args);

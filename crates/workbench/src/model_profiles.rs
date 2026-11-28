@@ -2012,12 +2012,17 @@ impl Profiles {
         }
     }
 
-    pub fn model_ids(&self, provider: &Provider) -> Vec<String> {
-        let mut ids: Vec<_> = self
-            .entries
+    pub(super) fn configured_model_ids(&self, provider: &Provider) -> impl Iterator<Item = &str> {
+        self.entries
             .get(provider.id())
             .into_iter()
-            .flat_map(|profile| profile.models.iter().map(|model| model.id.clone()))
+            .flat_map(|profile| profile.models.iter().map(|model| model.id.as_str()))
+    }
+
+    pub fn model_ids(&self, provider: &Provider) -> Vec<String> {
+        let mut ids: Vec<_> = self
+            .configured_model_ids(provider)
+            .map(str::to_owned)
             .collect();
         if let Some(models) = BUILTIN_MODELS.get(provider.id())
             && !(provider.id() == "openai" && provider.adapter() != Adapter::OpenAiResponses)
@@ -4226,7 +4231,7 @@ mod tests {
         let profiles = Profiles::default();
         let model_id = "moonshotai/Kimi-K3.1-Pro";
         for (provider_id, total, max_output) in
-            [("baseten", 15, 262_144), ("together", 16, 1_048_576)]
+            [("baseten", 15, 262_144), ("together", 24, 1_048_576)]
         {
             let provider = profiles.provider(provider_id).unwrap();
             assert_eq!(profiles.model_ids(&provider).len(), total);
@@ -4251,6 +4256,78 @@ mod tests {
         assert_eq!(previous.max_tokens, Some(1_048_576));
         let latest = profiles.model(&together, model_id).unwrap();
         assert_eq!(latest.mapped_effort("medium"), Some(None));
+    }
+
+    #[test]
+    fn together_catalog_matches_active_upstream_models_and_toggle_levels() {
+        let profiles = Profiles::default();
+        let provider = profiles.provider("together").unwrap();
+        let mut ids = profiles.model_ids(&provider);
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "MiniMaxAI/MiniMax-M3.1-Flash",
+                "Prism-ML/Ternary-Bonsai-27B",
+                "Qwen/Qwen3.5-9B",
+                "Qwen/Qwen3.6-Plus",
+                "Qwen/Qwen3.7-Max",
+                "Qwen/Qwen3.7-Plus",
+                "Qwen/Qwen3.8-Flash",
+                "Qwen/Qwen4-Max",
+                "deepseek-ai/DeepSeek-V4.1-Flash",
+                "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+                "deepseek-ai/DeepSeek-V4.1-Flash-1017-fast",
+                "elorian-labs/glimpse-1.0",
+                "meta-models/Muse-Glimmer-30B",
+                "meta-models/Muse-Spark-Open-816B-A42B",
+                "moonshotai/Kimi-K3",
+                "moonshotai/Kimi-K3.1-Pro",
+                "nvidia/NVIDIA-Nemotron-3.5-Super-VL",
+                "reflection/Beam-1.0-501B-A23B",
+                "ricursive-ai/Ripple-65B-Preview",
+                "tencent/Hy4",
+                "thinkingmachines/Inkling-2-Small",
+                "zai-org/GLM-5.2",
+                "zai-org/GLM-5.3",
+                "zai-org/GLM-5.3-Flash",
+            ]
+        );
+        assert_eq!(
+            super::super::model_selection::default_for_provider(&provider, &ids)
+                .map(String::as_str),
+            Some("moonshotai/Kimi-K3")
+        );
+        for id in ids {
+            let model = profiles.model(&provider, &id).unwrap();
+            assert_eq!(model.reasoning, Some(true), "{id}");
+            assert_eq!(
+                model.levels(Adapter::ChatCompletions).unwrap(),
+                ["off", "high"],
+                "{id}"
+            );
+            assert_eq!(
+                profiles
+                    .chat_compatibility(&provider, Some(&model))
+                    .supports_strict_mode(),
+                Some(false),
+                "{id}"
+            );
+        }
+        let flash = profiles
+            .model(&provider, "deepseek-ai/DeepSeek-V4.1-Flash-1017-fast")
+            .unwrap();
+        assert_eq!(flash.name.as_deref(), Some("DeepSeek V4.1 Flash 1017 Fast"));
+        assert_eq!(flash.input_modalities().unwrap(), ["text", "image"]);
+        assert_eq!(flash.context_window, Some(1_048_576));
+        assert_eq!(flash.max_tokens, Some(384_000));
+        assert_eq!(
+            flash.cost.unwrap().value(),
+            json!({"input":0.6,"output":2.4,"cacheRead":0.012,"cacheWrite":0.0})
+        );
+        let glm = profiles.model(&provider, "zai-org/GLM-5.3").unwrap();
+        assert_eq!(glm.input_modalities().unwrap(), ["text"]);
+        assert_eq!(glm.max_tokens, Some(262_144));
     }
 
     #[test]

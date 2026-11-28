@@ -8199,11 +8199,12 @@ fn http_idle_timeout_applies_to_native_provider_streams() {
 
 #[test]
 fn model_requests_use_configured_http_proxy_and_environment_overrides() {
-    for (provider, path, from_env) in [
-        ("ollama", "/v1/chat/completions", false),
-        ("anthropic", "/v1/messages", false),
-        ("google", "/v1beta", true),
-        ("radius", "/v1/messages", true),
+    for (provider, path, from_env, offline) in [
+        ("ollama", "/v1/chat/completions", false, false),
+        ("ollama", "/v1/chat/completions", false, true),
+        ("anthropic", "/v1/messages", false, true),
+        ("google", "/v1beta", true, true),
+        ("radius", "/v1/messages", true, true),
     ] {
         let root = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -8276,7 +8277,6 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
             .args([
                 "--no-session",
                 "--no-mcp",
-                "--offline",
                 "--provider",
                 provider,
                 "--model",
@@ -8290,6 +8290,9 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                 "--print",
                 "hello",
             ]);
+        if offline {
+            command.arg("--offline");
+        }
         if from_env {
             command.env("http_proxy", &proxy);
         }
@@ -8756,10 +8759,7 @@ fn default_model_and_provider_are_read_as_separate_fields() {
 }
 
 #[test]
-fn ant_ling_startup_replaces_only_missing_retired_defaults() {
-    let root = tempfile::tempdir().unwrap();
-    let settings_path = root.path().join("settings.json");
-    let models_path = root.path().join("models.json");
+fn startup_replaces_only_missing_retired_builtin_defaults() {
     for (settings, credential, models, extra, saved_session_model, expected) in [
         (
             json!({"defaultProvider":"ant-ling","defaultModel":"Ring-2.6-1T"}),
@@ -8830,10 +8830,143 @@ fn ant_ling_startup_replaces_only_missing_retired_defaults() {
             "ANT_LING_API_KEY",
             json!({}),
             vec![],
-            Some("Ring-2.6-1T"),
+            Some(("ant-ling", "Ring-2.6-1T", "Ling-3.1-flash")),
             ("ant-ling", "Ling-3.1-flash", "high"),
         ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"openai/gpt-oss-120b","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("together", "moonshotai/Kimi-K3", "off"),
+        ),
+        (
+            json!({"defaultModel":"together/deepseek-ai/DeepSeek-V4-Pro-0813","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("together", "moonshotai/Kimi-K3", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"MiniMaxAI/MiniMax-M3","defaultThinkingLevel":"off"}),
+            "GEMINI_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("google", "gemini-4-argon", "low"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"moonshotai/Kimi-K3","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![],
+            Some(("together", "thinkingmachines/Inkling", "moonshotai/Kimi-K3")),
+            ("together", "moonshotai/Kimi-K3", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({"providers":{"together":{"models":[{"id":"thinkingmachines/Inkling"}]}}}),
+            vec![],
+            None,
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"openai/gpt-oss-120b","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec!["--provider", "together", "--model", "openai/gpt-oss-120b"],
+            None,
+            ("together", "openai/gpt-oss-120b", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![
+                "--provider",
+                "together",
+                "--model",
+                "thinkingmachines/Inkling",
+            ],
+            None,
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"MiniMaxAI/MiniMax-M3","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec!["--model", "together/MiniMaxAI/MiniMax-M3:off"],
+            None,
+            ("together", "MiniMaxAI/MiniMax-M3", "off"),
+        ),
+        (
+            json!({"defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec!["--model", "OPENAI/GPT-OSS-120B"],
+            None,
+            ("together", "openai/gpt-oss-120b", "off"),
+        ),
+        (
+            json!({"defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec!["--model", "TOGETHER/THINKINGMACHINES/INKLING:off"],
+            None,
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![
+                "--provider",
+                "together",
+                "--model",
+                "THINKINGMACHINES/INKLING",
+            ],
+            None,
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultModel":"together/thinkingmachines/Inkling","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({"providers":{"together":{"baseUrl":"https://fixture.example/v1","apiKey":"fixture"}}}),
+            vec![],
+            None,
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({"providers":{"together":{"baseUrl":"https://fixture.example/v1","apiKey":"fixture"}}}),
+            vec![],
+            Some(("together", "openai/gpt-oss-120b", "openai/gpt-oss-120b")),
+            ("together", "thinkingmachines/Inkling", "off"),
+        ),
+        (
+            json!({"defaultProvider":"together","defaultModel":"private/unknown-model","defaultThinkingLevel":"off"}),
+            "TOGETHER_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("together", "private/unknown-model", "off"),
+        ),
+        (
+            json!({"defaultProvider":"groq","defaultModel":"openai/gpt-oss-120b","defaultThinkingLevel":"off"}),
+            "GROQ_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("groq", "openai/gpt-oss-120b", "low"),
+        ),
     ] {
+        let root = tempfile::tempdir().unwrap();
+        let settings_path = root.path().join("settings.json");
+        let models_path = root.path().join("models.json");
         let saved_settings = settings.to_string();
         std::fs::write(&settings_path, &saved_settings).unwrap();
         std::fs::write(&models_path, models.to_string()).unwrap();
@@ -8844,11 +8977,11 @@ fn ant_ling_startup_replaces_only_missing_retired_defaults() {
                 command.env(name, value);
             }
         }
-        if let Some(model) = saved_session_model {
+        if let Some((provider, model, _)) = saved_session_model {
             let path = root.path().join("resume.jsonl");
             let mut session = pi_rs::Session::open(&path).unwrap();
             session
-                .select_provider_model(Some("ant-ling"), model, None)
+                .select_provider_model(Some(provider), model, None)
                 .unwrap();
             session
                 .append_user_with_images("saved conversation".into(), vec![], None)
@@ -8889,7 +9022,12 @@ fn ant_ling_startup_replaces_only_missing_retired_defaults() {
         for id in ["state", "after"] {
             let data = &events.iter().find(|event| event["id"] == id).unwrap()["data"];
             assert_eq!(data["model"]["provider"], expected.0, "{settings}: {data}");
-            assert_eq!(data["model"]["id"], expected.1, "{settings}: {data}");
+            let expected_model = if id == "state" {
+                saved_session_model.map_or(expected.1, |(_, _, model)| model)
+            } else {
+                expected.1
+            };
+            assert_eq!(data["model"]["id"], expected_model, "{settings}: {data}");
             assert_eq!(data["thinkingLevel"], expected.2, "{settings}: {data}");
         }
         assert_eq!(
@@ -8897,6 +9035,747 @@ fn ant_ling_startup_replaces_only_missing_retired_defaults() {
             saved_settings
         );
     }
+}
+
+fn together_fixture_cli(root: &std::path::Path, trusted: bool) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command.env_clear();
+    for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.current_dir(root).env("PI_RS_HOME", root).args([
+        "--no-session",
+        "--no-mcp",
+        if trusted { "--trust" } else { "--no-trust" },
+        "--offline",
+    ]);
+    command
+}
+
+fn together_saved_model_rpc(
+    root: &std::path::Path,
+    extra: &[&str],
+    credentials: &[(&str, &str)],
+) -> std::process::Output {
+    let mut child = together_fixture_cli(root, false)
+        .envs(credentials.iter().copied())
+        .args(["--mode", "rpc"])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let write = child.stdin.take().unwrap().write_all(
+        b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n",
+    );
+    let output = child.wait_with_output().unwrap();
+    if output.status.success() {
+        write.unwrap();
+    }
+    output
+}
+
+fn together_saved_model_states(output: std::process::Output) -> [Value; 2] {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["id"] == "new" && event["success"] == true)
+    );
+    ["state", "after"]
+        .map(|id| events.iter().find(|event| event["id"] == id).unwrap()["data"]["model"].clone())
+}
+
+#[test]
+fn together_retired_fallback_uses_the_relay_catalog_across_workspace_restore() {
+    for (advertised, configured, relay_key, provider_flag, expected) in [
+        (
+            Some(vec!["relay-model"]),
+            None,
+            true,
+            true,
+            Some(("together", "relay-model")),
+        ),
+        (
+            Some(vec!["relay-model"]),
+            None,
+            true,
+            false,
+            Some(("together", "relay-model")),
+        ),
+        (
+            Some(vec!["relay-model"]),
+            None,
+            false,
+            false,
+            Some(("groq", "openai/gpt-oss-120b")),
+        ),
+        (
+            Some(vec![]),
+            Some("configured-model"),
+            true,
+            true,
+            Some(("together", "configured-model")),
+        ),
+        (
+            Some(vec![]),
+            None,
+            true,
+            true,
+            Some(("together", "moonshotai/Kimi-K3")),
+        ),
+        (
+            None,
+            None,
+            true,
+            true,
+            Some(("together", "thinkingmachines/Inkling")),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut profile = json!({"baseUrl":base, "models":configured.into_iter().map(|id| json!({"id":id})).collect::<Vec<_>>()});
+        if relay_key {
+            profile["apiKey"] = json!("relay-fixture");
+        }
+        std::fs::write(
+            root.path().join("models.json"),
+            json!({"providers":{"together":profile}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling"})
+                .to_string(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("GET /v1/models "), "{first}");
+            let mut auth = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("authorization")
+                {
+                    auth = Some(value.trim().to_owned());
+                }
+            }
+            assert_eq!(auth.as_deref(), relay_key.then_some("Bearer relay-fixture"));
+            let (status, body) = if let Some(ids) = advertised {
+                (
+                    "200 OK",
+                    json!({"data":ids.into_iter().map(|id| json!({"id":id})).collect::<Vec<_>>()}),
+                )
+            } else {
+                ("503 Service Unavailable", json!({}))
+            };
+            let body = body.to_string();
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        // Leaving --workspace unset lets RPC restore "." as an absolute path.
+        let flags: &[&str] = if provider_flag {
+            &["--provider", "together"]
+        } else {
+            &[]
+        };
+        let credentials: &[(&str, &str)] = if relay_key {
+            &[]
+        } else {
+            &[
+                ("GROQ_API_KEY", "official-fixture"),
+                ("TOGETHER_API_KEY", "official-together-fixture"),
+            ]
+        };
+        let output = together_saved_model_rpc(root.path(), flags, credentials);
+        server.join().unwrap();
+        if let Some((provider, id)) = expected {
+            for model in together_saved_model_states(output) {
+                assert_eq!(model["provider"], provider);
+                assert_eq!(model["id"], id);
+            }
+        } else {
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("no model is available for the selected provider")
+            );
+        }
+    }
+}
+
+#[test]
+fn together_relay_fallback_respects_case_insensitive_model_route_ownership() {
+    for advertised in [vec![], vec!["moonshotai/Kimi-K3", "relay-model"]] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(
+            root.path().join("models.json"),
+            json!({"providers":{"together":{
+                "baseUrl":base,"apiKey":"relay-fixture",
+                "models":[{"id":"MOONSHOTAI/KIMI-K3","baseUrl":"https://other.example/v1"}]
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({
+                "defaultProvider":"together","defaultModel":"thinkingmachines/Inkling"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let expected = if advertised.is_empty() {
+            None
+        } else {
+            Some("relay-model")
+        };
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("GET /v1/models "), "{first}");
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+            }
+            let body = json!({"data":advertised.into_iter().map(|id| json!({"id":id})).collect::<Vec<_>>()}).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let output = together_saved_model_rpc(root.path(), &["--provider", "together"], &[]);
+        server.join().unwrap();
+        for model in together_saved_model_states(output) {
+            assert_eq!(model["provider"], "together");
+            let id = model["id"].as_str().unwrap();
+            assert!(!id.eq_ignore_ascii_case("moonshotai/Kimi-K3"), "{id}");
+            if let Some(expected) = expected {
+                assert_eq!(id, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn together_retired_default_discovers_again_after_rpc_workspace_switch() {
+    let root = tempfile::tempdir().unwrap();
+    let launch = root.path().join("launch");
+    let target = root.path().join("target");
+    std::fs::create_dir(&launch).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    let target_session = root.path().join("target.jsonl");
+    Session::open(&target_session)
+        .unwrap()
+        .set_working_directory(&target)
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"together":{"baseUrl":base,"apiKey":"relay-fixture"}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling"}).to_string(),
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        for id in ["relay-before-switch", "relay-after-switch"] {
+            loop {
+                let (mut socket, mut reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.is_empty() || line == "\r\n" {
+                        break;
+                    }
+                }
+                if first.starts_with("GET /api/ps ") {
+                    write!(
+                        socket,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                assert!(first.starts_with("GET /v1/models "), "{first}");
+                let body = json!({"data":[{"id":id}]}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                break;
+            }
+        }
+    });
+
+    let mut child = together_fixture_cli(root.path(), false)
+        .args(["--mode", "rpc", "--workspace"])
+        .arg(&launch)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for request in [
+        json!({"id":"start","type":"get_state"}),
+        json!({"id":"switch","type":"switch_session","sessionPath":target_session}),
+        json!({"id":"switched","type":"get_state"}),
+        json!({"id":"new","type":"new_session"}),
+        json!({"id":"after","type":"get_state"}),
+    ] {
+        writeln!(input, "{request}").unwrap();
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let reply = |id| events.iter().find(|event| event["id"] == id).unwrap();
+    for id in ["switch", "new"] {
+        assert_eq!(reply(id)["success"], true, "{events:?}");
+    }
+    for (id, model) in [
+        ("start", "relay-before-switch"),
+        ("switched", "relay-after-switch"),
+        ("after", "relay-after-switch"),
+    ] {
+        assert_eq!(reply(id)["data"]["model"]["provider"], "together");
+        assert_eq!(reply(id)["data"]["model"]["id"], model, "{events:?}");
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn explicit_catalog_read_keeps_the_proxy_for_remote_routes_in_offline_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"httpProxy":format!("http://{}", proxy.local_addr().unwrap())}).to_string(),
+    )
+    .unwrap();
+    // The proxy observes CONNECT without resolving this reserved remote name.
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"together":{
+            "baseUrl":"https://catalog.invalid:8443/v1", "apiKey":"fixture-key",
+            "models":[{"id":"configured-fixture"}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+
+    let server = std::thread::spawn(move || {
+        loop {
+            let (mut socket, mut reader, first) = accept_proxy_request(proxy.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            // The fixture records the chosen destination and never opens a tunnel.
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            if first.trim_end() == "CONNECT catalog.invalid:8443 HTTP/1.1" {
+                break;
+            }
+        }
+    });
+
+    let mut child = together_fixture_cli(root.path(), false)
+        .args([
+            "--mode",
+            "rpc",
+            "--provider",
+            "together",
+            "--model",
+            "configured-fixture",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{}",
+        json!({"id":"models","type":"get_available_models"})
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let reply = BufReader::new(output.stdout.as_slice())
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+        .find(|reply| reply["id"] == "models")
+        .unwrap();
+    assert_eq!(reply["success"], true, "{reply}");
+    assert!(
+        reply["data"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| {
+                model["id"] == "configured-fixture" && model["provider"] == "together"
+            }),
+        "{reply}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn together_workspace_discovery_is_direct_and_replacement_inference_uses_the_proxy() {
+    let root = tempfile::tempdir().unwrap();
+    let launch = root.path().join("launch");
+    let target = root.path().join("target");
+    std::fs::create_dir(&launch).unwrap();
+    std::fs::create_dir_all(target.join(".pi")).unwrap();
+    let target_session = root.path().join("target.jsonl");
+    Session::open(&target_session)
+        .unwrap()
+        .set_working_directory(&target)
+        .unwrap();
+
+    let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", relay.local_addr().unwrap());
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let relay_key = if cfg!(unix) {
+        "!printf relay-fixture"
+    } else {
+        "relay-fixture"
+    };
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{
+            "ollama":{"baseUrl":format!("{base}/ollama/v1")},
+            "together":{
+                "baseUrl":format!("{base}/together/v1"), "apiKey":relay_key,
+                "models":[{"id":"separate-route", "baseUrl":format!("{base}/other/v1")}]
+            }
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"defaultProvider":"ollama","defaultModel":"launch-model","httpProxy":proxy_url})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        target.join(".pi/settings.json"),
+        json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling"}).to_string(),
+    )
+    .unwrap();
+
+    let relay_addr = relay.local_addr().unwrap();
+    let proxy_server = std::thread::spawn(move || {
+        loop {
+            let (mut socket, mut reader, first) = accept_proxy_request(proxy.try_clone().unwrap());
+            assert_eq!(first.trim_end(), format!("CONNECT {relay_addr} HTTP/1.1"));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            let is_inference = line.starts_with("POST /together/v1/chat/completions ");
+            assert!(
+                is_inference
+                    || line.starts_with("GET /ollama/api/ps ")
+                    || line.starts_with("GET /together/api/ps "),
+                "{line}"
+            );
+            let mut request = line.clone();
+            let mut length = 0;
+            loop {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+                request.push_str(&line);
+            }
+            request.push_str("x-fixture-proxy: forwarded\r\n\r\n");
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let mut origin = TcpStream::connect(relay_addr).unwrap();
+            origin
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            origin.write_all(request.as_bytes()).unwrap();
+            origin.write_all(&body).unwrap();
+            std::io::copy(&mut origin, &mut socket).unwrap();
+            if is_inference {
+                break;
+            }
+        }
+    });
+    let server = std::thread::spawn(move || {
+        let mut discovered = false;
+        loop {
+            let (mut socket, mut reader, first) = accept_proxy_request(relay.try_clone().unwrap());
+            let mut authorization = None;
+            let mut via_proxy = false;
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    match name.to_ascii_lowercase().as_str() {
+                        "authorization" => authorization = Some(value.trim().to_owned()),
+                        "x-fixture-proxy" => via_proxy = value.trim() == "forwarded",
+                        "content-length" => length = value.trim().parse().unwrap(),
+                        _ => {}
+                    }
+                }
+            }
+            if first.starts_with("GET /ollama/api/ps ")
+                || first.starts_with("GET /together/api/ps ")
+            {
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            assert_eq!(authorization.as_deref(), Some("Bearer relay-fixture"));
+            if first.starts_with("GET /together/v1/models ") {
+                assert!(!via_proxy);
+                assert!(!discovered);
+                discovered = true;
+                let body = r#"{"data":[{"id":"relay-replacement"},{"id":"separate-route"}]}"#;
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                continue;
+            }
+            assert!(
+                first.starts_with("POST /together/v1/chat/completions "),
+                "{first}"
+            );
+            assert!(discovered && via_proxy);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], "relay-replacement");
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"relay fixture answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            break;
+        }
+    });
+
+    let mut child = together_fixture_cli(root.path(), true)
+        .args([
+            "--no-tools",
+            "--no-skills",
+            "--no-extensions",
+            "--mode",
+            "rpc",
+            "--workspace",
+        ])
+        .arg(&launch)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let (events, received) = std::sync::mpsc::channel();
+    let output = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if events
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut observed = Vec::new();
+    for request in [
+        json!({"id":"start","type":"get_state"}),
+        json!({"id":"switch","type":"switch_session","sessionPath":target_session}),
+        json!({"id":"switched","type":"get_state"}),
+        json!({"id":"new","type":"new_session"}),
+        json!({"id":"after","type":"get_state"}),
+        json!({"id":"prompt","type":"prompt","message":"fixture prompt"}),
+    ] {
+        writeln!(input, "{request}").unwrap();
+        loop {
+            let event = received.recv_timeout(Duration::from_secs(30)).unwrap();
+            let matched = event["id"] == request["id"];
+            observed.push(event);
+            if matched {
+                break;
+            }
+        }
+    }
+    while !observed.iter().any(|event| event["type"] == "agent_end") {
+        observed.push(received.recv_timeout(Duration::from_secs(30)).unwrap());
+    }
+    assert!(
+        observed.iter().any(|event| {
+            event["type"] == "message_end"
+                && event["message"]["content"].as_array().is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part["text"] == "relay fixture answer")
+                })
+        }),
+        "{:?}",
+        observed.iter().find(|event| event["type"] == "agent_end")
+    );
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    reader.join().unwrap();
+    let events = observed;
+    let reply = |id| events.iter().find(|event| event["id"] == id).unwrap();
+    for id in ["switch", "new", "prompt"] {
+        assert_eq!(reply(id)["success"], true, "{events:?}");
+    }
+    for (id, provider, model) in [
+        ("start", "ollama", "launch-model"),
+        ("switched", "together", "relay-replacement"),
+        ("after", "together", "relay-replacement"),
+    ] {
+        assert_eq!(reply(id)["data"]["model"]["provider"], provider);
+        assert_eq!(reply(id)["data"]["model"]["id"], model, "{events:?}");
+    }
+    server.join().unwrap();
+    proxy_server.join().unwrap();
+}
+
+#[test]
+fn together_saved_retired_id_uses_the_configured_case_and_model_route() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"together":{"baseUrl":"https://relay.example/v1","models":[{
+            "id":"ThinkingMachines/INKLING",
+            "api":"anthropic-messages",
+            "baseUrl":"https://retired-model.example/v1"
+        }]}}})
+        .to_string(),
+    )
+    .unwrap();
+    for settings in [
+        json!({"defaultProvider":"together","defaultModel":"thinkingmachines/Inkling"}),
+        json!({"defaultModel":"together/thinkingmachines/Inkling"}),
+    ] {
+        std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+        for model in together_saved_model_states(together_saved_model_rpc(root.path(), &[], &[])) {
+            assert_eq!(model["provider"], "together");
+            assert_eq!(model["id"], "ThinkingMachines/INKLING");
+            assert_eq!(model["api"], "anthropic-messages");
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let model_base = format!("http://{}/retired/v1", listener.local_addr().unwrap());
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"together":{"baseUrl":"https://relay.example/v1","models":[{
+            "id":"ThinkingMachines/INKLING",
+            "baseUrl":model_base
+        }]}}})
+        .to_string(),
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(
+            first.starts_with("POST /retired/v1/chat/completions "),
+            "{first}"
+        );
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Authorization: Bearer inline-fixture"))
+        );
+        let size = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; size];
+        reader.read_exact(&mut body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["model"], "ThinkingMachines/INKLING");
+        let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+    });
+    let output = together_fixture_cli(root.path(), false)
+        .args(["--api-key", "inline-fixture", "--print", "fixture prompt"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
+    server.join().unwrap();
 }
 
 #[test]
