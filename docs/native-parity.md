@@ -7527,6 +7527,32 @@ The file getter reports paths managed by the SDK. Hosts that supply their own
 journal store retain responsibility for its location. ID and name reads return
 an error while the journal is locked.
 
+`AgentSession::get_last_assistant_text()` and native RPC
+`get_last_assistant_text` select from the active branch after compaction and
+context edits. They concatenate text and trim ECMAScript whitespace. An empty
+normal reply ends the search, while an omitted reply or a non-normal reply
+without text lets it continue. RPC `get_messages` keeps an edited reply's
+original stop reason, even if the edit removes all its text or calls. For
+native completions without a recognized length limit or recorded failure, the
+original presence of tool calls distinguishes `toolUse` from `stop`. Pi
+imports keep their original stop reasons. Marked failed and cancelled turn
+partials can provide display text without entering model context. A durable
+retry or overflow marker omits the superseded partial on its branch, including
+after cancelling backoff or resuming overflow recovery from a saved failure.
+The raw attempt and its usage remain in the journal. Earlier native journals
+that recorded the omission as a context edit still hide that partial. Edits
+to display-only completions leave measured usage and model projection intact.
+Pi-compatible export includes an advisory flag on generated omission edits.
+On import, the flag keeps the edit display-only when its target matches the
+nearest failed completion on that branch. Other edits retain their ordinary
+semantics.
+Older readers can open journals containing the retry marker and may display
+the superseded partial.
+Older unmarked failures and summary partials remain excluded. RPC keeps
+unmodified imported blocks, including signed thinking, when restoring an empty
+normal reply after tool-call repair.
+[Pinned Pi assistant text selection](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4522-L4549)
+
 ### SDK skill commands
 
 `SkillResources::expand_command` renders Pi-style `/skill:name` invocations

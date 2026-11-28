@@ -2505,10 +2505,12 @@ impl Agent<'_> {
                         )
                         .await?;
                 }
-                let attempt = active
+                let ReplyAttempt {
+                    outcome: result,
+                    partial_request,
+                } = active
                     .reply(session, attempt, true, cancel, observer, Some(followups))
                     .await?;
-                let result = attempt.outcome;
                 if let Err(Error::Model(message) | Error::RetryableModel(message)) = &result
                     && crate::retry::context_overflow_error(message)
                     && session.auto_compaction_control().enabled()
@@ -2530,6 +2532,18 @@ impl Agent<'_> {
                     && retry_attempt < settings.max_retries
                     && request_index + 1 < active.limits.model_requests
                 {
+                    // Persist the omission before notifying the caller or entering
+                    // cancellable backoff. The failed completion remains in history.
+                    if let Some(request_id) = partial_request {
+                        commit(
+                            session,
+                            Event::SourceEntry {
+                                format: crate::journal::RETRY_SCHEDULED.into(),
+                                entry: serde_json::json!({"requestId": request_id}),
+                            },
+                            observer,
+                        )?;
+                    }
                     retry_attempt += 1;
                     let delay_ms = settings.delay_ms(retry_attempt);
                     let retry_wait = control.begin_wait();
@@ -3955,11 +3969,12 @@ impl Agent<'_> {
         };
         // Only turn replies are displayable. Summary requests can contain
         // private prompt material and must never enter the RPC transcript.
-        if retain_reply && matches!(result, Err(Error::Cancelled)) && !content.is_empty() {
+        let partial_failure = failure.filter(|_| retain_reply && !content.is_empty());
+        if let Some(failure) = partial_failure {
             commit(
                 session,
                 Event::SourceEntry {
-                    format: "pi-rs:aborted-turn-partial".into(),
+                    format: crate::journal::turn_partial_marker(failure).into(),
                     entry: serde_json::json!({"requestId": request_id}),
                 },
                 observer,
@@ -4026,7 +4041,10 @@ impl Agent<'_> {
             observer(Notification::Committed(record));
         });
         self.settle_usage(request_id, &usage, &metadata).await?;
-        Ok(ReplyAttempt { outcome: result })
+        Ok(ReplyAttempt {
+            outcome: result,
+            partial_request: partial_failure.map(|_| request_id),
+        })
     }
 
     async fn settle_usage(
@@ -7459,6 +7477,7 @@ impl PreparedAttempt<'_> {
 
 struct ReplyAttempt {
     outcome: Result<Reply>,
+    partial_request: Option<Uuid>,
 }
 
 struct Reply {
@@ -9849,7 +9868,15 @@ mod tree_tests {
         async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
             assert!(request.max_output_tokens >= self.minimum_output_tokens);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 || self.always_fail {
+            if call == 0 {
+                return Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("overflow partial".into())),
+                    Err(Error::Model(
+                        "prompt is too long: private-fixture-secret".into(),
+                    )),
+                ])));
+            }
+            if self.always_fail {
                 return Err(Error::Model(
                     "prompt is too long: private-fixture-secret".into(),
                 ));
@@ -9931,6 +9958,27 @@ mod tree_tests {
                     &mut |_| {},
                 )
                 .await;
+            let failed = session
+                .records()
+                .iter()
+                .find(|record| {
+                    matches!(&record.event,
+                Event::ModelFinished { partial, .. } if partial == "overflow partial")
+                })
+                .unwrap();
+            assert!(
+                session
+                    .records()
+                    .iter()
+                    .any(
+                        |record| crate::superseded_turn_partial(session.records(), record)
+                            == Some(failed.id)
+                    )
+            );
+            assert_ne!(
+                session.last_assistant_text().as_deref(),
+                Some("overflow partial")
+            );
             if !provide && run_budget == 16 {
                 assert!(matches!(result, Err(Error::Budget)));
                 assert_eq!(model.calls.load(Ordering::SeqCst), 1);
@@ -9946,10 +9994,12 @@ mod tree_tests {
                 model.calls.load(Ordering::SeqCst),
                 if provide { 2 } else { 3 }
             );
-            let events = seen.lock().unwrap();
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0]["reason"], "overflow");
-            assert_eq!(events[0]["willRetry"], true);
+            {
+                let events = seen.lock().unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0]["reason"], "overflow");
+                assert_eq!(events[0]["willRetry"], true);
+            }
             if !provide {
                 assert!(!session.records().iter().any(|record| matches!(&record.event,
                     Event::ModelFinished { partial, failure: None, reply: None, .. } if partial == "model summary")),
@@ -9966,6 +10016,54 @@ mod tree_tests {
                     .unwrap()
                     .contains("private-fixture-secret")
             );
+            if always_fail {
+                // Reopen exactly after the durable failure, before recovery
+                // could persist its marker. The next attempt has no text.
+                let run_id = failed.run_id.unwrap();
+                let prefix =
+                    Session::from_records(session.records()[..failed.id as usize].to_vec())
+                        .unwrap();
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory
+                    .path()
+                    .join("interrupted-before-overflow-marker.jsonl");
+                prefix.export_jsonl(&path).unwrap();
+                let mut reopened = Session::open(&path).unwrap();
+                assert_eq!(
+                    reopened.last_assistant_text().as_deref(),
+                    Some("overflow partial")
+                );
+                assert!(
+                    agent
+                        .run_correlated(
+                            &mut reopened,
+                            run_id,
+                            None,
+                            &mut inputs,
+                            &CancellationToken::new(),
+                            &mut |_| {}
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    reopened.branch().iter().any(|record| matches!(record.event,
+                    Event::Compacted { retain_from: Some(boundary), .. } if boundary <= failed.id))
+                );
+                assert!(
+                    reopened
+                        .branch()
+                        .iter()
+                        .any(
+                            |record| crate::superseded_turn_partial(reopened.records(), record)
+                                == Some(failed.id)
+                        )
+                );
+                assert_ne!(
+                    reopened.last_assistant_text().as_deref(),
+                    Some("overflow partial")
+                );
+            }
         }
     }
 
@@ -10006,6 +10104,10 @@ mod tree_tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("prompt is too long"), "{error}");
+        assert_eq!(
+            session.last_assistant_text().as_deref(),
+            Some("overflow partial")
+        );
         assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert!(
             !session

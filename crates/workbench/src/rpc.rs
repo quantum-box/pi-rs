@@ -1998,7 +1998,8 @@ pub(super) fn snapshot_response(
             entries.ensure_valid()?;
             Ok(entries.fork_messages())
         }
-        "get_last_assistant_text" => Ok(super::rpc_messages::last_assistant_text(session)
+        "get_last_assistant_text" => Ok(session
+            .last_assistant_text()
             .map_or_else(|| json!({}), |text| json!({"text":text}))),
         "get_messages" => {
             let (messages, native) = super::rpc_messages::snapshot(session);
@@ -3842,12 +3843,42 @@ mod tests {
         let empty_reply = json!({"type":"message","id":"d","parentId":"c","message":{
             "role":"assistant","stopReason":"stop","content":[]
         }});
+        let failed = json!({"type":"message","id":"e","parentId":"d","message":{
+            "role":"assistant","stopReason":"error","content":[{"type":"text","text":" \u{0085}partial\u{feff}"}]
+        }});
+        let empty_edit = json!({"type":"context_edit","id":"f","parentId":"e","targetId":"a",
+            "replacement":{"content":[]}});
+        let omit_failure = json!({"type":"context_edit","id":"g","parentId":"f","targetId":"e",
+            "replacement":null});
+        let omit_empty_reply = json!({"type":"context_edit","id":"h","parentId":"g","targetId":"d",
+            "replacement":null});
+        let sibling = json!({"type":"message","id":"i","parentId":"a","message":{
+            "role":"assistant","stopReason":"aborted","content":[{"type":"text","text":"\u{feff} "}]
+        }});
+        let newer = json!({"type":"message","id":"j","parentId":"i","message":{
+            "role":"assistant","stopReason":"stop","content":[{"type":"text","text":"newer"}]
+        }});
+        let edit_newer = json!({"type":"context_edit","id":"k","parentId":"j","targetId":"j",
+            "replacement":{"content":[]}});
+        let omit_newer = json!({"type":"context_edit","id":"l","parentId":"k","targetId":"j",
+            "replacement":null});
+        let compacted = json!({"type":"compaction","id":"m","parentId":"l",
+            "firstKeptEntryId":"i","summary":"summary","tokensBefore":100});
         let entries = [
             json!({"type":"session","version":3}),
             answer,
             aborted,
             thinking_only,
             empty_reply,
+            failed,
+            empty_edit,
+            omit_failure,
+            omit_empty_reply,
+            sibling,
+            newer,
+            edit_newer,
+            omit_newer,
+            compacted,
         ];
         let mut args = Cli::try_parse_from(["pi"]).unwrap();
         for (length, expected) in [
@@ -3856,6 +3887,15 @@ mod tests {
             (3, json!({"text":"Hello world"})),
             (4, json!({"text":"Hello world"})),
             (5, json!({})),
+            (6, json!({"text":"\u{0085}partial"})),
+            (7, json!({"text":"\u{0085}partial"})),
+            (8, json!({})),
+            (9, json!({})),
+            (10, json!({"text":"Hello world"})),
+            (11, json!({"text":"newer"})),
+            (12, json!({})),
+            (13, json!({"text":"Hello world"})),
+            (14, json!({})),
         ] {
             let body = entries[..length]
                 .iter()
@@ -3874,6 +3914,14 @@ mod tests {
                 .unwrap(),
                 Some(expected)
             );
+            if length == 12 {
+                let messages = command(&json!({"type":"get_messages"}), &mut args, &mut None)
+                    .unwrap()
+                    .unwrap();
+                let last = messages["messages"].as_array().unwrap().last().unwrap();
+                assert_eq!(last["stopReason"], "stop");
+                assert_eq!(last["content"], json!([]));
+            }
         }
     }
 

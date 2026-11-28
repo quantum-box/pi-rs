@@ -2011,6 +2011,12 @@ impl AgentSession {
             session.conversation_at(session.head())
         }
     }
+    /// Text of the latest qualifying assistant reply on the active branch.
+    /// A normally completed reply with no text returns `None`. A busy journal
+    /// returns an error, as with [`Self::messages`].
+    pub fn get_last_assistant_text(&self) -> Result<Option<String>> {
+        Ok(self.journal()?.last_assistant_text())
+    }
     /// Usage and message counts across the complete durable session.
     pub fn statistics(&self) -> Result<crate::SessionStats> {
         Ok(self.journal()?.statistics())
@@ -12020,6 +12026,341 @@ mod tests {
                     usage: None,
                 }),
             ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_last_assistant_text_treats_custom_finish_reason_without_calls_as_stop() {
+        struct CustomFinish;
+        #[async_trait::async_trait]
+        impl Model for CustomFinish {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("reply".into())),
+                    Ok(ModelEvent::Metadata(crate::ModelMetadata {
+                        finish_reason: Some("vendor-complete".into()),
+                        ..Default::default()
+                    })),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        let mut session = SessionBuilder::new(Arc::new(CustomFinish), "fixture")
+            .in_memory()
+            .unwrap();
+        session.prompt("older").await.unwrap();
+        session.prompt("newer").await.unwrap();
+        let mut journal = session.journal().unwrap();
+        let target = journal.current_message_entries().last().unwrap().0;
+        journal
+            .edit_context(target, Some(crate::ContextContent::Blocks(vec![])))
+            .unwrap();
+        drop(journal);
+        assert_eq!(session.get_last_assistant_text().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn sdk_last_assistant_text_tracks_edits_branches_and_compaction() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.get_last_assistant_text().unwrap(), None);
+        session.prompt("first").await.unwrap();
+        let first = session.journal().unwrap().head();
+        session.prompt("second").await.unwrap();
+        let second = session
+            .journal()
+            .unwrap()
+            .current_message_entries()
+            .last()
+            .unwrap()
+            .0;
+        let original = session.journal().unwrap().head();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("answer 2")
+        );
+
+        session
+            .journal()
+            .unwrap()
+            .edit_context(second, Some(crate::ContextContent::Blocks(vec![])))
+            .unwrap();
+        assert_eq!(session.get_last_assistant_text().unwrap(), None);
+        session
+            .journal()
+            .unwrap()
+            .edit_context(second, None)
+            .unwrap();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("answer 1")
+        );
+
+        session.checkout(first).unwrap();
+        session.prompt("sibling").await.unwrap();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("answer 3")
+        );
+        session.checkout(original).unwrap();
+        session
+            .journal()
+            .unwrap()
+            .edit_context(
+                second,
+                Some(crate::ContextContent::Text(
+                    "\u{feff}\u{00a0}\u{0085} revised\u{3000}".into(),
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("\u{0085} revised")
+        );
+
+        for (retain_from, expected) in [(Some(second), Some("\u{0085} revised")), (None, None)] {
+            session
+                .journal()
+                .unwrap()
+                .append(crate::Event::Compacted {
+                    summary: "summary".into(),
+                    system_prompt: None,
+                    retain_from,
+                    tokens_before: None,
+                    states: Default::default(),
+                    usage: None,
+                    usage_metadata: None,
+                })
+                .unwrap();
+            assert_eq!(
+                session.get_last_assistant_text().unwrap().as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_last_assistant_text_includes_failed_and_cancelled_turn_partials() {
+        struct PartialModel(AtomicUsize);
+        #[async_trait::async_trait]
+        impl Model for PartialModel {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                assert!(!request.messages.iter().any(|message| matches!(message,
+                    Message::Assistant { content, .. } if content.contains("partial"))));
+                let (text, error) = match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => ("failed partial", Error::Model("fixture failure".into())),
+                    1 => ("cancelled partial", Error::Cancelled),
+                    _ => ("\u{feff}\u{00a0}", Error::Model("fixture failure".into())),
+                };
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text(text.into())),
+                    Err(error),
+                ])))
+            }
+        }
+        let mut session =
+            SessionBuilder::new(Arc::new(PartialModel(AtomicUsize::new(0))), "fixture")
+                .in_memory()
+                .unwrap();
+        for (input, expected) in [
+            ("fail", "failed partial"),
+            ("cancel", "cancelled partial"),
+            ("blank failure", "cancelled partial"),
+        ] {
+            assert!(session.prompt(input).await.is_err());
+            assert_eq!(
+                session.get_last_assistant_text().unwrap().as_deref(),
+                Some(expected)
+            );
+            assert!(
+                session
+                    .messages()
+                    .unwrap()
+                    .iter()
+                    .all(|message| !matches!(message, Message::Assistant { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_last_assistant_text_omits_partial_only_when_retry_is_scheduled() {
+        struct RetryPartialModel {
+            calls: AtomicUsize,
+            terminal_text: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl Model for RetryPartialModel {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                assert!(request.messages.iter().all(|message| !matches!(message,
+                    Message::Assistant { content, .. } if content.contains("partial"))));
+                let events = match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => vec![
+                        Ok(ModelEvent::Text("previous answer".into())),
+                        Ok(ModelEvent::Complete {
+                            calls: vec![],
+                            usage: Some(crate::Usage {
+                                input_tokens: 83,
+                                output_tokens: 7,
+                            }),
+                        }),
+                    ],
+                    attempt => vec![
+                        Ok(ModelEvent::Text(
+                            if attempt == 1 {
+                                "first partial"
+                            } else {
+                                self.terminal_text
+                            }
+                            .into(),
+                        )),
+                        Err(Error::RetryableModel("fixture failure".into())),
+                    ],
+                };
+                Ok(Box::pin(futures_util::stream::iter(events)))
+            }
+        }
+
+        for (retry, cancel, terminal_text, expected) in [
+            (false, false, "", "first partial"),
+            (true, true, "", "previous answer"),
+            (true, false, "", "previous answer"),
+            (true, false, "terminal partial", "terminal partial"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("retry.jsonl");
+            let model = Arc::new(RetryPartialModel {
+                calls: AtomicUsize::new(0),
+                terminal_text,
+            });
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .open(&path)
+                .unwrap();
+            let controls = session.controls();
+            controls
+                .set_retry_settings(crate::RetrySettings {
+                    enabled: retry,
+                    max_retries: 1,
+                    base_delay_ms: if cancel { 60_000 } else { 0 },
+                    max_agent_delay_ms: 60_000,
+                })
+                .unwrap();
+            session
+                .journal()
+                .unwrap()
+                .append(crate::Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session.prompt("first question").await.unwrap();
+            let mut first_partial = None;
+            let mut omission_committed = false;
+            let error = session
+                .prompt_with_observer("second question", &mut |notification| match notification {
+                    crate::Notification::Committed(record) => match &record.event {
+                        crate::Event::ModelFinished {
+                            partial,
+                            failure: Some(crate::ModelFailure::Retryable),
+                            usage: crate::UsageReport::Unconfirmed,
+                            ..
+                        } if partial == "first partial" => first_partial = Some(record.id),
+                        crate::Event::SourceEntry { format, .. }
+                            if format == crate::journal::RETRY_SCHEDULED =>
+                        {
+                            omission_committed = true
+                        }
+                        _ => {}
+                    },
+                    crate::Notification::Retry(crate::RetryEvent::Start { .. }) => {
+                        assert!(omission_committed);
+                        if cancel {
+                            controls.abort_retry().unwrap();
+                        }
+                    }
+                    _ => {}
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(matches!(error, Error::Cancelled), cancel);
+            assert_eq!(omission_committed, retry);
+            assert_eq!(
+                model.calls.load(Ordering::SeqCst),
+                if retry && !cancel { 3 } else { 2 }
+            );
+            assert_eq!(
+                session.get_last_assistant_text().unwrap().as_deref(),
+                Some(expected)
+            );
+            drop(session);
+
+            let reopened = SessionBuilder::new(model, "fixture").open(&path).unwrap();
+            assert_eq!(
+                reopened.get_last_assistant_text().unwrap().as_deref(),
+                Some(expected)
+            );
+            let journal = reopened.journal().unwrap();
+            assert_eq!(journal.context_budget_estimate().usage_tokens, 90);
+            assert_eq!(journal.context_usage_estimate().usage_tokens, 90);
+            assert!(
+                !journal
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, crate::Event::ContextEdited { .. }))
+            );
+            let partial = &journal.records()[first_partial.unwrap() as usize - 1];
+            assert!(matches!(&partial.event,
+                crate::Event::ModelFinished { partial, usage: crate::UsageReport::Unconfirmed, .. }
+                    if partial == "first partial"));
+            assert!(
+                journal
+                    .current_messages()
+                    .iter()
+                    .all(|message| !matches!(message,
+                Message::Assistant { content, .. } if content.contains("partial")))
+            );
+            assert!(
+                journal
+                    .current_messages()
+                    .iter()
+                    .any(|message| matches!(message,
+                Message::Assistant { content, .. } if content.is_empty()))
+            );
+            if retry && cancel {
+                let mut records = journal.records().to_vec();
+                let marker = records.iter_mut().find(|record| matches!(&record.event,
+                    crate::Event::SourceEntry { format, .. } if format == crate::journal::RETRY_SCHEDULED)).unwrap();
+                marker.event = crate::Event::ContextEdited {
+                    target: partial.id,
+                    replacement: None,
+                };
+                let legacy = Session::from_records(records).unwrap();
+                assert_eq!(
+                    legacy.last_assistant_text().as_deref(),
+                    Some("previous answer")
+                );
+                assert_eq!(
+                    legacy.context_budget_estimate(),
+                    journal.context_budget_estimate()
+                );
+                assert_eq!(
+                    legacy.context_usage_estimate(),
+                    journal.context_usage_estimate()
+                );
+                assert_eq!(legacy.current_messages(), journal.current_messages());
+
+                let mut before_retry = Session::from_records(journal.records().to_vec()).unwrap();
+                before_retry.checkout(partial.id).unwrap();
+                assert_eq!(
+                    before_retry.last_assistant_text().as_deref(),
+                    Some("first partial")
+                );
+            }
         }
     }
 

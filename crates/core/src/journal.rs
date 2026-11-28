@@ -12,6 +12,14 @@ use crate::{
     Usage, UsageReport,
 };
 
+mod assistant_transcript;
+
+pub(crate) use assistant_transcript::RETRY_SCHEDULED;
+pub use assistant_transcript::{
+    AssistantTranscriptEntry, native_assistant_stop_reason, superseded_turn_partial,
+    superseded_turn_partial_with_completion,
+};
+
 pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
 const BRANCH_FALLBACK_JOURNAL_VERSION: u32 = 4;
 pub(crate) const TOOL_DECISION_JOURNAL_VERSION: u32 = 5;
@@ -1694,16 +1702,14 @@ impl Session {
         let token_index = crate::tokens::SourceTokenIndex::new(self, &branch);
         let entries = conversation_entries_unrepaired(&branch, self.operations());
         let system_invalidations = crate::tokens::non_additive_native_system_checkpoints(&branch);
-        let invalidated_at = branch
-            .iter()
-            .rev()
-            .find_map(|record| {
-                (matches!(
-                    record.event,
-                    Event::ContextEdited { .. } | Event::Compacted { .. }
-                ) || system_invalidations.contains(&record.id))
+        let invalidated_at = branch_with_context_edits(&branch)
+            .filter_map(|(record, context_edit)| {
+                (matches!(record.event, Event::Compacted { .. })
+                    || context_edit
+                    || system_invalidations.contains(&record.id))
                 .then_some(record.id)
             })
+            .last()
             .unwrap_or(0);
         let completions: BTreeMap<_, _> = branch
             .iter()
@@ -1801,14 +1807,11 @@ impl Session {
     pub(crate) fn context_budget_estimate(&self) -> crate::ContextUsageEstimate {
         let branch = self.branch();
         let entries = conversation_entries(&branch, self.operations());
-        let invalidated_at = branch
-            .iter()
-            .rev()
-            .find_map(|record| {
-                matches!(
+        let invalidated_at = branch_with_context_edits(&branch)
+            .filter_map(|(record, context_edit)| {
+                (matches!(
                     record.event,
-                    Event::ContextEdited { .. }
-                        | Event::Compacted { .. }
+                    Event::Compacted { .. }
                         | Event::SystemCheckpoint { .. }
                         | Event::ModelSelected { .. }
                         | Event::BranchModelSelected { .. }
@@ -1816,9 +1819,10 @@ impl Session {
                             fallback_model: Some(_),
                             ..
                         }
-                )
-                .then_some(record.id)
+                ) || context_edit)
+                    .then_some(record.id)
             })
+            .last()
             .unwrap_or(0);
         let completions: BTreeMap<_, _> = branch
             .iter()
@@ -1911,29 +1915,8 @@ impl Session {
     }
 
     pub(crate) fn imported_assistant_message(&self, source: u64) -> Option<&serde_json::Value> {
-        let assistant = self.records.get(source.checked_sub(1)? as usize)?;
-        let Event::Assistant {
-            request_id: Some(request_id),
-            ..
-        } = &assistant.event
-        else {
-            return None;
-        };
-        let completion = self
-            .records
-            .get(assistant.parent?.checked_sub(1)? as usize)?;
-        if !matches!(&completion.event, Event::ModelFinished { request_id: id, .. } if id == request_id)
-        {
-            return None;
-        }
-        let original = self
-            .records
-            .get(completion.parent?.checked_sub(1)? as usize)?;
-        let Event::SourceEntry { format, entry } = &original.event else {
-            return None;
-        };
-        (format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant")
-            .then_some(&entry["message"])
+        let lookup = |id: u64| self.records.get(id.checked_sub(1)? as usize);
+        imported_assistant_source(lookup(source)?, lookup).map(|(entry, _)| &entry["message"])
     }
 
     pub fn operations(&self) -> Vec<(Invocation, OperationState)> {
@@ -2839,29 +2822,29 @@ impl Session {
 
     /// A refresh during a run belongs to the latest unchanged model request.
     pub fn cache_request_current(&self, session_id: Uuid, request_id: Uuid) -> bool {
-        self.session_id() == session_id
-            && self.host_binding().is_none()
-            && self
-                .branch()
-                .into_iter()
-                .rev()
-                .find_map(|record| match record.event {
-                    Event::ModelRequested {
-                        request_id: current,
-                        ..
-                    } => Some(current == Some(request_id)),
-                    Event::Compacted { .. }
-                    | Event::BranchSummary { .. }
-                    | Event::ContextEdited { .. }
-                    | Event::BashExecution { .. }
-                    | Event::CustomMessage { .. }
-                    | Event::CustomMessageDelivered { .. }
-                    | Event::User { .. }
-                    | Event::UserWithImages { .. }
-                    | Event::UserImages { .. } => Some(false),
-                    _ => None,
-                })
-                == Some(true)
+        if self.session_id() != session_id || self.host_binding().is_some() {
+            return false;
+        }
+        let branch = self.branch();
+        branch_with_context_edits(&branch)
+            .filter_map(|(record, context_edit)| match record.event {
+                Event::ModelRequested {
+                    request_id: current,
+                    ..
+                } => Some(current == Some(request_id)),
+                Event::Compacted { .. }
+                | Event::BranchSummary { .. }
+                | Event::BashExecution { .. }
+                | Event::CustomMessage { .. }
+                | Event::CustomMessageDelivered { .. }
+                | Event::User { .. }
+                | Event::UserWithImages { .. }
+                | Event::UserImages { .. } => Some(false),
+                _ if context_edit => Some(false),
+                _ => None,
+            })
+            .last()
+            == Some(true)
     }
 
     pub(crate) fn append_cache_warm(
@@ -4118,23 +4101,40 @@ pub fn aborted_turn_partial_request(event: &Event) -> Option<Uuid> {
 /// Whether a completion is a marked, display-only cancelled turn partial.
 #[doc(hidden)]
 pub fn is_aborted_turn_partial(records: &[Record], record: &Record) -> bool {
+    turn_partial_failure(records, record) == Some(ModelFailure::Cancelled)
+}
+
+pub(crate) fn turn_partial_marker(failure: ModelFailure) -> &'static str {
+    match failure {
+        ModelFailure::Cancelled => "pi-rs:aborted-turn-partial",
+        ModelFailure::Failed | ModelFailure::Retryable => "pi-rs:failed-turn-partial",
+    }
+}
+
+/// The failure of a marked, display-only turn partial. Summary partials and
+/// older unmarked failures have no display provenance.
+#[doc(hidden)]
+pub fn turn_partial_failure(records: &[Record], record: &Record) -> Option<ModelFailure> {
     let Event::ModelFinished {
         request_id,
-        failure: Some(ModelFailure::Cancelled),
+        failure: Some(failure),
         partial,
         ..
     } = &record.event
     else {
-        return false;
+        return None;
     };
-    let Some(parent) = record
-        .parent
-        .and_then(|id| id.checked_sub(1))
-        .and_then(|index| records.get(index as usize))
-    else {
-        return false;
+    let parent = records.get(record.parent?.checked_sub(1)? as usize)?;
+    let Event::SourceEntry { format, entry } = &parent.event else {
+        return None;
     };
-    aborted_turn_partial_request(&parent.event) == Some(*request_id) && !partial.is_empty()
+    (!partial.is_empty()
+        && format == turn_partial_marker(*failure)
+        && entry["requestId"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            == Some(*request_id))
+    .then_some(*failure)
 }
 
 fn validate_context_edit(
@@ -4146,8 +4146,8 @@ fn validate_context_edit(
         .checked_sub(1)
         .and_then(|index| records.get(index as usize))
         .ok_or_else(|| Error::Session("invalid context edit target".into()))?;
-    let assistant =
-        matches!(record.event, Event::Assistant { .. }) || is_aborted_turn_partial(records, record);
+    let assistant = matches!(record.event, Event::Assistant { .. })
+        || turn_partial_failure(records, record).is_some();
     if !assistant
         && !matches!(
             record.event,
@@ -4999,30 +4999,174 @@ pub(crate) fn conversation_entries(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<(u64, Message)> {
-    let retain_from = path
-        .iter()
+    conversation_entries_since(path, operations, retained_message_floor(path))
+}
+
+fn retained_message_floor(path: &[&Record]) -> u64 {
+    path.iter()
         .rev()
         .find_map(|record| match record.event {
             Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(record.id)),
             _ => None,
         })
-        .unwrap_or(0);
-    conversation_entries_since(path, operations, retain_from)
+        .unwrap_or(0)
 }
 
 pub(crate) fn conversation_entries_unrepaired(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<(u64, Message)> {
-    let retain_from = path
-        .iter()
-        .rev()
-        .find_map(|record| match record.event {
-            Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(record.id)),
+    conversation_entries_since_inner(path, operations, retained_message_floor(path), false)
+}
+
+fn context_edits<'a>(path: &[&'a Record]) -> BTreeMap<u64, &'a Option<crate::ContextContent>> {
+    path.iter()
+        .filter_map(|record| match &record.event {
+            Event::ContextEdited {
+                target,
+                replacement,
+            } => Some((*target, replacement)),
             _ => None,
         })
-        .unwrap_or(0);
-    conversation_entries_since_inner(path, operations, retain_from, false)
+        .collect()
+}
+
+/// Find the nearest completion on the marker's branch without crossing a run boundary.
+fn nearest_model_completion<'a>(
+    marker: &Record,
+    lookup: impl Fn(u64) -> Option<&'a Record>,
+) -> Option<&'a Record> {
+    let mut parent = marker.parent;
+    while let Some(record) = parent.and_then(&lookup) {
+        if record.run_id != marker.run_id {
+            return None;
+        }
+        if matches!(record.event, Event::ModelFinished { .. }) {
+            return Some(record);
+        }
+        parent = record.parent;
+    }
+    None
+}
+
+fn imported_assistant_source<'a>(
+    assistant: &Record,
+    lookup: impl Fn(u64) -> Option<&'a Record>,
+) -> Option<(&'a serde_json::Value, &'a Record)> {
+    let Event::Assistant {
+        request_id: Some(request),
+        ..
+    } = &assistant.event
+    else {
+        return None;
+    };
+    let completion = lookup(assistant.parent?)?;
+    let Event::ModelFinished { request_id, .. } = &completion.event else {
+        return None;
+    };
+    if request_id != request {
+        return None;
+    }
+    let Event::SourceEntry { format, entry } = &lookup(completion.parent?)?.event else {
+        return None;
+    };
+    (format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant")
+        .then_some((entry, completion))
+}
+
+/// Carry the nearest preceding completion from the record's actual parent.
+/// `parent_completion` is the nearest completion strictly before `parent`.
+#[doc(hidden)]
+pub fn nearest_completion_before(
+    record: &Record,
+    parent: Option<&Record>,
+    parent_completion: Option<u64>,
+) -> Option<u64> {
+    let parent = parent
+        .filter(|parent| record.parent == Some(parent.id) && record.run_id == parent.run_id)?;
+    if matches!(parent.event, Event::ModelFinished { .. }) {
+        Some(parent.id)
+    } else {
+        parent_completion
+    }
+}
+
+fn branch_with_nearest_completion<'a, 'b>(
+    branch: &'b [&'a Record],
+) -> impl Iterator<Item = (&'a Record, Option<u64>)> + 'b {
+    let mut parent = None;
+    let mut completion = None;
+    branch.iter().copied().map(move |record| {
+        completion = nearest_completion_before(record, parent, completion);
+        parent = Some(record);
+        (record, completion)
+    })
+}
+
+fn branch_with_context_edits<'a, 'b>(
+    branch: &'b [&'a Record],
+) -> impl Iterator<Item = (&'a Record, bool)> + 'b {
+    let lookup = |id| {
+        branch
+            .binary_search_by_key(&id, |record| record.id)
+            .ok()
+            .map(|index| branch[index])
+    };
+    branch_with_nearest_completion(branch).map(move |(record, completion)| {
+        (record, is_model_context_edit(record, completion, lookup))
+    })
+}
+
+fn is_model_context_edit<'a>(
+    record: &Record,
+    nearest_completion: Option<u64>,
+    lookup: impl Fn(u64) -> Option<&'a Record>,
+) -> bool {
+    let Event::ContextEdited {
+        target,
+        replacement,
+    } = &record.event
+    else {
+        return false;
+    };
+    let Some(target) = lookup(*target) else {
+        return true;
+    };
+    if matches!(target.event, Event::ModelFinished { .. }) {
+        return false;
+    }
+    if replacement.is_some() {
+        return true;
+    }
+    let Some(source) = record.parent.and_then(&lookup) else {
+        return true;
+    };
+    let Event::SourceEntry { format, entry } = &source.event else {
+        return true;
+    };
+    // The flag is advisory. The original failed reply must correspond to the
+    // nearest completion, as it would for a native retry or overflow marker.
+    !(record.run_id.is_none()
+        && source.id + 1 == record.id
+        && source.timestamp == record.timestamp
+        && format == "pi"
+        && entry["type"] == "context_edit"
+        && entry
+            .get("replacement")
+            .is_some_and(serde_json::Value::is_null)
+        && entry[crate::pi_import::SUPERSEDED_PARTIAL_FIELD] == true
+        && imported_assistant_source(target, lookup).is_some_and(|(message, completion)| {
+            matches!(
+                completion.event,
+                Event::ModelFinished {
+                    failure: Some(ModelFailure::Failed),
+                    ..
+                }
+            ) && entry["targetId"]
+                .as_str()
+                .is_some_and(|id| message["id"] == id)
+                && nearest_completion == Some(completion.id)
+        }))
 }
 
 fn conversation_entries_since(
@@ -5097,16 +5241,16 @@ fn conversation_entries_since_inner(
             _ => None,
         })
         .collect();
-    let edits: BTreeMap<_, _> = path
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::ContextEdited {
-                target,
-                replacement,
-            } => Some((*target, replacement)),
-            _ => None,
-        })
-        .collect();
+    let mut edits = context_edits(path);
+    if !edits.is_empty() {
+        // Previous versions wrote retry omissions as edits to display-only
+        // completions. Explicit edits to those partials also stay in display.
+        for record in path {
+            if matches!(record.event, Event::ModelFinished { .. }) {
+                edits.remove(&record.id);
+            }
+        }
+    }
     // Replacement blocks may introduce calls with no corresponding result.
     // Compare those calls with the actual repaired model projection, while
     // keeping an otherwise empty assistant for its thinking and usage.
@@ -5336,7 +5480,7 @@ fn conversation_entries_since_inner(
             (source, message)
         })
         .collect();
-    if repair && !edits.is_empty() {
+    if repair && !edits.is_empty() && branch_with_context_edits(path).any(|(_, edit)| edit) {
         let thinking_sources: BTreeSet<_> = messages
             .iter()
             .filter_map(|(source, message)| {

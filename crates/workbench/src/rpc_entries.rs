@@ -23,6 +23,7 @@ struct Position {
     model: Option<u64>,
     response_model: Option<u64>,
     explicit_model_seen: bool,
+    nearest_completion: Option<u64>,
 }
 
 pub(super) struct Entries {
@@ -502,6 +503,11 @@ impl Cursor {
             .parent
             .map_or_else(Position::default, |id| self.positions[id as usize]);
         let mut position = parent;
+        position.nearest_completion = pi_rs::nearest_completion_before(
+            record,
+            record.parent.map(|id| &records[id as usize - 1]),
+            parent.nearest_completion,
+        );
         let entry = match &record.event {
             Event::SourceEntry { format, entry } if format == "pi" => {
                 if entry["type"] == "model_change" {
@@ -567,10 +573,23 @@ impl Cursor {
                 position.imported = None;
                 None
             }
-            Event::ModelFinished { .. } if pi_rs::is_aborted_turn_partial(records, record) => self
-                .messages
-                .aborted_partial(records, record)
-                .map(|message| json!({"type":"message", "message":message})),
+            Event::SourceEntry { .. } => pi_rs::superseded_turn_partial_with_completion(
+                records,
+                record,
+                position.nearest_completion,
+            )
+            .and_then(|target| self.positions[target as usize].visible)
+            .map(|target| {
+                json!({"type":"context_edit","targetId":target.to_string(),"replacement":null,
+                    (pi_rs::pi_import::SUPERSEDED_PARTIAL_FIELD):true})
+            }),
+            Event::ModelFinished { .. }
+                if pi_rs::turn_partial_failure(records, record).is_some() =>
+            {
+                self.messages
+                    .turn_partial(records, record)
+                    .map(|message| json!({"type":"message", "message":message}))
+            }
             Event::CacheWarm {
                 metadata,
                 usage,
