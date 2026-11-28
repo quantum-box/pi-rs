@@ -1368,6 +1368,8 @@ impl Default for QueueModes {
 pub struct Conversation {
     pub id: Uuid,
     pub config: Config,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_info: Option<SessionInfoEntry>,
     #[serde(default)]
     pub queue_modes: QueueModes,
     #[serde(default)]
@@ -2520,6 +2522,11 @@ impl Conversation {
             )
     }
 
+    /// The current display name. A blank session-info entry clears it.
+    pub fn session_name(&self) -> Option<&str> {
+        self.session_info.as_ref()?.name.as_deref()
+    }
+
     /// Current model request identity for a submission placed in this run.
     pub fn model_request_id(&self, submission: Uuid) -> Option<Uuid> {
         match self.phase {
@@ -2788,6 +2795,41 @@ pub struct SessionMessagePage {
     /// Most recent first, including within an atomic message batch.
     pub entries: Vec<SessionMessageEntry>,
     pub older: Option<SessionMessageCursor>,
+}
+
+/// An append-only display name change. It does not add a model message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfoEntry {
+    pub id: Uuid,
+    pub name: Option<String>,
+}
+
+/// An original entry in the committed session history.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SessionEntry {
+    Message(SessionMessageEntry),
+    SessionInfo {
+        entry: SessionInfoEntry,
+        origin: Uuid,
+        observation: crate::observer::Cursor,
+    },
+}
+
+impl SessionEntry {
+    pub fn id(&self) -> Uuid {
+        match self {
+            Self::Message(entry) => entry.history.id,
+            Self::SessionInfo { entry, .. } => entry.id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEntryCursor(SessionMessageCursor);
+
+pub struct SessionEntryPage {
+    pub entries: Vec<SessionEntry>,
+    pub older: Option<SessionEntryCursor>,
 }
 
 pub struct PositionedViewPage {
@@ -3818,6 +3860,7 @@ pub struct UnifiedHistoryPage {
 pub enum ForkBoundary {
     Observation,
     Message { entry_id: Uuid },
+    SessionInfo { entry_id: Uuid },
     Application { entry_id: Uuid },
     Display { entry_id: Uuid },
 }
@@ -7177,6 +7220,7 @@ impl Harness {
                     }
                     // Settings changes can race external model/tool calls. Preserve the
                     // newest values; boundary commits retry selection separately.
+                    state.session_info = latest.session_info.clone();
                     state.queue_modes = latest.queue_modes;
                     state.after_failed_run = latest.after_failed_run;
                     for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
@@ -8296,6 +8340,11 @@ impl Harness {
             event["_reset_baseline_sha256"] =
                 serde_json::Value::String(reset_baseline_digest(baseline)?);
         }
+        if let Some(info) = state.session_info.as_ref()
+            && old.is_some_and(|old| old.session_info.as_ref() != Some(info))
+        {
+            event["session_info"] = serde_json::to_value(info)?;
+        }
         append.set_value(&event)?;
         let fork_key = format!("runtime/fork/{}/{:020}", state.id, append.cursor.0).into_bytes();
         let fork_snapshot = crate::fork::Snapshot {
@@ -8306,6 +8355,10 @@ impl Harness {
             submissions: state.submissions.clone(),
             tool_states: state.tool_states.clone(),
             documents: HashMap::from([
+                (
+                    "pi-rs/runtime/session-info".into(),
+                    serde_json::to_value(&state.session_info)?,
+                ),
                 (
                     "pi-rs/runtime/queue-modes".into(),
                     serde_json::to_value(state.queue_modes)?,
@@ -8847,6 +8900,32 @@ impl Harness {
             }
         }
     }
+    /// Append a session-info entry. Line breaks are flattened and an empty name clears it.
+    pub fn set_session_name(&mut self, id: Uuid, name: &str) -> Result<Uuid, Error> {
+        let name = name
+            .split(['\r', '\n'])
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let name = name.trim();
+        let entry = SessionInfoEntry {
+            id: Uuid::new_v4(),
+            name: (!name.is_empty()).then(|| name.to_owned()),
+        };
+        loop {
+            let (mut state, version) = self.load(id)?;
+            state.session_info = Some(entry.clone());
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&state, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                other => return other.map(|()| entry.id),
+            }
+        }
+    }
+
     /// Persist delivery modes, including while a run is active. Each boundary reads the latest values.
     pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
         loop {
@@ -8894,6 +8973,7 @@ impl Harness {
         Conversation {
             id,
             config,
+            session_info: None,
             queue_modes: QueueModes::default(),
             after_failed_run: AfterFailedRun::default(),
             extensions: vec![],
@@ -8970,6 +9050,8 @@ impl Harness {
         }
         state.tool_attempt = None;
         state.id = child;
+        // This is a new task-owned session, not a user-visible history fork.
+        state.session_info = None;
         state.context_generation = Some(Uuid::new_v4());
         state.extensions.retain(|name| {
             !name.starts_with(crate::subagent_management::EXTENSION_PREFIX)
@@ -9267,6 +9349,10 @@ impl Harness {
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
             for (name, document) in [
                 (
+                    "pi-rs/runtime/session-info",
+                    serde_json::to_value(&cut.session_info)?,
+                ),
+                (
                     "pi-rs/runtime/queue-modes",
                     serde_json::to_value(cut.queue_modes)?,
                 ),
@@ -9436,6 +9522,12 @@ impl Harness {
         let point = crate::fork::extract_cut(id, &record)?;
         let state = Conversation {
             id: Uuid::new_v4(),
+            session_info: point
+                .documents
+                .get("pi-rs/runtime/session-info")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .flatten(),
             config: point.config,
             queue_modes: point
                 .documents
@@ -10475,9 +10567,48 @@ impl Harness {
         cursor: &SessionMessageCursor,
         limit: std::num::NonZeroUsize,
     ) -> Result<SessionMessagePage, Error> {
+        let (entries, older) = self.session_history_page(
+            cursor,
+            limit,
+            |source, observation| self.session_messages_in_observation(source, observation),
+            |entry| entry.history.id,
+        )?;
+        Ok(SessionMessagePage { entries, older })
+    }
+
+    /// Capture the committed session entries, including session-info changes.
+    pub fn session_entries_start(&self, id: Uuid) -> Result<SessionEntryCursor, Error> {
+        self.session_messages_start(id).map(SessionEntryCursor)
+    }
+
+    /// Page original session entries in reverse commit order across fork cuts.
+    pub fn session_entries(
+        &self,
+        cursor: &SessionEntryCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<SessionEntryPage, Error> {
+        let (entries, older) = self.session_history_page(
+            &cursor.0,
+            limit,
+            |source, observation| self.session_entries_in_observation(source, observation),
+            SessionEntry::id,
+        )?;
+        Ok(SessionEntryPage {
+            entries,
+            older: older.map(SessionEntryCursor),
+        })
+    }
+
+    fn session_history_page<E>(
+        &self,
+        cursor: &SessionMessageCursor,
+        limit: std::num::NonZeroUsize,
+        read_entries: impl Fn(Uuid, u64) -> Result<Vec<E>, Error>,
+        entry_id: impl Fn(&E) -> Uuid,
+    ) -> Result<(Vec<E>, Option<SessionMessageCursor>), Error> {
         if limit.get() > 256 {
             return Err(Error::Invalid(
-                "session message page limit exceeds 256".into(),
+                "session history page limit exceeds 256".into(),
             ));
         }
         let store = self.subagent_store()?;
@@ -10492,10 +10623,7 @@ impl Harness {
                     return Err(crate::fork::Error::InvalidCursor.into());
                 }
                 let Some(parent) = self.fork_parent(position.source)? else {
-                    return Ok(SessionMessagePage {
-                        entries,
-                        older: None,
-                    });
+                    return Ok((entries, None));
                 };
                 let parent = self.original_session_cut(parent)?;
                 position.source = parent.source;
@@ -10511,12 +10639,12 @@ impl Harness {
                 if position.observation == 1 && self.fork_parent(position.source)?.is_some() {
                     Vec::new()
                 } else {
-                    self.session_messages_in_observation(position.source, position.observation)?
+                    read_entries(position.source, position.observation)?
                 };
             if let Some(cutoff) = position.cutoff {
                 let index = messages
                     .iter()
-                    .position(|entry| entry.history.id == cutoff)
+                    .position(|entry| entry_id(entry) == cutoff)
                     .ok_or(crate::fork::Error::InvalidSnapshot)?;
                 messages.truncate(index + 1);
             }
@@ -10533,10 +10661,7 @@ impl Harness {
             // The next distinct entry determines whether there is another
             // page without handing back an empty tail of non-message commits.
             if entries.len() == limit.get() {
-                return Ok(SessionMessagePage {
-                    entries,
-                    older: Some(position),
-                });
+                return Ok((entries, Some(position)));
             }
             let count = remaining.min(limit.get() - entries.len());
             entries.extend(messages.drain(remaining - count..remaining).rev());
@@ -10597,11 +10722,11 @@ impl Harness {
         Ok(cut)
     }
 
-    fn session_observation_transcript(
+    fn session_observation(
         &self,
         source: Uuid,
         observation: u64,
-    ) -> Result<Option<crate::transcript::Cursor>, Error> {
+    ) -> Result<crate::observer::Record, Error> {
         let previous = observation
             .checked_sub(1)
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
@@ -10611,15 +10736,44 @@ impl Harness {
             crate::observer::Cursor(observation),
             std::num::NonZeroUsize::MIN,
         )?;
-        let record = page
-            .records
-            .first()
+        page.records
+            .into_iter()
+            .next()
             .filter(|record| record.cursor.0 == observation)
-            .ok_or(crate::fork::Error::InvalidSnapshot)?;
-        let reference = record.value.get("_transcript");
+            .ok_or_else(|| crate::fork::Error::InvalidSnapshot.into())
+    }
+
+    fn session_observation_transcript(
+        &self,
+        source: Uuid,
+        observation: u64,
+    ) -> Result<Option<crate::transcript::Cursor>, Error> {
+        let record = self.session_observation(source, observation)?;
         Ok(serde_json::from_value(
-            reference.cloned().unwrap_or_default(),
+            record.value.get("_transcript").cloned().unwrap_or_default(),
         )?)
+    }
+
+    fn session_entries_in_observation(
+        &self,
+        source: Uuid,
+        observation: u64,
+    ) -> Result<Vec<SessionEntry>, Error> {
+        let record = self.session_observation(source, observation)?;
+        let mut entries: Vec<_> = self
+            .session_messages_from_record(source, &record)?
+            .into_iter()
+            .map(SessionEntry::Message)
+            .collect();
+        if let Some(info) = record.value.get("session_info") {
+            self.authenticate_fork_anchor(source, observation)?;
+            entries.push(SessionEntry::SessionInfo {
+                entry: serde_json::from_value(info.clone())?,
+                origin: source,
+                observation: record.cursor,
+            });
+        }
+        Ok(entries)
     }
 
     fn session_messages_in_observation(
@@ -10627,7 +10781,19 @@ impl Harness {
         source: Uuid,
         observation: u64,
     ) -> Result<Vec<SessionMessageEntry>, Error> {
-        let Some(mut position) = self.session_observation_transcript(source, observation)? else {
+        let record = self.session_observation(source, observation)?;
+        self.session_messages_from_record(source, &record)
+    }
+
+    fn session_messages_from_record(
+        &self,
+        source: Uuid,
+        record: &crate::observer::Record,
+    ) -> Result<Vec<SessionMessageEntry>, Error> {
+        let observation = record.cursor.0;
+        let Some(mut position): Option<crate::transcript::Cursor> =
+            serde_json::from_value(record.value.get("_transcript").cloned().unwrap_or_default())?
+        else {
             return Ok(Vec::new());
         };
         let store = self.owner.store();
@@ -10709,7 +10875,7 @@ impl Harness {
         Ok(batches.into_iter().rev().flatten().collect())
     }
 
-    /// Fork at the exact committed boundary of a message occurrence.
+    /// Fork at a session-info entry or original message occurrence.
     /// Interior messages require a proven safe append. Inherited entries must
     /// be visible in the shared chain or recorded session ancestry and have a
     /// verified origin snapshot. Local observations are scanned across resets.
@@ -10952,28 +11118,51 @@ impl Harness {
             (None, Some((origin, position))) => {
                 self.fork_at_position_with_membership(origin, position, &membership)
             }
-            (None, None) if self.fork_parent(id)?.is_some() => {
-                // A replacement can hide inherited messages from the model
-                // projection without removing them from the session history.
-                let mut cursor = Some(self.session_messages_start(id)?);
+            (Some(_), Some(_)) => Err(crate::fork::Error::InvalidSnapshot.into()),
+            (None, None) => {
+                // Metadata and archived inherited messages may be outside the
+                // current model projection. Only search the session's fork cuts.
+                let mut cursor = Some(self.session_entries_start(id)?);
                 let mut archived = None;
                 while let Some(position) = cursor {
-                    let page = self.session_messages(
+                    let page = self.session_entries(
                         &position,
                         std::num::NonZeroUsize::new(64).expect("nonzero"),
                     )?;
                     for entry in page.entries {
-                        if entry.history.id == entry_id && archived.replace(entry).is_some() {
+                        if entry.id() == entry_id && archived.replace(entry).is_some() {
                             return Err(crate::fork::Error::InvalidSnapshot.into());
                         }
                     }
                     cursor = page.older;
                 }
-                let entry = archived.ok_or(crate::fork::Error::InvalidCursor)?;
-                let original = self.original_occurrence_position(&entry.history, &entry.message)?;
-                self.fork_at_position_with_membership(entry.history.origin, original, &membership)
+                match archived.ok_or(crate::fork::Error::InvalidCursor)? {
+                    SessionEntry::Message(entry) => {
+                        let original =
+                            self.original_occurrence_position(&entry.history, &entry.message)?;
+                        self.fork_at_position_with_membership(
+                            entry.history.origin,
+                            original,
+                            &membership,
+                        )
+                    }
+                    SessionEntry::SessionInfo {
+                        origin,
+                        observation,
+                        ..
+                    } => self.fork_at_selected(
+                        origin,
+                        observation,
+                        ForkBoundary::SessionInfo { entry_id },
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                        &membership,
+                    ),
+                }
             }
-            _ => Err(crate::fork::Error::InvalidCursor.into()),
         }
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
@@ -24607,6 +24796,22 @@ impl Scheduler {
     pub fn fork_parent(&self, id: Uuid) -> Result<Option<ForkParent>, Error> {
         self.harness.fork_parent(id)
     }
+    pub fn set_session_name(&mut self, id: Uuid, name: &str) -> Result<Uuid, Error> {
+        self.harness.set_session_name(id, name)
+    }
+
+    pub fn session_entries_start(&self, id: Uuid) -> Result<SessionEntryCursor, Error> {
+        self.harness.session_entries_start(id)
+    }
+
+    pub fn session_entries(
+        &self,
+        cursor: &SessionEntryCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<SessionEntryPage, Error> {
+        self.harness.session_entries(cursor, limit)
+    }
+
     pub fn session_messages_start(&self, id: Uuid) -> Result<SessionMessageCursor, Error> {
         self.harness.session_messages_start(id)
     }
@@ -27809,6 +28014,8 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         .and_then(|v| v.remove("after_failed_run"));
     new.as_object_mut()
         .and_then(|v| v.remove("after_failed_run"));
+    old.as_object_mut().and_then(|v| v.remove("session_info"));
+    new.as_object_mut().and_then(|v| v.remove("session_info"));
     old.as_object_mut().and_then(|v| v.remove("queue_modes"));
     new.as_object_mut().and_then(|v| v.remove("queue_modes"));
     let old_submissions = old
@@ -35584,6 +35791,7 @@ mod scheduler_tests {
         let base = Conversation {
             id: Uuid::new_v4(),
             config: config(),
+            session_info: None,
             queue_modes: QueueModes::default(),
             after_failed_run: AfterFailedRun::default(),
             extensions: vec![],

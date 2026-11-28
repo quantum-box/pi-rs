@@ -533,6 +533,56 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
     assert_eq!(bodies[12]["model"], "fixture");
 }
 
+#[test]
+fn rpc_session_name_is_sanitized_and_retained_on_reopen() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("durable.sqlite");
+    let rpc = |args: &[&str], requests: &[Value]| {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_pi-rs-durable"))
+            .env("OPENAI_API_KEY", "fixture-key")
+            .arg("--db")
+            .arg(&db)
+            .args(["--endpoint", &endpoint, "--rpc"])
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = process.stdin.take().unwrap();
+        for request in requests {
+            writeln!(input, "{request}").unwrap();
+        }
+        drop(input);
+        frames(process.wait_with_output().unwrap())
+    };
+    let responses = rpc(
+        &["--model", "fixture"],
+        &[
+            json!({"type":"get_state"}),
+            json!({"type":"set_session_name","name":"  Test\r\nTitle  "}),
+            json!({"type":"set_session_name","name":"   "}),
+            json!({"type":"get_state"}),
+        ],
+    );
+    assert_eq!(responses.len(), 4);
+    assert!(responses[0]["data"].get("sessionName").is_none());
+    assert_eq!(responses[1]["success"], true);
+    assert_eq!(responses[2]["success"], false);
+    assert_eq!(responses[3]["data"]["sessionName"], "Test Title");
+    let id = responses[3]["data"]["sessionId"].as_str().unwrap();
+    let reopened = rpc(&["--conversation", id], &[json!({"type":"get_state"})]);
+    assert_eq!(reopened[0]["data"]["sessionName"], "Test Title");
+    assert_eq!(reopened[0]["data"]["messageCount"], 0);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
 fn frames(output: Output) -> Vec<Value> {
     assert!(
         output.status.success(),

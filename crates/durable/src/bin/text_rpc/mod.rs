@@ -361,8 +361,15 @@ async fn respond(
             }
             Err(error) => Err(error.to_string()),
         },
+        "set_session_name" => match request["name"].as_str().map(str::trim) {
+            Some(name) if !name.is_empty() => scheduler
+                .set_session_name(id, name)
+                .map(|_| None)
+                .map_err(|error| error.to_string()),
+            _ => Err("Session name cannot be empty".into()),
+        },
         "get_state" => scheduler.conversation(id).map(|state| {
-            Some(json!({
+            let mut data = json!({
                 "sessionId": id,
                 "model": {"id": model, "provider":"openai", "api":"openai-responses"},
                 "isStreaming": state.input_run_active(),
@@ -371,7 +378,11 @@ async fn respond(
                 "followUpMode": state.queue_modes.follow_up_mode,
                 "messageCount": messages(&state).len(),
                 "pendingMessageCount": state.submissions.iter().filter(|s| matches!(s.status, Status::Queued)).count()
-            }))
+            });
+            if let Some(name) = state.session_name() {
+                data["sessionName"] = json!(name);
+            }
+            Some(data)
         }).map_err(|error| error.to_string()),
         "get_messages" => scheduler.conversation(id).map(|state| {
             let mut data = json!({"messages":messages(&state)});
