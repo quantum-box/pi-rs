@@ -1260,9 +1260,13 @@ including changed sections and available, added, or removed tools. Tool
 parameters expand to show types, required flags, and descriptions.
 User shell executions appear in HTML exports even when excluded from model
 context. The first ten output lines stay visible, with the rest folded.
-Prompt-template arguments preserve literal backslashes and quoted empty
-values. Positional arguments, defaults and slices use Pi's placeholder
-syntax and expand only once.
+Prompt-template arguments open quotes only at the start of a token. Apostrophes
+inside words and unmatched opening quotes stay literal. Inside a quoted token,
+a backslash escapes its matching quote, while other backslashes stay literal.
+Quoted empty values keep their positions, and JavaScript whitespace separates
+unquoted arguments. Positional arguments, defaults and slices use Pi's
+placeholder syntax and expand only once.
+[Pi's prompt-template argument parser](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/prompt-templates.ts#L25-L76)
 Each directory contributes its first readable context file in Pi order
 (`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`).
 Context files are loaded from outer directories toward the workspace, and a
