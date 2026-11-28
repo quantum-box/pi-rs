@@ -3711,7 +3711,11 @@ mod tests {
         let provider = json!({"fixture":{"baseUrl":"http://127.0.0.1:9/v1/",
             "models":[{"id":"paint","type":"image","api":"pi-image","input":["text","image"]}]}});
         let catalogue = Catalogue::parse(provider.as_object().unwrap()).unwrap();
-        let entry = &catalogue.0[0];
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "fixture" && entry.model.id == "paint")
+            .unwrap();
         assert_eq!(entry.endpoint.path(), "/v1/image");
         let input = json!([{"type":"text","text":"draw"},
             {"type":"image","mimeType":"image/png","data":"YQ=="}]);
