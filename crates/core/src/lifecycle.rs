@@ -451,6 +451,34 @@ pub(crate) async fn notify_with_host(
     observer: &mut Observer<'_>,
     host: std::sync::Arc<dyn crate::ToolHost>,
 ) {
+    notify_with_active_host(
+        registry,
+        event,
+        states,
+        timeout,
+        observer,
+        ActiveHost::Shared(host),
+    )
+    .await;
+}
+
+#[derive(Clone)]
+pub(crate) enum ActiveHost {
+    Shared(std::sync::Arc<dyn ToolHost>),
+    AgentStart {
+        scoped: crate::agent::AgentStartHost,
+        mcp: std::sync::Arc<dyn ToolHost>,
+    },
+}
+
+pub(crate) async fn notify_with_active_host(
+    registry: &Registry,
+    event: LifecycleEvent,
+    states: &ExtensionStates,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    host: ActiveHost,
+) {
     notify_inner(
         registry,
         event,
@@ -572,7 +600,7 @@ async fn notify_session_callback(
                         &states,
                         timeout,
                         (&mut collect, &mut include_all, None),
-                        Some(host),
+                        Some(ActiveHost::Shared(host)),
                         compaction,
                     )
                     .await
@@ -749,7 +777,7 @@ async fn notify_inner(
     states: &ExtensionStates,
     timeout: Duration,
     (observer, include, ui): LifecycleObservers<'_, '_>,
-    host: Option<std::sync::Arc<dyn crate::ToolHost>>,
+    host: Option<ActiveHost>,
     compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
 ) {
     notify_inner_once(
@@ -762,7 +790,11 @@ async fn notify_inner(
         compaction,
     )
     .await;
-    deliver_mcp_changes(registry, states, timeout, observer, host).await;
+    let mcp_host = host.map(|host| match host {
+        ActiveHost::Shared(host) => host,
+        ActiveHost::AgentStart { mcp, .. } => mcp,
+    });
+    deliver_mcp_changes(registry, states, timeout, observer, mcp_host).await;
 }
 
 async fn deliver_mcp_changes(
@@ -770,7 +802,7 @@ async fn deliver_mcp_changes(
     states: &ExtensionStates,
     timeout: Duration,
     observer: &mut Observer<'_>,
-    host: Option<std::sync::Arc<dyn crate::ToolHost>>,
+    host: Option<std::sync::Arc<dyn ToolHost>>,
 ) {
     let runtime = &registry.mcp_servers;
     let Some(mut delivery) = runtime.begin_delivery() else {
@@ -794,7 +826,7 @@ async fn deliver_mcp_changes(
             states,
             remaining,
             (observer, &mut |_| true, None),
-            host.clone(),
+            host.clone().map(ActiveHost::Shared),
             None,
         )
         .await;
@@ -808,10 +840,12 @@ async fn notify_inner_once(
     states: &ExtensionStates,
     timeout: Duration,
     (observer, include, ui): LifecycleObservers<'_, '_>,
-    host: Option<std::sync::Arc<dyn crate::ToolHost>>,
+    host: Option<ActiveHost>,
     compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
 ) {
-    let deadline = platform_time::Instant::now() + timeout.min(Duration::from_secs(10));
+    let budget = timeout.min(Duration::from_secs(10));
+    let started = platform_time::Instant::now();
+    let deadline = started + budget;
     for extension in registry.extensions.iter().filter(|extension| match event {
         LifecycleEvent::McpServersChange { .. } => extension.handles_mcp_servers_change(),
         _ if !extension.handles_lifecycle() => false,
@@ -839,17 +873,28 @@ async fn notify_inner_once(
         let error = match platform_time::timeout_at(
             deadline,
             crate::sdk::scope_extension_callback(
-                host.as_ref().and_then(|host| host.callback_scope_owner()),
+                match &host {
+                    Some(ActiveHost::Shared(host)) => host.callback_scope_owner(),
+                    _ => None,
+                },
                 async {
                     if !include(extension.id()) {
                         return Ok(());
                     }
                     match &host {
                         Some(host) => {
-                            let scoped = crate::sdk::scope_callback_host(
-                                host.for_extension(extension.id())
-                                    .unwrap_or_else(|| host.clone()),
-                            );
+                            let _lifetime;
+                            let scoped = match host {
+                                ActiveHost::Shared(host) => crate::sdk::scope_callback_host(
+                                    host.for_extension(extension.id())
+                                        .unwrap_or_else(|| host.clone()),
+                                ),
+                                ActiveHost::AgentStart { scoped: host, .. } => {
+                                    let lifetime = host.cancellation.child_token();
+                                    _lifetime = lifetime.clone().drop_guard();
+                                    host.for_extension(extension.id(), lifetime, started, budget)
+                                }
+                            };
                             if let Some((trigger, metadata)) = &compaction {
                                 extension
                                     .compaction_lifecycle_with_host(
