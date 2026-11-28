@@ -729,6 +729,61 @@ fn restore_draft(view: &mut View, mut input: pi_rs::QueuedMessage) {
     view.draft_images = input.images;
 }
 
+#[cfg(any(unix, windows))]
+fn apply_color_snapshot(
+    snapshot: Option<crate::ui::terminal_color_batch::ColorSnapshot>,
+    args: &Cli,
+    view: &mut View,
+    theme: &mut Theme,
+) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+    let (changed, redraw) = apply_terminal_color_snapshot(snapshot, theme);
+    if changed {
+        refresh_terminal_theme_selection(args, view, theme);
+    }
+    changed || redraw
+}
+
+#[cfg(any(unix, windows))]
+fn terminal_color_reply(
+    event: InputEvent,
+    colors: &mut ColorQueries,
+    args: &Cli,
+    view: &mut View,
+    theme: &mut Theme,
+    output: &mut dyn Write,
+) -> Result<bool> {
+    let end_of_batch = matches!(event, InputEvent::PrimaryDeviceAttributes);
+    let snapshot = match event {
+        InputEvent::PrimaryDeviceAttributes => colors.receive_color_marker(output)?,
+        InputEvent::TerminalColorInvalid { target } => {
+            colors.record_invalid_color(target, output)?
+        }
+        InputEvent::TerminalPalette {
+            index,
+            red,
+            green,
+            blue,
+        } => colors.record_color(index, [red, green, blue], output)?,
+        InputEvent::TerminalColor {
+            foreground,
+            red,
+            green,
+            blue,
+        } => colors.record_color(if foreground { 16 } else { 17 }, [red, green, blue], output)?,
+        _ => return Ok(false),
+    };
+    let mut dirty = apply_color_snapshot(snapshot, args, view, theme);
+    if end_of_batch && !colors.color_requery && colors.color_queries.is_empty() {
+        dirty |= finish_initial_terminal_colors(theme);
+    } else {
+        dirty |= settle_complete_colors(colors, theme);
+    }
+    Ok(dirty)
+}
+
 pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(Error::Config(
@@ -796,6 +851,17 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
         if last_theme_check.elapsed() >= Duration::from_millis(500) {
             dirty |= watcher.poll(&mut theme)?;
             last_theme_check = Instant::now();
+        }
+        #[cfg(any(unix, windows))]
+        {
+            terminal.colors.poll_color_timeout()?;
+            dirty |= apply_color_snapshot(
+                terminal.colors.timeout_color_batch(Instant::now()),
+                &args,
+                &mut view,
+                &mut theme,
+            );
+            dirty |= expire_initial_terminal_colors(&terminal.colors, &mut theme);
         }
         terminal.update_progress(args.settings.terminal_progress() && conversation.busy())?;
         if dirty {
@@ -921,6 +987,11 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                     picker.clear_mouse_press();
                 }
             }
+            Some(InputEvent::Event(Event::Mouse(mouse)))
+                if args.tui_mode != Some(TuiMode::Regular) =>
+            {
+                dirty = view.fullscreen_mouse(mouse, &args);
+            }
             Some(InputEvent::Event(Event::Paste(text))) => {
                 if let Some((_, dialog)) = &mut view.local_editor {
                     dialog.paste(&text);
@@ -940,10 +1011,26 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                 terminal.keyboard_reply(true)?;
             }
             #[cfg(any(unix, windows))]
-            Some(InputEvent::PrimaryDeviceAttributes) => {
-                finish_initial_terminal_colors(&mut theme);
+            Some(
+                event @ (InputEvent::PrimaryDeviceAttributes
+                | InputEvent::TerminalColorInvalid { .. }
+                | InputEvent::TerminalPalette { .. }
+                | InputEvent::TerminalColor { .. }),
+            ) => {
                 #[cfg(unix)]
-                terminal.keyboard_reply(false)?;
+                let keyboard_marker = matches!(event, InputEvent::PrimaryDeviceAttributes);
+                dirty = terminal_color_reply(
+                    event,
+                    &mut terminal.colors,
+                    &args,
+                    &mut view,
+                    &mut theme,
+                    &mut std::io::stdout(),
+                )?;
+                #[cfg(unix)]
+                if keyboard_marker {
+                    terminal.keyboard_reply(false)?;
+                }
             }
             #[cfg(any(unix, windows))]
             Some(InputEvent::Appearance { dark }) if terminal.appearance_notifications => {
@@ -957,25 +1044,6 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                     refresh_terminal_theme_selection(&args, &mut view, &mut theme);
                 }
             }
-            #[cfg(any(unix, windows))]
-            Some(InputEvent::TerminalColor {
-                foreground,
-                red,
-                green,
-                blue,
-            }) => {
-                if let Some(snapshot) = terminal.colors.record_color(
-                    if foreground { 16 } else { 17 },
-                    [red, green, blue],
-                    &mut std::io::stdout(),
-                )? {
-                    let (changed, _) = apply_terminal_color_snapshot(snapshot, &mut theme);
-                    if changed {
-                        refresh_terminal_theme_selection(&args, &mut view, &mut theme);
-                    }
-                }
-                settle_complete_colors(&terminal.colors, &mut theme);
-            }
             _ => dirty = false,
         }
     }
@@ -984,6 +1052,87 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn durable_terminal_applies_palette_and_accepts_a_new_query_after_da1() {
+        const CHILD: &str = "PI_DURABLE_TERMINAL_COLOR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::durable::tests::durable_terminal_applies_palette_and_accepts_a_new_query_after_da1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        crate::ui::theme::reset_terminal_background();
+        let _pending = crate::ui::theme::PendingTerminalColors::new();
+        let mut theme = Theme::system();
+        let args = Cli::try_parse_from(["pi"]).unwrap();
+        let mut view = View::default();
+        let mut colors = ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        let inputs = [
+            InputEvent::TerminalColor {
+                foreground: false,
+                red: 0,
+                green: 0,
+                blue: 0,
+            },
+            InputEvent::TerminalColor {
+                foreground: true,
+                red: 255,
+                green: 255,
+                blue: 255,
+            },
+        ]
+        .into_iter()
+        .chain((0..16).map(|index| InputEvent::TerminalPalette {
+            index,
+            red: 10 + index,
+            green: 40 + index,
+            blue: 70 + index,
+        }))
+        .chain([InputEvent::PrimaryDeviceAttributes]);
+        let mut redraw = false;
+        for event in inputs {
+            redraw |= terminal_color_reply(
+                event,
+                &mut colors,
+                &args,
+                &mut view,
+                &mut theme,
+                &mut output,
+            )
+            .unwrap();
+        }
+        assert!(redraw);
+        assert!(matches!(
+            theme.color("accent"),
+            crossterm::style::Color::Rgb { .. }
+        ));
+        assert!(colors.color_queries.is_empty());
+
+        let bytes = output.len();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(output.len() > bytes);
+        terminal_color_reply(
+            InputEvent::PrimaryDeviceAttributes,
+            &mut colors,
+            &args,
+            &mut view,
+            &mut theme,
+            &mut output,
+        )
+        .unwrap();
+        assert!(colors.color_queries.is_empty());
+    }
 
     #[test]
     fn navigation_restores_an_input_and_its_image_in_an_empty_editor() {

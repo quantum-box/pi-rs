@@ -251,6 +251,109 @@ mod tests {
         }
     }
 
+    struct ProgressFixture;
+
+    #[async_trait::async_trait]
+    impl Model for ProgressFixture {
+        async fn stream(&self, request: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+            if matches!(
+                request.messages.last(),
+                Some(pi_rs_core::Message::Tool { .. })
+            ) {
+                return Fixture.stream(request).await;
+            }
+            Ok(Box::pin(futures_util::stream::iter([Ok(
+                ModelEvent::Complete {
+                    calls: vec![pi_rs_core::ToolCall {
+                        id: "preview-call".into(),
+                        name: "preview".into(),
+                        arguments: "{}".into(),
+                    }],
+                    usage: None,
+                },
+            )])))
+        }
+    }
+
+    impl pi_rs_core::Extension for ProgressFixture {
+        fn id(&self) -> &str {
+            "progress-fixture"
+        }
+
+        fn tools(&self) -> Vec<Arc<dyn pi_rs_core::Tool>> {
+            vec![Arc::new(Self)]
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl pi_rs_core::Tool for ProgressFixture {
+        fn spec(&self) -> pi_rs_core::ToolSpec {
+            pi_rs_core::ToolSpec {
+                name: "preview".into(),
+                description: "Synthetic tool progress".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: pi_rs_core::ToolContext,
+        ) -> pi_rs_core::Outcome {
+            unreachable!("fixture needs a tool host")
+        }
+
+        async fn invoke_with_host(
+            &self,
+            _: serde_json::Value,
+            _: pi_rs_core::ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: Arc<dyn pi_rs_core::ToolHost>,
+        ) -> pi_rs_core::Outcome {
+            host.report_progress(serde_json::json!({"content":[{"type":"text","text":"preview"}]}))
+                .await
+                .unwrap();
+            pi_rs_core::Outcome::Succeeded("final".into())
+        }
+    }
+
+    #[test]
+    fn mock_ipc_prompt_feeds_tool_progress() {
+        let session = SessionBuilder::new(Arc::new(ProgressFixture), "fixture")
+            .extension(Arc::new(ProgressFixture))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let mut progress = session.subscribe_tool_progress();
+        let app = tauri::test::mock_builder()
+            .manage(session_state_from_session(session))
+            .invoke_handler(tauri::generate_handler![commands::prompt, commands::close])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let response = tauri::test::get_ipc_response(
+            &webview,
+            request("prompt", serde_json::json!({"text":"run preview"})),
+        )
+        .unwrap();
+        assert_eq!(response.deserialize::<String>().unwrap(), "fixture answer");
+        let update = progress.try_recv().unwrap();
+        assert_eq!(
+            serde_json::to_value(update.as_ref()).unwrap(),
+            serde_json::json!({
+                "toolCallId":"preview-call", "toolName":"preview", "args":{},
+                "partialResult":{"content":[{"type":"text","text":"preview"}]}
+            })
+        );
+        tauri::test::get_ipc_response(&webview, request("close", serde_json::json!({}))).unwrap();
+        assert_eq!(
+            progress.try_recv().unwrap_err(),
+            tokio::sync::broadcast::error::TryRecvError::Closed
+        );
+    }
+
     #[test]
     fn mock_ipc_reuses_managed_session_and_dispatches_commands() {
         let app = configure(tauri::test::mock_builder(), Arc::new(Fixture), "fixture")
