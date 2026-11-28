@@ -9380,10 +9380,11 @@ fn explicit_catalog_read_keeps_the_proxy_for_remote_routes_in_offline_mode() {
         json!({"httpProxy":format!("http://{}", proxy.local_addr().unwrap())}).to_string(),
     )
     .unwrap();
+    // The proxy observes CONNECT without resolving this reserved remote name.
     std::fs::write(
         root.path().join("models.json"),
         json!({"providers":{"together":{
-            "baseUrl":"https://127.0.0.2:1/v1", "apiKey":"fixture-key",
+            "baseUrl":"https://catalog.invalid:8443/v1", "apiKey":"fixture-key",
             "models":[{"id":"configured-fixture"}]
         }}})
         .to_string(),
@@ -9406,7 +9407,7 @@ fn explicit_catalog_read_keeps_the_proxy_for_remote_routes_in_offline_mode() {
                     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .unwrap();
-            if first.trim_end() == "CONNECT 127.0.0.2:1 HTTP/1.1" {
+            if first.trim_end() == "CONNECT catalog.invalid:8443 HTTP/1.1" {
                 break;
             }
         }
