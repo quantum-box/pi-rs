@@ -2248,6 +2248,66 @@ fn standalone_block_reset_can_fork_at_an_inherited_interior_message() {
         )
         .unwrap();
     assert!(harness.fork_by_entry_id(id, entries[0]).is_err());
+    let before_checkout = harness.conversation(child).unwrap().messages;
+    assert!(harness.checkout_session_entry(child, entries[0]).is_err());
+    assert_eq!(
+        harness.conversation(child).unwrap().messages,
+        before_checkout
+    );
+}
+
+#[test]
+fn standalone_block_reset_checkout_keeps_inherited_blocks_and_the_original_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let id = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let selected = vec![serde_json::json!({"type":"text","text":"selected"})];
+    let later = vec![
+        serde_json::json!({"type":"text","text":"later"}),
+        serde_json::json!({"type":"image","mimeType":"image/png","data":"aW1hZ2U="}),
+    ];
+    let (_, entries) = harness
+        .reset_with_blocks(
+            id,
+            Some("handoff".into()),
+            vec![selected.clone(), later.clone()],
+        )
+        .unwrap();
+    let child = harness.fork_by_entry_id(id, entries[1]).unwrap();
+    let draft = harness
+        .navigate_session_entry(child, entries[1])
+        .unwrap()
+        .unwrap();
+    assert_eq!(draft.history.id, entries[1]);
+    assert_eq!(draft.blocks, Some(later.clone()));
+    drop(harness);
+
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let state = harness.conversation(child).unwrap();
+    assert_eq!(state.messages.len(), 2);
+    assert_eq!(state.content_blocks.len(), 1);
+    assert_eq!(state.content_blocks[&1].message_id, entries[0]);
+    assert_eq!(state.content_blocks[&1].blocks, selected);
+    let tree = harness
+        .session_tree(&harness.session_entries_start(child).unwrap())
+        .unwrap();
+    assert_eq!(tree.leaf_id, Some(entries[0]));
+    assert!(
+        tree.entries
+            .iter()
+            .any(|entry| entry.entry.id() == entries[1])
+    );
+    harness.checkout_session_entry(child, entries[1]).unwrap();
+    let restored = harness.conversation(child).unwrap();
+    assert_eq!(restored.messages.len(), 3);
+    assert_eq!(restored.content_blocks[&2].blocks, later);
 }
 
 #[test]
