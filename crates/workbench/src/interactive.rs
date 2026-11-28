@@ -8934,7 +8934,19 @@ pub(super) async fn run(
         } else {
             shell_words::quote(&path).into_owned()
         };
-        println!("Resume this session with pi --session {path}");
+        let profile = args
+            .resume_agent_dir
+            .as_ref()
+            .map(|directory| {
+                let directory = directory.to_string_lossy();
+                if cfg!(windows) {
+                    format!(" --agent-dir '{}'", directory.replace('\'', "''"))
+                } else {
+                    format!(" --agent-dir {}", shell_words::quote(&directory))
+                }
+            })
+            .unwrap_or_default();
+        println!("Resume this session with pi{profile} --session {path}");
     }
     if interrupted || super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
     {

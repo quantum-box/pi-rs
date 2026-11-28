@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod agent_dir_arg;
 mod anthropic_auth;
 mod anthropic_federation;
 mod attachments;
@@ -89,6 +90,11 @@ type RpcModelImages = std::sync::Arc<std::sync::Mutex<rpc::ModelImageCache>>;
     after_help = "Pi aliases: -v (--version), -nt (--no-tools), -nbt (--no-builtin-tools), -xt (--exclude-tools), -ne (--no-extensions), -ns (--no-skills), -np (--no-prompt-templates), -nc (--no-context-files), -na (--no-approve).\nUse pi-rs --durable --help for the experimental durable text CLI."
 )]
 struct Cli {
+    /// Config directory for settings, authentication, and resources.
+    #[arg(long, value_name = "DIR")]
+    agent_dir: Option<PathBuf>,
+    #[arg(skip)]
+    resume_agent_dir: Option<PathBuf>,
     #[arg(skip)]
     initial_selection: Option<InitialSelection>,
     #[arg(skip)]
@@ -1543,9 +1549,11 @@ fn startup_ready(ready: &mut Option<tokio::sync::oneshot::Sender<()>>) {
     }
 }
 
-fn run_durable_cli() -> Option<i32> {
-    let mut arguments = std::env::args_os().skip(1);
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--durable")) {
+fn run_durable_cli(argv: &[std::ffi::OsString]) -> Option<i32> {
+    let mut arguments = argv.iter().skip(1);
+    if arguments.next().map(std::ffi::OsString::as_os_str)
+        != Some(std::ffi::OsStr::new("--durable"))
+    {
         return None;
     }
     let result = std::env::current_exe().and_then(|executable| {
@@ -1584,7 +1592,28 @@ fn main() {
         unsafe { std::env::remove_var(program_resume::TOKEN_ENV) };
     }
     let resume_token = resume_token.and_then(|token| token.into_string().ok());
-    if let Some(code) = run_durable_cli() {
+    let (argv, agent_dir) = match agent_dir_arg::take(std::env::args_os().collect()) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(path) = &agent_dir {
+        // Before the runtime or any worker threads start, make the explicit
+        // choice authoritative for native code and inherited child processes.
+        unsafe {
+            std::env::set_var("PI_RS_HOME", path);
+            std::env::set_var("PI_CODING_AGENT_DIR", path);
+        }
+    }
+    let resume_agent_dir = agent_dir.or_else(|| {
+        (std::env::var_os("PI_RS_HOME").is_some()
+            || std::env::var_os("PI_CODING_AGENT_DIR").is_some())
+        .then(|| agent_dir_arg::absolute_literal(&pi_rs_workbench::agent_dir()).ok())
+        .flatten()
+    });
+    if let Some(code) = run_durable_cli(&argv) {
         std::process::exit(code);
     }
     #[cfg(windows)]
@@ -1593,13 +1622,13 @@ fn main() {
         std::thread::Builder::new()
             .name("pi".into())
             .stack_size(4 * 1024 * 1024)
-            .spawn(move || run_cli(resume_token))
+            .spawn(move || run_cli(resume_token, argv, resume_agent_dir))
             .expect("start Pi runtime thread")
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     };
     #[cfg(not(windows))]
-    let code = run_cli(resume_token);
+    let code = run_cli(resume_token, argv, resume_agent_dir);
     // Detached discovery threads may still be finishing. Wait for any token
     // rotation and prevent another one from starting before process exit.
     let _refreshes = process::stop_new_refreshes();
@@ -1613,13 +1642,17 @@ fn main() {
 const RPC_FILE_ARGUMENT_ERROR: &str = "Error: @file arguments are not supported in RPC mode";
 
 #[tokio::main(flavor = "current_thread")]
-async fn run_cli(resume_token: Option<String>) -> i32 {
+async fn run_cli(
+    resume_token: Option<String>,
+    mut argv: Vec<std::ffi::OsString>,
+    resume_agent_dir: Option<PathBuf>,
+) -> i32 {
     // Terminal-owned workers receive the same foreground-group SIGINT as the
     // frontend and editor. Their parent handles terminal interrupts and sends
     // explicit cancel/shutdown commands; do not independently stop the worker.
     // Worker::start places its internal flag first, before user arguments.
-    let terminal_managed = std::env::args_os()
-        .nth(1)
+    let terminal_managed = argv
+        .get(1)
         .is_some_and(|arg| arg == "--terminal-managed-worker");
     let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
     let command_cancel = CancellationToken::new();
@@ -1637,7 +1670,6 @@ async fn run_cli(resume_token: Option<String>) -> i32 {
         }
     });
     tokio::task::yield_now().await;
-    let mut argv: Vec<_> = std::env::args_os().collect();
     let export_plan = cli_compat::export_plan(&argv);
     if let Some(plan) = &export_plan {
         argv = plan.validation_args.clone();
@@ -1697,6 +1729,7 @@ async fn run_cli(resume_token: Option<String>) -> i32 {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        args.resume_agent_dir = resume_agent_dir;
         program_resume::capture_cli_options(&mut args, &matches);
         if args.terminal_resume {
             program_resume::bind_startup(&mut args)?;

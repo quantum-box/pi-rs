@@ -1185,7 +1185,15 @@ the provider is journaled for restoration and remains absent from ordinary
 non-trace CLI output.
 
 User settings and keybindings use the existing `~/.pi-rs` agent directory (or
-`PI_RS_HOME` / `PI_CODING_AGENT_DIR`). `/theme <name>` persists the selected
+`PI_RS_HOME` / `PI_CODING_AGENT_DIR`). Pi v1.7's `--agent-dir <dir>` overrides
+both environment variables, accepts relative, home-relative and file URL paths,
+and selects the last occurrence before `--`. It requires a separate directory
+argument; native rejects the unsupported `--agent-dir=...` spelling before loading
+a profile. Without the flag, the native
+`PI_RS_HOME` precedence and default directory remain unchanged. The resolved
+profile is inherited by children and included in terminal resume commands.
+[Pi v1.7 agent-dir parsing](https://github.com/earendil-works/pi/blob/2126569de40d5595dd3f41f7af126001f04c1de0/packages/coding-agent/src/cli/agent-dir-arg.ts)
+`/theme <name>` persists the selected
 theme. `/reload` reloads settings, context, skills, prompts, native extensions, MCP,
 keybindings and themes. Remaining application key actions are tracked above.
 

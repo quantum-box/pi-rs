@@ -1177,6 +1177,7 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
     }
     let session_path = workspace.join("session with spaces.jsonl");
     let session_dir = workspace.join("new journals");
+    let profile = workspace.join("profile with spaces");
     pi_rs::Session::open(&session_path)
         .unwrap()
         .append_user_with_images("resume test transcript".into(), vec![], None)
@@ -1232,6 +1233,8 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
                 "--workspace",
             ])
             .arg(&workspace)
+            .arg("--agent-dir")
+            .arg(&profile)
             .arg("--session")
             .arg(&session_path)
             .arg("--session-dir")
@@ -1250,6 +1253,8 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
             path.to_str().unwrap(),
             "--workspace",
             workspace.to_str().unwrap(),
+            "--agent-dir",
+            profile.to_str().unwrap(),
             "--no-trust",
             "--no-mcp",
             "--offline",
@@ -1289,11 +1294,15 @@ fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() 
         verify(text, &new_path)
     });
     master
-        .write_all(b"!test -z \"${OSC7577_TOKEN+x}\" && touch child-token-absent\r")
+        .write_all(b"!test -z \"${OSC7577_TOKEN+x}\" && test \"$PI_RS_HOME\" = \"$PI_CODING_AGENT_DIR\" && printf %s \"$PI_RS_HOME\" > child-profile && touch child-token-absent\r")
         .unwrap();
     output_until_with_timeout(&mut master, Duration::from_secs(20), |_| {
         workspace.join("child-token-absent").is_file()
     });
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("child-profile")).unwrap(),
+        profile.to_str().unwrap()
+    );
     master.write_all(b"/quit\r").unwrap();
     output_until(&mut master, |text| {
         resume_report_bodies(text, TOKEN).any(|body| body.ends_with(":clear=1"))
@@ -1797,7 +1806,7 @@ fn terminal_image_interrupt_during_reload_keeps_regular_transcript() {
     );
     output_until(&mut master, |text| {
         record_erase(text);
-        text.contains("Resume this session with pi --session")
+        text.contains("Resume this session with pi --agent-dir") && text.contains(" --session ")
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
