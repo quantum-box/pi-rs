@@ -831,7 +831,16 @@ impl Session {
 
     /// Hold an exclusive OS lock for the lifetime of the session.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut session = Self::with_store(FileStore::open(path.as_ref())?)?;
+        Self::open_file(FileStore::open(path.as_ref())?)
+    }
+
+    /// Open an existing journal with recovery and an exclusive OS lock.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_file(FileStore::open_existing(path.as_ref())?)
+    }
+
+    fn open_file(store: FileStore) -> Result<Self> {
+        let mut session = Self::with_store(store)?;
         if session.host_binding().is_none() {
             crate::extension_boundary::repair_plan_on_open(&mut session)?;
             session.recover_tree_trigger_handoff()?;

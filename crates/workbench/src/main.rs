@@ -51,6 +51,7 @@ mod operation_models;
 mod packages;
 mod pi_messages;
 mod process;
+mod program_resume;
 mod providers;
 mod vertex_auth;
 #[cfg(windows)]
@@ -165,6 +166,21 @@ struct Cli {
     /// Path to the private append-only session journal.
     #[arg(long, default_value_os_t = interactive::new_session_path())]
     session: PathBuf,
+    /// Internal OSC restore with an explicit journal and workspace binding.
+    #[arg(long, hide = true, requires_all = ["session", "workspace"])]
+    terminal_resume: bool,
+    #[arg(long, hide = true, requires = "terminal_resume")]
+    terminal_resume_confirm_project: bool,
+    #[arg(long, hide = true, requires_all = ["terminal_managed_worker", "session", "workspace"])]
+    terminal_resume_worker: bool,
+    #[arg(long, hide = true, requires = "terminal_resume_worker")]
+    terminal_resume_approved: bool,
+    #[arg(skip)]
+    resume_existing_session: Option<(PathBuf, PathBuf)>,
+    #[arg(skip)]
+    resume_limits: program_resume::ExplicitLimits,
+    #[arg(skip)]
+    resume_explicit_extensions: bool,
     /// Open or create a named session in this workspace's session directory.
     #[arg(long, conflicts_with_all = ["session", "continue_session", "resume_session", "no_session"], value_parser = sessions::validate_id)]
     session_id: Option<String>,
@@ -356,6 +372,81 @@ struct InitialSelection {
 }
 
 impl Cli {
+    fn resume_requires_existing(&self) -> bool {
+        self.bound_resume_paths(&self.session).is_some()
+    }
+
+    fn bound_resume_paths(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<(&std::path::Path, &std::path::Path)> {
+        use std::path::Path;
+
+        let (journal, workspace) = self.resume_existing_session.as_ref()?;
+        fn parent(path: &Path) -> &Path {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+        }
+        let matches_entry = |path: &Path| {
+            path == journal
+                || path.file_name().is_some_and(|name| {
+                    parent(path)
+                        .canonicalize()
+                        .is_ok_and(|parent| parent.join(name) == *journal)
+                })
+        };
+        // Resolve the parent independently so a directory alias still matches
+        // when the protected journal has been removed. A direct file alias can
+        // still identify that entry even when the symlink is dangling.
+        (matches_entry(path)
+            || path.canonicalize().as_ref().ok() == Some(journal)
+            || std::fs::read_link(path)
+                .is_ok_and(|target| matches_entry(&parent(path).join(target))))
+        .then_some((journal, workspace))
+    }
+
+    fn canonical_resume_path(&self, path: PathBuf) -> PathBuf {
+        match self.bound_resume_paths(&path) {
+            Some((journal, _)) => journal.to_owned(),
+            None => path,
+        }
+    }
+
+    fn bind_existing_session(&mut self) {
+        self.resume_existing_session = Some((self.session.clone(), self.workspace.clone()));
+    }
+
+    fn project_trust(&self) -> Result<Option<bool>> {
+        let decision = config::project_trust(
+            &self.workspace,
+            if self.no_trust {
+                Some(false)
+            } else if self.trust || self.project.is_some() {
+                Some(true)
+            } else {
+                None
+            },
+        )?;
+        if decision == Some(true) && program_resume::needs_fresh_approval(self) {
+            if self.terminal_resume_worker {
+                return Err(Error::Config(
+                    "terminal resume requires fresh project approval".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        Ok(decision)
+    }
+
+    fn open_session(&self) -> Result<Session> {
+        if self.resume_requires_existing() {
+            program_resume::open_bound_session(self)
+        } else {
+            Session::open(&self.session)
+        }
+    }
+
     fn theme_setting(&self) -> Option<&str> {
         self.extension_theme
             .as_deref()
@@ -710,7 +801,7 @@ impl Cli {
         source: pi_rs::ModelSelectSource,
     ) -> Result<()> {
         let selected = self.prepare_model_change(provider, model, thinking, source)?;
-        selected.record_model_selection(&mut Session::open(&selected.session)?)?;
+        selected.record_model_selection(&mut selected.open_session()?)?;
         *self = selected;
         Ok(())
     }
@@ -1488,6 +1579,13 @@ fn run_durable_cli() -> Option<i32> {
 }
 
 fn main() {
+    let resume_token = std::env::var_os(program_resume::TOKEN_ENV);
+    if resume_token.is_some() {
+        // This is the binary entry point, before the runtime, other threads,
+        // or any child process starts. The token must never reach a child.
+        unsafe { std::env::remove_var(program_resume::TOKEN_ENV) };
+    }
+    let resume_token = resume_token.and_then(|token| token.into_string().ok());
     if let Some(code) = run_durable_cli() {
         std::process::exit(code);
     }
@@ -1497,13 +1595,13 @@ fn main() {
         std::thread::Builder::new()
             .name("pi".into())
             .stack_size(4 * 1024 * 1024)
-            .spawn(run_cli)
+            .spawn(move || run_cli(resume_token))
             .expect("start Pi runtime thread")
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     };
     #[cfg(not(windows))]
-    let code = run_cli();
+    let code = run_cli(resume_token);
     // Detached discovery threads may still be finishing. Wait for any token
     // rotation and prevent another one from starting before process exit.
     let _refreshes = process::stop_new_refreshes();
@@ -1517,7 +1615,7 @@ fn main() {
 const RPC_FILE_ARGUMENT_ERROR: &str = "Error: @file arguments are not supported in RPC mode";
 
 #[tokio::main(flavor = "current_thread")]
-async fn run_cli() -> i32 {
+async fn run_cli(resume_token: Option<String>) -> i32 {
     // Terminal-owned workers receive the same foreground-group SIGINT as the
     // frontend and editor. Their parent handles terminal interrupts and sends
     // explicit cancel/shutdown commands; do not independently stop the worker.
@@ -1601,6 +1699,12 @@ async fn run_cli() -> i32 {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        program_resume::capture_cli_options(&mut args, &matches);
+        if args.terminal_resume {
+            program_resume::bind_startup(&mut args)?;
+        } else if args.terminal_resume_worker {
+            program_resume::bind_worker(&mut args)?;
+        }
         if let Some(plan) = export_plan {
             if plan.input.as_os_str().is_empty() {
                 return Err(Error::Config("export input is required".into()));
@@ -1672,16 +1776,7 @@ async fn run_cli() -> i32 {
                 _ = &mut signal_rx => Err(Error::Cancelled),
             };
         }
-        let decision = config::project_trust(
-            &args.workspace,
-            if args.no_trust {
-                Some(false)
-            } else if args.trust || args.project.is_some() {
-                Some(true)
-            } else {
-                None
-            },
-        )?;
+        let decision = args.project_trust()?;
         args.trusted = decision.unwrap_or(false);
         args.trust_pending = decision.is_none();
         args.settings = if matches!(args.command, Some(Command::Serve))
@@ -1822,7 +1917,7 @@ async fn run_cli() -> i32 {
         let mcp_login = args.list_models.is_none() && matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }));
         let standalone_share = args.list_models.is_none() && matches!(&args.command, Some(Command::Share));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx)));
+        let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx), resume_token));
         if managed {
             tokio::select! {
                 biased;
@@ -1950,6 +2045,7 @@ async fn execute(
     mut args: Cli,
     output_truncated: &mut bool,
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+    resume_token: Option<String>,
 ) -> Result<()> {
     let pi_style_invocation = args.command.is_none();
     let patterns: Vec<_> = if let Some(patterns) = &args.models {
@@ -2246,7 +2342,7 @@ async fn execute(
         if !args.session.is_file() {
             return Err(Error::Config("session file not found".into()));
         }
-    } else if args.fork_session.is_none() {
+    } else if args.fork_session.is_none() && !args.terminal_resume {
         args.session = sessions::resolve_reference(&args.session, &directory)?;
     }
     if args
@@ -2347,7 +2443,7 @@ async fn execute(
     );
     let mut command = args.command.take().unwrap_or(Command::Interactive);
     if matches!(command, Command::Interactive) {
-        return interactive::run(args, follow_up_prompts, ready).await;
+        return interactive::run(args, follow_up_prompts, ready, resume_token).await;
     }
     if !matches!(&command, Command::Share)
         && let Some(parent) = args
@@ -2365,7 +2461,7 @@ async fn execute(
     let mut session = if matches!(&command, Command::Share) {
         Session::open_for_share(&args.session)?
     } else {
-        Session::open(&args.session)?
+        args.open_session()?
     };
     if session.host_binding().is_some() {
         return Err(Error::Session(

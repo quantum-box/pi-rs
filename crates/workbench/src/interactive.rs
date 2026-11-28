@@ -3438,7 +3438,7 @@ impl View {
     }
 
     fn restore(&mut self, args: &Cli) -> Result<()> {
-        let session = Session::open(&args.session)?;
+        let session = args.open_session()?;
         self.restore_session(args, &session)
     }
     fn restore_session(&mut self, args: &Cli, session: &Session) -> Result<()> {
@@ -4764,13 +4764,17 @@ render_call_id: None,
     fn suspend_terminal(
         &mut self,
         terminal: &mut Option<Terminal>,
-        mode: Option<TuiMode>,
+        args: &Cli,
+        resume: Option<&mut super::program_resume::Reporter>,
     ) -> Result<()> {
-        if mode == Some(TuiMode::Regular) {
+        if args.tui_mode == Some(TuiMode::Regular) {
             self.finish_regular()?;
         }
-        if let Err(error) = Terminal::suspend(terminal, mode, self.graphics.cleanup()) {
+        if let Err(error) = Terminal::suspend(terminal, args.tui_mode, self.graphics.cleanup()) {
             self.append(&error.to_string());
+        }
+        if let Some(reporter) = resume {
+            reporter.report(args, true)?;
         }
         if self.graphics.enabled() {
             images::query_cell_size()?;
@@ -5392,7 +5396,7 @@ fn slash(
             }
         }
         "/name" => {
-            let mut session = Session::open(&args.session)?;
+            let mut session = args.open_session()?;
             if !rest.is_empty() {
                 let name = pi_rs::sanitize_session_name(rest);
                 if session.name().unwrap_or_default() != name {
@@ -5413,12 +5417,12 @@ fn slash(
             } else {
                 Some(pi_rs::ContextContent::Text(content.into()))
             };
-            Session::open(&args.session)?.edit_context(target, replacement)?;
+            args.open_session()?.edit_context(target, replacement)?;
             view.append("Updated future model context");
         }
         "/label" => {
             let (id, label) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-            let mut session = Session::open(&args.session)?;
+            let mut session = args.open_session()?;
             let target = id
                 .parse()
                 .map_err(|_| Error::Config("use /label <record-id> [label]".into()))?;
@@ -5426,7 +5430,7 @@ fn slash(
             view.append("Label saved");
         }
         "/fork" if rest.is_empty() => {
-            let session = Session::open(&args.session)?;
+            let session = args.open_session()?;
             let items: Vec<_> = session
                 .branch()
                 .iter()
@@ -5452,7 +5456,7 @@ fn slash(
             }
         }
         "/clone" | "/fork" => {
-            let session = Session::open(&args.session)?;
+            let session = args.open_session()?;
             let (entry_id, position, target, input) = if name == "/fork" {
                 let target = rest
                     .parse::<u64>()
@@ -5499,7 +5503,7 @@ fn slash(
             )?;
             drop(session);
             args.session = destination;
-            args.restore_session_model(&Session::open(&args.session)?)?;
+            args.restore_session_model(&args.open_session()?)?;
             view.restore(args)?;
             view.clear_extension_chrome();
             args.session_transition = Some(pi_rs::SessionStartReason::Fork);
@@ -5519,7 +5523,7 @@ fn slash(
                     args.workspace.join(path)
                 }
             };
-            let session = Session::open(&args.session)?;
+            let session = args.open_session()?;
             sessions::export(&session, &destination)?;
             view.append(&format!("Exported {}", destination.display()));
         }
@@ -5565,7 +5569,7 @@ fn slash(
             switch_session(args, view, destination)?;
         }
         "/copy" => {
-            sessions::copy_last(&Session::open(&args.session)?)?;
+            sessions::copy_last(&args.open_session()?)?;
             view.append("Copied last response");
         }
         "/share" => {
@@ -5938,7 +5942,11 @@ fn slash(
             let workspace = args.workspace.canonicalize()?;
             if let Some(parent) = args.session.parent() {
                 for path in sessions::stored_paths(parent)? {
-                    if let Ok(session) = Session::open(&path) {
+                    let path = args.canonical_resume_path(path);
+                    if documents.contains_key(&path) {
+                        continue;
+                    }
+                    if let Ok(session) = open_picker_session(args, &path) {
                         if session.host_binding().is_some() {
                             continue;
                         }
@@ -6009,22 +6017,7 @@ fn slash(
             view.picker = Some(picker);
         }
         "/resume" => {
-            let path = PathBuf::from(rest);
-            if !path.is_file() {
-                return Err(Error::Config("session file not found".into()));
-            }
-            if Worker::check_session_transition(
-                worker,
-                args,
-                pi_rs::BeforeSessionTransition::Switch {
-                    reason: pi_rs::SessionSwitchReason::Resume,
-                    target_session_file: Some(path.clone()),
-                },
-            )? {
-                view.append("Session resume cancelled");
-                return Ok(None);
-            }
-            switch_session(args, view, path)?;
+            resume_session(args, view, worker, PathBuf::from(rest))?;
         }
         "/compact" => {
             view.pending_request = Some(
@@ -6084,7 +6077,7 @@ fn slash(
             } else {
                 "todo-list"
             };
-            let session = Session::open(&args.session)?;
+            let session = args.open_session()?;
             let states = session.extension_states();
             view.append(
                 &states
@@ -6131,7 +6124,7 @@ fn slash(
             let id = rest
                 .parse()
                 .map_err(|_| Error::Config("use /checkout <record-id>".into()))?;
-            let mut session = Session::open(&args.session)?;
+            let mut session = args.open_session()?;
             session.checkout(id)?;
             args.restore_session_model(&session)?;
             drop(session);
@@ -6459,6 +6452,7 @@ pub(super) async fn run(
     mut args: Cli,
     follow_up_prompts: Vec<String>,
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+    resume_token: Option<String>,
 ) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(Error::Config(
@@ -6480,6 +6474,12 @@ pub(super) async fn run(
     }
     let reported_settings = args.settings.diagnostics().to_vec();
     args = prepare_initial_session_async(args).await?;
+    if args.trusted && super::program_resume::needs_fresh_approval(&args) {
+        args.trusted = false;
+        args.trust_pending = true;
+        args.settings = super::config::Settings::load(&args.workspace, false)?;
+        args.refresh_workspace_selection();
+    }
     for warning in args.settings.diagnostics() {
         if !reported_settings.contains(warning) {
             eprintln!("{warning}");
@@ -6514,7 +6514,7 @@ pub(super) async fn run(
     };
     let changelog_path = super::config::agent_dir().join("pi-rs-changelog.json");
     let mut extension_changelog_session = {
-        let session = Session::open(&args.session)?;
+        let session = args.open_session()?;
         view.restore_session(&args, &session)?;
         let empty = session.current_messages().is_empty();
         if empty
@@ -6568,6 +6568,7 @@ pub(super) async fn run(
                 .map(|prompt| (prompt, Vec::new())),
         )
         .collect();
+    let mut resume = resume_token.and_then(super::program_resume::Reporter::new);
     let mut dirty = true;
     let frame_interval = Duration::from_millis(16);
     let mut last_frame = Instant::now() - frame_interval;
@@ -6590,7 +6591,7 @@ pub(super) async fn run(
         if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
             && _terminal.is_some()
         {
-            view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+            view.suspend_terminal(&mut _terminal, &args, resume.as_mut())?;
             dirty = true;
         }
         #[cfg(any(unix, windows))]
@@ -6741,7 +6742,7 @@ pub(super) async fn run(
         }
         if !is_busy(&worker)
             && let Some(pending) = &view.pending_thinking
-            && persist_pending_thinking(pending).is_ok()
+            && persist_pending_thinking(pending, &args).is_ok()
         {
             if pending.session == args.session && pending.previous_level != pending.level {
                 args.selection_events
@@ -7437,6 +7438,9 @@ pub(super) async fn run(
                 }
             }
         }
+        if let Some(reporter) = &mut resume {
+            reporter.report(&args, false)?;
+        }
         if let Some(title) = view.pending_terminal_title.take() {
             execute!(std::io::stdout(), crossterm::terminal::SetTitle(title))?;
         }
@@ -8056,7 +8060,7 @@ pub(super) async fn run(
                                     "type":"set_session_label","target":id,"label":label,"id":request,
                                 })).map(|()| picker.track_tree_label(request, id))
                             } else {
-                                Session::open(&args.session).and_then(|mut session| {
+                                args.open_session().and_then(|mut session| {
                                     session.set_label(id, label)?;
                                     picker.refresh_tree(
                                         session_tree::picker(&session, TreeFilter::Default),
@@ -8449,7 +8453,9 @@ pub(super) async fn run(
                 match action {
                     "app.suspend" => {
                         #[cfg(unix)]
-                        view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+                        {
+                            view.suspend_terminal(&mut _terminal, &args, resume.as_mut())?;
+                        }
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
                     }
@@ -8764,7 +8770,7 @@ pub(super) async fn run(
                                             }
                                             #[cfg(unix)]
                                             if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                                                view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+                                                view.suspend_terminal(&mut _terminal, &args, resume.as_mut())?;
                                             }
                                         },
                                     }
@@ -8881,6 +8887,12 @@ pub(super) async fn run(
     #[cfg(all(unix, debug_assertions))]
     test_input_drain_barrier();
     let _ = input.drain(Duration::from_secs(1), Duration::from_millis(50));
+    if !interrupted
+        && !super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+        && let Some(reporter) = &mut resume
+    {
+        reporter.clear()?;
+    }
     let finish = if args.tui_mode == Some(TuiMode::Regular) {
         view.finish_regular()
     } else {
@@ -8893,7 +8905,7 @@ pub(super) async fn run(
         drop(worker.take());
     }
     if let Some(pending) = view.pending_thinking.take() {
-        persist_pending_thinking(&pending)?;
+        persist_pending_thinking(&pending, &args)?;
         if pending.session == args.session && pending.previous_level != pending.level {
             args.selection_events
                 .push(pi_rs::LifecycleEvent::ThinkingLevelSelect {
@@ -8967,12 +8979,13 @@ fn is_busy(worker: &Option<Worker>) -> bool {
         .is_some_and(|worker| worker.busy || worker.bashing)
 }
 
-fn persist_pending_thinking(pending: &PendingThinking) -> Result<()> {
-    Session::open(&pending.session)?.select_thinking_level(
-        pending.provider.as_deref(),
-        &pending.model,
-        &pending.level,
-    )
+fn persist_pending_thinking(pending: &PendingThinking, args: &Cli) -> Result<()> {
+    let mut session = if args.bound_resume_paths(&pending.session).is_some() {
+        super::program_resume::open_bound_session_at(args, &pending.session)?
+    } else {
+        Session::open(&pending.session)?
+    };
+    session.select_thinking_level(pending.provider.as_deref(), &pending.model, &pending.level)
 }
 
 fn start_prompt(
@@ -9973,15 +9986,15 @@ fn confirm_tree(view: &mut View, id: u64) {
 }
 
 fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
-    let input = Session::open(&args.session)?
-        .records()
-        .get(id.saturating_sub(1) as usize)
-        .and_then(|record| match &record.event {
-            pi_rs::Event::User { content, .. } | pi_rs::Event::UserWithImages { content, .. } => {
-                Some(content.clone())
-            }
-            _ => None,
-        });
+    let input =
+        args.open_session()?
+            .records()
+            .get(id.saturating_sub(1) as usize)
+            .and_then(|record| match &record.event {
+                pi_rs::Event::User { content, .. }
+                | pi_rs::Event::UserWithImages { content, .. } => Some(content.clone()),
+                _ => None,
+            });
     restore_workspace(args)?;
     let images = std::mem::take(&mut view.draft_images);
     let restored = view.restore(args);
@@ -10689,6 +10702,14 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
     items
 }
 
+fn open_picker_session(args: &Cli, path: &Path) -> Result<Session> {
+    if args.bound_resume_paths(path).is_some() {
+        super::program_resume::open_bound_session_at(args, path)
+    } else {
+        Session::open_existing(path)
+    }
+}
+
 fn select(
     selection: Selection,
     args: &mut Cli,
@@ -10717,7 +10738,8 @@ fn select(
         }
         Selection::CancelBugReport => view.append("Bug report cancelled"),
         Selection::RenameSession(path, name) => {
-            let mut session = Session::open(&path)?;
+            let path = args.canonical_resume_path(path);
+            let mut session = open_picker_session(args, &path)?;
             if session.host_binding().is_some() {
                 return Err(Error::Session(
                     "managed sessions must be renamed by their host".into(),
@@ -10738,10 +10760,11 @@ fn select(
             slash("/resume", args, view, None)?;
         }
         Selection::DeleteSession(path) => {
+            let path = args.canonical_resume_path(path);
             if path.canonicalize().ok() == args.session.canonicalize().ok() {
                 return Err(Error::Config("Cannot delete the active session".into()));
             }
-            let session = Session::open(&path)?;
+            let session = open_picker_session(args, &path)?;
             if session.host_binding().is_some() {
                 return Err(Error::Session(
                     "managed sessions must be deleted by their host".into(),
@@ -10752,12 +10775,7 @@ fn select(
             slash("/resume", args, view, None)?;
         }
         Selection::Resume(path) => {
-            slash(
-                &format!("/resume {}", path.display()),
-                args,
-                view,
-                Some(worker),
-            )?;
+            resume_session(args, view, Some(worker), path)?;
         }
         Selection::Checkout(id) => {
             if id == Session::snapshot(&args.session)?.head() {
@@ -11042,6 +11060,7 @@ fn select(
         Selection::Trust(decision) => {
             crate::config::save_trust(&args.workspace, decision)?;
             args.trusted = decision;
+            args.terminal_resume_approved = decision && args.resume_requires_existing();
             args.trust_pending = false;
             args.settings = args.settings.reload_latest(&args.workspace, decision)?;
             for warning in args.settings.diagnostics() {
@@ -11135,10 +11154,34 @@ fn queued_transition_cancel(
     Ok(false)
 }
 
+fn resume_session(
+    args: &mut Cli,
+    view: &mut View,
+    worker: Option<&mut Option<Worker>>,
+    path: PathBuf,
+) -> Result<()> {
+    let path = args.canonical_resume_path(path);
+    if !path.is_file() {
+        return Err(Error::Config("session file not found".into()));
+    }
+    if Worker::check_session_transition(
+        worker,
+        args,
+        pi_rs::BeforeSessionTransition::Switch {
+            reason: pi_rs::SessionSwitchReason::Resume,
+            target_session_file: Some(path.clone()),
+        },
+    )? {
+        view.append("Session resume cancelled");
+        return Ok(());
+    }
+    switch_session(args, view, path)
+}
+
 fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> {
     let mut next = args.clone();
     next.settings.fork_worker_history();
-    next.session = path;
+    next.session = args.canonical_resume_path(path);
     next.session_transition = Some(pi_rs::SessionStartReason::Resume);
     if view.async_transitions {
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -11179,7 +11222,12 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
     Ok(())
 }
 
-async fn prepare_initial_session_async(args: Cli) -> Result<Cli> {
+async fn prepare_initial_session_async(mut args: Cli) -> Result<Cli> {
+    if std::mem::take(&mut args.terminal_resume) {
+        let mut session = args.open_session()?;
+        initialize_open_session(&mut args, &mut session)?;
+        return Ok(args);
+    }
     let (sender, receiver) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let mut args = args;
@@ -11228,7 +11276,11 @@ fn prepare_initial_session(args: &mut Cli) -> Result<()> {
 }
 
 fn initialize_session(args: &mut Cli) -> Result<()> {
-    let mut session = Session::open(&args.session)?;
+    let mut session = args.open_session()?;
+    initialize_open_session(args, &mut session)
+}
+
+fn initialize_open_session(args: &mut Cli, session: &mut Session) -> Result<()> {
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),
@@ -11240,14 +11292,16 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
-    args.restore_session_model(&session)?;
+    args.restore_session_model(session)?;
     super::thinking::adjust(args);
-    args.record_automatic_model_selection(&mut session)?;
+    args.record_automatic_model_selection(session)?;
     Ok(())
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
-    let session = Session::open(&args.session)?;
-    if let Some(cwd) = session.working_directory() {
+    let session = args.open_session()?;
+    if let Some((_, workspace)) = args.bound_resume_paths(&args.session) {
+        args.workspace = workspace.to_owned();
+    } else if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);
         if !path.is_dir() {
             return Err(Error::Config(
@@ -11256,16 +11310,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
         }
         args.workspace = path;
     }
-    let decision = crate::config::project_trust(
-        &args.workspace,
-        if args.no_trust {
-            Some(false)
-        } else if args.trust || args.project.is_some() {
-            Some(true)
-        } else {
-            None
-        },
-    )?;
+    let decision = args.project_trust()?;
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
     args.settings = args.settings.reload_latest(&args.workspace, args.trusted)?;
@@ -16430,6 +16475,105 @@ exit {exit}
         assert!(
             matches!(&shown[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**live**")
         );
+    }
+
+    #[test]
+    fn program_resume_picker_cannot_recreate_a_removed_journal() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.workspace = directory.path().canonicalize().unwrap();
+        args.session = args.workspace.join("restored.jsonl");
+        args.bind_existing_session();
+        let path = args.session.clone();
+        drop(pi_rs::Session::open(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(super::open_picker_session(&args, &path).is_err());
+        let mut view = super::View::default();
+        let result = super::select(
+            super::Selection::RenameSession(path.clone(), "new label".into()),
+            &mut args,
+            &mut view,
+            &mut super::Theme::system(),
+            &mut None,
+        );
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn program_resume_picker_carries_bound_identity_through_an_alias() {
+        use clap::Parser;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = root.join("original");
+        let other = root.join("other");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&other).unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline", "--no-trust", "--no-extensions"]);
+        args.workspace = original.clone();
+        args.session = root.join("restored.jsonl");
+        let journal = args.session.clone();
+        pi_rs::Session::open(&journal)
+            .unwrap()
+            .set_working_directory(&original)
+            .unwrap();
+        let snapshot = super::super::program_resume::snapshot_bound_session(&args);
+        if cfg!(target_os = "linux") && snapshot.is_err() {
+            // Linux containers can place every temporary directory on overlayfs.
+            return;
+        }
+        snapshot.unwrap();
+        args.bind_existing_session();
+
+        let alias = root.join("directory alias");
+        symlink(&root, &alias).unwrap();
+        let aliased_journal = alias.join("restored.jsonl");
+        let file_alias = root.join("journal alias.jsonl");
+        symlink(&journal, &file_alias).unwrap();
+        assert_eq!(args.canonical_resume_path(file_alias.clone()), journal);
+
+        args.workspace = other.clone();
+        args.session = root.join("other.jsonl");
+        let mut view = super::View::default();
+        super::select(
+            super::Selection::Resume(aliased_journal.clone()),
+            &mut args,
+            &mut view,
+            &mut super::Theme::system(),
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(args.session, journal);
+        assert_eq!(args.workspace, original);
+
+        pi_rs::Session::open_existing(&journal)
+            .unwrap()
+            .set_working_directory(&other)
+            .unwrap();
+        let error = super::open_picker_session(&args, &aliased_journal)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from the registered workspace")
+        );
+
+        fs::remove_file(&journal).unwrap();
+        assert!(args.open_session().is_err());
+        assert_eq!(args.canonical_resume_path(aliased_journal.clone()), journal);
+        args.session = aliased_journal;
+        assert!(args.open_session().is_err());
+        args.session = file_alias;
+        assert!(args.open_session().is_err());
+        assert!(!journal.exists());
     }
 
     #[test]

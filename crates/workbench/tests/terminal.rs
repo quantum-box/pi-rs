@@ -126,8 +126,25 @@ fn output_until_with_timeout(
 }
 
 fn spawn_auth_login(root: &std::path::Path, args: &[&str]) -> (File, File, Process) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root)
+        .env("PI_RS_HOME", root)
+        .env("TERM", "xterm-256color")
+        .args(["auth", "login"])
+        .args(args);
+    spawn_child_pty(&mut command)
+}
+
+fn spawn_child_pty(command: &mut Command) -> (File, File, Process) {
     let mut master_fd = -1;
     let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     assert_eq!(
         unsafe {
             libc::openpty(
@@ -135,7 +152,7 @@ fn spawn_auth_login(root: &std::path::Path, args: &[&str]) -> (File, File, Proce
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -148,12 +165,7 @@ fn spawn_auth_login(root: &std::path::Path, args: &[&str]) -> (File, File, Proce
         0
     );
     let process = Process(
-        Command::new(env!("CARGO_BIN_EXE_pi"))
-            .current_dir(root)
-            .env("PI_RS_HOME", root)
-            .env("TERM", "xterm-256color")
-            .args(["auth", "login"])
-            .args(args)
+        command
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave.try_clone().unwrap()))
@@ -1111,6 +1123,339 @@ fn terminal_hyperlink_capabilities_reprobe_tmux_after_override() {
         output_until(&mut master, |text| text.contains("cached probe fixture"));
         assert_eq!(probes(), 2, "{mode}");
     }
+}
+
+fn osc_test_mount_supported(root: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        root.ancestors().all(|path| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: path is NUL-terminated, and statfs initializes stat on success.
+            unsafe {
+                libc::statfs(path.as_ptr(), stat.as_mut_ptr()) == 0
+                    && [
+                        libc::EXT4_SUPER_MAGIC as u32,
+                        libc::BTRFS_SUPER_MAGIC as u32,
+                        libc::XFS_SUPER_MAGIC as u32,
+                        libc::TMPFS_MAGIC as u32,
+                    ]
+                    .contains(&(stat.assume_init().f_type as u32))
+            }
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        cfg!(target_os = "macos")
+    }
+}
+
+fn resume_report_bodies<'a>(text: &'a str, token: &'a str) -> impl Iterator<Item = &'a str> {
+    use sha2::{Digest, Sha256};
+    text.split("\x1b]7577;").skip(1).filter_map(move |report| {
+        let (report, _) = report.split_once("\x1b\\")?;
+        let (body, mac) = report.rsplit_once(":mac=")?;
+        assert_eq!(
+            mac,
+            format!("{:x}", Sha256::digest(format!("{body}:{token}")))
+        );
+        assert!(!report.contains(token));
+        Some(body)
+    })
+}
+
+#[test]
+fn terminal_reports_persistent_resume_command_and_keeps_token_out_of_children() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    const TOKEN: &str = "terminal-test-token";
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().canonicalize().unwrap();
+    if !osc_test_mount_supported(&workspace) {
+        return;
+    }
+    let session_path = workspace.join("session with spaces.jsonl");
+    let session_dir = workspace.join("new journals");
+    pi_rs::Session::open(&session_path)
+        .unwrap()
+        .append_user_with_images("resume test transcript".into(), vec![], None)
+        .unwrap();
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&workspace)
+            .env("PI_RS_HOME", workspace.join("home"))
+            .env("TERM", "xterm-256color")
+            .env("OSC7577_TOKEN", TOKEN)
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--coding-tools",
+                "--tui-mode=regular",
+                "--models=qwen*,mistral*",
+                "--use-theme=dark",
+                "--max-requests=4",
+                "--max-output-tokens=256",
+                "--output-budget=512",
+                "--model-timeout-secs=20",
+                "--context-window=4096",
+                "--terminal-resume",
+                "--workspace",
+            ])
+            .arg(&workspace)
+            .arg("--session")
+            .arg(&session_path)
+            .arg("--session-dir")
+            .arg(&session_dir)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+
+    let verify = |text: &str, path: &std::path::Path| {
+        let expected = [
+            "--terminal-resume",
+            "--session",
+            path.to_str().unwrap(),
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--no-trust",
+            "--no-mcp",
+            "--offline",
+            "--coding-tools",
+            "--tui-mode=regular",
+            "--models=qwen*,mistral*",
+            "--use-theme=dark",
+            "--max-requests=4",
+            "--max-output-tokens=256",
+            "--output-budget=512",
+            "--model-timeout-secs=20",
+            "--context-window=4096",
+            "--session-dir",
+            session_dir.to_str().unwrap(),
+        ];
+        let expected = expected.map(|arg| STANDARD.encode(arg)).join(",");
+        resume_report_bodies(text, TOKEN).any(|body| {
+            body.ends_with(&format!(
+                ",{expected}:cwd={}",
+                STANDARD.encode(workspace.to_str().unwrap())
+            ))
+        })
+    };
+    output_until(&mut master, |text| {
+        text.contains("Enter to send") && verify(text, &session_path)
+    });
+
+    master.write_all(b"/new\r").unwrap();
+    output_until(&mut master, |text| {
+        let Some(new_path) = std::fs::read_dir(&session_dir)
+            .ok()
+            .and_then(|mut dir| dir.find_map(|entry| entry.ok().map(|entry| entry.path())))
+        else {
+            return false;
+        };
+        assert_ne!(new_path, session_path);
+        verify(text, &new_path)
+    });
+    master
+        .write_all(b"!test -z \"${OSC7577_TOKEN+x}\" && touch child-token-absent\r")
+        .unwrap();
+    output_until_with_timeout(&mut master, Duration::from_secs(20), |_| {
+        workspace.join("child-token-absent").is_file()
+    });
+    master.write_all(b"/quit\r").unwrap();
+    output_until(&mut master, |text| {
+        resume_report_bodies(text, TOKEN).any(|body| body.ends_with(":clear=1"))
+    });
+}
+
+#[test]
+fn terminal_resume_prompts_again_for_a_shared_workspace() {
+    assert_terminal_resume_project_trust(ResumeTrustFixture::SharedWorkspace, false);
+}
+
+#[test]
+fn terminal_resume_prompts_again_for_shared_project_configuration() {
+    assert_terminal_resume_project_trust(ResumeTrustFixture::SharedConfiguration, false);
+}
+
+#[test]
+fn terminal_resume_preserves_saved_project_denial() {
+    assert_terminal_resume_project_trust(ResumeTrustFixture::SharedConfiguration, true);
+}
+
+#[test]
+fn terminal_resume_prompts_before_a_project_stdio_launch() {
+    assert_terminal_resume_project_trust(ResumeTrustFixture::Stdio, false);
+}
+
+#[test]
+fn terminal_resume_prompts_before_a_project_enables_global_stdio() {
+    assert_terminal_resume_project_trust(ResumeTrustFixture::StdioOverride, false);
+}
+
+#[derive(Clone, Copy)]
+enum ResumeTrustFixture {
+    SharedWorkspace,
+    SharedConfiguration,
+    Stdio,
+    StdioOverride,
+}
+
+fn assert_terminal_resume_project_trust(fixture: ResumeTrustFixture, saved_denial: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    if !osc_test_mount_supported(&root) {
+        return;
+    }
+    let workspace = root.join("shared workspace");
+    let project = workspace.join(".pi");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir(workspace.join(".git")).unwrap();
+    let home = root.join("home");
+    std::fs::create_dir(&home).unwrap();
+    let stdio = matches!(
+        fixture,
+        ResumeTrustFixture::Stdio | ResumeTrustFixture::StdioOverride
+    );
+    match fixture {
+        ResumeTrustFixture::SharedWorkspace | ResumeTrustFixture::SharedConfiguration => {
+            let shared = if matches!(fixture, ResumeTrustFixture::SharedWorkspace) {
+                &workspace
+            } else {
+                &project
+            };
+            std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        }
+        ResumeTrustFixture::Stdio => {
+            std::fs::write(
+                project.join("mcp.json"),
+                r#"{"mcpServers":{"fixture":{"command":"/usr/bin/true","cwd":"."}}}"#,
+            )
+            .unwrap();
+        }
+        ResumeTrustFixture::StdioOverride => {
+            std::fs::write(
+                home.join("mcp.json"),
+                r#"{"mcpServers":{"fixture":{"command":"/usr/bin/true","enabled":false}}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                project.join("mcp.json"),
+                r#"{"mcpServers":{"fixture":{"enabled":true}}}"#,
+            )
+            .unwrap();
+        }
+    }
+    std::fs::write(
+        home.join("settings.json"),
+        r#"{"defaultProjectTrust":"always"}"#,
+    )
+    .unwrap();
+    if saved_denial {
+        std::fs::write(
+            home.join("trust.json"),
+            serde_json::json!({(workspace.to_str().unwrap()): false}).to_string(),
+        )
+        .unwrap();
+    }
+    let journal = root.join("session.jsonl");
+    pi_rs::Session::open(&journal)
+        .unwrap()
+        .set_working_directory(&workspace)
+        .unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(&workspace)
+        .env("PI_RS_HOME", home)
+        .env("TERM", "xterm-256color")
+        .args(["--terminal-resume", "--offline", "--workspace"])
+        .arg(&workspace)
+        .arg("--session")
+        .arg(&journal);
+    if !stdio {
+        command.args(["--no-mcp", "--no-extensions"]);
+    }
+    let (mut master, _slave, _process) = spawn_child_pty(&mut command);
+    if saved_denial {
+        output_until(&mut master, |text| {
+            assert!(!text.contains("Load project configuration?"));
+            text.contains("Enter to send")
+        });
+        return;
+    }
+    output_until(&mut master, |text| {
+        text.contains("Load project configuration?")
+    });
+    master.write_all(b"\x1b[B\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Project configuration skipped")
+    });
+}
+
+#[test]
+fn terminal_resume_worker_rejects_a_missing_journal_before_startup() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let journal = root.join("missing.jsonl");
+    let home = root.join("unused home");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--terminal-managed-worker",
+            "--terminal-resume-worker",
+            "--stdin-control",
+            "--offline",
+            "--no-trust",
+            "--workspace",
+        ])
+        .arg(&root)
+        .arg("--session")
+        .arg(&journal)
+        .arg("serve")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires an existing private regular journal"),
+        "{stderr}"
+    );
+    assert!(!journal.exists());
+    assert!(!home.exists());
 }
 
 const KITTY_IMAGE: &str = "\x1b_Ga=t,";
@@ -3365,7 +3710,9 @@ enum SuspendTrigger {
 }
 
 fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
+    const TOKEN: &str = "test-suspend-resume-token";
     let root = tempfile::tempdir().unwrap();
+    let report_resume = osc_test_mount_supported(&root.path().canonicalize().unwrap());
     let home = root.path().join("home");
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -3404,6 +3751,11 @@ fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
     let original = unsafe { original.assume_init() };
     let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
     command.process_group(0);
+    if report_resume {
+        command.env("OSC7577_TOKEN", TOKEN);
+    } else {
+        command.env_remove("OSC7577_TOKEN");
+    }
     // The test owns this child job, so suspension cannot stop the test runner.
     unsafe {
         command.pre_exec(|| {
@@ -3430,7 +3782,11 @@ fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
             .spawn()
             .unwrap(),
     );
-    output_until(&mut master, |text| text.contains("Enter to send"));
+    output_until(&mut master, |text| {
+        text.contains("Enter to send")
+            && (!report_resume
+                || resume_report_bodies(text, TOKEN).any(|body| body.contains(":argv=")))
+    });
     for round in 0..16 {
         size.ws_col = 90 + round;
         assert_eq!(
@@ -3533,16 +3889,29 @@ exit 1
         unsafe { libc::kill(-(process.0.id() as libc::pid_t), libc::SIGCONT) },
         0
     );
-    let expected_after_resume = if trigger == SuspendTrigger::Reload {
+    if trigger == SuspendTrigger::Reload && report_resume {
+        output_until(&mut master, |text| {
+            assert!(!text.contains("\x1b]11;?"));
+            resume_report_bodies(text, TOKEN).any(|body| body.contains(":argv="))
+                && text.contains("\x1b[>4;2m")
+        });
         std::fs::File::create(home.join("probe-release")).unwrap();
-        "Reloaded settings"
+        output_until(&mut master, |text| text.contains("Reloaded settings"));
     } else {
-        "resume-draft"
-    };
-    output_until(&mut master, |text| {
-        assert!(!text.contains("\x1b]11;?"));
-        text.contains(expected_after_resume) && text.contains("\x1b[>4;2m")
-    });
+        let marker = if trigger == SuspendTrigger::Reload {
+            std::fs::File::create(home.join("probe-release")).unwrap();
+            "Reloaded settings"
+        } else {
+            "resume-draft"
+        };
+        output_until(&mut master, |text| {
+            assert!(!text.contains("\x1b]11;?"));
+            text.contains(marker)
+                && text.contains("\x1b[>4;2m")
+                && (!report_resume
+                    || resume_report_bodies(text, TOKEN).any(|body| body.contains(":argv=")))
+        });
+    }
     // An old or foreign DA1 and late OSC must not launch another query after
     // the shell owned the terminal, and ordinary input must still be usable.
     master

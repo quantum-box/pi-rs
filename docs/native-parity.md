@@ -6561,6 +6561,49 @@ into their logical blocks, and encrypted blocks stay separate. Replay is
 bound to the original endpoint and model. A loopback RPC check exercised
 restart, encrypted-only thinking and a switch to a different model endpoint.
 
+### Terminal session restoration
+
+An interactive native session can report an OSC 7577 resume command when
+a supporting terminal supplies `OSC7577_TOKEN`. The report binds the native
+executable, canonical journal path, and canonical workspace. Automatic restore
+checks that workspace before reading the journal or evaluating project trust.
+A journal with a different saved workspace is rejected. Ordinary `--session`
+and `--resume` retain their existing workspace behavior.
+
+The command carries restrictive options such as `--no-trust`, `--no-mcp`,
+`--no-extensions`, `--offline`, and explicit tool selections, including
+`--coding-tools`. The command carries the model scope, terminal mode, theme
+name, and explicit request, output-token, output-budget, model-time, and
+context-window limits. Pi skips reporting for ephemeral sessions and pending
+trust decisions. It also skips reporting for credentials, connection options,
+project directories, explicitly selected extension, skill, prompt-template
+or theme resources, extension flags, external order or evaluation endpoints,
+system prompt overrides, and extra instructions. Interactive mode adds its
+default extensions again on restore. Automatic restore
+accepts an owner-only regular journal under protected directories on an
+allowlisted local filesystem. Linux accepts ext-family, XFS, Btrfs, and tmpfs.
+macOS accepts local APFS, HFS, and tmpfs
+with ownership enforced and without extended ACL grants. The checks reject
+unknown filesystem semantics, network filesystems, and mounts that ignore
+ownership. The session picker keeps the canonical journal and original
+workspace when a path resolves through an alias. Workers and the picker use
+existing-only opens for that journal, including later reopens. An explicit
+new session can create a journal.
+
+If Pi cannot verify protection for the workspace or its project configuration
+and resource paths at report or restore time, the normal project trust prompt
+requires fresh approval before loading trusted project configuration. Project
+package declarations and project MCP configuration that starts a local
+process also require approval. This includes enabled stdio servers and HTTP
+servers with command-backed headers, as well as project overrides or settings
+that enable those user servers. A previously denied workspace remains
+untrusted. These safeguards are native restrictions on unattended restore.
+
+Session switches replace the report. Returning from suspend refreshes it
+immediately, including during package reload. A missing journal or a normal
+quit clears the record. Pi removes the token before starting the runtime or
+child processes and keeps it out of the journal. [Pinned upstream reporter](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/modes/interactive/program-resume-reporter.ts).
+
 ### Terminal hyperlink capability
 
 An explicit boolean in `terminal.hyperlinks` takes precedence over

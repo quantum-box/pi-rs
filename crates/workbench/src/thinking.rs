@@ -1,5 +1,5 @@
 //! Effective thinking controls shared by RPC and the terminal.
-use pi_rs::{Error, Result, Session};
+use pi_rs::{Error, Result};
 
 use super::Cli;
 
@@ -235,11 +235,8 @@ pub(super) fn next_level(args: &mut Cli) -> Option<String> {
 }
 
 fn persist(args: &mut Cli, level: &str) -> Result<()> {
-    Session::open(&args.session)?.select_thinking_level(
-        args.recorded_provider(),
-        &args.model,
-        level,
-    )?;
+    args.open_session()?
+        .select_thinking_level(args.recorded_provider(), &args.model, level)?;
     select(args, level);
     Ok(())
 }
@@ -259,6 +256,7 @@ pub(super) fn select(args: &mut Cli, level: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_rs::Session;
 
     #[test]
     fn ant_ling_applies_the_clamped_default_before_restoring_a_session() {
