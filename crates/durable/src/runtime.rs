@@ -104,6 +104,8 @@ pub enum Error {
     #[error("reentrant conversation abort")]
     ReentrantAbort,
     #[error("invalid operation: {0}")]
+    CheckpointableSelectionChanged(String),
+    #[error("invalid operation: {0}")]
     Invalid(String),
 }
 
@@ -2216,11 +2218,10 @@ fn stop_at_unsafe_park_boundary(stage: &str, state: &Conversation) {
     let Some(root) = std::env::var_os("PI_UNSAFE_BOUNDARY_DIR") else {
         return;
     };
-    std::fs::write(
+    crate::publish_ready_marker(
         std::path::PathBuf::from(root).join("boundary"),
         serde_json::to_vec(&state.tool_attempt()).unwrap(),
-    )
-    .unwrap();
+    );
     loop {
         std::thread::park();
     }
@@ -3843,6 +3844,11 @@ pub struct UnifiedHistoryCommit {
     pub applications: Option<Vec<crate::application_entry::ApplicationEntry>>,
     /// Generation and tool progress committed alongside any other records.
     pub progress: Vec<ProgressHistoryFrame>,
+    /// Document changes in the conversation's explicit address scope.
+    pub documents: Vec<(
+        crate::document::Address,
+        crate::document::DocumentOperationFrame,
+    )>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5738,7 +5744,7 @@ impl Harness {
             {
                 Ok(())
             }
-            _ => Err(Error::Invalid(
+            _ => Err(Error::CheckpointableSelectionChanged(
                 "checkpointable extension selection missing or changed".into(),
             )),
         }
@@ -13722,8 +13728,8 @@ impl Harness {
     }
 
     /// Read at most `limit` complete commits in the captured range. Observation
-    /// and application records are snapshots. Progress-only commits also
-    /// advance the cursor in the same order as all other commits.
+    /// and application records are snapshots. Document operation and progress
+    /// frames advance the same cursor, including commits without a snapshot.
     pub fn unified_history(
         &self,
         cursor: &UnifiedHistoryCursor,
@@ -13738,7 +13744,7 @@ impl Harness {
         let progress_prefix =
             crate::observer::Observer::progress_history(store, cursor.conversation).record_prefix();
         let app_key = crate::application_entry::key(cursor.conversation);
-        let mut frames = self.owner.store().conversation_commits_including_progress(
+        let records = store.conversation_commits_including_progress(
             &prefix,
             Some(&progress_prefix),
             &app_key,
@@ -13746,10 +13752,26 @@ impl Harness {
             cursor.through,
             limit.get() + 1,
         )?;
+        let scope = crate::document::Address::conversation_scope_prefix(cursor.conversation);
+        let document_commits = store.scoped_document_commit_positions(
+            &scope,
+            cursor.after,
+            cursor.through,
+            limit.get() + 1,
+        )?;
+        // Both sources read the same immutable range. If a sequence is in the
+        // first N merged frames, it must be in the first N of each component
+        // where it occurs, so the merged page cannot split a commit.
+        let mut frames: std::collections::BTreeMap<_, _> = records
+            .into_iter()
+            .map(|(sequence, records)| (sequence, (records, None)))
+            .collect();
+        for (sequence, revision) in document_commits {
+            frames.entry(sequence).or_default().1 = Some(revision);
+        }
         let has_more = frames.len() > limit.get();
-        frames.truncate(limit.get());
-        let mut commits = Vec::with_capacity(frames.len());
-        for (sequence, records) in frames {
+        let mut commits = Vec::with_capacity(frames.len().min(limit.get()));
+        for (sequence, (records, document_commit)) in frames.into_iter().take(limit.get()) {
             let mut snapshots = Vec::new();
             let mut applications = None;
             let mut progress = Vec::new();
@@ -13794,11 +13816,24 @@ impl Harness {
                     });
                 }
             }
+            let documents = if let Some(revision) = document_commit {
+                let changes =
+                    store.scoped_document_changes_at_commit(&scope, revision, sequence)?;
+                crate::document::scoped_document_operations(
+                    store,
+                    cursor.conversation,
+                    revision,
+                    changes,
+                )?
+            } else {
+                Vec::new()
+            };
             commits.push(UnifiedHistoryCommit {
                 sequence,
                 snapshots,
                 applications,
                 progress,
+                documents,
             });
         }
         let mut next = cursor.clone();
@@ -13890,14 +13925,7 @@ impl Harness {
         conversation: Uuid,
         after: u64,
     ) -> Result<Option<(u64, u64, Vec<MergedDocumentChange>)>, Error> {
-        let scope = conversation.to_string();
-        let mut encoded = serde_json::to_vec(&[scope])?;
-        if encoded.pop() != Some(b']') {
-            return Err(Error::Invalid("invalid document scope".into()));
-        }
-        encoded.push(b',');
-        let mut prefix = b"durable/document/".to_vec();
-        prefix.extend(encoded);
+        let prefix = crate::document::Address::conversation_scope_prefix(conversation);
         let Some((revision, sequence, changes)) = self
             .owner
             .store()
@@ -15424,6 +15452,43 @@ impl Harness {
             if cancel.is_cancelled() {
                 return Err(Error::Interrupted);
             }
+            let input = crate::transcript::MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: output.clone(),
+            };
+            let mut request =
+                self.model_request_with_blocks(&state, state.config.system_prompt.clone())?;
+            for queued in state.submissions.iter().filter(|queued| {
+                queued.status == Status::Queued && queued.kind == SubmissionKind::Input
+            }) {
+                let index = request.request.request.messages.len();
+                request.request.request.messages.push(Message::User {
+                    content: queued.content.clone(),
+                });
+                if let Some(blocks) = &queued.input_blocks {
+                    request.request.blocks.insert(index, blocks.clone());
+                }
+            }
+            let index = request.request.request.messages.len();
+            request.request.request.messages.push(Message::User {
+                content: String::new(),
+            });
+            request.request.blocks.insert(index, input.clone());
+            if profile.is_some_and(|profile| !profile.supports_images) {
+                crate::images::project_nonvision_request(
+                    &mut request.request.request,
+                    &mut request.request.blocks,
+                    &mut request.tool_blocks,
+                );
+            }
+            adapter.validate_image_admission(&crate::model::ProviderResultRequest {
+                request,
+                tool_errors: if adapter.supports_tool_result_metadata() {
+                    tool_error_bindings(&state)?
+                } else {
+                    Default::default()
+                },
+            })?;
             let sid = Uuid::new_v4();
             state.submissions.push(Submission {
                 kind: SubmissionKind::Input,
@@ -15431,10 +15496,7 @@ impl Harness {
                 request_id: request_id.clone(),
                 content: String::new(),
                 image_notes: notes.clone(),
-                input_blocks: Some(crate::transcript::MessageContentBlocks {
-                    message_id: Uuid::new_v4(),
-                    blocks: output.clone(),
-                }),
+                input_blocks: Some(input),
                 on_abort: options.on_abort,
                 status: if place_now {
                     Status::Running
@@ -15488,6 +15550,36 @@ impl Harness {
                 }
             }
         }
+    }
+
+    fn model_request_with_blocks(
+        &self,
+        state: &Conversation,
+        system_prompt: String,
+    ) -> Result<crate::model::DurableToolRequest, Error> {
+        let mut messages = vec![Message::System {
+            content: system_prompt,
+        }];
+        messages.extend(state.messages.clone());
+        let request = model_request(
+            &state.config.model,
+            messages,
+            self.ordered_tool_specs(state)?,
+            state.config.max_output_tokens,
+        );
+        let mut blocks = std::collections::BTreeMap::new();
+        let mut tool_blocks = std::collections::BTreeMap::new();
+        for (index, binding) in &state.content_blocks {
+            match state.messages.get(*index) {
+                Some(Message::User { .. }) => blocks.insert(index + 1, binding.clone()),
+                Some(Message::Tool { .. }) => tool_blocks.insert(index + 1, binding.clone()),
+                _ => return Err(crate::transcript::Error::Corrupt.into()),
+            };
+        }
+        Ok(crate::model::DurableToolRequest {
+            request: crate::model::DurableRequest { request, blocks },
+            tool_blocks,
+        })
     }
 
     /// Append an ordered user block occurrence to an idle conversation.
@@ -19806,26 +19898,14 @@ impl Harness {
                             system_prompt.push_str(&sections);
                         }
                     }
-                    let mut messages = vec![Message::System {
-                        content: system_prompt,
-                    }];
-                    messages.extend(c.messages.clone());
-                    let specs = self.ordered_tool_specs(&c)?;
-                    let mut request =
-                        model_request(&c.config.model, messages, specs, c.config.max_output_tokens);
-                    let mut blocks = std::collections::BTreeMap::new();
-                    let mut tool_blocks = std::collections::BTreeMap::new();
-                    for (index, binding) in &c.content_blocks {
-                        match c.messages.get(*index) {
-                            Some(Message::User { .. }) => {
-                                blocks.insert(index + 1, binding.clone());
-                            }
-                            Some(Message::Tool { .. }) => {
-                                tool_blocks.insert(index + 1, binding.clone());
-                            }
-                            _ => return Err(crate::transcript::Error::Corrupt.into()),
-                        }
-                    }
+                    let crate::model::DurableToolRequest {
+                        request:
+                            crate::model::DurableRequest {
+                                mut request,
+                                mut blocks,
+                            },
+                        mut tool_blocks,
+                    } = self.model_request_with_blocks(&c, system_prompt)?;
                     let metadata_adapter = c
                         .provider_adapter
                         .as_ref()

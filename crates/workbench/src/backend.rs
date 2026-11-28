@@ -10,7 +10,7 @@ use pi_rs::{
     AgentInput, CancellationToken, Compaction, Error, InputKind, LifecycleEvent, QueueMode,
     QueuedMessage, Result, Session, SessionShutdownReason, SessionStartReason,
 };
-use pi_rs_workbench::coding::CodingTools;
+use pi_rs_workbench::coding::{CodingTools, UserShellExecution};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -150,6 +150,9 @@ enum Request {
         request_id: Option<serde_json::Value>,
     },
     AbortBash,
+    ExtensionUiThemeClaim {
+        id: Uuid,
+    },
     ExtensionUiResponse {
         id: Uuid,
         value: pi_rs::UiResponse,
@@ -584,7 +587,8 @@ impl SessionSnapshot {
             let mut emitted = Vec::new();
             for index in start..end as usize {
                 emitted.extend(cursor.appended(
-                    &self.records[..=index],
+                    &self.records[..end as usize],
+                    index,
                     self.record_metadata.get(&self.records[index].id),
                     &self.record_metadata,
                 ));
@@ -632,9 +636,17 @@ impl SessionSnapshot {
         }
     }
 
+    #[cfg(test)]
     fn record(&mut self, record: &pi_rs::Record) -> Vec<serde_json::Value> {
+        self.record_with_metadata(record, pi_rs::record_event_metadata(record.id))
+    }
+
+    fn record_with_metadata(
+        &mut self,
+        record: &pi_rs::Record,
+        metadata: Option<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
         self.revision = self.revision.wrapping_add(1);
-        let metadata = pi_rs::record_event_metadata(record.id);
         let metadata_changed = metadata
             .as_ref()
             .is_some_and(|value| self.record_metadata.get(&record.id) != Some(value))
@@ -694,7 +706,7 @@ impl SessionSnapshot {
             return Vec::new();
         }
         if changed {
-            self.replay = pi_rs::pi_import::StreamVerifier::new();
+            self.replay.restart();
             *cursor = super::rpc_entries::Cursor::default();
         }
         #[cfg(test)]
@@ -734,7 +746,8 @@ impl SessionSnapshot {
         let mut emitted = Vec::new();
         for index in start..observed_end {
             emitted.extend(cursor.appended(
-                &self.records[..=index],
+                &self.records[..observed_end],
+                index,
                 self.record_metadata.get(&self.records[index].id),
                 &self.record_metadata,
             ));
@@ -945,7 +958,7 @@ impl pi_rs::ToolHost for QueueMessageHost {
 struct ShellCompletion {
     id: Uuid,
     request_id: Option<serde_json::Value>,
-    result: Result<pi_rs::BashExecution>,
+    result: Result<UserShellExecution>,
 }
 
 pub fn run(
@@ -972,7 +985,11 @@ async fn run_worker(
             json!({"type":"worker_extension_sources", "sources":runtime.extension_sources}),
         );
     }
-    let ui = Arc::new(super::extension_ui::Broker::default());
+    let ui = Arc::new(super::extension_ui::Broker::new(
+        args.terminal_managed_worker,
+    ));
+    let base_theme_paths = runtime.resources.themes.clone();
+    ui.refresh_themes(&base_theme_paths);
     runtime.registry.set_ui(ui.clone());
     let active = Arc::new(Mutex::new(ControlState::default()));
     let stopping = Arc::new(AtomicBool::new(false));
@@ -1063,27 +1080,25 @@ async fn run_worker(
     };
     emit_refreshed_entries(refreshed);
     share_ready.send_replace(true);
-    let startup_trigger = session
-        .host_binding()
-        .is_none()
-        .then(|| {
-            session
-                .pending_extension_boundary_run()
-                .or_else(|| session.pending_custom_trigger())
-        })
-        .flatten();
+    let startup_trigger = pending_worker_run(&session);
     drop(session);
     *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
     *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
-    resources_ready.send_replace(true);
     if runtime.registry.has_resource_discovery_hooks() {
+        ui.refresh_themes(&runtime.resources.themes);
         output(json!({"type":"resources_discovered","resources":discovered}));
     }
+    resources_ready.send_replace(true);
     if args.terminal_managed_worker {
         let messages = runtime.registry.custom_message_renderers();
         let entries = runtime.registry.custom_entry_renderers();
         output(json!({
             "type":"backend_ready",
+            "extension_packages":if matches!(startup_reason, SessionStartReason::Startup) {
+                runtime.loaded_extension_packages.as_slice()
+            } else {
+                &[]
+            },
             "custom_message_renderers":messages.types().collect::<Vec<_>>(),
             "custom_entry_renderers":entries.types().collect::<Vec<_>>(),
             "tool_rendering":true,
@@ -1138,7 +1153,7 @@ async fn run_worker(
                                     }
                                 }
                             }
-                            Ok((starts_run && !session.queued_inputs().is_empty(), session.pending_custom_trigger()))
+                            Ok((starts_run && !session.queued_inputs().is_empty(), pending_worker_run(&session)))
                         });
                         for (reply, result) in replies {
                             let _ = reply.send(result);
@@ -1322,6 +1337,7 @@ async fn run_worker(
             model_reports_thinking = reported_thinking;
             refresh_snapshot(&snapshot, &Session::open(&args.session)?);
             if switched {
+                ui.refresh_themes(&base_theme_paths);
                 notify_session_lifecycle(
                     &args,
                     &runtime,
@@ -1343,14 +1359,15 @@ async fn run_worker(
                     )
                     .await?;
                 refresh_snapshot(&snapshot, &session);
-                pending_discovery_trigger = session.pending_custom_trigger();
+                pending_discovery_trigger = pending_worker_run(&session);
                 drop(session);
                 *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
                 *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
-                resources_ready.send_replace(true);
                 if runtime.registry.has_resource_discovery_hooks() {
+                    ui.refresh_themes(&runtime.resources.themes);
                     output(json!({"type":"resources_discovered","resources":discovered}));
                 }
+                resources_ready.send_replace(true);
             }
             {
                 let mut snapshot = snapshot.lock().expect("session snapshot");
@@ -1498,12 +1515,8 @@ async fn run_worker(
             };
             match request {
                 Request::TriggerCustom { run_id } => {
-                    if session
-                        .pending_extension_boundary_run()
-                        .or_else(|| session.pending_custom_trigger())
-                        != Some(run_id)
-                    {
-                        return Err(Error::Session("custom trigger is no longer pending".into()));
+                    if pending_worker_run(session) != Some(run_id) {
+                        return Err(Error::Session("run is no longer pending".into()));
                     }
                     let answer = Box::pin(agent.run_correlated_with_events(
                         session,
@@ -1534,6 +1547,11 @@ async fn run_worker(
                     rpc,
                     ..
                 } => {
+                    if session.pending_before_agent_start_run().is_some() {
+                        return Err(Error::Session(
+                            "resume the pending run preflight before submitting a prompt".into(),
+                        ));
+                    }
                     let mut prompt_acknowledged = false;
                     if queued_only
                         && !agent
@@ -1965,9 +1983,7 @@ async fn run_worker(
             }
         }
         if idle_callback_operation {
-            pending_discovery_trigger = run_session
-                .as_ref()
-                .and_then(Session::pending_custom_trigger);
+            pending_discovery_trigger = run_session.as_ref().and_then(pending_worker_run);
         }
         drop(run_session);
         if started && resume_queued && (result.is_ok() || matches!(&result, Err(Error::Cancelled)))
@@ -2027,6 +2043,16 @@ async fn run_worker(
     runtime.close().await
 }
 
+fn pending_worker_run(session: &Session) -> Option<Uuid> {
+    if session.host_binding().is_some() {
+        return None;
+    }
+    session
+        .pending_extension_boundary_run()
+        .or_else(|| session.pending_before_agent_start_run())
+        .or_else(|| session.pending_custom_trigger())
+}
+
 async fn notify_session_lifecycle(args: &Cli, runtime: &runtime::Runtime, event: LifecycleEvent) {
     if !runtime.registry.has_session_lifecycle_hooks() {
         return;
@@ -2065,7 +2091,7 @@ fn save_shell(
 
 fn record_shell(
     session: &mut Session,
-    execution: &pi_rs::BashExecution,
+    execution: &UserShellExecution,
     args: &Cli,
     snapshot: &Mutex<SessionSnapshot>,
 ) -> Result<()> {
@@ -2073,11 +2099,16 @@ fn record_shell(
         session.set_working_directory(&args.workspace)?;
         refresh_snapshot(snapshot, session);
     }
-    session.append_local_bash_result(execution.clone())?;
-    observe_snapshot(
-        pi_rs::Notification::Committed(session.records().last().expect("saved shell execution")),
+    session.append_local_bash_result_with_output_error(
+        execution.execution.clone(),
+        execution.full_output_error.as_deref(),
+    )?;
+    let record = session.records().last().expect("saved shell execution");
+    observe_snapshot_with_metadata(
+        pi_rs::Notification::Committed(record),
         args.trace,
         snapshot,
+        session.record_metadata(record.id).cloned(),
     );
     Ok(())
 }
@@ -2091,7 +2122,7 @@ fn finish_shell(shell: &ShellCompletion, active: &Mutex<ControlState>) {
 fn report_shell_end(
     id: Uuid,
     request_id: Option<&serde_json::Value>,
-    result: &Result<pi_rs::BashExecution>,
+    result: &Result<UserShellExecution>,
 ) {
     match result {
         Ok(execution) => output(
@@ -2124,6 +2155,15 @@ fn observe_snapshot(
     trace: bool,
     snapshot: &Mutex<SessionSnapshot>,
 ) {
+    observe_snapshot_with_metadata(event, trace, snapshot, None);
+}
+
+fn observe_snapshot_with_metadata(
+    event: pi_rs::Notification<'_>,
+    trace: bool,
+    snapshot: &Mutex<SessionSnapshot>,
+    metadata: Option<serde_json::Value>,
+) {
     if let pi_rs::Notification::Committed(record) = &event
         && let pi_rs::Event::ToolFinished { operation_id, .. } = &record.event
     {
@@ -2155,7 +2195,10 @@ fn observe_snapshot(
     };
     let (entries, projection_error) = if let pi_rs::Notification::Committed(record) = &event {
         let mut snapshot = snapshot.lock().expect("session snapshot");
-        let entries = snapshot.record(record);
+        let entries = snapshot.record_with_metadata(
+            record,
+            metadata.or_else(|| pi_rs::record_event_metadata(record.id)),
+        );
         (entries, snapshot.projection_error.take())
     } else {
         (Vec::new(), None)
@@ -2565,29 +2608,29 @@ fn read_requests(
                                 let states = pi_rs::Session::from_records(records)?.extension_states();
                                 let event = pi_rs::UserBashEvent { command: command.clone(), exclude_from_context, cwd };
                                 let host = Arc::new(QueueMessageHost { inputs: host_inputs, cancellation: cancel.clone() });
-                                match registry.prepare_user_bash_with_host(&event, &states, &cancel, host.clone()).await? {
-                                    Some(pi_rs::UserBashReplacement::Result(result)) => {
+                                match registry.prepare_user_bash_with_output_error(&event, &states, &cancel, host.clone()).await? {
+                                    Some((pi_rs::UserBashReplacement::Result(result), full_output_error)) => {
                                         if !result.output.is_empty() {
                                             output(json!({"type":"bash_execution_update","executionId":id,"output":result.output,"id":request_id}));
                                         }
-                                        return Ok(pi_rs::BashExecution {
+                                        return Ok(UserShellExecution::new(pi_rs::BashExecution {
                                             command: command.clone(), output: result.output, exit_code: result.exit_code,
                                             cancelled: result.cancelled, truncated: result.truncated,
                                             full_output_path: result.full_output_path, exclude_from_context,
-                                        });
+                                        }, full_output_error.as_deref()));
                                     }
-                                    Some(pi_rs::UserBashReplacement::Operations { extension, state }) => {
-                                        return tools.execute_shell_operations_with_host(&event, extension.as_ref(), state.as_ref(), timeout, &cancel, &mut |chunk| {
+                                    Some((pi_rs::UserBashReplacement::Operations { extension, state }, _)) => {
+                                        return tools.execute_shell_operations_with_output_error(&event, extension.as_ref(), state.as_ref(), timeout, &cancel, &mut |chunk| {
                                             output(json!({"type":"bash_execution_update","executionId":id,"output":chunk,"id":request_id}));
                                         }, host).await;
                                     }
                                     None => {}
                                 }
                             }
-                            let mut execution = tools.execute_shell(&command, timeout, &cancel, &mut |chunk| {
+                            let mut execution = tools.execute_shell_with_output_error(&command, timeout, &cancel, &mut |chunk| {
                                 output(json!({"type":"bash_execution_update","executionId":id,"output":chunk,"id":request_id}));
                             }).await?;
-                            execution.exclude_from_context = exclude_from_context;
+                            execution.execution.exclude_from_context = exclude_from_context;
                             Ok(execution)
                         }.await;
                         let _ = completed.send(ShellCompletion { id, request_id, result }).await;
@@ -2629,6 +2672,10 @@ fn read_requests(
                     ) {
                         control_response("select_live_model", Some(json!(id)), Err(error));
                     }
+                }
+                Request::ExtensionUiThemeClaim { id } => {
+                    let theme = ui.claim_theme(id);
+                    output(json!({"type":"extension_ui_theme_claim","id":id,"theme":theme}));
                 }
                 Request::ExtensionUiResponse { id, value } => ui.resolve(id, value),
                 request @ (Request::Steer { .. }

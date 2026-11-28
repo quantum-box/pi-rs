@@ -1,4 +1,5 @@
 // Real driver tests with a deterministic competing writer at claim commit.
+use crate::publish_ready_marker;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use pi_rs_core::{
@@ -23,11 +24,6 @@ struct ModelStub {
     arguments: String,
 }
 struct ClaimPassHook(Option<Arc<std::sync::atomic::AtomicUsize>>, bool);
-fn publish_ready_marker(path: std::path::PathBuf, data: impl AsRef<[u8]>) {
-    let staging = path.with_extension("tmp");
-    std::fs::write(&staging, data).unwrap();
-    std::fs::rename(staging, path).unwrap();
-}
 
 #[async_trait]
 impl crate::extension::Hook for ClaimPassHook {
@@ -1904,20 +1900,28 @@ async fn exercise_conversation_park_claim_with_late_publication(
                     .unwrap();
             });
         }
+        let mut controlled_writer = None;
         if case == "selection_hook_writer_busy" && !graph_aba {
             let path = path.clone();
-            let hold_for = if retry_after_busy { 6 } else { 20 };
+            let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+            crate::task_driver::after_pending_enqueue_for_test(root_id, move || {
+                let _ = pending_tx.send(());
+            });
             crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
+                let writer = std::thread::spawn(move || {
                     let conn = rusqlite::Connection::open(path).unwrap();
                     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
                     ready_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_secs(hold_for));
+                    let _ = release_rx.recv_timeout(Duration::from_secs(60));
                     conn.execute_batch("ROLLBACK").unwrap();
                 });
-                ready_rx.recv().unwrap();
+                ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                writer_tx.send(writer).unwrap();
             });
+            controlled_writer = Some((pending_rx, release_tx, writer_rx));
         }
         if matches!(
             case,
@@ -2021,14 +2025,30 @@ async fn exercise_conversation_park_claim_with_late_publication(
         }
         let key = format!("durable/replay-safe-async/{root_id}/conversation-park-cancel-receipt");
         if case == "selection_hook_writer_busy" {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while after_calls.load(Ordering::SeqCst) == 0 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
+            let writer = if let Some((pending, release, writer)) = controlled_writer {
+                tokio::time::timeout(Duration::from_secs(30), pending)
+                    .await
+                    .expect("driver did not retain the pending cancel receipt")
+                    .unwrap();
+                Some((
+                    release,
+                    writer.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ))
+            } else {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while after_calls.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                None
+            };
             if retry_after_busy {
+                if let Some((release, writer)) = writer {
+                    release.send(()).unwrap();
+                    writer.join().unwrap();
+                }
                 tokio::time::timeout(Duration::from_secs(20), async {
                     while store.get(key.as_bytes()).unwrap().is_none() {
                         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2045,6 +2065,10 @@ async fn exercise_conversation_park_claim_with_late_publication(
                 tokio::time::sleep(Duration::from_secs(7)).await;
             }
             let report = driver.shutdown_with_pending().unwrap();
+            if let Some((release, writer)) = writer {
+                release.send(()).unwrap();
+                writer.join().unwrap();
+            }
             let known = report
                 .pending()
                 .iter()
@@ -10921,11 +10945,10 @@ async fn nested_woken_evidence_worker() {
                 name: "policy".into(),
                 ..Default::default()
             });
-            std::fs::write(
+            publish_ready_marker(
                 control.join("pending-held"),
                 format!("{identity_result:?};{selection_result:?}"),
-            )
-            .unwrap();
+            );
             while !control.join("release-pending").exists() {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -10943,7 +10966,7 @@ async fn nested_woken_evidence_worker() {
                 name: "policy".into(),
                 ..Default::default()
             });
-            std::fs::write(control.join("selection-replaced"), format!("{result:?}")).unwrap();
+            publish_ready_marker(control.join("selection-replaced"), format!("{result:?}"));
         });
     }
 

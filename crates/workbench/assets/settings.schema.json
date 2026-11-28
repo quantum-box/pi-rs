@@ -81,7 +81,9 @@
       "type": "boolean"
     },
     "showCacheMissNotices": {
-      "type": "boolean"
+      "type": "boolean",
+      "deprecated": true,
+      "description": "Legacy setting migrated to notices."
     },
     "transport": {
       "enum": ["sse", "websocket", "websocket-cached", "auto"]
@@ -102,6 +104,7 @@
     "markdown": {
       "type": "object",
       "properties": {
+        "codeBlockIndent": { "type": "string", "default": "  " },
         "mermaid": { "enum": ["off", "final", "streaming"] }
       }
     },
@@ -109,6 +112,8 @@
       "type": "object",
       "properties": {
         "clearOnShrink": { "type": "boolean" },
+        "hyperlinks": { "description": "Use true or false to override hyperlink detection. Use \"auto\" for automatic detection. Other legacy values are preserved and treated as automatic." },
+        "trueColor": { "description": "Use true or false to override true color detection. Use \"auto\" for automatic detection. Other legacy values are preserved and treated as automatic." },
         "showTerminalProgress": { "type": "boolean" },
         "showImages": { "type": "boolean" },
         "imageWidthCells": { "type": "integer", "minimum": 1 }
@@ -128,6 +133,15 @@
       "type": "object",
       "properties": {
         "anthropicExtraUsage": { "type": "boolean", "default": true }
+      }
+    },
+    "notices": {
+      "type": "object",
+      "properties": {
+        "cacheMisses": { "type": "boolean", "default": false },
+        "cacheWarming": { "type": "boolean", "default": false },
+        "compactionCosts": { "type": "boolean", "default": false },
+        "reasoningDrops": { "type": "boolean", "default": false }
       }
     },
     "extensions": {

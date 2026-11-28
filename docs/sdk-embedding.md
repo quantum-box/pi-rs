@@ -14,6 +14,24 @@ resolves provider-qualified historical selections when sessions reopen or
 navigate branches. This is useful when two providers use the same model name:
 the SDK never guesses a provider or silently replaces an existing binding.
 
+Use `catalog.models()` to list descriptors and `catalog.find(provider, model)`
+to look up one exact pair. A registered model can have a descriptor with
+`info: None`. Use `catalog.providers()` to list provider identities that have
+registered models, or `catalog.find_provider(provider)` to inspect a single
+provider and iterate its models. These reads expose only identities and
+host-supplied metadata. They do not load config, access credentials, probe
+providers, or infer a default route. Listings are ordered by the registered
+identities, and lookup is case-sensitive.
+
+A host can register the model's selectable reasoning levels with
+`ModelCatalogBuilder::set_thinking_levels`. Use
+`catalog.thinking_levels(provider, model)` to populate a picker in the host's
+order. An empty list means the host declared no selectable levels. `None`
+means that no list is available. This is the host-owned catalog equivalent
+of [Pi's available thinking levels](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2827-L2838).
+The list describes capability metadata. The host still chooses a client
+configured for the selected level.
+
 For older journals that recorded a model name without its provider, the host
 may explicitly authorize that name with `session_builder_with_legacy_model`.
 Use this only when the host knows which provider the old name represents; the
@@ -21,22 +39,89 @@ ordinary `session_builder` deliberately leaves such histories unbound.
 
 ```rust,no_run
 use std::sync::Arc;
-use pi_rs::{Model, ModelCatalogBuilder};
+use pi_rs::{CatalogModelInfo, Model, ModelCatalogBuilder};
 
 fn session_builder(client: Arc<dyn Model>) -> pi_rs::Result<pi_rs::SessionBuilder> {
     let mut models = ModelCatalogBuilder::new();
-    models.register("my-provider", "my-model", client)?;
-    models.build().session_builder("my-provider", "my-model")
+    models.register_with_info(
+        "my-provider",
+        "my-model",
+        client,
+        CatalogModelInfo {
+            display_name: Some("My model".into()),
+            ..Default::default()
+        },
+    )?;
+    models.set_thinking_levels(
+        "my-provider",
+        "my-model",
+        ["off", "low", "high"].map(str::to_owned),
+    )?;
+    let catalog = models.build();
+    let model = catalog
+        .find("my-provider", "my-model")
+        .expect("registered above");
+    catalog.session_builder(model.provider, model.model)
 }
 ```
 
 Clients, endpoints and credentials remain the host's responsibility. Journal
 identities are used only for exact lookups in this trusted snapshot; unknown
 identities do not cause a network request or automatic fallback. Build a new
-catalog and new sessions after changing credentials or endpoint policy. Existing
-sessions retain their original clients. Hosts needing automatic fallback can
-provide their own `HistoricalModelResolver` instead. This provider-neutral API
-does not depend on Tauri or a desktop runtime.
+catalog after changing provider or model definitions, credentials, or endpoint
+policy. Share the replacement snapshot for new lookups and sessions. Previously
+cloned catalogs and existing sessions retain their original bindings. Hosts
+needing automatic fallback can provide their own `HistoricalModelResolver`.
+This provider-neutral API does not depend on Tauri or a desktop runtime.
+
+### Reload saved keys and model routes
+
+Native hosts using the workspace's `pi-rs-workbench` crate can rebuild a live
+catalog with `AuthFileReadGrants` and `ModelClientFactory`. Prepare the exact
+provider and endpoint grants and the complete set of model definitions for
+each reload. Read the granted file once, then build every client from that
+credential snapshot.
+
+```rust,no_run
+use pi_rs::ModelCatalog;
+use pi_rs_workbench::{
+    auth_factory::AuthFileReadGrants,
+    model_factory::{ModelClientFactory, NativeModelDefinition},
+};
+
+fn reload<'a>(
+    live: &mut ModelCatalog,
+    grants: &AuthFileReadGrants,
+    definitions: impl IntoIterator<Item = NativeModelDefinition<'a>>,
+) -> pi_rs::Result<()> {
+    let factory = ModelClientFactory::new(grants.load()?);
+    let candidate = factory.catalog(definitions)?;
+    *live = candidate;
+    Ok(())
+}
+```
+
+If the load or build fails, the previous catalog remains published. A missing
+auth file yields an empty credential snapshot, so building a defined route
+that requires a key fails. For a shared catalog, build the candidate on a
+blocking worker, then take the host's state lock only to publish the completed
+catalog. Serialize reloads or check a host-owned revision before publishing
+so an older rebuild cannot overwrite a newer one.
+
+Use the replacement catalog to start new sessions. Retained sessions, clients,
+and catalog clones keep their original credentials and routes. Release or
+close them when they should stop using those routes. Revoke a retired key at
+the provider if it must stop working regardless of the client's lifetime.
+
+For explicitly granted `models.json` entries, a host can use
+`ModelFileReadGrants::load(&factory)` to build the candidate. That loader can
+return an empty catalog for a missing file, so check any required model
+identities before publishing. These file reads capture separate inputs.
+
+OAuth acquisition and refresh stay with the host. Use `HostAuthBuilder` to
+bind a host-supplied bearer credential to an exact supported route. In Tauri,
+keep the grants, rebuild, and credential values in the Rust backend. Browser
+Wasm clients continue to use the host-configured gateway.
 
 ## Native quickstart
 
@@ -50,6 +135,27 @@ cargo run --locked -p pi-rs-ollama --example sdk_chat
 
 Set `PI_RS_EXAMPLE_MODEL` to use another installed model. For a browser-only
 app, a native server can own the session and expose an application-specific API.
+
+## Session statistics
+
+`AgentSession::session_stats()` reads the Pi-visible session ID, the
+SDK-managed session path when available, durable totals, and current branch
+context usage from one journal snapshot. The path is available for sessions
+opened with the SDK or forked to a path. In-memory sessions and journals passed
+to `SessionBuilder::build` have no SDK-managed path. The call returns an error
+if the session is closed or the journal is busy.
+
+Set `Limits::context_window` to include branch context usage. A missing or
+zero window leaves `context_usage` absent. After compaction, the token count
+can remain unknown until a fresh measured response. The snapshot makes no
+provider calls. Hosts that want provider discovery can call the existing
+`AgentSession::context_usage().await` explicitly.
+
+The `totals` field uses the existing `SessionStats` accounting and native
+session UUID. This includes alternate branches and compacted history. The
+workbench RPC counts Pi-projected message entries and adds usage from its
+native model operations, so message counts and usage totals can differ from
+the SDK snapshot.
 
 ## Native state and Tauri
 
@@ -145,6 +251,35 @@ choose which frontend callers may invoke them and enforce its own workspace,
 credential, and network policies. The SDK's session state is not a sandbox.
 See [Tauri's state guide](https://v2.tauri.app/develop/state-management/) and
 [command guide](https://v2.tauri.app/develop/calling-rust/).
+
+### Live tool results
+
+Subscribe with `AgentSession::subscribe_tool_progress()` before starting work.
+Direct prompts and runs started through cloned controls publish owned
+`Arc<ToolProgressUpdate>` values with the tool call ID, name, argument preview,
+partial result, and parent call ID for nested tools. The payload
+keeps the result format supplied by the tool. Hosts can use it to update their
+tool renderer while the call is running. Final results still arrive as
+committed records on `AgentSession::subscribe()`.
+
+The progress stream retains up to 32 updates per session. A slow subscription
+reports `RecvError::Lagged` and can then continue with the retained updates.
+Closing or dropping the session closes the stream after buffered updates are
+drained. Progress is transient and reopening the journal cannot replay it.
+
+In Tauri, create the receiver while you have access to the managed session,
+then release the state lock before reading the stream. An authorized frontend
+can provide a `tauri::ipc::Channel<ToolProgressUpdate>` to a host command.
+The forwarding task can send `update.as_ref().clone()` through that channel
+after applying the host's disclosure policy. Arguments and partial results may
+contain private data. Handle lag by resuming with the newest available updates
+and reconcile the display with the final committed result. Stop forwarding
+when the channel disconnects or the SDK receiver closes.
+
+This is a Rust API in `pi-rs-core` and also compiles for `wasm32-unknown-unknown`.
+The JavaScript browser SDK uses a separate `wasm-bindgen` wrapper around the core
+session. Its prompt and resume methods return promises for completed answers,
+and its current bindings do not expose this subscription.
 
 ## Browser WASM status
 

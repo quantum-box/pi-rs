@@ -1,10 +1,13 @@
 //! Terminal presentation over the same journaled CLI used by automation.
+use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::config::NoticeKind;
 use crate::ui::{
+    color::ColorMode,
     editor::Editor,
     images::{self, Cleanup, InlineImage, Renderer},
     keys::Keys,
@@ -39,6 +42,13 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{Cli, Provider, TuiMode, changelog, process::Worker, radius_auth, sessions};
 
+fn plain_notice_text(text: &str) -> String {
+    // Keep U+0085 for transcript search. Span rendering strips it from terminal output.
+    text.chars()
+        .filter(|character| !character.is_control() || matches!(*character, '\n' | '\t' | '\u{85}'))
+        .collect()
+}
+
 // Shell output is displayed separately from the model-facing context framing.
 fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
     // Finish stripping the untrusted output before adding host-generated
@@ -57,14 +67,6 @@ fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
             output.push('\n');
         }
         output.push_str(&status);
-    }
-    if execution.truncated
-        && let Some(path) = &execution.full_output_path
-    {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str(&format!("Output truncated. Full output: {path}"));
     }
     output
 }
@@ -668,6 +670,7 @@ impl<W: Write> Drop for FrameWriter<W> {
 
 #[derive(PartialEq)]
 struct RegularLayout {
+    color_mode: ColorMode,
     width: usize,
     height: usize,
     cell: (f64, f64),
@@ -675,6 +678,7 @@ struct RegularLayout {
     expand_tools: bool,
     hide_thinking: bool,
     output: TranscriptOptions<'static>,
+    code_block_indent: String,
 }
 #[derive(Default)]
 struct RegularState {
@@ -1277,6 +1281,67 @@ impl ExtensionWorkingStatus {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReasoningDropKind {
+    Anthropic,
+    OpenAi,
+}
+
+struct ReasoningDrop {
+    kind: ReasoningDropKind,
+    count: usize,
+    reasons: Vec<&'static str>,
+}
+
+impl ReasoningDrop {
+    fn from_diagnostic(diagnostic: &pi_rs::AssistantDiagnostic) -> Option<Self> {
+        use pi_rs::AssistantDiagnostic;
+
+        let mut reasons = Vec::new();
+        let mut remember = |reason| {
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        };
+        let (kind, count) = match diagnostic {
+            AssistantDiagnostic::AnthropicInputTransformations { details, .. } => {
+                details.thinking_drop_reasons().for_each(&mut remember);
+                (
+                    ReasoningDropKind::Anthropic,
+                    diagnostic.dropped_thinking_blocks(),
+                )
+            }
+            AssistantDiagnostic::OpenAiInputTransformations { details, .. } => {
+                details.reasons().for_each(&mut remember);
+                (ReasoningDropKind::OpenAi, details.removed_reasoning_items())
+            }
+            AssistantDiagnostic::AnthropicThreadFallback { .. } => return None,
+        };
+        (count > 0).then_some(Self {
+            kind,
+            count,
+            reasons,
+        })
+    }
+
+    fn notice(&self) -> String {
+        let (provider, noun) = match self.kind {
+            ReasoningDropKind::Anthropic => ("Anthropic", "thinking block"),
+            ReasoningDropKind::OpenAi => ("OpenAI", "reasoning item"),
+        };
+        let plural = if self.count == 1 { "" } else { "s" };
+        let reasons = if self.reasons.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", self.reasons.join(", "))
+        };
+        format!(
+            "{provider} dropped {} {noun}{plural}{reasons} (details in session)",
+            self.count
+        )
+    }
+}
+
 #[derive(Default)]
 struct View {
     live_model_choices: VecDeque<LiveModelChoice>,
@@ -1284,6 +1349,7 @@ struct View {
     async_transitions: bool,
     pending_transition: Option<std::sync::mpsc::Receiver<Result<Cli>>>,
     regular: RegularState,
+    detected_hyperlinks: Cell<Option<bool>>,
     graphics: Renderer,
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
     pending_terminal_title: Option<String>,
@@ -1315,8 +1381,9 @@ struct View {
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
     theme_refresh_requested: bool,
+    terminal_closed: bool,
     thinking_settings: Option<ThinkingSettings>,
-    warning_settings_parent: Option<Picker>,
+    toggle_settings_parent: Option<Picker>,
     anthropic_subscription_warning_shown: bool,
     pending_thinking: Option<PendingThinking>,
     session_name: Option<String>,
@@ -1359,8 +1426,9 @@ struct View {
     flash: Option<(String, Instant)>,
     tokens: u64,
     cache_stats: super::cache_stats::Tracker,
-    pending_thinking_drop: Option<(uuid::Uuid, usize)>,
-    previous_thinking_drop: usize,
+    pending_reasoning_drop: Option<(uuid::Uuid, ReasoningDrop)>,
+    pending_aborted_turn_partial: Option<(u64, uuid::Uuid)>,
+    previous_reasoning_drop: Option<(ReasoningDropKind, usize)>,
     cache_warming_status: Option<super::cache_warming::status::State>,
     model_operations: std::collections::HashSet<String>,
     history: Vec<String>,
@@ -1477,6 +1545,97 @@ impl View {
     fn cancel_extension_dialog(&mut self, id: &Value) {
         self.dialogs.retain(|dialog| json!(dialog.id) != *id);
     }
+    fn apply_extension_theme(
+        &mut self,
+        selection: super::extension_ui::PreparedTheme,
+        args: &mut Cli,
+        theme: &mut Theme,
+    ) -> pi_rs::UiResponse {
+        use super::extension_ui::PreparedTheme;
+        let result = match selection {
+            PreparedTheme::System => {
+                save_extension_theme_name(args, "system".into()).map(|()| Theme::system())
+            }
+            PreparedTheme::Named { palette, path } => {
+                save_extension_theme_name(args, palette.name.clone())
+                    .map(|()| Theme::from_named_palette(palette, path.map(PathBuf::from)))
+            }
+            PreparedTheme::Palette { palette } => Theme::from_extension_palette(palette),
+            PreparedTheme::Unavailable { error } => {
+                // Pi falls back to the system palette on a named load failure.
+                self.replace_extension_theme(theme, Theme::system());
+                Err(Error::Config(error))
+            }
+        };
+        pi_rs::UiResponse::ThemeChanged(match result {
+            Ok(next) => {
+                self.replace_extension_theme(theme, next);
+                pi_rs::UiThemeChange {
+                    success: true,
+                    error: None,
+                }
+            }
+            Err(error) => pi_rs::UiThemeChange {
+                success: false,
+                error: Some(error.to_string()),
+            },
+        })
+    }
+
+    fn replace_extension_theme(&mut self, theme: &mut Theme, next: Theme) {
+        *theme = next;
+        self.theme_refresh_requested = true;
+        self.regular.redraw = true;
+    }
+
+    fn theme_worker_event(
+        &mut self,
+        active: &mut Worker,
+        value: &Value,
+        args: &mut Cli,
+        theme: &mut Theme,
+    ) -> Result<bool> {
+        let id = || serde_json::from_value::<uuid::Uuid>(value["id"].clone());
+        let (id, response) = match value["type"].as_str() {
+            Some("extension_ui_theme_claim") => {
+                let id = id()?;
+                if !active.pending_theme_requests.remove(&id) || value["theme"].is_null() {
+                    return Ok(true);
+                }
+                let response = if self.terminal_closed {
+                    super::extension_ui::theme_unavailable()
+                } else {
+                    let selection = serde_json::from_value(value["theme"].clone())?;
+                    self.apply_extension_theme(selection, args, theme)
+                };
+                (id, response)
+            }
+            Some("extension_ui_request") => match value["method"].as_str() {
+                Some("setTheme") => {
+                    let id = id()?;
+                    active.pending_theme_requests.insert(id);
+                    active.send(json!({"type":"extension_ui_theme_claim","id":id}))?;
+                    return Ok(true);
+                }
+                Some("getActiveTheme") => (
+                    id()?,
+                    pi_rs::UiResponse::Theme(theme.clone().extension_palette()),
+                ),
+                Some("getTheme") if value["name"] == "system" => (
+                    id()?,
+                    pi_rs::UiResponse::Theme(Theme::system().extension_palette()),
+                ),
+                _ => return Ok(false),
+            },
+            Some("extension_ui_cancelled") => {
+                return Ok(id().is_ok_and(|id| active.pending_theme_requests.remove(&id)));
+            }
+            _ => return Ok(false),
+        };
+        active.send(json!({"type":"extension_ui_response","id":id,"value":response}))?;
+        Ok(true)
+    }
+
     fn ui_request(&mut self, value: &Value) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
         let id: uuid::Uuid = serde_json::from_value(value["id"].clone())?;
         let request: pi_rs::UiRequest = serde_json::from_value(value.clone())?;
@@ -1548,6 +1707,13 @@ impl View {
             }
             pi_rs::UiRequest::PasteToEditor { text } => self.paste_editor_text(&text),
             pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
+            pi_rs::UiRequest::GetTheme { .. }
+            | pi_rs::UiRequest::GetActiveTheme
+            | pi_rs::UiRequest::SetTheme { .. } => {
+                return Err(Error::Config(
+                    "theme selection requires the terminal controller".into(),
+                ));
+            }
             pi_rs::UiRequest::GetEditorText => {
                 return Ok(Some((
                     id,
@@ -1900,15 +2066,7 @@ impl View {
         true
     }
     fn append(&mut self, text: &str) {
-        // Keep U+0085 for transcript search only. Span rendering strips it
-        // before terminal output, as it does for other control characters.
-        let text = text
-            .chars()
-            .filter(|character| {
-                !character.is_control() || matches!(*character, '\n' | '\t' | '\u{85}')
-            })
-            .collect();
-        self.append_entry(Entry::Notice(text));
+        self.append_entry(Entry::Notice(plain_notice_text(text)));
     }
     fn show_status(&mut self, mode: Option<TuiMode>, status: String) {
         if (mode != Some(TuiMode::Regular) || self.regular.committed < self.lines.len())
@@ -2558,6 +2716,12 @@ impl View {
         };
         *output = crate::ui::render::strip_shell_ansi(&display_tool_blocks(blocks));
         *parts = tool_result_parts(&update["content"], self.graphics.enabled());
+        if name == "codemode"
+            && let Some(text) = codemode_progress_text(&update["details"])
+        {
+            output.clone_from(&text);
+            parts.push(ToolPart::Text(text));
+        }
         records.progress = records.progress.wrapping_add(1);
         self.partial_tool_results.insert(
             id.clone(),
@@ -2699,43 +2863,68 @@ impl View {
     }
 
     fn observe_cache(&mut self, record: &pi_rs::Record, args: &Cli) {
-        if let Some(notice) = self.cache_stats.observe(record, &args.model_profiles)
-            && args.settings.boolean("showCacheMissNotices") == Some(true)
-        {
-            if matches!(
-                record.event,
-                pi_rs::Event::SourceEntry { .. } | pi_rs::Event::CacheWarm { .. }
-            ) {
-                self.append(&notice);
-            } else {
-                self.lines.push(Entry::Warning(notice));
-            }
+        let Some(text) = self.cache_stats.observe(record, &args.model_profiles) else {
+            return;
+        };
+        if matches!(
+            record.event,
+            pi_rs::Event::SourceEntry { .. } | pi_rs::Event::CacheWarm { .. }
+        ) {
+            self.append_entry(Entry::TranscriptNotice {
+                kind: NoticeKind::CacheWarming,
+                text: plain_notice_text(&text),
+            });
+        } else {
+            self.lines.push(Entry::TranscriptNotice {
+                kind: NoticeKind::CacheMisses,
+                text,
+            });
         }
     }
 
-    fn observe_thinking_drop(&mut self, event: &pi_rs::Event) -> Option<usize> {
-        match event {
+    fn observe_reasoning_drop(&mut self, record: &pi_rs::Record) -> Option<ReasoningDrop> {
+        let pending_aborted = self.pending_aborted_turn_partial.take();
+        self.pending_aborted_turn_partial =
+            pi_rs::aborted_turn_partial_request(&record.event).map(|id| (record.id, id));
+        match &record.event {
+            pi_rs::Event::ModelFinished {
+                request_id,
+                failure: Some(pi_rs::ModelFailure::Cancelled),
+                partial,
+                ..
+            } if !partial.is_empty()
+                && pending_aborted.is_some_and(|(marker_id, pending_id)| {
+                    record.parent == Some(marker_id) && *request_id == pending_id
+                }) =>
+            {
+                self.pending_reasoning_drop = None;
+                self.previous_reasoning_drop = None;
+            }
             pi_rs::Event::ModelFinished {
                 request_id,
                 metadata,
                 failure: None,
                 ..
             } => {
-                let count = metadata
+                self.pending_reasoning_drop = metadata
                     .diagnostics
                     .iter()
-                    .map(pi_rs::AssistantDiagnostic::dropped_thinking_blocks)
-                    .sum();
-                self.pending_thinking_drop = Some((*request_id, count));
+                    .find_map(ReasoningDrop::from_diagnostic)
+                    .map(|drop| (*request_id, drop));
             }
             pi_rs::Event::Assistant { request_id, .. } => {
-                let count = self
-                    .pending_thinking_drop
+                let drop = self
+                    .pending_reasoning_drop
                     .take()
                     .filter(|(id, _)| Some(id) == request_id.as_ref())
-                    .map_or(0, |(_, count)| count);
-                let previous = std::mem::replace(&mut self.previous_thinking_drop, count);
-                return (count > previous).then_some(count);
+                    .map(|(_, drop)| drop);
+                let previous = std::mem::replace(
+                    &mut self.previous_reasoning_drop,
+                    drop.as_ref().map(|drop| (drop.kind, drop.count)),
+                );
+                return drop.filter(|drop| {
+                    !previous.is_some_and(|(kind, count)| kind == drop.kind && count >= drop.count)
+                });
             }
             _ => {}
         }
@@ -2823,15 +3012,7 @@ impl View {
         }
     }
 
-    fn show_summary_billing(
-        &mut self,
-        record: &pi_rs::Record,
-        records: &[pi_rs::Record],
-        args: &Cli,
-    ) {
-        if args.settings.boolean("showCacheMissNotices") != Some(true) {
-            return;
-        }
+    fn show_summary_billing(&mut self, record: &pi_rs::Record, records: &[pi_rs::Record]) {
         let Some((usage, metadata)) = record.summary_usage(records) else {
             return;
         };
@@ -2848,9 +3029,10 @@ impl View {
             .and_then(|number| number.as_f64())
             .filter(|cost| *cost >= 0.01)
             .map_or_else(String::new, |cost| format!(" (~${cost:.2})"));
-        self.lines.push(Entry::Warning(format!(
-            "{label}: {tokens} tokens billed{cost}"
-        )));
+        self.lines.push(Entry::TranscriptNotice {
+            kind: NoticeKind::CompactionCosts,
+            text: format!("{label}: {tokens} tokens billed{cost}"),
+        });
     }
 
     fn request_queue_restore(&mut self, worker: &mut Option<Worker>, args: &Cli, report: bool) {
@@ -3090,7 +3272,7 @@ impl View {
         }
         self.receive(&value);
         if value["type"] == "record"
-            && matches!(
+            && (matches!(
                 value["record"]["event"]["type"].as_str(),
                 Some(
                     "model_selected"
@@ -3104,7 +3286,7 @@ impl View {
                         | "custom_message_delivered"
                         | "custom_entry"
                 )
-            )
+            ) || value["record"]["event"]["format"] == "pi-rs:aborted-turn-partial")
             && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
         {
             if let pi_rs::Event::CustomMessage { message }
@@ -3119,19 +3301,15 @@ impl View {
                 self.cache_stats.select_provider(args.provider.id());
             }
             self.add_summary(&record, None);
-            self.show_summary_billing(&record, &[], args);
+            self.show_summary_billing(&record, &[]);
             self.observe_cache(&record, args);
-            if let Some(count) = self.observe_thinking_drop(&record.event)
-                && args.settings.boolean("showCacheMissNotices") == Some(true)
+            if let Some(drop) = self.observe_reasoning_drop(&record)
+                && args.settings.notices().shows(NoticeKind::ReasoningDrops)
             {
-                let noun = if count == 1 {
-                    "thinking block"
-                } else {
-                    "thinking blocks"
-                };
-                self.lines.push(Entry::Warning(format!(
-                    "Anthropic dropped {count} {noun} (details in session)"
-                )));
+                self.lines.push(Entry::TranscriptNotice {
+                    kind: NoticeKind::ReasoningDrops,
+                    text: drop.notice(),
+                });
             }
         }
     }
@@ -3205,8 +3383,9 @@ impl View {
         self.history_index = None;
         self.tokens = 0;
         self.cache_stats = super::cache_stats::Tracker::default();
-        self.pending_thinking_drop = None;
-        self.previous_thinking_drop = 0;
+        self.pending_reasoning_drop = None;
+        self.pending_aborted_turn_partial = None;
+        self.previous_reasoning_drop = None;
         self.cache_warming_status = None;
         self.model_operations.clear();
         let records = session.records();
@@ -3284,7 +3463,7 @@ impl View {
                         render_call_id: None,
                         rendered: None,
                     });
-                    self.finish_tool(&id, &outcome);
+                    self.finish_tool(&id, &outcome, None);
                 }
                 pi_rs::Event::BashExecution { execution } => {
                     self.lines.push(Entry::Tool {
@@ -3301,7 +3480,11 @@ impl View {
                         failed: execution.cancelled
                             || execution.exit_code.is_some_and(|code| code != 0),
                         finished: true,
-                        parts: Vec::new(),
+                        parts: execution
+                            .truncation_note()
+                            .map(ToolPart::TruncationNotice)
+                            .into_iter()
+                            .collect(),
                         numbered_diff: false,
                         render_records: None,
                         render_call_id: None,
@@ -3377,14 +3560,14 @@ impl View {
                     outcome,
                 } => {
                     self.track_tool_render(&operation_id.to_string(), record.id, false);
-                    self.finish_tool(&operation_id.to_string(), outcome);
+                    self.finish_tool(&operation_id.to_string(), outcome, None);
                 }
                 _ => {}
             }
             self.add_summary(record, Some(session));
-            self.show_summary_billing(record, records, args);
+            self.show_summary_billing(record, records);
             self.observe_cache(record, args);
-            self.observe_thinking_drop(&record.event);
+            self.observe_reasoning_drop(record);
         }
         if show_startup_header(args) {
             self.append(if crate::ui::keys::windows_keybindings() {
@@ -3444,13 +3627,23 @@ impl View {
             rendered: None,
         });
     }
-    fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
+    fn finish_tool(
+        &mut self,
+        operation: &str,
+        outcome: &pi_rs::Outcome,
+        truncation_notice: Option<String>,
+    ) {
         if self.model_operations.remove(operation) {
             if let Some(usage) = pi_rs_extensions::codemode::ModelUsage::from_outcome(outcome) {
                 self.tokens = self.tokens.saturating_add(usage.total_tokens);
             }
             return;
         }
+        let nested_progress = self
+            .partial_tool_results
+            .get(operation)
+            .and_then(|partial| partial.details.as_ref())
+            .and_then(codemode_progress_text);
         let mut rendered_parts = match outcome {
             pi_rs::Outcome::Structured { data, .. }
             | pi_rs::Outcome::StructuredWithDetails { data, .. } => {
@@ -3480,6 +3673,7 @@ impl View {
                     "[{model} does not support images; it saw a placeholder instead]"
                 )));
             }
+            rendered_parts.extend(truncation_notice.map(ToolPart::TruncationNotice));
             *parts = rendered_parts;
             let diff = match outcome {
                 pi_rs::Outcome::SucceededWithDetails { details, .. }
@@ -3492,6 +3686,15 @@ impl View {
             };
             *numbered_diff = diff.is_some();
             *output = diff.map_or_else(|| display_tool_result(outcome), str::to_owned);
+            if name == "codemode"
+                && let Some(text) = nested_progress
+            {
+                if parts.is_empty() {
+                    parts.push(ToolPart::Text(output.clone()));
+                }
+                output.insert_str(0, &format!("{text}\n"));
+                parts.insert(0, ToolPart::Text(text));
+            }
             *failed = !matches!(
                 outcome,
                 pi_rs::Outcome::Succeeded(_)
@@ -3595,12 +3798,21 @@ render_call_id: None,
             }
             Some("bash_execution_end") => {
                 self.shell_running = false;
-                let outcome = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
-                    Ok(execution) if !execution.cancelled && execution.exit_code.is_none_or(|code| code == 0) => pi_rs::Outcome::Succeeded(shell_display_output(&execution)),
-                    Ok(execution) => pi_rs::Outcome::TextResult { output: shell_display_output(&execution), details: None, is_error: true },
-                    Err(_) => pi_rs::Outcome::Failed(value["error"].as_str().unwrap_or("Shell execution failed").into()),
+                let (outcome, note) = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
+                    Ok(execution) => (
+                        pi_rs::Outcome::TextResult {
+                            output: shell_display_output(&execution),
+                            details: None,
+                            is_error: execution.cancelled || execution.exit_code.is_some_and(|code| code != 0),
+                        },
+                        execution.truncation_note(),
+                    ),
+                    Err(_) => (
+                        pi_rs::Outcome::Failed(value["error"].as_str().unwrap_or("Shell execution failed").into()),
+                        None,
+                    ),
                 };
-                self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome);
+                self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome, note);
             }
             Some("auto_retry_start") => {
                 self.phase = Some("再試行待ち");
@@ -3780,14 +3992,12 @@ render_call_id: None,
                     }
                     Some("tool_finished" | "tool_reconciled") => {
                         self.phase = Some("処理を継続中");
-                        if let Some(record) = value["record"]["id"].as_u64() {
-                            self.track_tool_render(event["operation_id"].as_str().unwrap_or_default(), record, false);
-                        }
+                        let operation = event["operation_id"].as_str().unwrap_or_default();
                         if let Ok(outcome) = serde_json::from_value(event["outcome"].clone()) {
-                            self.finish_tool(
-                                event["operation_id"].as_str().unwrap_or_default(),
-                                &outcome,
-                            );
+                            self.finish_tool(operation, &outcome, None);
+                        }
+                        if let Some(record) = value["record"]["id"].as_u64() {
+                            self.track_tool_render(operation, record, false);
                         }
                     }
                     Some("compacted" | "branch_summary") => self.summarizing = false,
@@ -4044,9 +4254,10 @@ render_call_id: None,
 
     fn draw(&mut self, args: &Cli, theme: &Theme, busy: bool, keys: &Keys) -> Result<()> {
         let _strike_budget = crate::ui::strike::frame_budget();
+        let color_mode = ColorMode::resolve(args.settings.terminal_true_color());
         self.expand_key = keys.first_binding("app.tools.expand");
         if args.tui_mode == Some(TuiMode::Regular) {
-            return self.draw_regular(args, theme, busy, keys);
+            return self.draw_regular(args, theme, busy, keys, color_mode);
         }
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
@@ -4247,11 +4458,11 @@ render_call_id: None,
         self.graphics.clear_fullscreen_frame(&mut out)?;
         for (row, line) in header.iter().enumerate() {
             queue!(out, MoveTo(0, row as u16))?;
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
         }
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + header_rows) as u16))?;
-            line.draw(&mut out, if modal { width } else { body_width })?;
+            line.draw(&mut out, if modal { width } else { body_width }, color_mode)?;
             let covered = search_overlay.as_ref().is_some_and(|(rows, columns, ..)| {
                 line.image
                     .as_ref()
@@ -4287,7 +4498,7 @@ render_call_id: None,
                     ("│", "scrollbarTrack")
                 };
                 queue!(out, MoveTo((width - 1) as u16, (row + header_rows) as u16))?;
-                Line::themed(glyph, theme, role).draw(&mut out, 1)?;
+                Line::themed(glyph, theme, role).draw(&mut out, 1, color_mode)?;
             }
         }
         let border_row = height - prompt_height - 2 - footer.len() - below.len();
@@ -4301,35 +4512,35 @@ render_call_id: None,
             theme,
             "border",
         )
-        .draw(&mut out, width)?;
+        .draw(&mut out, width, color_mode)?;
         for (row, line) in prompt.iter().enumerate() {
             queue!(out, MoveTo(0, (border_row + 1 + row) as u16))?;
             let mut line = Line::themed(line, theme, "text");
             if row == cursor_row && !hardware_cursor && !modal && self.search.is_none() {
                 line.mark_cursor(column);
             }
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
         }
         for (row, line) in below.iter().enumerate() {
             queue!(
                 out,
                 MoveTo(0, (border_row + 1 + prompt_height + row) as u16)
             )?;
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
         }
         let footer_row = height - footer.len();
         queue!(out, MoveTo(0, (footer_row - 1) as u16))?;
-        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width)?;
+        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width, color_mode)?;
         for (row, line) in footer.iter().enumerate() {
             queue!(out, MoveTo(0, (footer_row + row) as u16))?;
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
         }
         if let Some((rows, columns, overlay, cursor_row, cursor_column)) = search_overlay {
             let left = columns.start;
             let top = header_rows + rows.start;
             for (row, line) in overlay.iter().enumerate() {
                 queue!(out, MoveTo(left as u16, (top + row) as u16))?;
-                line.draw(&mut out, columns.len())?;
+                line.draw(&mut out, columns.len(), color_mode)?;
             }
             if cursor_row < body_height {
                 queue!(
@@ -4395,16 +4606,30 @@ render_call_id: None,
         Ok(())
     }
 
-    fn transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'_> {
+    fn transcript_options<'a>(&'a self, args: &'a Cli, streaming: bool) -> TranscriptOptions<'a> {
         TranscriptOptions {
             hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            code_block_indent: Some(args.settings.code_block_indent()),
             ..self.base_transcript_options(args, streaming)
         }
     }
 
     fn base_transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'static> {
+        let hyperlinks = if let Some(enabled) = args.settings.terminal_hyperlinks() {
+            self.detected_hyperlinks.set(None);
+            enabled
+        } else if let Some(detected) = self.detected_hyperlinks.get() {
+            detected
+        } else {
+            let detected = crate::ui::render::detect_terminal_hyperlinks();
+            self.detected_hyperlinks.set(Some(detected));
+            detected
+        };
         TranscriptOptions {
             hidden_thinking_label: None,
+            code_block_indent: None,
+            hyperlinks,
+            notices: args.settings.notices(),
             image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
                 .then(|| args.settings.terminal_image_width()),
             padding: args.settings.output_padding(),
@@ -4479,6 +4704,7 @@ render_call_id: None,
         lines.push(Line::themed(&self.model_display(args), theme, "dim"));
         let session = Session::snapshot(&args.session)?;
         let (messages, _) = super::rpc_messages::snapshot(&session);
+        let color_mode = ColorMode::resolve(args.settings.terminal_true_color());
         let mut output = format!(
             "Debug output at {}\nTerminal: {}x{}\nTotal lines: {}\n\n=== All rendered lines with visible widths ===\n",
             chrono::Utc::now().to_rfc3339(),
@@ -4488,7 +4714,7 @@ render_call_id: None,
         );
         for (index, line) in lines.iter().enumerate() {
             let mut rendered = Vec::new();
-            line.draw(&mut rendered, width)?;
+            line.draw(&mut rendered, width, color_mode)?;
             let rendered = String::from_utf8_lossy(&rendered);
             output.push_str(&format!(
                 "[{index}] (w={width}) {}\n",
@@ -4529,9 +4755,11 @@ render_call_id: None,
     }
 
     fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
+        let color_mode = ColorMode::resolve(args.settings.terminal_true_color());
         self.graphics.reset();
         let output = TranscriptOptions {
             hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            code_block_indent: Some(args.settings.code_block_indent()),
             ..self.base_transcript_options(args, false)
         };
         let width = usize::from(terminal::size()?.0.max(1));
@@ -4539,7 +4767,7 @@ render_call_id: None,
         queue!(out, MoveToColumn(0), Print("\r\n"))?;
         for entry in &self.lines {
             for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking, output) {
-                line.draw(&mut out, width)?;
+                line.draw(&mut out, width, color_mode)?;
                 self.graphics
                     .paint(&line, &mut out, usize::MAX, usize::MAX)?;
                 queue!(out, Print("\r\n"))?;
@@ -4549,13 +4777,21 @@ render_call_id: None,
         Ok(())
     }
 
-    fn draw_regular(&mut self, args: &Cli, theme: &Theme, busy: bool, keys: &Keys) -> Result<()> {
+    fn draw_regular(
+        &mut self,
+        args: &Cli,
+        theme: &Theme,
+        busy: bool,
+        keys: &Keys,
+        color_mode: ColorMode,
+    ) -> Result<()> {
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
         let hardware_cursor = args.settings.show_hardware_cursor();
         let base_output = self.base_transcript_options(args, false);
         let layout = RegularLayout {
+            color_mode,
             width,
             height,
             cell: images::cell_dimensions(),
@@ -4563,6 +4799,7 @@ render_call_id: None,
             expand_tools: self.expand_tools,
             hide_thinking: self.hide_thinking,
             output: base_output,
+            code_block_indent: args.settings.code_block_indent().to_owned(),
         };
         let redraw = self.regular.layout.is_some()
             && (self.regular.redraw
@@ -4590,6 +4827,7 @@ render_call_id: None,
         }
         let output = TranscriptOptions {
             hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            code_block_indent: Some(args.settings.code_block_indent()),
             ..base_output
         };
         let render_entry = |entry: &Entry| {
@@ -4701,7 +4939,7 @@ render_call_id: None,
             queue!(out, Print("\r\n"))?;
             if self.regular.committed == 0 || redraw {
                 for line in self.header_lines(args, theme, width, 16, false) {
-                    line.draw(&mut out, width)?;
+                    line.draw(&mut out, width, color_mode)?;
                     queue!(out, Print("\r\n"))?;
                 }
             }
@@ -4712,7 +4950,7 @@ render_call_id: None,
                 .iter()
                 .flat_map(render_entry)
             {
-                line.draw(&mut out, width)?;
+                line.draw(&mut out, width, color_mode)?;
                 self.graphics
                     .paint(&line, &mut out, usize::MAX, usize::MAX)?;
                 queue!(out, Print("\r\n"))?;
@@ -4721,7 +4959,7 @@ render_call_id: None,
         }
         if committing {
             for line in pending() {
-                line.draw(&mut out, width)?;
+                line.draw(&mut out, width, color_mode)?;
                 self.graphics
                     .paint(&line, &mut out, usize::MAX, usize::MAX)?;
                 queue!(out, Print("\r\n"))?;
@@ -4736,7 +4974,7 @@ render_call_id: None,
             self.regular.max_rows.max(total_rows)
         };
         for (row, line) in active.iter().enumerate() {
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
             self.graphics.paint_active(
                 line,
                 &mut out,
@@ -4755,7 +4993,7 @@ render_call_id: None,
             theme,
             "border",
         )
-        .draw(&mut out, width)?;
+        .draw(&mut out, width, color_mode)?;
         queue!(out, Print("\r\n"))?;
         for (row, line) in prompt.iter().enumerate() {
             let mut line = Line::themed(line, theme, "text");
@@ -4763,17 +5001,17 @@ render_call_id: None,
             {
                 line.mark_cursor(column);
             }
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
             queue!(out, Print("\r\n"))?;
         }
         for line in &below {
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
             queue!(out, Print("\r\n"))?;
         }
-        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width)?;
+        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width, color_mode)?;
         for line in &footer {
             queue!(out, Print("\r\n"))?;
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, width, color_mode)?;
         }
         self.regular.cursor_row = active.len() + 1 + cursor;
         self.regular.region_height = region_height;
@@ -4826,6 +5064,38 @@ fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
         .collect()
 }
 
+fn codemode_progress_text(details: &Value) -> Option<String> {
+    const VISIBLE_CALLS: usize = 6;
+    let calls = details["calls"].as_array()?;
+    if calls.is_empty() {
+        return None;
+    }
+    let hidden = calls.len().saturating_sub(VISIBLE_CALLS);
+    let mut lines = Vec::new();
+    if hidden > 0 {
+        lines.push(format!("… {hidden} earlier calls"));
+    }
+    for call in &calls[hidden..] {
+        let status = match call["status"].as_str()? {
+            "running" => "…",
+            "ok" => "✓",
+            "error" => "✗",
+            "cancelled" => "⊘",
+            _ => continue,
+        };
+        let name = call["name"].as_str()?;
+        let args = call["args"].as_str().unwrap_or_default();
+        let duration = call["durationMs"]
+            .as_u64()
+            .map_or(String::new(), |ms| format!(" {ms}ms"));
+        lines.push(format!("{status} {name} {args}{duration}"));
+    }
+    if let Some(omitted) = details["omittedCalls"].as_u64().filter(|count| *count > 0) {
+        lines.push(format!("… {omitted} additional calls omitted"));
+    }
+    Some(crate::ui::render::strip_shell_ansi(&lines.join("\n")))
+}
+
 fn display_tool_blocks(blocks: &[Value]) -> String {
     blocks
         .iter()
@@ -4861,7 +5131,8 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     outcome.tool_content()
 }
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug  /changelog\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. See /hotkeys for transcript search and navigation.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug  /changelog  /bug [description]\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. See /hotkeys for transcript search and navigation.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const BUG_REPORT_PICKER_TITLE: &str = "Export bug report ZIP to the launch directory";
 
 fn slash(
     input: &str,
@@ -5034,6 +5305,36 @@ fn slash(
             let session = Session::open(&args.session)?;
             sessions::export(&session, &destination)?;
             view.append(&format!("Exported {}", destination.display()));
+        }
+        "/bug" => {
+            if worker.is_some_and(|worker| is_busy(worker)) {
+                view.append("Wait for the current operation before exporting a bug report");
+                return Ok(None);
+            }
+            view.picker = Some(Picker::new(
+                BUG_REPORT_PICKER_TITLE,
+                vec![
+                    Item {
+                        label: "Metadata and diagnostics only".into(),
+                        selection: Selection::ExportBugReport {
+                            description: rest.into(),
+                            include_transcript: false,
+                        },
+                    },
+                    Item {
+                        label: "Include current-branch transcript (messages and tool output)"
+                            .into(),
+                        selection: Selection::ExportBugReport {
+                            description: rest.into(),
+                            include_transcript: true,
+                        },
+                    },
+                    Item {
+                        label: "Cancel".into(),
+                        selection: Selection::CancelBugReport,
+                    },
+                ],
+            ));
         }
         "/import" => {
             let destination = session_path(&args.workspace, args.session_dir.as_deref());
@@ -5657,6 +5958,45 @@ fn load_resolved_theme(
     Err(error)
 }
 
+fn save_extension_theme_name(args: &mut Cli, name: String) -> Result<()> {
+    if args.settings.string("theme") != Some(name.as_str()) {
+        args.settings.set_user("theme", json!(name))?;
+    }
+    args.extension_theme = Some(name);
+    Ok(())
+}
+
+fn notify_extension_selection(
+    worker: &mut Option<Worker>,
+    args: &mut Cli,
+    view: &mut View,
+    theme: &mut Theme,
+    event: &pi_rs::LifecycleEvent,
+) -> Result<bool> {
+    let mut handled = false;
+    if let Some((active, id)) = Worker::begin_selection(worker, args, event)? {
+        active.wait_selection(id, None, |active, value| {
+            let is_theme_event = view.theme_worker_event(active, value, args, theme)?;
+            handled |= is_theme_event;
+            Ok(is_theme_event)
+        })?;
+    }
+    Ok(handled)
+}
+
+fn reset_extension_theme_for_rebind(args: &Cli, view: &mut View, theme: &mut Theme) {
+    if theme.is_extension_instance() {
+        let next = load_resolved_theme(
+            args.theme_setting().unwrap_or("system"),
+            &args.theme_paths,
+            &args.workspace,
+            args.trusted,
+        )
+        .unwrap_or_else(|_| Theme::system());
+        view.replace_extension_theme(theme, next);
+    }
+}
+
 #[cfg(any(unix, windows))]
 fn follows_terminal_appearance(selection: Option<&str>) -> bool {
     let selection = selection.unwrap_or("system");
@@ -5667,7 +6007,7 @@ fn follows_terminal_appearance(selection: Option<&str>) -> bool {
 fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
     // A reported background remains authoritative until a newer color reply arrives.
     let changed = crate::ui::theme::set_appearance(dark);
-    let redraw_system = changed && theme.name == "system";
+    let redraw_system = changed && theme.uses_terminal_colors();
     if redraw_system {
         *theme = Theme::system();
     }
@@ -5688,12 +6028,12 @@ fn handle_terminal_appearance(
         crate::ui::theme::clear_terminal_palette();
     }
     let (changed, redraw) = apply_terminal_appearance(theme, dark);
-    if invalidate && theme.name == "system" && !redraw {
+    if invalidate && theme.uses_terminal_colors() && !redraw {
         *theme = Theme::system();
     }
     Ok((
         changed || invalidate,
-        redraw || (invalidate && theme.name == "system"),
+        redraw || (invalidate && theme.uses_terminal_colors()),
     ))
 }
 
@@ -5719,7 +6059,7 @@ fn apply_terminal_color_snapshot(
         }
         colors_reported = true;
     }
-    let redraw_system = colors_reported && theme.name == "system";
+    let redraw_system = colors_reported && theme.uses_terminal_colors();
     if redraw_system {
         *theme = Theme::system();
     }
@@ -5728,6 +6068,9 @@ fn apply_terminal_color_snapshot(
 
 #[cfg(any(unix, windows))]
 fn refresh_terminal_theme_selection(args: &Cli, view: &mut View, theme: &mut Theme) {
+    if theme.is_extension_instance() {
+        return;
+    }
     let selection = args.theme_setting().unwrap_or("system");
     if let (Some(settings), Some(picker)) = (&view.theme_settings, &view.picker) {
         if let Ok(next) = settings.preview(picker, args) {
@@ -5743,7 +6086,7 @@ fn refresh_terminal_theme_selection(args: &Cli, view: &mut View, theme: &mut The
 
 #[cfg(any(unix, windows))]
 fn finish_initial_terminal_colors(theme: &mut Theme) -> bool {
-    if crate::ui::theme::finish_terminal_colors_pending() && theme.name == "system" {
+    if crate::ui::theme::finish_terminal_colors_pending() && theme.uses_terminal_colors() {
         *theme = Theme::system();
         true
     } else {
@@ -5838,6 +6181,7 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     loop {
         if dirty {
             let (width, height) = terminal::size().unwrap_or((80, 24));
+            let color_mode = ColorMode::resolve(args.settings.terminal_true_color());
             execute!(screen.output, MoveTo(0, 0), Clear(ClearType::All))?;
             if let Some(picker) = &view.picker {
                 for (row, line) in picker
@@ -5849,7 +6193,7 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
                         break;
                     }
                     queue!(screen.output, MoveTo(0, row as u16))?;
-                    line.draw(&mut screen.output, width as usize)?;
+                    line.draw(&mut screen.output, width as usize, color_mode)?;
                 }
             }
             screen.output.flush()?;
@@ -5950,18 +6294,21 @@ pub(super) async fn run(
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
         ..View::default()
     };
-    {
+    let changelog_path = super::config::agent_dir().join("pi-rs-changelog.json");
+    let mut extension_changelog_session = {
         let session = Session::open(&args.session)?;
         view.restore_session(&args, &session)?;
-        if session.current_messages().is_empty()
+        let empty = session.current_messages().is_empty();
+        if empty
             && let Ok(Some(notice)) = changelog::startup(
-                &super::config::agent_dir().join("pi-rs-changelog.json"),
+                &changelog_path,
                 args.settings.boolean("collapseChangelog").unwrap_or(false),
             )
         {
             view.append_entry(Entry::Changelog(notice));
         }
-    }
+        empty.then(|| args.session.clone())
+    };
     view.resources = initial_resources;
     if args.trust_pending {
         slash("/trust", &mut args, &mut view, None)?;
@@ -6128,10 +6475,18 @@ pub(super) async fn run(
             view.append(&error.to_string());
             dirty = true;
         }
-        if let Some(reason) = args.session_transition.take()
-            && let Err(error) = Worker::transition(&mut worker, &args, reason)
-        {
-            view.append(&error.to_string());
+        if let Some(reason) = args.session_transition.take() {
+            if matches!(
+                reason,
+                pi_rs::SessionStartReason::New
+                    | pi_rs::SessionStartReason::Resume
+                    | pi_rs::SessionStartReason::Fork
+            ) {
+                reset_extension_theme_for_rebind(&args, &mut view, &mut theme);
+            }
+            if let Err(error) = Worker::transition(&mut worker, &args, reason) {
+                view.append(&error.to_string());
+            }
             dirty = true;
         }
         if worker
@@ -6180,9 +6535,18 @@ pub(super) async fn run(
         }
         if !is_busy(&worker) {
             for event in std::mem::take(&mut args.selection_events) {
-                if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
-                    view.append(&format!("Extension selection notification: {error}"));
-                    dirty = true;
+                match notify_extension_selection(
+                    &mut worker,
+                    &mut args,
+                    &mut view,
+                    &mut theme,
+                    &event,
+                ) {
+                    Ok(handled) => dirty |= handled,
+                    Err(error) => {
+                        view.append(&format!("Extension selection notification: {error}"));
+                        dirty = true;
+                    }
                 }
             }
         }
@@ -6347,8 +6711,19 @@ pub(super) async fn run(
                 view.request_started = Some(Instant::now());
             }
             let events: Vec<_> = active.drain_events();
-            for value in events {
+            for mut value in events {
                 if value["type"] == "backend_ready" {
+                    if extension_changelog_session.take().as_ref() == Some(&args.session)
+                        && let Ok(packages) =
+                            serde_json::from_value::<Vec<_>>(value["extension_packages"].take())
+                        && let Ok(Some(notice)) = changelog::startup_extensions(
+                            &changelog_path,
+                            &packages,
+                            args.settings.boolean("collapseChangelog").unwrap_or(false),
+                        )
+                    {
+                        view.append_entry(Entry::Changelog(notice));
+                    }
                     active.message_renderer_types =
                         serde_json::from_value(value["custom_message_renderers"].clone())
                             .unwrap_or_default();
@@ -6380,6 +6755,10 @@ pub(super) async fn run(
                         start_share_upload(&mut view, pending, snapshot);
                         dirty = true;
                     }
+                    continue;
+                }
+                if view.theme_worker_event(active, &value, &mut args, &mut theme)? {
+                    dirty = true;
                     continue;
                 }
                 if value["type"] == "extension_ui_request" {
@@ -6471,7 +6850,10 @@ pub(super) async fn run(
                 }
                 let resources_changed = value["type"] == "resources_discovered";
                 view.receive_worker(value, &mut args);
-                if resources_changed && let Some(name) = args.theme_setting() {
+                if resources_changed
+                    && !theme.is_extension_instance()
+                    && let Some(name) = args.theme_setting()
+                {
                     match load_resolved_theme(
                         name,
                         &args.theme_paths,
@@ -7302,8 +7684,12 @@ pub(super) async fn run(
                             view.picker = Some(picker);
                         }
                         Input::Cancel => {
-                            if picker.title == "Warnings"
-                                && let Some(mut parent) = view.warning_settings_parent.take()
+                            if picker.title == BUG_REPORT_PICKER_TITLE {
+                                view.append("Bug report cancelled");
+                                continue;
+                            }
+                            if picker.is_toggle_settings_submenu()
+                                && let Some(mut parent) = view.toggle_settings_parent.take()
                             {
                                 parent.refresh_settings(settings_items(
                                     &args,
@@ -7452,11 +7838,17 @@ pub(super) async fn run(
                                     if range.start == 0 && view.editor.text.starts_with('/'));
                             let settings = picker.title == "Settings";
                             if settings
-                                && matches!(&selection, Selection::EditSetting(name) if name == "warnings")
+                                && let Selection::EditSetting(name) = &selection
+                                && matches!(name.as_str(), "warnings" | "notices")
                             {
-                                view.warning_settings_parent = Some(picker);
+                                let title = if name == "warnings" {
+                                    "Warnings"
+                                } else {
+                                    "Notices"
+                                };
+                                view.toggle_settings_parent = Some(picker);
                                 view.picker =
-                                    Some(Picker::new("Warnings", warning_settings_items(&args)));
+                                    Some(Picker::new(title, toggle_settings_items(&args, title)));
                                 continue;
                             }
                             if settings
@@ -7689,11 +8081,11 @@ pub(super) async fn run(
                             }
                             let result =
                                 select(selection, &mut args, &mut view, &mut theme, &mut worker);
-                            if settings || picker.title == "Warnings" {
+                            if settings || picker.is_toggle_settings_submenu() {
                                 let items = if settings {
                                     settings_items(&args, &view, worker.as_ref())
                                 } else {
-                                    warning_settings_items(&args)
+                                    toggle_settings_items(&args, &picker.title)
                                 };
                                 picker.refresh_settings(items);
                                 if let Err(error) = result {
@@ -7940,11 +8332,21 @@ pub(super) async fn run(
                         view.viewport.follow();
                         let auth_command =
                             matches!(input.split_whitespace().next(), Some("/login" | "/logout"));
-                        if !auth_command {
+                        let bug_command = input
+                            .split_once(char::is_whitespace)
+                            .map_or(input.as_str(), |(name, _)| name)
+                            == "/bug";
+                        if !auth_command && !bug_command {
                             view.remember_prompt(&input);
                         }
                         view.history_index = None;
-                        if input.trim() == "/theme" {
+                        if bug_command {
+                            if let Err(error) =
+                                slash(&input, &mut args, &mut view, Some(&mut worker))
+                            {
+                                view.append(&error.to_string());
+                            }
+                        } else if input.trim() == "/theme" {
                             let names = Theme::discover(
                                 &args.theme_paths,
                                 &args.workspace,
@@ -7978,6 +8380,7 @@ pub(super) async fn run(
                             ) {
                                 Ok(next) => {
                                     args.settings.set_user("theme", json!(name.trim()))?;
+                                    args.extension_theme = None;
                                     args.use_theme = Some(name.trim().into());
                                     theme = next;
                                     view.theme_refresh_requested = true;
@@ -8051,6 +8454,7 @@ pub(super) async fn run(
                             view.clear_extension_chrome();
                             args.settings =
                                 args.settings.reload_latest(&args.workspace, args.trusted)?;
+                            args.extension_theme = None;
                             for warning in args.settings.diagnostics() {
                                 view.append(warning);
                             }
@@ -8090,7 +8494,12 @@ pub(super) async fn run(
                                 args.trusted,
                             ) {
                                 Ok(next) => theme = next,
-                                Err(error) => view.append(&error.to_string()),
+                                Err(error) => {
+                                    if theme.is_extension_instance() {
+                                        view.replace_extension_theme(&mut theme, Theme::system());
+                                    }
+                                    view.append(&error.to_string());
+                                }
                             }
                             view.theme_refresh_requested = true;
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
@@ -8189,6 +8598,7 @@ pub(super) async fn run(
         Ok(())
     };
     drop(_terminal.take());
+    view.terminal_closed = true;
     finish?;
     if is_busy(&worker) {
         drop(worker.take());
@@ -8204,7 +8614,9 @@ pub(super) async fn run(
         }
     }
     for event in std::mem::take(&mut args.selection_events) {
-        if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
+        if let Err(error) =
+            notify_extension_selection(&mut worker, &mut args, &mut view, &mut theme, &event)
+        {
             eprintln!("Extension selection notification: {error}");
         }
     }
@@ -9512,12 +9924,30 @@ fn start_thinking_levels(
     Ok(receiver)
 }
 
-fn warning_settings_items(args: &Cli) -> Vec<Item> {
-    let enabled = args.settings.warn_anthropic_extra_usage();
-    vec![Item {
-        label: format!("Anthropic extra usage · {enabled}"),
-        selection: Selection::Setting("warnings.anthropicExtraUsage".into(), json!(!enabled)),
-    }]
+fn toggle_settings_items(args: &Cli, title: &str) -> Vec<Item> {
+    if title == "Warnings" {
+        let enabled = args.settings.warn_anthropic_extra_usage();
+        return vec![Item {
+            label: format!("Anthropic extra usage · {enabled}"),
+            selection: Selection::Setting("warnings.anthropicExtraUsage".into(), json!(!enabled)),
+        }];
+    }
+    let notices = args.settings.notices();
+    [
+        (NoticeKind::CacheMisses, "Cache misses"),
+        (NoticeKind::CacheWarming, "Cache warming"),
+        (NoticeKind::CompactionCosts, "Compaction costs"),
+        (NoticeKind::ReasoningDrops, "Reasoning drops"),
+    ]
+    .into_iter()
+    .map(|(kind, label)| {
+        let enabled = notices.shows(kind);
+        Item {
+            label: format!("{label} · {enabled}"),
+            selection: Selection::Setting(format!("notices.{}", kind.key()), json!(!enabled)),
+        }
+    })
+    .collect()
 }
 
 fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item> {
@@ -9766,20 +10196,6 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         },
         Item {
             label: format!(
-                "Cache miss notices · {}",
-                if args.settings.boolean("showCacheMissNotices") == Some(true) {
-                    "true"
-                } else {
-                    "false"
-                }
-            ),
-            selection: Selection::Setting(
-                "showCacheMissNotices".into(),
-                json!(args.settings.boolean("showCacheMissNotices") != Some(true)),
-            ),
-        },
-        Item {
-            label: format!(
                 "Collapse changelog · {}",
                 args.settings.boolean("collapseChangelog").unwrap_or(false)
             ),
@@ -9831,6 +10247,10 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         Item {
             label: "Warnings · configure".into(),
             selection: Selection::EditSetting("warnings".into()),
+        },
+        Item {
+            label: "Notices · configure".into(),
+            selection: Selection::EditSetting("notices".into()),
         },
         Item {
             label: format!("Default thinking level per model · {thinking_summary}"),
@@ -9987,6 +10407,25 @@ fn select(
     worker: &mut Option<Worker>,
 ) -> Result<()> {
     match selection {
+        Selection::ExportBugReport {
+            description,
+            include_transcript,
+        } => {
+            let id = uuid::Uuid::new_v4();
+            let result = (|| {
+                let directory = std::env::current_dir()?;
+                let session = Session::snapshot(&args.session)?;
+                super::bug_report::write(&directory, &session, id, &description, include_transcript)
+            })();
+            match result {
+                Ok(path) => view.append(&format!(
+                    "Bug report exported to: {}\nReport ID: {id}",
+                    path.display()
+                )),
+                Err(error) => view.append(&format!("Failed to export bug report: {error}")),
+            }
+        }
+        Selection::CancelBugReport => view.append("Bug report cancelled"),
         Selection::RenameSession(path, name) => {
             let mut session = Session::open(&path)?;
             if session.host_binding().is_some() {
@@ -10247,6 +10686,9 @@ fn select(
             } else if let Some(member) = key.strip_prefix("warnings.") {
                 args.settings
                     .set_user_member("warnings", member, value.clone())?;
+            } else if let Some(member) = key.strip_prefix("notices.") {
+                args.settings
+                    .set_user_member("notices", member, value.clone())?;
             } else if key == "theme" {
                 let next = load_resolved_theme(
                     value
@@ -10257,6 +10699,7 @@ fn select(
                     args.trusted,
                 )?;
                 args.settings.set_user(&key, value.clone())?;
+                args.extension_theme = None;
                 args.use_theme = value.as_str().map(str::to_owned);
                 *theme = next;
                 view.theme_refresh_requested = true;
@@ -10305,6 +10748,7 @@ fn select(
             let next =
                 load_resolved_theme(&name, &args.theme_paths, &args.workspace, args.trusted)?;
             args.settings.set_user("theme", json!(name))?;
+            args.extension_theme = None;
             args.use_theme = Some(name);
             *theme = next;
             view.theme_refresh_requested = true;
@@ -11036,6 +11480,7 @@ fn complete_input(args: &Cli, view: &mut View) {
             "/theme",
             "/settings",
             "/debug",
+            "/bug",
             "/changelog",
             "/reload",
         ]
@@ -11340,6 +11785,370 @@ mod tests {
             dialog.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &Keys::default()),
             Some(pi_rs::UiResponse::Text(value)) if value.is_empty()
         ));
+    }
+
+    #[test]
+    fn transcript_notice_settings_render_each_kind_independently() {
+        use super::*;
+        use clap::Parser;
+        use pi_rs::{AssistantDiagnostic, ModelMetadata, Usage, UsageReport};
+
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("settings.json");
+        let mut args = Cli::parse_from(["pi", "--offline"]);
+        std::fs::write(&user, r#"{"showCacheMissNotices":true}"#).unwrap();
+        args.settings =
+            crate::config::Settings::load_from_paths(directory.path(), false, &user).unwrap();
+        let mut view = View::default();
+        let usage = Usage {
+            input_tokens: 25_000,
+            output_tokens: 1,
+        };
+        let request_id = uuid::Uuid::nil();
+        let records = [
+            pi_rs::Event::CacheWarm {
+                metadata: ModelMetadata::default(),
+                usage,
+                note: Some("fixture warm".into()),
+            },
+            pi_rs::Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    diagnostics: AssistantDiagnostic::from_pi_diagnostics(&json!([{
+                        "type":"anthropic_input_transformations", "timestamp":0,
+                        "details":{"transformations":[{"type":"thinking_dropped"}]}
+                    }])),
+                    ..ModelMetadata::default()
+                },
+                usage: UsageReport::Measured { usage },
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            },
+            pi_rs::Event::Assistant {
+                content: "fixture response".into(),
+                invocations: vec![],
+                usage: Some(usage),
+                request_id: Some(request_id),
+            },
+            pi_rs::Event::Compacted {
+                summary: "fixture summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: Some(25_000),
+                states: Default::default(),
+                usage: Some(Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                }),
+                usage_metadata: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| pi_rs::Record {
+            version: 1,
+            id: (index + 1) as u64,
+            parent: Some(index as u64),
+            event,
+            timestamp: None,
+            run_id: None,
+        });
+        for record in records {
+            view.receive_worker(json!({"type":"record","record":record}), &mut args);
+        }
+        let imported = pi_rs::Record {
+            version: 1,
+            id: 5,
+            parent: Some(4),
+            timestamp: None,
+            run_id: None,
+            event: pi_rs::Event::SourceEntry {
+                format: "pi".into(),
+                entry: json!({"type":"usage", "kind":"cache_warm", "note":"imported warm", "usage":{"input":2}}),
+            },
+        };
+        view.observe_cache(&imported, &args);
+
+        let cases = [
+            (NoticeKind::CacheMisses, "25k tokens re-billed"),
+            (NoticeKind::CacheWarming, "fixture warm"),
+            (NoticeKind::CacheWarming, "imported warm"),
+            (NoticeKind::CompactionCosts, "Compaction: 12 tokens billed"),
+            (
+                NoticeKind::ReasoningDrops,
+                "Anthropic dropped 1 thinking block",
+            ),
+        ];
+        let theme = Theme::system();
+        for enabled in [
+            None,
+            Some(NoticeKind::CacheMisses),
+            Some(NoticeKind::CacheWarming),
+            Some(NoticeKind::CompactionCosts),
+            Some(NoticeKind::ReasoningDrops),
+        ] {
+            let notices = enabled.map_or_else(|| json!({}), |kind| json!({(kind.key()):true}));
+            std::fs::write(&user, json!({"notices":notices}).to_string()).unwrap();
+            args.settings =
+                crate::config::Settings::load_from_paths(directory.path(), false, &user).unwrap();
+            let options = view.base_transcript_options(&args, false);
+            let transcript = view
+                .lines
+                .iter()
+                .flat_map(|entry| entry.render(&theme, 100, true, true, options))
+                .flat_map(|line| line.spans)
+                .map(|span| span.text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            for (kind, text) in cases {
+                assert_eq!(
+                    transcript.contains(text),
+                    enabled == Some(kind),
+                    "{text}: {transcript}"
+                );
+            }
+        }
+        assert_eq!(view.cache_stats.missed_tokens, 25_000);
+    }
+
+    #[test]
+    fn cancelled_turn_partial_resets_reasoning_drop_baseline_live_and_on_restore() {
+        use super::*;
+        use clap::Parser;
+        use pi_rs::{AssistantDiagnostic, Event, ModelFailure, ModelMetadata, UsageReport};
+
+        let mut args = Cli::parse_from(["pi", "--offline"]);
+        let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        initial
+            .append_user_with_images("question".into(), vec![], None)
+            .unwrap();
+        let answered = uuid::Uuid::new_v4();
+        let aborted = uuid::Uuid::new_v4();
+        let request = |id| Event::ModelRequested {
+            model: "fixture".into(),
+            messages: 1,
+            tools: 0,
+            max_output_tokens: 64,
+            request_id: Some(id),
+            context_head: None,
+            context_sha256: None,
+            context_transformed: None,
+            context_configuration_sha256: None,
+            tool_decision: None,
+        };
+        let diagnostics = AssistantDiagnostic::from_pi_diagnostics(&json!([{
+            "type":"openai_input_transformations",
+            "timestamp":17,
+            "details":{"transformations":[{
+                "type":"reasoning","id":"rs_prefix","action":"removed","reason":"prefix_mismatch"
+            }]}
+        }]));
+        let events = [
+            request(answered),
+            Event::ModelFinished {
+                request_id: answered,
+                metadata: ModelMetadata {
+                    diagnostics,
+                    ..Default::default()
+                },
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            },
+            Event::Assistant {
+                request_id: Some(answered),
+                content: "answer".into(),
+                invocations: vec![],
+                usage: None,
+            },
+            request(aborted),
+            Event::SourceEntry {
+                format: "pi-rs:aborted-turn-partial".into(),
+                entry: json!({"requestId":aborted}),
+            },
+            Event::ModelFinished {
+                request_id: aborted,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Cancelled),
+                partial: "partial answer".into(),
+                reply: None,
+            },
+        ];
+        let mut records = initial.records().to_vec();
+        let mut live = View::default();
+        for event in events {
+            let parent = records.last().unwrap();
+            let record = pi_rs::Record {
+                version: parent.version,
+                id: parent.id + 1,
+                parent: Some(parent.id),
+                event,
+                timestamp: None,
+                run_id: None,
+            };
+            live.receive_worker(json!({"type":"record","record":record}), &mut args);
+            records.push(record);
+        }
+        assert!(live.previous_reasoning_drop.is_none());
+
+        let complete = Session::from_records(records.clone()).unwrap();
+        let mut reopened = View::default();
+        reopened.restore_session(&args, &complete).unwrap();
+        assert!(reopened.previous_reasoning_drop.is_none());
+
+        // Cancelling without a displayable partial leaves the preceding reply as the baseline.
+        let Event::ModelFinished { partial, .. } = &mut records.last_mut().unwrap().event else {
+            unreachable!("last record is the cancelled completion");
+        };
+        partial.clear();
+        reopened
+            .restore_session(&args, &Session::from_records(records).unwrap())
+            .unwrap();
+        assert!(matches!(
+            reopened.previous_reasoning_drop,
+            Some((ReasoningDropKind::OpenAi, 1))
+        ));
+    }
+
+    #[test]
+    fn openai_reasoning_drop_notices_follow_the_previous_assistant_type() {
+        use super::*;
+        use clap::Parser;
+        use pi_rs::{AssistantDiagnostic, ModelMetadata, UsageReport};
+
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.json");
+        let mut args = Cli::parse_from(["pi", "--offline"]);
+        let set_enabled = |args: &mut Cli, enabled| {
+            std::fs::write(
+                &settings,
+                json!({"notices":{"reasoningDrops":enabled}}).to_string(),
+            )
+            .unwrap();
+            args.settings =
+                crate::config::Settings::load_from_paths(directory.path(), false, &settings)
+                    .unwrap();
+        };
+        let prefix = json!({"type":"reasoning","id":"rs_prefix","action":"removed","reason":"prefix_mismatch"});
+        let organization = json!({"type":"reasoning","id":"rs_org","action":"removed","reason":"organization_mismatch"});
+        let openai = |transformations: Value| json!([{"type":"openai_input_transformations","timestamp":17,"details":{"transformations":transformations}}]);
+        let mut next_record = 10;
+        let mut receive = |view: &mut View, args: &mut Cli, diagnostics: Value| {
+            let request_id = uuid::Uuid::new_v4();
+            let events = [
+                pi_rs::Event::ModelFinished {
+                    request_id,
+                    metadata: ModelMetadata {
+                        diagnostics: AssistantDiagnostic::from_pi_diagnostics(&diagnostics),
+                        ..Default::default()
+                    },
+                    usage: UsageReport::Unconfirmed,
+                    failure: None,
+                    partial: String::new(),
+                    reply: None,
+                },
+                pi_rs::Event::Assistant {
+                    request_id: Some(request_id),
+                    content: "answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                },
+            ];
+            for event in events {
+                let record = pi_rs::Record {
+                    version: 2,
+                    id: next_record,
+                    parent: Some(next_record - 1),
+                    event,
+                    timestamp: None,
+                    run_id: None,
+                };
+                next_record += 1;
+                view.receive_worker(json!({"type":"record","record":record}), args);
+            }
+        };
+        let notices = |view: &View| {
+            view.lines
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::TranscriptNotice {
+                        kind: NoticeKind::ReasoningDrops,
+                        text,
+                    } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let single = "OpenAI dropped 1 reasoning item: prefix_mismatch (details in session)";
+        let multiple = "OpenAI dropped 3 reasoning items: prefix_mismatch, organization_mismatch (details in session)";
+        let mut view = View::default();
+        set_enabled(&mut args, false);
+        receive(&mut view, &mut args, openai(json!([prefix])));
+        assert!(notices(&view).is_empty());
+        set_enabled(&mut args, true);
+        receive(&mut view, &mut args, openai(json!([prefix])));
+        assert!(notices(&view).is_empty());
+        receive(
+            &mut view,
+            &mut args,
+            json!([{
+                "type":"anthropic_input_transformations", "timestamp":18,
+                "details":{"transformations":vec![json!({"type":"thinking_dropped","reason":"prefix_binding_mismatch"});4]}
+            }]),
+        );
+        receive(&mut view, &mut args, openai(json!([prefix])));
+        receive(
+            &mut view,
+            &mut args,
+            openai(json!([prefix, organization, prefix])),
+        );
+        receive(&mut view, &mut args, openai(json!([prefix, organization])));
+        receive(&mut view, &mut args, openai(json!([prefix, organization])));
+        receive(&mut view, &mut args, json!([]));
+        receive(&mut view, &mut args, openai(json!([prefix])));
+        assert_eq!(
+            notices(&view),
+            [
+                "Anthropic dropped 4 thinking blocks: prefix_binding_mismatch (details in session)",
+                single,
+                multiple,
+                single,
+            ]
+        );
+
+        let diagnostics = openai(json!([prefix, organization]));
+        let pi_path = directory.path().join("pi.jsonl");
+        std::fs::write(&pi_path, format!("{}\n{}\n", json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{
+                "role":"assistant","provider":"openai","api":"openai-responses","model":"gpt-6.2-sol",
+                "content":[{"type":"text","text":"answer"}],"diagnostics":diagnostics
+            }}))).unwrap();
+        let imported = crate::session_import::read(&pi_path).unwrap();
+        let native_path = directory.path().join("native.jsonl");
+        imported.export_jsonl(&native_path).unwrap();
+        let reopened = Session::open(&native_path).unwrap();
+        let context = reopened.model_conversation_at(reopened.head()).unwrap();
+        assert!(!json!(context).to_string().contains("rs_prefix"));
+        let share = crate::rpc_entries::Entries::new(&reopened)
+            .write_share_branch(&reopened, directory.path())
+            .unwrap();
+        std::fs::write(&pi_path, share).unwrap();
+        let reimported = crate::session_import::read(&pi_path).unwrap();
+        let (messages, _) = crate::rpc_messages::snapshot(&reimported);
+        assert_eq!(messages[0]["diagnostics"], diagnostics);
+        view.restore_session(&args, &reopened).unwrap();
+        assert!(notices(&view).is_empty());
+        receive(&mut view, &mut args, openai(json!([prefix, organization])));
+        assert!(notices(&view).is_empty());
+        receive(
+            &mut view,
+            &mut args,
+            openai(json!([prefix, organization, prefix])),
+        );
+        assert_eq!(notices(&view), [multiple]);
     }
 
     #[test]
@@ -12097,6 +12906,7 @@ mod tests {
                 data: json!({"content":[{"type":"text", "text":"Read image file [image/png]"}]}),
                 details: json!({"imageUnsupportedByModel":"text-only"}),
             },
+            None,
         );
         let theme = Theme::system();
         let entry = view.lines.last().unwrap();
@@ -13744,11 +14554,7 @@ exit {exit}
             shells,
             [
                 ("bash", "hi\n", false),
-                (
-                    "bash (excluded)",
-                    "bad\n(exit 1)\nOutput truncated. Full output: /tmp/output",
-                    true
-                ),
+                ("bash (excluded)", "bad\n(exit 1)", true),
                 ("bash", "(cancelled)", true)
             ]
         );
@@ -13767,6 +14573,7 @@ exit {exit}
             .flat_map(|line| line.spans.into_iter().map(|span| span.text))
             .collect::<String>();
         assert!(rendered.contains("echo hi") && rendered.contains("hi"));
+        assert!(rendered.contains("Output truncated. Full output: /tmp/output"));
         assert!(!rendered.contains("Ran `") && !rendered.contains("```"));
         let original = imported
             .records()
@@ -13793,6 +14600,30 @@ exit {exit}
         assert!(
             matches!(view.lines.last(), Some(Entry::Tool { output, failed: true, finished: true, .. }) if output == "bad\n(exit 1)")
         );
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"truncated","command":"echo long"}),
+        );
+        let output = format!("{}final shell line", "preview line\n".repeat(12));
+        view.receive(&json!({"type":"bash_execution_end","executionId":"truncated","data":{"command":"echo long","output":output,"exitCode":0,"cancelled":false,"truncated":true}}));
+        for expanded in [false, true] {
+            let rendered = view
+                .lines
+                .last()
+                .unwrap()
+                .render(
+                    &Theme::system(),
+                    100,
+                    expanded,
+                    true,
+                    TranscriptOptions::default(),
+                )
+                .into_iter()
+                .flat_map(|row| row.spans.into_iter().map(|span| span.text))
+                .collect::<String>();
+            assert!(rendered.contains("Output truncated"));
+            assert!(rendered.contains("preview line"));
+            assert_eq!(rendered.contains("final shell line"), expanded);
+        }
     }
 
     #[test]
@@ -14086,6 +14917,53 @@ exit {exit}
         assert!(view.model_list.is_none());
         assert!(view.picker.is_none());
         assert!(sender.send(Ok(vec!["stale".into()])).is_err());
+    }
+
+    #[test]
+    fn configured_code_block_indent_reaches_saved_and_live_transcript_rows() {
+        use super::*;
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let settings_path = directory.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"outputPad":0,"markdown":{"codeBlockIndent":"· "}}"#,
+        )
+        .unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.workspace = directory.path().to_owned();
+        args.settings =
+            super::super::config::Settings::load_from_paths(&args.workspace, false, &settings_path)
+                .unwrap();
+        let view = View {
+            lines: vec![Entry::user("```\nsaved sample\n```".into())],
+            streaming: "```\nlive sample\n```".into(),
+            ..View::default()
+        };
+        let theme = Theme::system();
+        let saved = view.lines[0].render(
+            &theme,
+            80,
+            false,
+            true,
+            view.transcript_options(&args, false),
+        );
+        let live = Entry::Assistant(view.streaming_markdown(false)).render(
+            &theme,
+            80,
+            false,
+            true,
+            view.transcript_options(&args, true),
+        );
+        for (lines, expected) in [(saved, "· saved sample"), (live, "· live sample")] {
+            let row: String = lines[1]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect();
+            assert_eq!(row, expected);
+        }
     }
 
     #[test]
@@ -14554,6 +15432,44 @@ exit {exit}
     }
 
     #[test]
+    fn codemode_displays_live_and_cancelled_calls_alongside_script_output() {
+        let mut view = super::View::default();
+        let operation_id = uuid::Uuid::new_v4();
+        let operation = operation_id.to_string();
+        view.add_tool(
+            &pi_rs::Invocation {
+                operation_id,
+                call: pi_rs::ToolCall {
+                    id: "script".into(),
+                    name: "codemode".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            Some(1),
+        );
+        view.track_tool_render(&operation, 2, true);
+        let update = |status| {
+            json!({
+                "toolCallId":"script","toolName":"codemode",
+                "partialResult":{"content":[],"details":{"calls":[{"name":"echo","args":"{}","status":status}]}}
+            })
+        };
+        assert!(view.render_tool_progress(&update("running")));
+        assert!(matches!(&view.lines[0], Entry::Tool { output, .. } if output.contains("… echo")));
+        assert!(view.render_tool_progress(&update("cancelled")));
+        view.finish_tool(
+            &operation,
+            &pi_rs::Outcome::Failed("retained output".into()),
+            None,
+        );
+        view.track_tool_render(&operation, 3, false);
+        assert!(
+            matches!(&view.lines[0], Entry::Tool { output, finished: true, .. }
+            if output.contains("⊘ echo") && output.contains("retained output"))
+        );
+    }
+
+    #[test]
     fn tool_renderer_projects_partial_results_until_the_matching_tool_finishes() {
         let mut view = super::View::default();
         let operation_id = uuid::Uuid::new_v4();
@@ -14613,7 +15529,11 @@ exit {exit}
         );
 
         view.track_tool_render(&operation, 3, false);
-        view.finish_tool(&operation, &pi_rs::Outcome::Succeeded("completed".into()));
+        view.finish_tool(
+            &operation,
+            &pi_rs::Outcome::Succeeded("completed".into()),
+            None,
+        );
         view.receive(&update("late"));
         assert!(view.partial_tool_results.is_empty());
         assert!(matches!(&view.lines[0], super::Entry::Tool {
@@ -15779,6 +16699,35 @@ exit {exit}
     }
 
     #[test]
+    fn theme_selection_catalog_and_palette_skip_the_same_oversized_duplicate() {
+        use super::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let large = directory.path().join("large.json");
+        let valid = directory.path().join("valid.json");
+        let mut theme: Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        theme["name"] = json!("custom");
+        std::fs::write(&large, format!("{}{}", " ".repeat(256 * 1024), theme)).unwrap();
+        std::fs::write(&valid, theme.to_string()).unwrap();
+
+        let paths = [large, valid.clone()];
+        let selected = load_resolved_theme("custom", &paths, directory.path(), false).unwrap();
+        let snapshot = pi_rs_workbench::theme_resources::extension_theme_snapshot(&paths).unwrap();
+        let listed = snapshot
+            .catalog()
+            .iter()
+            .find(|theme| theme.name == "custom")
+            .unwrap();
+        assert_eq!(selected.path, Some(valid));
+        assert_eq!(listed.path, selected.path);
+        assert_eq!(
+            snapshot.palette("custom"),
+            Some(&selected.extension_palette())
+        );
+    }
+
+    #[test]
     fn theme_settings_preview_skips_unrelated_invalid_theme() {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();
@@ -15829,6 +16778,141 @@ exit {exit}
         view.receive(&serde_json::json!({"type":"tool_call_delta","toolCallDelta":{"index":0,"name":"read","arguments":"{\"path\":\"x"}}));
         view.settle();
         assert!(view.streaming_tools.is_empty());
+    }
+
+    #[test]
+    fn extension_theme_instance_is_local_and_ignores_provenance_path() {
+        use super::*;
+        use crate::extension_ui::PreparedTheme;
+        use clap::Parser;
+        use crossterm::style::Color;
+        let mut args = Cli::parse_from(["pi", "--use-theme", "light"]);
+        let mut view = View::default();
+        let mut theme = Theme::system();
+        let palette = serde_json::from_value(json!({
+            "name":"system", "path":"relative.json", "colors":{
+                "accent":{"kind":"rgb","r":1,"g":2,"b":3}
+            }, "dim":["accent"]
+        }))
+        .unwrap();
+        assert_eq!(
+            view.apply_extension_theme(PreparedTheme::Palette { palette }, &mut args, &mut theme),
+            pi_rs::UiResponse::ThemeChanged(pi_rs::UiThemeChange {
+                success: true,
+                error: None,
+            })
+        );
+        assert_eq!(theme.color("accent"), Color::Rgb { r: 1, g: 2, b: 3 });
+        assert!(theme.is_dim("accent"));
+        assert!(theme.path.is_none());
+        assert!(!theme.uses_terminal_colors());
+        assert!(view.regular.redraw);
+        assert_eq!(args.theme_setting(), Some("light"));
+
+        let bad = serde_json::from_value(json!({"name":"invalid","colors":{},"dim":[]})).unwrap();
+        assert!(matches!(
+            view.apply_extension_theme(
+                PreparedTheme::Palette { palette: bad },
+                &mut args,
+                &mut theme
+            ),
+            pi_rs::UiResponse::ThemeChanged(pi_rs::UiThemeChange {
+                success: false,
+                error: Some(_),
+            })
+        ));
+        assert_eq!(theme.color("accent"), Color::Rgb { r: 1, g: 2, b: 3 });
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn extension_theme_instance_survives_ambient_picker_refresh() {
+        use super::*;
+        use clap::Parser;
+
+        let args = Cli::parse_from(["pi", "--use-theme", "light/dark"]);
+        let mut theme = Theme::from_extension_palette(Theme::system().extension_palette()).unwrap();
+        let expected = theme.clone().extension_palette();
+        let mut settings = ThemeSettings::new(Picker::new("Settings", vec![]), &args, &theme);
+        settings.stage = ThemeSettingsStage::Single;
+        let mut picker = settings.picker(&args);
+        picker.paste("light");
+        assert_eq!(settings.preview(&picker, &args).unwrap().name, "light");
+        let mut view = View {
+            picker: Some(picker),
+            theme_settings: Some(settings),
+            ..View::default()
+        };
+
+        refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+        assert!(theme.is_extension_instance());
+        assert_eq!(theme.clone().extension_palette(), expected);
+        view.picker = None;
+        view.theme_settings = None;
+        refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+        assert!(theme.is_extension_instance());
+        assert_eq!(theme.extension_palette(), expected);
+    }
+
+    #[test]
+    fn resolved_theme_load_does_not_expand_replaced_directories() {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = dir.path().join("replaced.json");
+        std::fs::create_dir(&resolved).unwrap();
+        let mut file: Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        file["name"] = json!("unlisted");
+        std::fs::write(resolved.join("unlisted.json"), file.to_string()).unwrap();
+        let paths = [resolved];
+        assert!(load_resolved_theme("unlisted", &paths, dir.path(), false).is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn extension_system_palette_follows_terminal_reports() {
+        use crate::ui::theme::{
+            Theme, begin_terminal_palette_query, finish_terminal_colors_pending,
+            mark_terminal_colors_pending, reset_terminal_background, set_terminal_color,
+            set_terminal_palette,
+        };
+        use pi_rs::UiThemeColor;
+
+        const CHILD: &str = "PI_RS_EXTENSION_SYSTEM_PALETTE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::extension_system_palette_follows_terminal_reports",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        reset_terminal_background();
+        mark_terminal_colors_pending();
+        let pending = Theme::system().extension_palette();
+        assert!(pending.path.is_none());
+        assert_eq!(pending.colors["accent"], UiThemeColor::Reset);
+        assert!(pending.dim.contains("muted"));
+
+        set_terminal_color(false, 0, 0, 0);
+        set_terminal_color(true, 255, 255, 255);
+        begin_terminal_palette_query();
+        for index in 0..16 {
+            set_terminal_palette(index, index, 40, 90);
+        }
+        assert!(finish_terminal_colors_pending());
+        let reported = Theme::system().extension_palette();
+        assert!(matches!(
+            reported.colors["accent"],
+            UiThemeColor::Rgb { .. }
+        ));
+        assert!(!reported.dim.contains("muted"));
     }
 
     #[cfg(any(unix, windows))]

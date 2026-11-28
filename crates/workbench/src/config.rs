@@ -4,12 +4,49 @@ use serde_json::{Map, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub(super) const DEFAULT_CODE_BLOCK_INDENT: &str = "  ";
+
 pub fn agent_dir() -> PathBuf {
     pi_rs_workbench::agent_dir()
 }
 
 type WorkerHistory =
     std::sync::Arc<std::sync::Mutex<Option<(PathBuf, bool, Vec<(PathBuf, Value)>)>>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    CacheMisses,
+    CacheWarming,
+    CompactionCosts,
+    ReasoningDrops,
+}
+
+impl NoticeKind {
+    const ALL: [Self; 4] = [
+        Self::CacheMisses,
+        Self::CacheWarming,
+        Self::CompactionCosts,
+        Self::ReasoningDrops,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::CacheMisses => "cacheMisses",
+            Self::CacheWarming => "cacheWarming",
+            Self::CompactionCosts => "compactionCosts",
+            Self::ReasoningDrops => "reasoningDrops",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoticeSettings([bool; NoticeKind::ALL.len()]);
+
+impl NoticeSettings {
+    pub fn shows(self, kind: NoticeKind) -> bool {
+        self.0[kind as usize]
+    }
+}
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
@@ -30,11 +67,11 @@ impl Settings {
         self.set_user_values_at(&agent_dir().join("settings.json"), values)
     }
     fn set_user_values_at(&mut self, path: &Path, values: &[(String, Value)]) -> Result<()> {
-        update_object(path, |settings| {
+        update_user_settings(path, |settings| {
             for (key, value) in values {
                 settings.insert(key.clone(), value.clone());
             }
-            validate_settings(&Value::Object(settings.clone()), path)
+            Ok(())
         })?;
         if !self.value.is_object() {
             self.value = Value::Object(Map::new());
@@ -475,6 +512,13 @@ impl Settings {
     pub fn enable_skill_commands(&self) -> bool {
         self.boolean("enableSkillCommands").unwrap_or(true)
     }
+    pub fn terminal_hyperlinks(&self) -> Option<bool> {
+        self.value["terminal"]["hyperlinks"].as_bool()
+    }
+    pub fn terminal_true_color(&self) -> Option<bool> {
+        // Like Pi, other JSON values leave capability detection in charge.
+        self.value["terminal"]["trueColor"].as_bool()
+    }
     pub fn terminal_progress(&self) -> bool {
         self.value["terminal"]["showTerminalProgress"]
             .as_bool()
@@ -498,6 +542,12 @@ impl Settings {
             .as_f64()
             .map_or(60, |width| width.min(f64::from(u16::MAX)) as usize)
     }
+    pub fn code_block_indent(&self) -> &str {
+        self.value["markdown"]["codeBlockIndent"]
+            .as_str()
+            .unwrap_or(DEFAULT_CODE_BLOCK_INDENT)
+    }
+
     pub fn mermaid_mode(&self) -> &str {
         self.value["markdown"]["mermaid"]
             .as_str()
@@ -529,6 +579,14 @@ impl Settings {
         self.value["warnings"]["anthropicExtraUsage"] != false
     }
 
+    pub fn notices(&self) -> NoticeSettings {
+        let mut notices = NoticeSettings::default();
+        for kind in NoticeKind::ALL {
+            notices.0[kind as usize] = self.value["notices"][kind.key()].as_bool().unwrap_or(false);
+        }
+        notices
+    }
+
     pub fn set_user_member(&mut self, key: &str, member: &str, value: Value) -> Result<()> {
         self.set_user_member_at(&agent_dir().join("settings.json"), key, member, value)
     }
@@ -548,10 +606,7 @@ impl Settings {
                 .insert(member.into(), value.clone());
             Ok(())
         };
-        update_object(path, |settings| {
-            update(settings)?;
-            validate_settings(&Value::Object(settings.clone()), path)
-        })?;
+        update_user_settings(path, update)?;
         if !self.value.is_object() {
             self.value = Value::Object(Map::new());
         }
@@ -579,14 +634,14 @@ impl Settings {
         self.remove_user_member_at(&agent_dir().join("settings.json"), key, member)
     }
     fn remove_user_member_at(&mut self, path: &Path, key: &str, member: &str) -> Result<()> {
-        update_object(path, |settings| {
+        update_user_settings(path, |settings| {
             if let Some(object) = settings.get_mut(key).and_then(Value::as_object_mut) {
                 object.remove(member);
                 if object.is_empty() {
                     settings.remove(key);
                 }
             }
-            validate_settings(&Value::Object(settings.clone()), path)
+            Ok(())
         })?;
         if let Some((_, user)) = self.resource_layers.first_mut()
             && let Some(settings) = user.as_object_mut()
@@ -633,21 +688,10 @@ impl Settings {
         self.set_user_at(&agent_dir().join("settings.json"), key, value)
     }
     fn set_user_at(&mut self, path: &Path, key: &str, value: Value) -> Result<()> {
-        std::fs::create_dir_all(path.parent().expect("agent directory"))?;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path.with_extension("lock"))?;
-        lock.lock()?;
-        let mut settings = read_object(path)?;
-        settings
-            .as_object_mut()
-            .expect("validated settings object")
-            .insert(key.into(), value.clone());
-        validate_settings(&settings, path)?;
-        write_json(path, &settings)?;
+        update_user_settings(path, |settings| {
+            settings.insert(key.into(), value.clone());
+            Ok(())
+        })?;
         if !self.value.is_object() {
             self.value = Value::Object(Map::new());
         }
@@ -667,6 +711,17 @@ impl Settings {
         });
         Ok(())
     }
+}
+
+fn update_user_settings(
+    path: &Path,
+    update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
+) -> Result<()> {
+    update_object(path, |settings| {
+        migrate_legacy_notices(settings);
+        update(settings)?;
+        validate_settings(&Value::Object(settings.clone()), path)
+    })
 }
 
 // A broken settings file must not hide the other layer. Writes still read the
@@ -827,6 +882,7 @@ fn migrate_legacy_settings(value: &mut Value) {
         settings.insert("transport".into(), Value::String(transport.into()));
         settings.remove("websockets");
     }
+    migrate_legacy_notices(settings);
     if let Some(retry) = settings.get_mut("retry").and_then(Value::as_object_mut)
         && let Some(delay) = retry.remove("maxDelayMs").filter(Value::is_number)
     {
@@ -855,6 +911,27 @@ fn migrate_legacy_settings(value: &mut Value) {
             }
         }
     }
+}
+
+fn migrate_legacy_notices(settings: &mut Map<String, Value>) {
+    let Some(shown) = settings
+        .get("showCacheMissNotices")
+        .and_then(Value::as_bool)
+    else {
+        return;
+    };
+    let Some(notices) = settings
+        .entry("notices")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+    else {
+        // Leave malformed explicit settings to the native schema validator.
+        return;
+    };
+    for kind in NoticeKind::ALL {
+        notices.entry(kind.key()).or_insert(Value::Bool(shown));
+    }
+    settings.remove("showCacheMissNotices");
 }
 
 pub fn project_trust(workspace: &Path, explicit: Option<bool>) -> Result<Option<bool>> {
@@ -988,7 +1065,7 @@ pub(super) fn update_object_locked(
     if let Some(guard) = shared {
         guard.check()?;
     }
-    write_json(path, &value)
+    write_json_with_guard(path, &value, shared)
 }
 
 pub(super) async fn update_auth_object(
@@ -1212,6 +1289,14 @@ fn injected_json_write_failure(path: &Path, value: &Value, stage: &'static str) 
 }
 
 pub fn write_json(path: &Path, value: &Value) -> Result<()> {
+    write_json_with_guard(path, value, None)
+}
+
+fn write_json_with_guard(
+    path: &Path,
+    value: &Value,
+    guard: Option<&super::auth_lock::Guard>,
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1225,12 +1310,65 @@ pub fn write_json(path: &Path, value: &Value) -> Result<()> {
     file.as_file().sync_all()?;
     #[cfg(test)]
     injected_json_write_failure(path, value, "rename")?;
-    file.persist(path).map_err(|error| Error::Io(error.error))?;
+    #[cfg(windows)]
+    if let Some(guard) = guard {
+        persist_locked_auth(file, path, guard)?;
+    } else {
+        file.persist(path).map_err(|error| Error::Io(error.error))?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = guard;
+        file.persist(path).map_err(|error| Error::Io(error.error))?;
+    }
     #[cfg(all(test, unix))]
     injected_json_write_failure(path, value, "directory-sync")?;
     #[cfg(unix)]
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+std::thread_local! {
+    static AUTH_REPLACE_BLOCKING_READER: std::cell::RefCell<Option<(PathBuf, std::fs::File)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(windows)]
+fn persist_locked_auth(
+    mut file: tempfile::NamedTempFile,
+    path: &Path,
+    guard: &super::auth_lock::Guard,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+    // A reader may hold the destination open while resolving the auth lock
+    // path. Retry replacement with the same synced file under the same lock.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        guard.check()?;
+        match file.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+                ) && Instant::now() < deadline =>
+            {
+                #[cfg(test)]
+                AUTH_REPLACE_BLOCKING_READER.with(|reader| {
+                    let mut reader = reader.borrow_mut();
+                    if reader.as_ref().is_some_and(|(target, _)| target == path) {
+                        drop(reader.take());
+                    }
+                });
+                file = error.file;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(Error::Io(error.error)),
+        }
+    }
 }
 
 fn merge(base: &mut Value, overlay: Value) {
@@ -1275,6 +1413,46 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn auth_update_retries_atomic_replacement_while_a_reader_has_the_file_open() {
+        use super::{AUTH_REPLACE_BLOCKING_READER, Error, read_object, update_object, write_json};
+        use serde_json::{Value, json};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        write_json(&path, &json!({"old": true})).unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            write_json(&path, &json!({"new": true})),
+            Err(Error::Io(error)) if matches!(error.raw_os_error(), Some(5 | 32))
+        ));
+
+        // Keep the reader open through serialization and sync. Only a real
+        // sharing error from the locked persist attempt releases it.
+        let resolved = super::super::auth_lock::resolved_auth_path(&path).unwrap();
+        AUTH_REPLACE_BLOCKING_READER.with(|slot| {
+            assert!(slot.replace(Some((resolved, reader))).is_none());
+        });
+        let result = update_object(&path, |data| {
+            data.insert("new".into(), Value::Bool(true));
+            Ok(())
+        });
+        let remaining_reader = AUTH_REPLACE_BLOCKING_READER.with(|slot| slot.take());
+        result.unwrap();
+        assert!(remaining_reader.is_none(), "locked persist never retried");
+        assert_eq!(
+            read_object(&path).unwrap(),
+            json!({"old": true, "new": true})
+        );
+    }
+
     #[test]
     fn cache_warming_uses_pi_default_and_user_setting() {
         let root = tempfile::tempdir().unwrap();
@@ -1294,6 +1472,156 @@ mod tests {
         }
         std::fs::write(&user, r#"{"cacheWarming":"unknown"}"#).unwrap();
         assert!(super::Settings::load_from_paths(root.path(), true, &user).is_err());
+    }
+
+    #[test]
+    fn true_color_setting_only_accepts_booleans_in_effective_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("settings.json");
+        let workspace = directory.path().join("project");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        let project = workspace.join(".pi/settings.json");
+        std::fs::write(&user, br#"{"terminal":{"trueColor":true}}"#).unwrap();
+        std::fs::write(&project, br#"{"terminal":{"trueColor":false}}"#).unwrap();
+        let load = |trusted| super::Settings::load_from_paths(&workspace, trusted, &user).unwrap();
+        assert_eq!(load(false).terminal_true_color(), Some(true));
+        assert_eq!(load(true).terminal_true_color(), Some(false));
+        std::fs::write(project, br#"{"terminal":{"trueColor":"auto"}}"#).unwrap();
+        assert_eq!(load(true).terminal_true_color(), None);
+    }
+
+    #[test]
+    fn legacy_notices_migrate_per_layer_and_explicit_fields_win() {
+        use super::{NoticeKind, Settings};
+        use serde_json::json;
+
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("settings.json");
+        let workspace = root.path().join("project");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        let original_user = r#"{"showCacheMissNotices":true,"notices":{"cacheMisses":true,"cacheWarming":false,"extensionFlag":true},"customSetting":7}"#;
+        let original_project = r#"{"showCacheMissNotices":false,"notices":{"cacheWarming":true}}"#;
+        std::fs::write(&user, original_user).unwrap();
+        std::fs::write(&project, original_project).unwrap();
+
+        let read_notices =
+            |settings: &Settings| NoticeKind::ALL.map(|kind| settings.notices().shows(kind));
+        assert_eq!(read_notices(&Settings::default()), [false; 4]);
+        let user_only = Settings::load_from_paths(&workspace, false, &user).unwrap();
+        assert_eq!(read_notices(&user_only), [true, false, true, true]);
+        let mut settings = Settings::load_from_paths(&workspace, true, &user).unwrap();
+        assert_eq!(read_notices(&settings), [false, true, false, false]);
+        assert!(settings.value().get("showCacheMissNotices").is_none());
+        assert_eq!(settings.cache_warming_mode(), "idle");
+        assert_eq!(std::fs::read_to_string(&user).unwrap(), original_user);
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), original_project);
+
+        settings
+            .set_user_member_at(&user, "notices", "reasoningDrops", json!(false))
+            .unwrap();
+        assert_eq!(
+            super::read_object(&user).unwrap(),
+            json!({
+                "notices": {
+                    "cacheMisses": true,
+                    "cacheWarming": false,
+                    "compactionCosts": true,
+                    "reasoningDrops": false,
+                    "extensionFlag": true
+                },
+                "customSetting": 7
+            })
+        );
+        assert_eq!(read_notices(&settings), [false, true, false, false]);
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), original_project);
+    }
+
+    #[test]
+    fn saving_one_notice_does_not_materialize_defaults_or_project_values() {
+        use super::{NoticeKind, Settings};
+        use serde_json::json;
+
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("settings.json");
+        let workspace = root.path().join("project");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"notices":{"cacheMisses":true,"reasoningDrops":false}}"#,
+        )
+        .unwrap();
+        let mut settings = Settings::load_from_paths(&workspace, true, &user).unwrap();
+        settings
+            .set_user_member_at(&user, "notices", "reasoningDrops", json!(true))
+            .unwrap();
+
+        assert_eq!(
+            super::read_object(&user).unwrap(),
+            json!({"notices":{"reasoningDrops":true}})
+        );
+        let notices = settings.notices();
+        assert!(notices.shows(NoticeKind::CacheMisses));
+        assert!(!notices.shows(NoticeKind::ReasoningDrops));
+        assert!(
+            Settings::load_from_paths(&workspace, false, &user)
+                .unwrap()
+                .notices()
+                .shows(NoticeKind::ReasoningDrops)
+        );
+    }
+
+    #[test]
+    fn terminal_capability_settings_preserve_non_boolean_values() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        for value in [
+            json!(true),
+            json!(false),
+            json!("auto"),
+            json!(null),
+            json!(1),
+            json!(["legacy"]),
+            json!({"legacy": true}),
+        ] {
+            let terminal = json!({"hyperlinks": value, "trueColor": value});
+            std::fs::write(&path, json!({"terminal": terminal}).to_string()).unwrap();
+            let mut settings = Settings::load_from_paths(directory.path(), false, &path).unwrap();
+            assert_eq!(settings.terminal_hyperlinks(), value.as_bool());
+            assert_eq!(settings.terminal_true_color(), value.as_bool());
+            assert_eq!(settings.value()["terminal"], terminal);
+
+            settings
+                .set_user_member_at(&path, "terminal", "showImages", json!(false))
+                .unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["terminal"]["hyperlinks"], value);
+            assert_eq!(saved["terminal"]["trueColor"], value);
+        }
+    }
+
+    #[test]
+    fn notice_settings_schema_reports_invalid_members_without_overwriting_them() {
+        use serde_json::json;
+
+        for kind in super::NoticeKind::ALL {
+            let value = json!({"showCacheMissNotices":true,"notices":{(kind.key()):"invalid"}});
+            let error = super::validate_settings(&value, std::path::Path::new("settings.json"))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("settings.json/notices/{}", kind.key()))
+            );
+        }
+        let value = json!({"showCacheMissNotices":true,"notices":[]});
+        let error =
+            super::validate_settings(&value, std::path::Path::new("settings.json")).unwrap_err();
+        assert!(error.to_string().contains("settings.json/notices"));
     }
 
     #[test]
@@ -2698,6 +3026,27 @@ mod tests {
         assert_eq!(settings.thinking_for_model("ollama", "b"), Some("max"));
         assert_eq!(settings.thinking_for_model("ollama", "c"), Some("low"));
         validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+    }
+
+    #[test]
+    fn markdown_code_block_indent_accepts_empty_and_custom_prefixes() {
+        let path = Path::new("settings.json");
+        assert_eq!(Settings::default().code_block_indent(), "  ");
+        for indent in ["", "· "] {
+            let settings = Settings {
+                value: json!({"markdown":{"codeBlockIndent":indent}}),
+                ..Settings::default()
+            };
+            validate_settings(settings.value(), path).unwrap();
+            assert_eq!(settings.code_block_indent(), indent);
+        }
+        let invalid = json!({"markdown":{"codeBlockIndent":2}});
+        assert!(
+            validate_settings(&invalid, path)
+                .unwrap_err()
+                .to_string()
+                .contains("/markdown/codeBlockIndent")
+        );
     }
 
     #[test]

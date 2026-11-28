@@ -420,7 +420,15 @@ impl ToolHost for LifecycleUiHost {
 
     async fn ui(&self, request: crate::UiRequest) -> crate::ExtensionResult<crate::UiResponse> {
         request.validate()?;
-        if request.needs_response() {
+        if request.needs_response()
+            && !matches!(
+                request,
+                crate::UiRequest::GetAllThemes
+                    | crate::UiRequest::GetTheme { .. }
+                    | crate::UiRequest::GetActiveTheme
+                    | crate::UiRequest::SetTheme { .. }
+            )
+        {
             return Err("lifecycle presentation does not support prompts".into());
         }
         tokio::select! {
@@ -1224,9 +1232,12 @@ mod wire_tests {
                 request: crate::UiRequest,
                 _: crate::CancellationToken,
             ) -> crate::ExtensionResult<crate::UiResponse> {
-                assert!(matches!(request, crate::UiRequest::SetHeader { .. }));
                 *self.0.lock().unwrap() += 1;
-                Ok(crate::UiResponse::Cancelled)
+                match request {
+                    crate::UiRequest::SetHeader { .. } => Ok(crate::UiResponse::Cancelled),
+                    crate::UiRequest::GetAllThemes => Ok(crate::UiResponse::Themes(vec![])),
+                    _ => panic!("unexpected lifecycle UI request"),
+                }
             }
         }
 
@@ -1256,6 +1267,10 @@ mod wire_tests {
                 assert!(host.tools().is_empty());
                 assert!(!host.supports_custom_entries());
                 host.ui(crate::UiRequest::SetHeader { lines: None }).await?;
+                assert_eq!(
+                    host.ui(crate::UiRequest::GetAllThemes).await?,
+                    crate::UiResponse::Themes(vec![])
+                );
                 assert!(
                     host.ui(crate::UiRequest::Confirm {
                         title: "Blocked prompt".into(),
@@ -1294,7 +1309,7 @@ mod wire_tests {
                 .await
                 .is_err()
         );
-        assert_eq!(*ui.0.lock().unwrap(), 1);
+        assert_eq!(*ui.0.lock().unwrap(), 2);
     }
 
     #[test]

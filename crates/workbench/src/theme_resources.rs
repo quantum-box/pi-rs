@@ -3,13 +3,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use crossterm::style::Color;
-use pi_rs::{Error, Result};
-use serde_json::Value;
+use pi_rs::{Error, Result, UiThemeColor, UiThemeInfo, UiThemePalette};
 
 const MAX_FILES: usize = 64;
 const MAX_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
-const MAX_VARIABLE_DEPTH: usize = 128;
 
 /// Exact absolute files the host authorizes this load to read. Paths cannot
 /// contain parent components. Symlinks are followed;
@@ -119,7 +117,7 @@ impl ThemeReadGrants {
         let mut themes = Vec::with_capacity(self.files.len());
         for path in &self.files {
             validate_path(path, "file")?;
-            let text = crate::prompt_resources::read_optional(path)?.ok_or_else(|| {
+            let text = read_theme_file(path)?.ok_or_else(|| {
                 Error::Config(format!("theme file is missing: {}", path.display()))
             })?;
             total = total
@@ -128,7 +126,6 @@ impl ThemeReadGrants {
             if total > MAX_TOTAL_BYTES {
                 return Err(Error::Config("theme files exceed size limit".into()));
             }
-            validate_variable_depth(&text)?;
             let parsed = crate::theme_parser::parse_theme(&text)?;
             if !names.insert(parsed.name.clone()) {
                 return Err(Error::Config(format!(
@@ -146,45 +143,158 @@ impl ThemeReadGrants {
     }
 }
 
+/// Read one bounded, regular theme file using the native loader policy.
+#[doc(hidden)]
+pub fn read_theme_file(path: &Path) -> Result<Option<String>> {
+    let text = crate::prompt_resources::read_optional_resource(path, "theme file")?;
+    if text
+        .as_deref()
+        .is_some_and(|text| text.starts_with('\u{feff}'))
+    {
+        return Err(Error::Config(
+            "theme file contains more than one UTF-8 BOM".into(),
+        ));
+    }
+    Ok(text)
+}
+
+/// The worker's catalog and fixed palettes share one ordered resource snapshot.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ExtensionThemeSnapshot {
+    catalog: Vec<UiThemeInfo>,
+    palettes: BTreeMap<String, (UiThemePalette, Option<PathBuf>)>,
+}
+
+impl ExtensionThemeSnapshot {
+    pub fn catalog(&self) -> &[UiThemeInfo] {
+        &self.catalog
+    }
+
+    pub fn palette(&self, name: &str) -> Option<&UiThemePalette> {
+        self.palettes.get(name).map(|(palette, _)| palette)
+    }
+
+    pub fn path(&self, name: &str) -> Option<&Path> {
+        self.palettes.get(name)?.1.as_deref()
+    }
+}
+
+/// Resolve the worker's already resolved theme files. The generated system
+/// palette is supplied by the terminal, which owns the live terminal colors.
+#[doc(hidden)]
+pub fn extension_theme_snapshot(paths: &[PathBuf]) -> Result<ExtensionThemeSnapshot> {
+    if paths.len() > MAX_DIRECTORY_ENTRIES {
+        return Err(Error::Config("too many resolved theme files".into()));
+    }
+    let mut bytes = 0usize;
+    let mut palettes = BTreeMap::new();
+    let mut catalog = Vec::new();
+    for source in [
+        include_str!("../assets/themes/dark.json"),
+        include_str!("../assets/themes/light.json"),
+    ] {
+        let theme = crate::theme_parser::parse_theme(source)?;
+        let palette = ui_theme_palette(theme.name, None, &theme.colors, Default::default());
+        catalog.push(UiThemeInfo {
+            name: palette.name.clone(),
+            path: None,
+        });
+        palettes.insert(palette.name.clone(), (palette, None));
+    }
+    for path in paths {
+        let Ok(Some(text)) = read_theme_file(path) else {
+            continue;
+        };
+        bytes += text.len();
+        if bytes > MAX_TOTAL_BYTES {
+            return Err(Error::Config(
+                "theme catalog exceeds its read size limit".into(),
+            ));
+        }
+        let Ok(theme) = crate::theme_parser::parse_theme(&text) else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            palettes.entry(theme.name.clone())
+        {
+            let wire_path = path.to_str().map(PathBuf::from);
+            catalog.push(UiThemeInfo {
+                name: theme.name.clone(),
+                path: wire_path.clone(),
+            });
+            entry.insert((
+                ui_theme_palette(theme.name, wire_path, &theme.colors, Default::default()),
+                Some(path.clone()),
+            ));
+        }
+    }
+    let locale = crate::locale::select(|name| std::env::var(name).ok());
+    let collator = crate::locale::collator(&locale).ok();
+    catalog.sort_by(|left, right| {
+        collator.as_ref().map_or_else(
+            || left.name.cmp(&right.name),
+            |collator| collator.compare(&left.name, &right.name),
+        )
+    });
+    catalog.insert(
+        0,
+        UiThemeInfo {
+            name: "system".into(),
+            path: None,
+        },
+    );
+    Ok(ExtensionThemeSnapshot { catalog, palettes })
+}
+
+#[doc(hidden)]
+pub fn ui_theme_palette(
+    name: String,
+    path: Option<PathBuf>,
+    colors: &BTreeMap<String, Color>,
+    dim: std::collections::BTreeSet<String>,
+) -> UiThemePalette {
+    UiThemePalette {
+        name,
+        path: path.filter(|path| path.to_str().is_some()),
+        colors: colors
+            .iter()
+            .map(|(role, color)| (role.clone(), ui_theme_color(*color)))
+            .collect(),
+        dim,
+    }
+}
+
+fn ui_theme_color(color: Color) -> UiThemeColor {
+    let index = match color {
+        Color::Rgb { r, g, b } => return UiThemeColor::Rgb { r, g, b },
+        Color::Reset => return UiThemeColor::Reset,
+        Color::AnsiValue(index) => index,
+        Color::Black => 0,
+        Color::DarkRed => 1,
+        Color::DarkGreen => 2,
+        Color::DarkYellow => 3,
+        Color::DarkBlue => 4,
+        Color::DarkMagenta => 5,
+        Color::DarkCyan => 6,
+        Color::Grey => 7,
+        Color::DarkGrey => 8,
+        Color::Red => 9,
+        Color::Green => 10,
+        Color::Yellow => 11,
+        Color::Blue => 12,
+        Color::Magenta => 13,
+        Color::Cyan => 14,
+        Color::White => 15,
+    };
+    UiThemeColor::Indexed { index }
+}
+
 fn validate_path(path: &Path, kind: &str) -> Result<()> {
     if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
         return Err(Error::Config(format!(
             "theme {kind} path must be absolute without parent components"
         )));
-    }
-    Ok(())
-}
-
-// Bound variable recursion before calling the parser shared with the TUI.
-fn validate_variable_depth(text: &str) -> Result<()> {
-    let value: Value = serde_json::from_str(text)?;
-    let Some(vars) = value.get("vars").and_then(Value::as_object) else {
-        return Ok(());
-    };
-    for key in vars.keys() {
-        let mut next = key.as_str();
-        let mut seen = HashSet::new();
-        loop {
-            if !seen.insert(next) {
-                break;
-            } // The shared parser reports referenced cycles.
-            if seen.len() > MAX_VARIABLE_DEPTH {
-                return Err(Error::Config(
-                    "theme variable chain exceeds depth limit".into(),
-                ));
-            }
-            let Some(value) = vars.get(next).and_then(Value::as_str) else {
-                break;
-            };
-            if value.is_empty()
-                || value.starts_with('#')
-                || value.to_ascii_lowercase().starts_with("okhsl(")
-                || value.to_ascii_lowercase().starts_with("oklch(")
-            {
-                break;
-            }
-            next = value;
-        }
     }
     Ok(())
 }

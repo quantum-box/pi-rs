@@ -67,8 +67,8 @@ jobs:
   native:
     name: Native tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # macOS needs extra time for the serial CLI, PTY, and Durable acceptance suites.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 30 || matrix.os == 'macos-latest' && 90 || 60 }}
+    # Unix jobs also run the serial Durable crash and recovery suites.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || matrix.os == 'macos-latest' && 90 || 75 }}
     strategy:
       fail-fast: false
       matrix:

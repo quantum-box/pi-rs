@@ -41,6 +41,149 @@ const MAX_INLINE_BYTES: usize = 7 * 1024 * 1024;
 // the preview and its warning before adding image metadata.
 const MAX_INLINE_IMAGE_LABEL_BYTES: usize = MAX_INLINE_BYTES - 6 * MAX_PREVIEW_UNITS - 4096;
 const WORKER_WAIT_LIMIT: Duration = Duration::from_secs(60);
+const MAX_PROGRESS_CALLS: usize = 64;
+const ARGS_PREVIEW_UNITS: usize = 200;
+const ERROR_PREVIEW_UNITS: usize = 500;
+const PROGRESS_WAIT: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CallStatus {
+    Running,
+    Ok,
+    Error,
+    Cancelled,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CallProgress {
+    id: String,
+    name: String,
+    args: String,
+    status: CallStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+struct NestedProgress {
+    operation: String,
+    calls: Vec<CallProgress>,
+    omitted: u64,
+}
+
+impl NestedProgress {
+    fn snapshot(&self, settle: bool) -> Value {
+        let calls: Vec<_> = self
+            .calls
+            .iter()
+            .map(|call| {
+                let mut value = json!(call);
+                if settle && call.status == CallStatus::Running {
+                    value["status"] = json!(CallStatus::Cancelled);
+                }
+                value
+            })
+            .collect();
+        json!({"content":[],"details":{"calls":calls,"omittedCalls":self.omitted}})
+    }
+
+    async fn publish(&self, host: &dyn ToolHost, settle: bool) {
+        let fallback = (!settle
+            && (self.calls.len() == MAX_PROGRESS_CALLS
+                || self
+                    .calls
+                    .iter()
+                    .any(|call| call.status == CallStatus::Running)))
+        .then(|| self.snapshot(true));
+        // Reporting is best effort. A slow embedder must not hold the script
+        // or its shutdown window open.
+        let _ = tokio::time::timeout(
+            PROGRESS_WAIT,
+            host.report_progress_with_settlement(self.snapshot(settle), fallback),
+        )
+        .await;
+    }
+
+    async fn start(&mut self, host: &dyn ToolHost, name: &str, arguments: &str) -> Option<usize> {
+        if self.calls.len() == MAX_PROGRESS_CALLS {
+            self.omitted = self.omitted.saturating_add(1);
+            host.update_progress_omitted_calls(self.omitted);
+            if self.omitted == 1 {
+                self.publish(host, false).await;
+            }
+            return None;
+        }
+        let index = self.calls.len();
+        self.calls.push(CallProgress {
+            id: format!("{}/{}", self.operation, index + 1),
+            name: progress_preview(name, ARGS_PREVIEW_UNITS),
+            args: progress_preview(arguments, ARGS_PREVIEW_UNITS),
+            status: CallStatus::Running,
+            duration_ms: None,
+            error: None,
+        });
+        self.publish(host, false).await;
+        Some(index)
+    }
+
+    async fn complete(
+        &mut self,
+        host: &dyn ToolHost,
+        index: usize,
+        started: Instant,
+        outcome: &Outcome,
+        cancelled: bool,
+    ) {
+        if matches!(outcome, Outcome::Pending { .. }) {
+            return;
+        }
+        let call = &mut self.calls[index];
+        call.duration_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        call.status = if !outcome.is_error() {
+            CallStatus::Ok
+        } else if cancelled {
+            CallStatus::Cancelled
+        } else {
+            CallStatus::Error
+        };
+        if outcome.is_error() {
+            call.error = Some(nested_error_preview(outcome));
+        }
+        self.publish(host, false).await;
+    }
+}
+
+fn progress_preview(text: &str, limit: usize) -> String {
+    if utf16_prefix_bytes(text.chars(), limit) == text.len() {
+        return text.to_owned();
+    }
+    let end = utf16_prefix_bytes(text.chars(), limit - 3);
+    format!("{}...", &text[..end])
+}
+
+fn nested_error_preview(outcome: &Outcome) -> String {
+    let text = match outcome {
+        Outcome::Failed(text)
+        | Outcome::Skipped(text)
+        | Outcome::Unknown(text)
+        | Outcome::TextResult { output: text, .. }
+        | Outcome::TextResultWithStructuredContent { output: text, .. } => text,
+        Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } => {
+            data["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|block| block["type"] == "text")
+                .and_then(|block| block["text"].as_str())
+                .unwrap_or("Nested tool failed")
+        }
+        _ => "Nested tool failed",
+    };
+    progress_preview(text, ERROR_PREVIEW_UNITS)
+}
 
 // Resizing never revokes a running worker. Excess permits are retired when
 // they become available, including when a running worker releases its slot.
@@ -145,6 +288,7 @@ fn parse_worker_limit(value: &str) -> Option<usize> {
 enum WorkerAdmissionError {
     Cancelled,
     Deadline,
+    StartupDeadline,
     Busy,
     Closed,
 }
@@ -157,6 +301,12 @@ impl WorkerAdmissionError {
                 "Script timed out: Execution timed out after {} ms while waiting for a free codemode worker",
                 timeout
                     .expect("admission deadline requires a timeout")
+                    .as_millis()
+            ),
+            Self::StartupDeadline => format!(
+                "Script timed out: Execution timed out after {} ms while waiting for codemode worker startup",
+                timeout
+                    .expect("startup deadline requires a timeout")
                     .as_millis()
             ),
             Self::Busy => format!(
@@ -289,6 +439,12 @@ impl Tool for ScriptTool {
     fn use_default_timeout(&self) -> bool {
         false
     }
+    fn settles_host_timeout(&self) -> bool {
+        true
+    }
+    fn bounds_progress_hooks(&self) -> bool {
+        true
+    }
     fn output_limit(&self) -> usize {
         8 * 1024 * 1024
     }
@@ -343,11 +499,20 @@ impl Tool for ScriptTool {
         if previous.is_some_and(|state| state.version != 1 || !state.data.is_object()) {
             return Outcome::Failed("invalid codemode store state".into()).into();
         }
+        let deadline = match options
+            .timeout
+            .map(|timeout| ScriptDeadline::new(started, timeout))
+            .transpose()
+        {
+            Ok(deadline) => deadline,
+            Err(error) => return Outcome::Failed(error).into(),
+        };
         static WORKERS: OnceLock<Arc<WorkerPool>> = OnceLock::new();
         let workers = WORKERS.get_or_init(|| WorkerPool::new(worker_limit));
-        let admission_deadline = match options.timeout {
-            Some(timeout) => match timeout
-                .checked_sub(started.elapsed())
+        let admission_deadline = match deadline {
+            Some(deadline) => match deadline
+                .at
+                .checked_duration_since(Instant::now())
                 .filter(|time| !time.is_zero())
             {
                 Some(remaining) => Some(remaining),
@@ -382,9 +547,7 @@ impl Tool for ScriptTool {
         let worker_cancel = context.cancellation.child_token();
         let format_cancel = context.cancellation.child_token();
         let _cancel_format_on_drop = format_cancel.clone().drop_guard();
-        // The caller may drop this future on timeout or cancellation. Keep the
-        // permit in the worker until QuickJS has actually stopped, and wake its
-        // interrupt handler even when nobody remains to await the join handle.
+        // Keep the interrupt armed if the caller drops the invocation after startup.
         let _cancel_on_drop = worker_cancel.clone().drop_guard();
         let worker_context = ToolContext {
             operation_id: context.operation_id,
@@ -392,38 +555,75 @@ impl Tool for ScriptTool {
         };
         let source = source.to_owned();
         let handle = tokio::runtime::Handle::current();
-        let timeout = options.timeout;
+        let (ready, worker_ready) = tokio::sync::oneshot::channel();
+        let (start, worker_start) = tokio::sync::oneshot::channel();
         let worker = tokio::task::spawn_blocking(move || {
-            let remaining = match timeout {
-                Some(timeout) => {
-                    match timeout
-                        .checked_sub(started.elapsed())
-                        .filter(|time| !time.is_zero())
-                    {
-                        Some(remaining) => Some(remaining),
-                        None => {
-                            return (
-                                Err("Script deadline elapsed before execution".into()),
-                                permit,
-                            );
-                        }
+            ready.send(()).map_err(|_| "Codemode startup cancelled")?;
+            // The caller keeps the permit while this job is in Tokio's queue.
+            // Once handed off, it stays with execution through worker shutdown.
+            let permit = worker_start
+                .blocking_recv()
+                .map_err(|_| "Codemode startup cancelled")?;
+            // Stop nested calls when execution settles, before any output
+            // formatting, and also if the worker unwinds.
+            let _cancel_nested_calls = worker_context.cancellation.clone().drop_guard();
+            let result = handle.block_on(async {
+                let progress = host.supports_progress().then(|| {
+                    Arc::new(tokio::sync::Mutex::new(NestedProgress {
+                        operation: worker_context.operation_id.to_string(),
+                        calls: Vec::new(),
+                        omitted: 0,
+                    }))
+                });
+                let cancellation = worker_context.cancellation.clone();
+                let result = evaluate(
+                    &source,
+                    store,
+                    host.clone(),
+                    worker_context,
+                    deadline,
+                    worker_sink,
+                    progress.clone(),
+                )
+                .await;
+                cancellation.cancel();
+                if let Some(progress) = progress {
+                    let progress = progress.lock().await;
+                    if !progress.calls.is_empty() {
+                        progress.publish(host.as_ref(), true).await;
                     }
                 }
-                None => None,
-            };
-            let result = handle.block_on(evaluate(
-                &source,
-                store,
-                host,
-                worker_context,
-                remaining,
-                worker_sink,
-            ));
-            (result, permit)
-        })
-        .await;
-        let (result, permit) = match worker {
-            Ok(result) => result,
+                result
+            });
+            Ok::<_, &str>((result, permit))
+        });
+        let startup = tokio::select! {
+            biased;
+            _ = context.cancellation.cancelled() => Err(WorkerAdmissionError::Cancelled),
+            () = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline.at.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => Err(WorkerAdmissionError::StartupDeadline),
+            result = worker_ready => {
+                if deadline.is_some_and(ScriptDeadline::elapsed) {
+                    Err(WorkerAdmissionError::StartupDeadline)
+                } else {
+                    result.map_err(|_| WorkerAdmissionError::Closed)
+                }
+            }
+        };
+        if let Err(error) = startup {
+            worker.abort();
+            return error.reply(started.elapsed(), options.timeout, (workers.limit)());
+        }
+        if start.send(permit).is_err() {
+            return Outcome::Failed("Codemode worker stopped before startup".into()).into();
+        }
+        let (result, permit) = match worker.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => return Outcome::Failed(error.into()).into(),
             Err(error) => {
                 return Outcome::Failed(format!("Codemode worker failed: {error}")).into();
             }
@@ -441,16 +641,14 @@ impl Tool for ScriptTool {
         };
         let elapsed = started.elapsed();
         let formatter_cancel = format_cancel.clone();
-        let output = tokio::task::spawn_blocking(move || {
-            with_worker_permit(permit, || {
-                sink.lock().expect("codemode output").finish(
-                    success,
-                    elapsed,
-                    error.as_deref(),
-                    options.max_output_tokens,
-                    &formatter_cancel,
-                )
-            })
+        let output = format_output(permit, &format_cancel, move || {
+            sink.lock().expect("codemode output").finish(
+                success,
+                elapsed,
+                error.as_deref(),
+                options.max_output_tokens,
+                &formatter_cancel,
+            )
         })
         .await;
         if format_cancel.is_cancelled() {
@@ -470,17 +668,16 @@ impl Tool for ScriptTool {
             }
         };
         let output = std::mem::take(&mut publication.value);
-        let outcome = if success {
+        let content = output["content"].as_array().into_iter().flatten();
+        let has_image = content.clone().any(|block| block["type"] == "image");
+        let outcome = if success || has_image {
             Outcome::Structured {
                 data: output,
                 attachments: vec![],
             }
         } else {
             Outcome::Failed(
-                output["content"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
+                content
                     .filter_map(|block| block["text"].as_str())
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -612,29 +809,54 @@ struct Completion {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct ScriptDeadline {
+    at: Instant,
+    timeout: Duration,
+}
+
+impl ScriptDeadline {
+    fn new(started: Instant, timeout: Duration) -> Result<Self, String> {
+        let at = started
+            .checked_add(timeout)
+            .ok_or("Invalid script deadline")?;
+        Ok(Self { at, timeout })
+    }
+
+    fn elapsed(self) -> bool {
+        Instant::now() >= self.at
+    }
+
+    fn error(self) -> String {
+        format!(
+            "Script timed out: Execution timed out after {} ms",
+            self.timeout.as_millis()
+        )
+    }
+}
+
 async fn evaluate(
     source: &str,
     store: Value,
     host: Arc<dyn ToolHost>,
     context: ToolContext,
-    timeout: Option<Duration>,
+    deadline: Option<ScriptDeadline>,
     sink: Arc<Mutex<Output>>,
+    progress: Option<Arc<tokio::sync::Mutex<NestedProgress>>>,
 ) -> Result<Completion, String> {
+    if context.cancellation.is_cancelled() {
+        return Err("Script cancelled".into());
+    }
+    if let Some(deadline) = deadline.filter(|deadline| deadline.elapsed()) {
+        return Err(deadline.error());
+    }
     let runtime = AsyncRuntime::new().map_err(|error| error.to_string())?;
     runtime.set_memory_limit(256 * 1024 * 1024).await;
     runtime.set_max_stack_size(512 * 1024).await;
-    let deadline = timeout
-        .map(|timeout| {
-            Instant::now()
-                .checked_add(timeout)
-                .ok_or("Invalid script deadline")
-        })
-        .transpose()?;
     let cancellation = context.cancellation.clone();
     runtime
         .set_interrupt_handler(Some(Box::new(move || {
-            cancellation.is_cancelled()
-                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            cancellation.is_cancelled() || deadline.is_some_and(ScriptDeadline::elapsed)
         })))
         .await;
     let javascript = AsyncContext::full(&runtime)
@@ -657,9 +879,20 @@ async fn evaluate(
     );
     let code = format!("__run(async () => {{\n{source}\n}})");
     let output_cancellation = context.cancellation.clone();
+    let startup_progress = progress
+        .as_ref()
+        .map(|progress| (progress.clone(), host.clone()));
     let operation = javascript.async_with(async move |ctx| {
         let result: rquickjs::Result<String> = async {
-            install_globals(&ctx, documents, host, store, sink, output_cancellation)?;
+            install_globals(
+                &ctx,
+                documents,
+                host,
+                store,
+                sink,
+                output_cancellation,
+                progress,
+            )?;
             match ctx.eval::<Promise, _>(code) {
                 Ok(promise) => promise.into_future::<String>().await,
                 Err(error) => Err(error),
@@ -696,17 +929,40 @@ async fn evaluate(
             }
         }
     });
+    let execution = async {
+        // A host acknowledgement can yield before QuickJS has any jobs.
+        // Keep it under the script's cancellation and deadline, outside the
+        // promise-liveness poll.
+        if let Some((progress, host)) = startup_progress {
+            progress.lock().await.publish(host.as_ref(), false).await;
+        }
+        operation.await
+    };
     let result = tokio::select! {
+        biased;
         _ = context.cancellation.cancelled() => return Err("Script cancelled".into()),
         result = async {
-            match timeout {
-                Some(timeout) => tokio::time::timeout(timeout, operation).await.map_err(|_| "Script timed out".to_owned())?,
-                None => operation.await,
+            let Some(deadline) = deadline else {
+                return execution.await;
+            };
+            // Runtime setup may have consumed the rest of the same budget.
+            if deadline.elapsed() {
+                return Err(deadline.error());
+            }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline.at.into()) => Err(deadline.error()),
+                result = execution => result,
             }
         } => result,
     };
     if context.cancellation.is_cancelled() {
         return Err("Script cancelled".into());
+    }
+    // QuickJS can return an interrupt exception before the async timer gets
+    // polled. CPU work and awaited host calls share the same timeout outcome.
+    if let Some(deadline) = deadline.filter(|deadline| deadline.elapsed()) {
+        return Err(deadline.error());
     }
     let result = result?;
     serde_json::from_str(&result).map_err(|error| error.to_string())
@@ -718,6 +974,7 @@ fn install_globals(
     store: Value,
     sink: Arc<Mutex<Output>>,
     cancellation: pi_rs_core::CancellationToken,
+    progress: Option<Arc<tokio::sync::Mutex<NestedProgress>>>,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
     let catalogue: Vec<_> = documents
@@ -817,6 +1074,7 @@ fn install_globals(
             let host = host.clone();
             let output = tool_output.clone();
             let cancellation = cancellation.clone();
+            let progress = progress.clone();
             async move {
                 if output.lock().expect("codemode output").limit_exceeded {
                     return Ok::<_, rquickjs::Error>(
@@ -832,11 +1090,35 @@ fn install_globals(
                     {
                         json!({"ok":false,"error":"This tool is not callable from a script"})
                     }
-                    Ok(arguments) => nested_tool_value(
-                        &name,
-                        host.call_with_cancellation(&name, arguments, cancellation)
-                            .await,
-                    ),
+                    Ok(parsed) => {
+                        let index = if let Some(progress) = &progress {
+                            progress
+                                .lock()
+                                .await
+                                .start(host.as_ref(), &name, &arguments)
+                                .await
+                        } else {
+                            None
+                        };
+                        let started = Instant::now();
+                        let outcome = host
+                            .call_with_cancellation(&name, parsed, cancellation.clone())
+                            .await;
+                        if let Some((progress, index)) = progress.as_ref().zip(index) {
+                            progress
+                                .lock()
+                                .await
+                                .complete(
+                                    host.as_ref(),
+                                    index,
+                                    started,
+                                    &outcome,
+                                    cancellation.is_cancelled(),
+                                )
+                                .await;
+                        }
+                        nested_tool_value(&name, outcome)
+                    }
                     Err(error) => json!({"ok":false,"error":error.to_string()}),
                 };
                 Ok::<_, rquickjs::Error>(result.to_string())
@@ -1164,9 +1446,40 @@ impl Drop for Publication {
         }
     }
 }
-fn with_worker_permit<P, T>(permit: P, format: impl FnOnce() -> T) -> T {
-    let _permit = permit;
-    format()
+async fn format_output(
+    permit: WorkerPermit,
+    cancellation: &pi_rs_core::CancellationToken,
+    format: impl FnOnce() -> Option<FormattedOutput> + Send + 'static,
+) -> Result<Option<FormattedOutput>, tokio::task::JoinError> {
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let formatter_cancel = cancellation.clone();
+    let (ready, formatter_ready) = tokio::sync::oneshot::channel();
+    let (start, formatter_start) = tokio::sync::oneshot::channel();
+    let mut formatter = tokio::task::spawn_blocking(move || {
+        ready.send(()).ok()?;
+        let _permit = formatter_start.blocking_recv().ok()?;
+        if formatter_cancel.is_cancelled() {
+            return None;
+        }
+        format()
+    });
+    // Hold the permit here until the blocking job is ready. Cancellation can
+    // release a queued slot immediately, while an active formatter owns its
+    // permit until it exits and drops any unpublished transcript.
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {}
+        output = async {
+            if formatter_ready.await.is_ok() {
+                let _ = start.send(permit);
+            }
+            (&mut formatter).await
+        } => return output,
+    }
+    formatter.abort();
+    Ok(None)
 }
 impl FormattedOutput {
     #[cfg(test)]
@@ -2751,6 +3064,204 @@ mod tests {
         let _ = stop_watchdog.send(());
         watchdog.join().unwrap();
     }
+    #[test]
+    fn deadline_expires_while_blocking_worker_startup_is_queued() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (occupied, occupied_rx) = tokio::sync::oneshot::channel();
+                let (release, release_rx) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    occupied.send(()).unwrap();
+                    let _ = release_rx.blocking_recv();
+                });
+                occupied_rx.await.unwrap();
+                let started = Arc::new(tokio::sync::Notify::new());
+                let host = Arc::new(StartedHost {
+                    started: started.clone(),
+                    wait_for_cancellation: false,
+                });
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ScriptTool { timeout: None }.invoke_transaction(
+                        json!({"code":"// @options: {\"timeout_ms\":100}\nawait tools.started({}); store('discard', true);"}),
+                        ToolContext {
+                            operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                            cancellation: Default::default(),
+                        },
+                        None,
+                        host,
+                    ),
+                )
+                .await
+                .expect("timeout reply must not wait for the blocking pool");
+                assert!(matches!(
+                    reply.outcome,
+                    Outcome::Failed(message)
+                        if message.contains("after 100 ms while waiting for codemode worker startup")
+                            && message.contains("The script did not start.")
+                ));
+                assert!(reply.state.is_none());
+                assert!(!blocker.is_finished());
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                // Let Tokio process the aborted job from the queue.
+                tokio::task::spawn_blocking(|| {}).await.unwrap();
+                assert!(tokio::time::timeout(Duration::ZERO, started.notified()).await.is_err());
+            });
+    }
+
+    struct RecordingHost {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<pi_rs_core::CancellationToken>>>,
+        release_formatter: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolHost for RecordingHost {
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "started".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }]
+        }
+
+        async fn call(&self, _: &str, _: Value) -> Outcome {
+            unreachable!("expected a scoped nested call");
+        }
+
+        async fn call_with_cancellation(
+            &self,
+            _: &str,
+            _: Value,
+            cancellation: pi_rs_core::CancellationToken,
+        ) -> Outcome {
+            // Queue ahead of the formatter while the only blocking thread
+            // still belongs to the script worker.
+            let release = self.release_formatter.lock().unwrap().take().unwrap();
+            tokio::task::spawn_blocking(move || {
+                let _ = release.blocking_recv();
+            });
+            self.started
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(cancellation)
+                .unwrap();
+            std::future::pending().await
+        }
+    }
+
+    #[test]
+    fn deadline_cancels_nested_call_before_formatting_and_keeps_partial_image() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (started, started_rx) = tokio::sync::oneshot::channel();
+                let (release, release_rx) = tokio::sync::oneshot::channel();
+                let host = Arc::new(RecordingHost {
+                    started: Mutex::new(Some(started)),
+                    release_formatter: Mutex::new(Some(release_rx)),
+                });
+                let script = tokio::spawn(async move {
+                    ScriptTool { timeout: None }
+                        .invoke_transaction(
+                            json!({"code": concat!(
+                                "// @options: {\"timeout_ms\":1000}\n",
+                                "text('partial'); ",
+                                "image({type:'image', mimeType:'image/png', data:'iVBORw0KGgo='}); ",
+                                "store('discard', true); await tools.started({});"
+                            )}),
+                            ToolContext {
+                                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                                cancellation: Default::default(),
+                            },
+                            None,
+                            host,
+                        )
+                        .await
+                });
+                let nested = tokio::time::timeout(Duration::from_secs(5), started_rx)
+                    .await
+                    .expect("nested call did not start")
+                    .unwrap();
+
+                tokio::time::timeout(Duration::from_secs(5), nested.cancelled())
+                    .await
+                    .expect("nested call must receive cancellation before formatting");
+                assert!(!script.is_finished());
+                release.send(()).unwrap();
+
+                let reply = tokio::time::timeout(Duration::from_secs(5), script)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(reply.state.is_none());
+                assert!(reply.outcome.is_error());
+                let Outcome::Structured { data, .. } = reply.outcome else {
+                    panic!("a timed-out image should remain structured");
+                };
+                let content = data["content"].as_array().unwrap();
+                let text = content
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for line in text.lines() {
+                    if let Some(path) = line.strip_prefix("Image saved to ") {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+                assert!(text.contains("partial"));
+                assert!(text.contains("Script timed out: Execution timed out after 1000 ms"));
+                assert!(content.iter().any(|block| *block == json!({
+                    "type":"image","mimeType":"image/png","data":"iVBORw0KGgo="
+                })));
+            });
+    }
+
+    #[tokio::test]
+    async fn script_deadline_reports_timeout_for_compute_and_host_waits() {
+        let host = Arc::new(StartedHost {
+            started: Arc::new(tokio::sync::Notify::new()),
+            wait_for_cancellation: true,
+        });
+        for operation in ["while (true) {}", "await tools.started({});"] {
+            let reply = ScriptTool { timeout: None }
+                .invoke_transaction(
+                    json!({"code":format!(
+                        "// @options: {{\"timeout_ms\":250}}\ntext('partial'); store('discard', true); {operation}",
+                    )}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: Default::default(),
+                    },
+                    None,
+                    host.clone(),
+                )
+                .await;
+            let Outcome::Failed(message) = reply.outcome else {
+                panic!("expected a deadline failure for {operation}");
+            };
+            assert!(message.contains("partial"), "{operation}: {message}");
+            assert!(
+                message.contains("Script timed out: Execution timed out after 250 ms"),
+                "{operation}: {message}"
+            );
+            assert!(reply.state.is_none());
+        }
+        tokio::time::timeout(Duration::ZERO, host.started.notified())
+            .await
+            .expect("the host-wait case must reach the nested call");
+    }
+
     #[tokio::test]
     async fn explicit_host_deadline_interrupts_busy_script() {
         let reply = ScriptTool { timeout: None }
@@ -3002,6 +3513,7 @@ mod tests {
                     },
                     None,
                     sink.clone(),
+                    None,
                 ),
             )
             .await
@@ -3095,6 +3607,79 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(1));
         }
     }
+
+    #[tokio::test]
+    async fn startup_progress_acknowledgement_does_not_trigger_promise_liveness() {
+        struct AcknowledgingHost(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+
+        #[async_trait::async_trait]
+        impl ToolHost for AcknowledgingHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                Vec::new()
+            }
+
+            fn supports_progress(&self) -> bool {
+                true
+            }
+
+            async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
+                assert_eq!(value["details"]["calls"], json!([]));
+                let ack = self.0.lock().unwrap().take().expect("startup progress");
+                ack.await
+                    .map_err(|_| "startup acknowledgement dropped".into())
+            }
+
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                panic!("text-only script must not call a tool");
+            }
+        }
+
+        for cancel in [false, true] {
+            let (acknowledge, ack) = tokio::sync::oneshot::channel();
+            let host = Arc::new(AcknowledgingHost(Mutex::new(Some(ack))));
+            let cancellation = pi_rs_core::CancellationToken::new();
+            let sink = Arc::new(Mutex::new(Output::default()));
+            let mut script = std::pin::pin!(evaluate(
+                "text('hello')",
+                json!({}),
+                host.clone(),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: cancellation.clone(),
+                },
+                None,
+                sink.clone(),
+                Some(Arc::new(tokio::sync::Mutex::new(NestedProgress {
+                    operation: "fixture".into(),
+                    calls: Vec::new(),
+                    omitted: 0,
+                }))),
+            ));
+
+            assert!(futures_util::poll!(&mut script).is_pending());
+            assert!(host.0.lock().unwrap().is_none());
+            assert!(sink.lock().unwrap().items.is_empty());
+
+            if cancel {
+                cancellation.cancel();
+                let Poll::Ready(Err(error)) = futures_util::poll!(&mut script) else {
+                    panic!(
+                        "cancellation must release the script while the acknowledgement is pending"
+                    );
+                };
+                assert_eq!(error, "Script cancelled");
+                assert!(acknowledge.is_closed());
+                assert!(sink.lock().unwrap().items.is_empty());
+            } else {
+                acknowledge.send(()).unwrap();
+                assert!(script.await.unwrap().ok);
+                assert!(
+                    matches!(&sink.lock().unwrap().items[..], [Item::Text(text)] if text == "hello")
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn unresolved_promise_fails_without_a_deadline() {
         struct DelayedHost;
@@ -3565,8 +4150,9 @@ mod tests {
                     operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                     cancellation: Default::default(),
                 },
-                Some(Duration::from_secs(10)),
+                Some(ScriptDeadline::new(Instant::now(), Duration::from_secs(10)).unwrap()),
                 sink.clone(),
+                None,
             )
             .await;
             assert_eq!(result.is_ok(), expected_success);
@@ -3591,8 +4177,9 @@ mod tests {
                 operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 cancellation: Default::default(),
             },
-            Some(Duration::from_secs(10)),
+            Some(ScriptDeadline::new(Instant::now(), Duration::from_secs(10)).unwrap()),
             sink.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -3615,8 +4202,9 @@ mod tests {
                 operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 cancellation: Default::default(),
             },
-            Some(Duration::from_secs(30)),
+            Some(ScriptDeadline::new(Instant::now(), Duration::from_secs(30)).unwrap()),
             sink.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -3644,50 +4232,101 @@ mod tests {
         assert!(std::fs::metadata(path).unwrap().len() >= (3 * MAX_OUTPUT) as u64);
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn cancelled_queued_formatter_releases_permit_before_pool_drains() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (occupied, occupied_rx) = tokio::sync::oneshot::channel();
+                let (release, release_rx) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    occupied.send(()).unwrap();
+                    let _ = release_rx.blocking_recv();
+                });
+                occupied_rx.await.unwrap();
+
+                let workers = WorkerPool::new(|| 1);
+                let cancellation = pi_rs_core::CancellationToken::new();
+                let permit = acquire_worker(&workers, &cancellation, None, WORKER_WAIT_LIMIT)
+                    .await
+                    .unwrap();
+                let (ran, mut ran_rx) = tokio::sync::oneshot::channel();
+                let formatter = format_output(permit, &cancellation, move || {
+                    let _ = ran.send(());
+                    None
+                });
+                tokio::pin!(formatter);
+                assert!(futures_util::poll!(&mut formatter).is_pending());
+                assert_eq!(workers.semaphore.available_permits(), 0);
+
+                cancellation.cancel();
+                let output = tokio::time::timeout(Duration::from_secs(2), &mut formatter)
+                    .await
+                    .expect("a cancelled formatter must return while the blocking pool is full")
+                    .unwrap();
+                assert!(output.is_none());
+                assert_eq!(workers.semaphore.available_permits(), 1);
+                assert!(!blocker.is_finished());
+
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                tokio::task::spawn_blocking(|| {}).await.unwrap();
+                assert!(matches!(
+                    ran_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                ));
+            });
+    }
+
     #[tokio::test]
     async fn dropped_formatting_keeps_worker_bounded_and_removes_transcript() {
-        let workers = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = workers.clone().acquire_owned().await.unwrap();
+        let workers = WorkerPool::new(|| 1);
         let cancellation = pi_rs_core::CancellationToken::new();
+        let permit = acquire_worker(&workers, &cancellation, None, WORKER_WAIT_LIMIT)
+            .await
+            .unwrap();
         let (created, path) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel::<()>();
         let task = tokio::spawn({
             let cancellation = cancellation.clone();
             async move {
                 let _cancel_on_drop = cancellation.clone().drop_guard();
-                let output = tokio::task::spawn_blocking(move || {
-                    with_worker_permit(permit, || {
-                        let mut output = Output::default();
-                        output.emit("text", "界".repeat(1000), "").unwrap();
-                        let formatted = output
-                            .finish(true, Duration::ZERO, None, 1, &cancellation)
-                            .unwrap();
-                        created
-                            .send(
-                                formatted.value["full_output_path"]
-                                    .as_str()
-                                    .unwrap()
-                                    .to_owned(),
-                            )
-                            .unwrap();
-                        blocked.recv().unwrap();
-                        formatted
-                    })
+                let formatter_cancel = cancellation.clone();
+                let output = format_output(permit, &cancellation, move || {
+                    let mut output = Output::default();
+                    output.emit("text", "界".repeat(1000), "").unwrap();
+                    let formatted = output
+                        .finish(true, Duration::ZERO, None, 1, &formatter_cancel)
+                        .unwrap();
+                    created
+                        .send(
+                            formatted.value["full_output_path"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned(),
+                        )
+                        .unwrap();
+                    blocked.recv().unwrap();
+                    Some(formatted)
                 })
                 .await
+                .unwrap()
                 .unwrap();
                 output.deliver()
             }
         });
         let path = path.await.unwrap();
         assert!(std::path::Path::new(&path).exists());
-        assert!(workers.clone().try_acquire_owned().is_err());
+        assert_eq!(workers.semaphore.available_permits(), 0);
         task.abort();
         let _ = task.await;
         assert!(cancellation.is_cancelled());
-        assert!(workers.clone().try_acquire_owned().is_err());
+        assert_eq!(workers.semaphore.available_permits(), 0);
         release.send(()).unwrap();
-        let permit = tokio::time::timeout(Duration::from_secs(5), workers.acquire())
+        let permit = tokio::time::timeout(Duration::from_secs(5), workers.semaphore.acquire())
             .await
             .unwrap()
             .unwrap();
@@ -3747,6 +4386,46 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    struct DeadlineFormatGate {
+        occupied: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DeadlineFormatGate {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "hold_formatter".into(),
+                description: "Queue a fixture ahead of the formatter".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            let occupied = self.occupied.lock().unwrap().take().unwrap();
+            let release = self.release.lock().unwrap().take().unwrap();
+            tokio::task::spawn_blocking(move || {
+                let _ = occupied.send(());
+                let _ = release.blocking_recv();
+            });
+            Outcome::Succeeded("queued".into())
+        }
+    }
+
+    struct DeadlineFormatExtension(Arc<DeadlineFormatGate>);
+
+    impl Extension for DeadlineFormatExtension {
+        fn id(&self) -> &str {
+            "deadline-format-fixture"
+        }
+
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![self.0.clone()]
+        }
+    }
+
+    const SDK_TEST_DEADLINE: Duration = Duration::from_secs(1);
+
     struct DeadlineModel;
     #[async_trait::async_trait]
     impl pi_rs_core::Model for DeadlineModel {
@@ -3763,9 +4442,8 @@ mod tests {
                 }
             }) {
                 assert!(
-                    content.contains("error")
-                        || content.contains("timed out")
-                        || content.contains("interrupt"),
+                    content.contains("Script timed out: Execution timed out after 1000 ms")
+                        && content.contains("before-timeout"),
                     "{content}"
                 );
                 vec![
@@ -3780,7 +4458,7 @@ mod tests {
                     calls: vec![ToolCall {
                         id: "deadline".into(),
                         name: "codemode".into(),
-                        arguments: json!({"code":"while (true) {}"}).to_string(),
+                        arguments: json!({"code":"text('before-timeout'); store('discard', true); await tools.hold_formatter({}); while (true) {}"}).to_string(),
                     }],
                     usage: None,
                 })]
@@ -3789,8 +4467,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn public_sdk_explicit_timeouts_interrupt_busy_scripts() {
+    #[test]
+    fn public_sdk_explicit_timeouts_interrupt_busy_scripts() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(check_public_sdk_deadline());
+    }
+
+    async fn check_public_sdk_deadline() {
         for explicit_limits in [false, true] {
             // Keep the original public struct literal and Duration field usable.
             let extension = Codemode {
@@ -3799,44 +4486,59 @@ mod tests {
                 timeout: if explicit_limits {
                     Duration::MAX
                 } else {
-                    Duration::from_millis(20)
+                    SDK_TEST_DEADLINE
                 },
+            };
+            let (occupied, occupied_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = tokio::sync::oneshot::channel();
+            let gate = DeadlineFormatGate {
+                occupied: Mutex::new(Some(occupied)),
+                release: Mutex::new(Some(release_rx)),
             };
             let mut builder = pi_rs_core::SessionBuilder::new(Arc::new(DeadlineModel), "fixture")
                 .extension(Arc::new(extension))
+                .unwrap()
+                .extension(Arc::new(DeadlineFormatExtension(Arc::new(gate))))
                 .unwrap();
             if explicit_limits {
                 builder = builder.limits(pi_rs_core::Limits {
-                    tool_timeout: Duration::from_millis(20),
+                    tool_timeout: SDK_TEST_DEADLINE,
                     ..Default::default()
                 });
             }
             let mut session = builder.in_memory().unwrap();
-            match session.prompt("test").await {
-                Ok(answer) => assert_eq!(answer, "done"),
-                // The host deadline can win the race with the worker's interrupt.
-                // Until the worker reports back, its outcome is safely unknown.
-                Err(pi_rs_core::Error::Reconciliation(operation_id)) if explicit_limits => {
-                    assert!(
-                        session
-                            .journal().unwrap()
-                            .operations()
-                            .iter()
-                            .any(|(invocation, state)| {
-                                invocation.operation_id == operation_id
-                                    && matches!(
-                                        state,
-                                        pi_rs_core::OperationState::Finished(Outcome::Unknown(reason)) if reason == "tool timed out"
-                                    )
-                            })
-                    );
-                    assert!(matches!(
-                        session.resume().await,
-                        Err(pi_rs_core::Error::Reconciliation(_))
-                    ));
-                }
-                result => panic!("unexpected timeout result: {result:?}"),
-            }
+            let (answer, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(session.prompt("test"), async {
+                    // The queued fixture starts only once QuickJS releases the
+                    // sole blocking thread. Keep the formatter queued briefly
+                    // after that execution deadline.
+                    occupied_rx.await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    release.send(()).unwrap();
+                })
+            })
+            .await
+            .expect("the SDK turn should settle");
+
+            let journal = session.journal().unwrap();
+            let operations = journal.operations();
+            assert!(
+                matches!(&answer, Ok(answer) if answer == "done"),
+                "explicit_limits={explicit_limits}: {answer:?}; journal={operations:?}"
+            );
+            assert!(operations.iter().any(|(invocation, state)| {
+                invocation.call.name == "codemode"
+                    && matches!(state, pi_rs_core::OperationState::Finished(Outcome::Failed(reason))
+                        if reason.contains("Script timed out: Execution timed out after 1000 ms")
+                            && reason.contains("before-timeout"))
+            }), "{operations:?}");
+            assert!(
+                journal
+                    .extension_states()
+                    .get(ID)
+                    .is_none_or(|state| state.data.get("discard").is_none())
+            );
+            drop(journal);
             session.close().await.unwrap();
         }
     }
@@ -3927,14 +4629,14 @@ mod tests {
             Outcome::Succeeded("read".into())
         }
     }
-    struct ParallelExtension;
+    struct ParallelExtension(usize);
     impl Extension for ParallelExtension {
         fn id(&self) -> &str {
             "parallel-test"
         }
         fn tools(&self) -> Vec<Arc<dyn Tool>> {
             vec![Arc::new(ParallelTool(Arc::new(tokio::sync::Barrier::new(
-                2,
+                self.0,
             ))))]
         }
     }
@@ -3966,7 +4668,7 @@ mod tests {
                 vec![Ok(ModelEvent::Complete {
                     calls: vec![ToolCall {
                         id: "script".into(), name: "codemode".into(),
-                        arguments: json!({"code":"text((await Promise.all([tools.barrier({}), tools.barrier({})])).join(','));"}).to_string(),
+                        arguments: json!({"code":"text((await Promise.all([tools.barrier({call:1}), tools.barrier({call:2})])).join(','));"}).to_string(),
                     }], usage: None,
                 })]
             };
@@ -3978,18 +4680,337 @@ mod tests {
         let mut session = pi_rs_core::SessionBuilder::new(Arc::new(ParallelModel), "fixture")
             .extension(Arc::new(Codemode::default()))
             .unwrap()
-            .extension(Arc::new(ParallelExtension))
+            .extension(Arc::new(ParallelExtension(2)))
             .unwrap()
             .in_memory()
             .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(2), session.prompt("parallel"))
-            .await
-            .unwrap()
-            .unwrap();
+        let mut updates = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.prompt_with_observer("parallel", &mut |event| {
+                if let Some(details) = codemode_update(event) {
+                    updates.push(details);
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(result, "done");
+        assert_eq!(updates[0]["calls"], json!([]));
+        assert_eq!(updates[1]["calls"][0]["status"], "running");
+        assert_eq!(updates[2]["calls"][0]["status"], "running");
+        assert_eq!(updates[2]["calls"][1]["status"], "running");
+        let calls = updates.last().unwrap()["calls"].as_array().unwrap();
+        for (index, call) in calls.iter().enumerate() {
+            assert_eq!(call["status"], "ok");
+            assert_eq!(call["args"], format!("{{\"call\":{}}}", index + 1));
+            assert_eq!(call["id"], updates[2]["calls"][index]["id"]);
+            assert!(call["durationMs"].is_u64());
+        }
+        assert_ne!(calls[0]["id"], calls[1]["id"]);
         assert_eq!(session.journal().unwrap().operations().len(), 3);
         session.close().await.unwrap();
     }
+
+    fn codemode_update(event: pi_rs_core::Notification<'_>) -> Option<Value> {
+        if let pi_rs_core::Notification::ToolProgress(
+            pi_rs_core::LifecycleEvent::ToolExecutionUpdate {
+                tool_name,
+                partial_result,
+                ..
+            },
+        ) = event
+            && tool_name == ID
+        {
+            return Some(partial_result["details"].clone());
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn codemode_settles_running_progress_on_sdk_abort_and_script_timeout() {
+        use pi_rs_core::{Error, Event, Notification};
+        for abort in [true, false] {
+            let mut session = pi_rs_core::SessionBuilder::new(Arc::new(ParallelModel), "fixture")
+                .extension(Arc::new(Codemode {
+                    timeout: if abort {
+                        Duration::MAX
+                    } else {
+                        Duration::from_millis(500)
+                    },
+                    ..Default::default()
+                }))
+                .unwrap()
+                .extension(Arc::new(ParallelExtension(3)))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+            let control = session.controls();
+            let mut running = false;
+            let mut settled = false;
+            let mut root_operation = None;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                session.prompt_with_observer("cancel", &mut |event| {
+                    if let Notification::Committed(record) = &event {
+                        match &record.event {
+                            Event::Assistant { invocations, .. } => {
+                                if let Some(root) =
+                                    invocations.iter().find(|tool| tool.call.name == ID)
+                                {
+                                    root_operation = Some(root.operation_id);
+                                }
+                            }
+                            Event::ToolFinished { operation_id, .. }
+                                if Some(*operation_id) == root_operation =>
+                            {
+                                assert!(
+                                    settled,
+                                    "the settlement snapshot must precede the parent result"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(details) = codemode_update(event) {
+                        let calls = details["calls"].as_array().unwrap();
+                        if calls.len() == 2 && calls.iter().all(|call| call["status"] == "running")
+                        {
+                            running = true;
+                            if abort {
+                                control.abort();
+                            }
+                        }
+                        if calls.len() == 2
+                            && calls.iter().all(|call| call["status"] == "cancelled")
+                        {
+                            settled = true;
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(running && settled);
+            if abort {
+                assert!(
+                    matches!(result, Err(Error::Cancelled | Error::Reconciliation(_))),
+                    "{result:?}"
+                );
+                assert!(session.journal().unwrap().operations().iter().any(
+                    |(invocation, state)| {
+                        invocation.call.name == ID
+                            && matches!(
+                                state,
+                                pi_rs_core::OperationState::Finished(Outcome::Unknown(_))
+                            )
+                    }
+                ));
+            } else {
+                let operations = session.journal().unwrap().operations();
+                assert!(
+                    matches!(result, Err(Error::Reconciliation(id)) if
+                        operations.iter().any(|(call, _)| call.operation_id == id && call.call.name == "barrier")
+                    ),
+                    "{result:?}"
+                );
+                // An interrupted child can require reconciliation before the
+                // parent finishes formatting its timeout reply.
+                let parent = operations
+                    .iter()
+                    .find(|(call, _)| call.call.name == ID)
+                    .unwrap();
+                match &parent.1 {
+                    pi_rs_core::OperationState::Finished(Outcome::Failed(message)) => {
+                        assert!(
+                            message.contains("Script timed out: Execution timed out after 500 ms")
+                        );
+                    }
+                    pi_rs_core::OperationState::Finished(Outcome::Unknown(reason)) => {
+                        assert_eq!(reason, "cancelled after dispatch was committed");
+                    }
+                    state => panic!("unexpected parent state: {state:?}"),
+                }
+            }
+            session.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn codemode_abort_keeps_omissions_after_the_last_progress_snapshot() {
+        use pi_rs_core::{Error, Message, ModelEvent, ModelStream, ToolCall};
+
+        struct WaitingTool(Arc<tokio::sync::Notify>);
+        #[async_trait::async_trait]
+        impl Tool for WaitingTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "overflow_probe".into(),
+                    description: "Reports when the last call is waiting".into(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+
+            async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+                if args["wait"] == true {
+                    self.0.notify_one();
+                    std::future::pending().await
+                } else {
+                    Outcome::Succeeded("done".into())
+                }
+            }
+        }
+
+        struct Tools(Arc<tokio::sync::Notify>);
+        impl Extension for Tools {
+            fn id(&self) -> &str {
+                "progress-overflow-fixture"
+            }
+
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                vec![Arc::new(WaitingTool(self.0.clone()))]
+            }
+        }
+
+        struct OverflowModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for OverflowModel {
+            async fn stream(&self, request: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+                assert!(
+                    !request
+                        .messages
+                        .iter()
+                        .any(|message| matches!(message, Message::Tool { .. }))
+                );
+                let code = format!(
+                    "for (let i = 0; i < {}; i++) await tools.overflow_probe({{}}); await tools.overflow_probe({{wait:true}});",
+                    MAX_PROGRESS_CALLS + 3
+                );
+                Ok(Box::pin(futures_util::stream::iter([Ok(
+                    ModelEvent::Complete {
+                        calls: vec![ToolCall {
+                            id: "overflow-script".into(),
+                            name: ID.into(),
+                            arguments: json!({"code":code}).to_string(),
+                        }],
+                        usage: None,
+                    },
+                )])))
+            }
+        }
+
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(OverflowModel), "fixture")
+            .extension(Arc::new(Codemode::default()))
+            .unwrap()
+            .extension(Arc::new(Tools(waiting.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let mut updates = Vec::new();
+        let mut observe = |event: pi_rs_core::Notification<'_>| {
+            if let Some(details) = codemode_update(event) {
+                updates.push(details);
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let (result, ()) = tokio::join!(
+                session.prompt_with_observer("fixture", &mut observe),
+                async {
+                    // The fourth omitted call has entered the host and cannot
+                    // return normally, so the reporter has to settle it.
+                    waiting.notified().await;
+                    control.abort();
+                }
+            );
+            result
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(Error::Cancelled | Error::Reconciliation(_))),
+            "{result:?}"
+        );
+        assert_eq!(updates[updates.len() - 2]["omittedCalls"], 1);
+        let terminal = updates.last().unwrap();
+        assert_eq!(terminal["omittedCalls"], 4);
+        let calls = terminal["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), MAX_PROGRESS_CALLS);
+        assert!(calls.iter().all(|call| call["status"] == "ok"));
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codemode_caps_previews_and_settles_unawaited_calls_on_success() {
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<Value>>);
+        #[async_trait::async_trait]
+        impl ToolHost for Recorder {
+            fn tools(&self) -> Vec<ToolSpec> {
+                Host.tools()
+            }
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn supports_progress(&self) -> bool {
+                true
+            }
+            async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
+                assert!(value.to_string().len() <= 1024 * 1024);
+                self.0.lock().unwrap().push(value);
+                Ok(())
+            }
+            async fn call(&self, _: &str, arguments: Value) -> Outcome {
+                if arguments["hold"] == true {
+                    return std::future::pending().await;
+                }
+                if arguments["fail"] == true {
+                    return Outcome::Failed("😀".repeat(300));
+                }
+                Outcome::Succeeded("done".into())
+            }
+        }
+        let host = Arc::new(Recorder::default());
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(5)),
+        }
+        .invoke_transaction(
+            json!({"code":r#"
+                    void tools.echo({hold:true});
+                    for (let i = 0; i < 65; i++) {
+                        try { await tools.echo({fail:true, text:'😀'.repeat(110)}); } catch (_) {}
+                    }
+                    store('settled', true);
+                    text('result kept');
+                "#}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            host.clone(),
+        )
+        .await;
+        assert!(matches!(reply.outcome, Outcome::Structured { .. }));
+        assert!(reply.outcome.tool_content().contains("result kept"));
+        assert_eq!(reply.state.unwrap().data["settled"], true);
+        let updates = host.0.lock().unwrap();
+        let details = &updates.last().unwrap()["details"];
+        let calls = details["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), MAX_PROGRESS_CALLS);
+        assert_eq!(details["omittedCalls"], 2);
+        assert_eq!(calls[0]["status"], "cancelled");
+        assert!(calls[0].get("durationMs").is_none());
+        assert_eq!(calls[1]["status"], "error");
+        for (field, limit) in [("args", ARGS_PREVIEW_UNITS), ("error", ERROR_PREVIEW_UNITS)] {
+            let text = calls[1][field].as_str().unwrap();
+            assert!(text.ends_with("..."));
+            assert!(text.encode_utf16().count() <= limit);
+        }
+    }
+
     #[tokio::test]
     async fn output_breach_skips_queued_write_and_returns_tool_failure_to_model() {
         use std::sync::atomic::{AtomicUsize, Ordering};

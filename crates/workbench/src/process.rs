@@ -7,6 +7,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 pub(super) const REFRESH_BARRIER_ENV: &str = "PI_RS_WORKER_REFRESH_BARRIER";
 pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
@@ -172,6 +173,7 @@ pub(super) struct Worker {
     refresh_barrier: tempfile::NamedTempFile,
     events: Receiver<Value>,
     pending_events: Vec<Value>,
+    pub(super) pending_theme_requests: std::collections::BTreeSet<Uuid>,
     extension_sources: std::collections::BTreeMap<String, Value>,
     pub(super) message_renderer_types: std::collections::BTreeSet<String>,
     pub(super) entry_renderer_types: std::collections::BTreeSet<String>,
@@ -354,6 +356,9 @@ impl Worker {
                 command.arg(flag);
             }
         }
+        for path in &args.themes {
+            command.arg("--theme").arg(path);
+        }
         for path in &args.prompt_template {
             command.arg("--prompt-template").arg(path);
         }
@@ -461,6 +466,7 @@ impl Worker {
             refresh_barrier,
             events,
             pending_events: startup_warnings,
+            pending_theme_requests: Default::default(),
             extension_sources: Default::default(),
             message_renderer_types: Default::default(),
             markdown_transformers: false,
@@ -751,36 +757,54 @@ impl Worker {
         }
         Ok(())
     }
-    pub(super) fn notify_selection(
-        slot: &mut Option<Self>,
-        args: &Cli,
-        event: &pi_rs::LifecycleEvent,
-    ) -> Result<()> {
-        Self::notify_selection_cancellable(None, slot, args, event)
-    }
-
     pub(super) fn notify_selection_cancellable(
         cancelled: Option<&std::sync::atomic::AtomicBool>,
         slot: &mut Option<Self>,
         args: &Cli,
         event: &pi_rs::LifecycleEvent,
     ) -> Result<()> {
+        if let Some((active, id)) = Self::begin_selection(slot, args, event)? {
+            active.wait_selection(id, cancelled, |_, _| Ok(false))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn begin_selection<'a>(
+        slot: &'a mut Option<Self>,
+        args: &Cli,
+        event: &pi_rs::LifecycleEvent,
+    ) -> Result<Option<(&'a mut Self, Uuid)>> {
         let Some(active) = Self::extension_worker(slot, args)? else {
-            return Ok(());
+            return Ok(None);
         };
         if active.session != args.session {
-            return Ok(());
+            return Ok(None);
         }
-        let id = json!(uuid::Uuid::new_v4());
+        let id = Uuid::new_v4();
         active.send(
             json!({"type":"selection_changed", "id":id, "session":args.session, "event":event}),
         )?;
+        Ok(Some((active, id)))
+    }
+
+    pub(super) fn wait_selection(
+        &mut self,
+        id: Uuid,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        mut handle: impl FnMut(&mut Self, &Value) -> Result<bool>,
+    ) -> Result<()> {
+        let id = json!(id);
         let deadline = Instant::now() + Duration::from_secs(15);
+        for event in std::mem::take(&mut self.pending_events) {
+            if !handle(self, &event)? {
+                self.pending_events.push(event);
+            }
+        }
         loop {
             if TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
                 || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
             {
-                active.interrupt_shutdown();
+                self.interrupt_shutdown();
                 return Err(Error::Cancelled);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -794,7 +818,7 @@ impl Worker {
             } else {
                 remaining
             };
-            let received = match active.events.recv_timeout(wait) {
+            let received = match self.events.recv_timeout(wait) {
                 Ok(value) => value,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(error) => {
@@ -806,7 +830,9 @@ impl Worker {
             if received["type"] == "selection_notified" && received["id"] == id {
                 return Ok(());
             }
-            active.pending_events.push(received);
+            if !handle(self, &received)? {
+                self.pending_events.push(received);
+            }
         }
     }
     pub(super) fn transition(
@@ -921,6 +947,12 @@ fn configuration(args: &Cli) -> Value {
         "values": args.extension_flags,
         "order": args.extension_flag_order,
     });
+    let theme_paths = args
+        .themes
+        .iter()
+        .map(|path| path.as_os_str().as_encoded_bytes())
+        .collect::<Vec<_>>();
+    let theme_inputs = json!({"disabled":args.no_themes,"paths":theme_paths});
     json!({
         "workspace":args.workspace,
         "provider":args.provider.id(),"endpoint":args.model_endpoint_for(&args.provider, Some(&args.model)),"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
@@ -930,7 +962,7 @@ fn configuration(args: &Cli) -> Value {
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
         "system_prompt":args.system_prompt,"append_system_prompt":args.append_system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
         "tools":args.tools,"exclude_tools":args.exclude_tools,"no_tools":args.no_tools,"no_builtin_tools":args.no_builtin_tools,
-        "no_extensions":args.no_extensions,"no_themes":args.no_themes,"no_skills":args.no_skills,"no_prompt_templates":args.no_prompt_templates,
+        "no_extensions":args.no_extensions,"theme_inputs":theme_inputs,"no_skills":args.no_skills,"no_prompt_templates":args.no_prompt_templates,
         "no_context_files":args.no_context_files,"no_mcp":args.no_mcp,"prompt_templates":args.prompt_template,
         "coding_tools":args.coding_tools,"requests":args.max_requests,"output_tokens":args.max_output_tokens,
         "output_budget":args.output_budget,"context_window":args.context_window,
@@ -996,6 +1028,25 @@ fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: I
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn worker_theme_identity_preserves_distinct_non_utf8_arguments() {
+        use clap::Parser;
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStrExt;
+
+        let args_for = |path: &[u8]| {
+            super::super::Cli::parse_from([
+                OsString::from("pi"),
+                OsString::from("--theme"),
+                OsStr::from_bytes(path).to_owned(),
+            ])
+        };
+        let first = super::configuration(&args_for(b"theme-\xff.json"));
+        let second = super::configuration(&args_for(b"theme-\xfe.json"));
+        assert_ne!(first["theme_inputs"], second["theme_inputs"]);
+    }
+
     #[test]
     fn settings_bootstrap_frame_preserves_following_input_and_rejects_invalid_lengths() {
         use std::io::Read;
@@ -1054,6 +1105,7 @@ mod tests {
             stdin,
             events,
             pending_events: Vec::new(),
+            pending_theme_requests: Default::default(),
             extension_sources: Default::default(),
             message_renderer_types: Default::default(),
             markdown_transformers: false,
