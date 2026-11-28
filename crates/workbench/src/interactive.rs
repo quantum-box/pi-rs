@@ -1229,6 +1229,7 @@ struct ExtensionChrome {
     footer: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
     working: ExtensionWorkingStatus,
     hidden_thinking_label: Option<String>,
+    editor: Option<crate::ui::editor::ExtensionEditor>,
 }
 
 #[derive(Default)]
@@ -1713,6 +1714,21 @@ impl View {
             }
             pi_rs::UiRequest::PasteToEditor { text } => self.paste_editor_text(&text),
             pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
+            pi_rs::UiRequest::SetEditorComponent { component } => {
+                self.extension_chrome.editor = component
+                    .map(crate::ui::editor::ExtensionEditor::new)
+                    .transpose()?;
+            }
+            pi_rs::UiRequest::GetEditorComponent => {
+                let response = self
+                    .extension_chrome
+                    .editor
+                    .as_ref()
+                    .map_or(pi_rs::UiResponse::Cancelled, |editor| {
+                        pi_rs::UiResponse::EditorComponent(editor.component.clone())
+                    });
+                return Ok(Some((id, response)));
+            }
             pi_rs::UiRequest::GetTheme { .. }
             | pi_rs::UiRequest::GetActiveTheme
             | pi_rs::UiRequest::SetTheme { .. } => {
@@ -1746,6 +1762,7 @@ impl View {
     fn clear_extension_chrome(&mut self) -> bool {
         let header_changed = self.extension_chrome.header.take().is_some();
         let label_changed = self.extension_chrome.hidden_thinking_label.take().is_some();
+        let editor_changed = self.extension_chrome.editor.take().is_some();
         self.regular.redraw |= header_changed || label_changed;
         if label_changed {
             self.panel_press = None;
@@ -1754,6 +1771,7 @@ impl View {
         self.extension_chrome.footer.take().is_some()
             || header_changed
             || label_changed
+            || editor_changed
             || working.message.is_some()
             || working.hidden
             || working.indicator.is_some()
@@ -4276,6 +4294,19 @@ render_call_id: None,
         let (mut rows, cursor, column) = self
             .editor
             .visible_rows(self.editor_width, self.editor_page);
+        if self.editor.text.is_empty()
+            && self.draft_images.is_empty()
+            && self.dialog().is_none()
+            && self.picker.is_none()
+            && let Some(placeholder) = self
+                .extension_chrome
+                .editor
+                .as_ref()
+                .and_then(|editor| editor.component.placeholder.as_ref())
+            && let Some(row) = rows.first_mut()
+        {
+            *row = clip(placeholder, self.editor_width);
+        }
         if padding > 0 {
             let left = " ".repeat(padding);
             for row in &mut rows {
@@ -8248,11 +8279,16 @@ pub(super) async fn run(
                 let action = if submit_completion {
                     "tui.input.submit"
                 } else {
-                    keys.action(
-                        key,
-                        view.editor.text.is_empty() && view.draft_images.is_empty(),
-                    )
-                    .unwrap_or("")
+                    let default = keys
+                        .action(
+                            key,
+                            view.editor.text.is_empty() && view.draft_images.is_empty(),
+                        )
+                        .unwrap_or("");
+                    view.extension_chrome
+                        .editor
+                        .as_ref()
+                        .map_or(default, |editor| editor.action(key, default))
                 };
                 if action != "app.interrupt" || is_busy(&worker) {
                     last_idle_interrupt = None;
@@ -11746,6 +11782,78 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editor_component_preserves_expanded_draft_and_open_dialog() {
+        use super::*;
+        use clap::Parser;
+
+        let args = Cli::parse_from(["pi"]);
+        let mut view = View::default();
+        let draft = "pasted content\n".repeat(11);
+        view.editor.paste(&draft);
+        let visible = view.prompt_rows(&args, 80, 30);
+        assert!(visible.0[0].contains("[paste #1"));
+        let dialog = uuid::Uuid::new_v4();
+        view.ui_request(&json!({"method":"input","id":dialog,"title":"Still open","initialValue":"dialog draft"}))
+            .unwrap();
+        let id = uuid::Uuid::new_v4();
+        let component = json!({
+            "placeholder":"Editor placeholder",
+            "keybindings":[{"key":"f6","action":"deleteCharBackward"},{"key":"tab","action":"undo"}]
+        });
+        view.ui_request(&json!({"method":"setEditorComponent","id":id,"component":component}))
+            .unwrap();
+        let get = json!({"method":"getEditorComponent","id":id});
+        let (_, response) = view.ui_request(&get).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), component);
+        let custom = view.extension_chrome.editor.as_ref().unwrap();
+        assert_eq!(
+            custom.action(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), ""),
+            "tui.editor.deleteCharBackward"
+        );
+        assert_eq!(
+            custom.action(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                "tui.input.tab"
+            ),
+            "tui.input.tab"
+        );
+        assert!(
+            view.ui_request(
+                &json!({"method":"setEditorComponent","id":id,"component":{"keybindings":[
+                    {"key":"f6","action":"undo"},{"key":"F6","action":"cursorLeft"}
+                ]}})
+            )
+            .is_err()
+        );
+        let (_, response) = view.ui_request(&get).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), component);
+        assert_eq!(view.dialog().unwrap().id, dialog);
+        view.dialog_mut().unwrap().paste("!");
+        view.ui_request(&json!({"method":"setEditorComponent","id":id,"component":null}))
+            .unwrap();
+        assert_eq!(
+            view.ui_request(&get).unwrap(),
+            Some((id, pi_rs::UiResponse::Cancelled))
+        );
+        assert_eq!(view.dialog().unwrap().id, dialog);
+        assert_eq!(
+            view.dialog_mut().unwrap().input(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &Keys::default(),
+            ),
+            Some(pi_rs::UiResponse::Text("dialog draft!".into())),
+        );
+        view.cancel_extension_dialog(&json!(dialog));
+        assert_eq!(view.prompt_rows(&args, 80, 30), visible);
+        let text = view
+            .ui_request(&json!({"method":"getEditorText","id":id}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, (id, pi_rs::UiResponse::Text(draft.clone())));
+        assert_eq!(view.editor.take(), draft);
+    }
+
     #[test]
     fn live_model_changes_use_the_latest_thinking_default() {
         use clap::Parser;

@@ -1808,6 +1808,116 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
 }
 
 #[test]
+fn editor_component_edits_then_restores_native_keys_in_both_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in ["regular", "fullscreen"] {
+        let directory = tempfile::tempdir().unwrap();
+        let session_path = directory.path().join("session.jsonl");
+        let extension = directory.path().join("editor-component.py");
+        std::fs::write(&extension, r#"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    descriptor = {'id':'editor-component','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True}
+    print(json.dumps({'version':1,'response':{'Ok':descriptor}}))
+else:
+    event = json.loads(sys.stdin.readline())['request']['event']
+    def ui(method, **fields):
+        print(json.dumps({'type':'ui','request':{'method':method,**fields}}), flush=True)
+        assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    if event['type'] == 'session_start':
+        ui('setEditorComponent', component={'placeholder':'Editor component ready','keybindings':[{'key':'f6','action':'deleteCharBackward'}]})
+    if event['type'] == 'session_info_changed':
+        ui('setEditorComponent', component=None)
+        ui('notify', message='Default editor restored after ' + event['name'])
+    print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
+"#).unwrap();
+        std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (mut master, mut slave) = (-1, -1);
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 110,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(size),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let mut process = Process(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(directory.path())
+                .env("PI_RS_HOME", directory.path().join("home"))
+                .env("TERM", "xterm-256color")
+                .args(["--no-trust", "--no-mcp", "--offline", "--tui-mode", mode])
+                .arg("--session")
+                .arg(&session_path)
+                .arg("--extension")
+                .arg(&extension)
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+        output_until(&mut master, |text| text.contains("component ready"));
+        master
+            .write_all(b"\x1b[?1;2c/name custom-keptX\x1b[17~\r")
+            .unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Default editor restored after custom-kept")
+        });
+        assert_eq!(
+            pi_rs::Session::snapshot(&session_path).unwrap().name(),
+            Some("custom-kept"),
+            "{mode}"
+        );
+        master.write_all(b"/name plain-keptX\x1b[17~\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Default editor restored after plain-keptX")
+        });
+        assert_eq!(
+            pi_rs::Session::snapshot(&session_path).unwrap().name(),
+            Some("plain-keptX"),
+            "{mode}"
+        );
+        master.write_all(b"/qui\t").unwrap();
+        output_until(&mut master, |text| text.contains("/quit"));
+        master.write_all(b"\r").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = process.0.try_wait().unwrap() {
+                assert!(status.success(), "{mode}: {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{mode}: completed quit command did not exit"
+            );
+            let mut output = [0; 8192];
+            let _ = master.read(&mut output);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[test]
 fn delayed_color_reply_does_not_type_tail_or_open_editor() {
     use std::os::unix::fs::PermissionsExt;
     fn wait_for(master: &mut File, expected: &str, timeout: Duration) -> String {

@@ -1009,14 +1009,14 @@ async fn run_worker(
     let (shell_completed, mut shell_results) = mpsc::channel(1);
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
+    let discover_resources = runtime.registry.has_resource_discovery_hooks();
     let snapshot = Arc::new(Mutex::new(open_initial_snapshot(
         &args.session,
         args.mode == Some(super::OutputMode::Rpc),
     )?));
     let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
-    let (resources_ready, ready_receiver) =
-        tokio::sync::watch::channel(!runtime.registry.has_resource_discovery_hooks());
+    let (resources_ready, ready_receiver) = tokio::sync::watch::channel(!discover_resources);
     let (share_ready, share_receiver) = tokio::sync::watch::channel(false);
     read_requests(
         commands,
@@ -1070,7 +1070,9 @@ async fn run_worker(
     )
     .await;
     let mut session = Session::snapshot(&args.session)?;
-    if session.host_binding().is_none() {
+    // The terminal recovers its journal before spawning this worker. Only
+    // reopen for writing when a discovery hook may save state.
+    if (!args.terminal_managed_worker || discover_resources) && session.host_binding().is_none() {
         session = Session::open(&args.session)?;
     }
     let discovered = runtime

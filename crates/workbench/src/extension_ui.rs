@@ -185,6 +185,14 @@ impl ExtensionUi for Broker {
         cancellation: CancellationToken,
     ) -> ExtensionResult<UiResponse> {
         request.validate()?;
+        if self.themes.is_none()
+            && matches!(
+                request,
+                UiRequest::SetEditorComponent { .. } | UiRequest::GetEditorComponent
+            )
+        {
+            return Ok(UiResponse::Cancelled);
+        }
         if matches!(
             request,
             UiRequest::GetAllThemes
@@ -271,6 +279,26 @@ impl ExtensionUi for Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn editor_component_requests_are_local_noops_in_headless_mode() {
+        let broker = Broker::default();
+        for request in [
+            UiRequest::SetEditorComponent {
+                component: Some(pi_rs::UiEditorComponent::default()),
+            },
+            UiRequest::GetEditorComponent,
+        ] {
+            assert_eq!(
+                broker
+                    .request(request, CancellationToken::new())
+                    .await
+                    .unwrap(),
+                UiResponse::Cancelled
+            );
+        }
+        assert!(broker.pending.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn theme_claim_checks_requester_before_waiter_is_polled() {
