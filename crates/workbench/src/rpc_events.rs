@@ -28,6 +28,7 @@ pub(super) struct Stream {
     calls: HashMap<Uuid, (Invocation, Option<String>)>,
     started_tools: HashSet<Uuid>,
     result_metadata: HashMap<Uuid, ToolResultMetadata>,
+    codemode_progress: HashMap<Uuid, Value>,
     pending_tools: HashMap<u64, PendingTool>,
     reasoning_items: HashMap<u64, (usize, bool)>,
     text_items: HashMap<u64, (usize, bool)>,
@@ -99,6 +100,7 @@ impl Stream {
                     );
                 }
             }
+            Some("tool_execution_update") => self.observe_codemode_progress(event),
             Some("internal_tool_attempt") => {
                 if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok()) {
                     events.extend(self.start_tool(id));
@@ -185,6 +187,29 @@ impl Stream {
         events
     }
 
+    fn observe_codemode_progress(&mut self, event: &Value) {
+        if event["toolName"] != "codemode" {
+            return;
+        }
+        let details = &event["partialResult"]["details"];
+        if details["calls"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty())
+        {
+            let mut matches = self.calls.iter().filter(|(id, (invocation, parent))| {
+                self.started_tools.contains(id)
+                    && invocation.call.name == "codemode"
+                    && event["toolCallId"].as_str() == Some(invocation.call.id.as_str())
+                    && event["parentToolCallId"].as_str() == parent.as_deref()
+            });
+            if let Some((id, _)) = matches.next()
+                && matches.next().is_none()
+            {
+                self.codemode_progress.insert(*id, details.clone());
+            }
+        }
+    }
+
     pub fn notify(&mut self, event: &Notification<'_>, args: &Cli) -> Vec<Value> {
         let mut events = Vec::new();
         match event {
@@ -239,7 +264,9 @@ impl Stream {
                 if let Some(id) = pi_rs::tool_attempt_operation_id() {
                     events.extend(self.start_tool(id));
                 } else {
-                    events.push(serde_json::to_value(event).expect("tool progress"));
+                    let event = serde_json::to_value(event).expect("tool progress");
+                    self.observe_codemode_progress(&event);
+                    events.push(event);
                 }
             }
             Notification::ToolCallDelta(delta) if !self.assistant.is_null() && !self.ended => {
@@ -513,6 +540,9 @@ impl Stream {
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
                     });
+                    if let Some(progress) = self.codemode_progress.remove(&operation_id) {
+                        event["codemodeProgress"] = progress;
+                    }
                     if let Some(duration_ms) = metadata.duration_ms {
                         event["durationMs"] = json!(duration_ms);
                     }
@@ -2100,6 +2130,82 @@ mod streaming_tool_tests {
             tool_result_value(text, Some(&outcome), Some(outcome.is_structured())),
             json!({"content":[{"type":"text","text":text}]})
         );
+    }
+
+    #[test]
+    fn codemode_progress_is_only_attached_to_the_lifecycle_event() {
+        let args = Cli::parse_from(["pi"]);
+        let operation_id = Uuid::new_v4();
+        for from_worker in [false, true] {
+            let mut stream = Stream::default();
+            stream.calls.insert(
+                operation_id,
+                (
+                    Invocation {
+                        operation_id,
+                        call: pi_rs::ToolCall {
+                            id: "script".into(),
+                            name: "codemode".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    None,
+                ),
+            );
+            stream.start_tool(operation_id).unwrap();
+            let mut terminal = Value::Null;
+            for status in ["running", "cancelled"] {
+                terminal = json!({"calls":[{"id":"script/1","name":"echo","args":"{}","status":status}],"omittedCalls":0});
+                let progress = pi_rs::LifecycleEvent::ToolExecutionUpdate {
+                    tool_call_id: "script".into(),
+                    tool_name: "codemode".into(),
+                    args: json!({}),
+                    partial_result: json!({"content":[],"details":terminal}),
+                    parent_tool_call_id: None,
+                };
+                if from_worker {
+                    stream.observe(&serde_json::to_value(&progress).unwrap(), &args);
+                } else {
+                    assert_eq!(
+                        stream
+                            .notify(&Notification::ToolProgress(&progress), &args)
+                            .len(),
+                        1
+                    );
+                }
+            }
+            let mut events = Vec::new();
+            let original = json!({"calls":"existing result metadata","custom":"kept"});
+            let outcome = Outcome::TextResult {
+                output: "fixture".into(),
+                details: Some(original.clone()),
+                is_error: true,
+            };
+            stream.record(
+                Event::ToolReconciled {
+                    operation_id,
+                    outcome: outcome.clone(),
+                },
+                &args,
+                &mut events,
+            );
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "tool_execution_end")
+                .unwrap();
+            assert_eq!(end["codemodeProgress"], terminal);
+            assert_eq!(end["result"]["details"], original);
+            assert_eq!(end["result"]["content"][0]["text"], outcome.tool_content());
+            assert_eq!(stream.tool_results[0]["details"], original);
+            assert!(stream.tool_results[0].get("codemodeProgress").is_none());
+            for event in events
+                .iter()
+                .filter(|event| event["type"] != "tool_execution_end")
+            {
+                assert!(!event.to_string().contains("omittedCalls"));
+            }
+            assert!(stream.codemode_progress.is_empty());
+        }
     }
 
     #[test]

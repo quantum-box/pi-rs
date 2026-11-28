@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, net::IpAddr, time::Duration};
 
 const MAX_STREAM: usize = 4 * 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const NAMESPACE: &str = "pi";
 
 /// Explicitly installed API-key Responses adapter. Credentials never enter hook payloads.
@@ -334,6 +335,14 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
     fn id(&self) -> &str {
         "openai-responses-api/v1"
     }
+    fn validate_image_admission(&self, request: &ProviderResultRequest) -> Result<()> {
+        if serde_json::to_vec(&self.result_payload(request)?)?.len() > MAX_REQUEST_BYTES {
+            return Err(Error::Config(
+                "image input would exceed the Responses request size limit with the current history and queued inputs".into(),
+            ));
+        }
+        Ok(())
+    }
     fn image_profile(&self, model: &str) -> Option<crate::images::ModelImageProfile> {
         self.model_inputs
             .profile(self.id(), self.provider_model(model).ok()?)
@@ -453,7 +462,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
             || body["max_output_tokens"]
                 .as_u64()
                 .is_none_or(|n| n == 0 || n > u64::from(request.max_output_tokens))
-            || serde_json::to_vec(body)?.len() > 4 * 1024 * 1024
+            || serde_json::to_vec(body)?.len() > MAX_REQUEST_BYTES
         {
             return Err(fail());
         }
