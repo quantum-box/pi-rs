@@ -1538,13 +1538,13 @@ impl SessionControl {
         let mut lifecycle_observer = observe;
         let mut journal_observer = observe;
         let future = IDLE_INPUT_SCOPE.scope(scope.clone(), async {
-            crate::lifecycle::notify_with_host_from(
+            crate::lifecycle::notify_with_active_host(
                 registry,
                 event,
                 &states,
                 self.tool_timeout,
                 &mut lifecycle_observer,
-                host,
+                crate::lifecycle::ActiveHost::Shared(host),
                 progress,
             )
             .await;
@@ -2601,6 +2601,14 @@ impl AgentSession {
     pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
         self.registry.registered_tool_info()
     }
+
+    /// Look up a configured tool by its exact registered name, including inactive tools.
+    /// Like the full inventory, this describes the session's configured registry,
+    /// without per-request refreshes or authorization decisions.
+    pub fn registered_tool(&self, name: &str) -> Option<crate::RegisteredToolInfo> {
+        self.registry.registered_tool(name)
+    }
+
     /// Snapshot the configured tool renderer chain for host presentation.
     pub fn tool_renderers(&self) -> crate::ToolRendererRegistry {
         self.registry.tool_renderers()
@@ -3174,8 +3182,8 @@ impl AgentSession {
     /// of its current and replacement instances. Instances that have been
     /// installed in another SDK session cannot participate in an owned reload.
     /// Preparation and permission decisions belong to the host. An absent prompt
-    /// keeps the current prompt. An absent candidate tool selection keeps the
-    /// current explicit selection for tools still registered.
+    /// keeps the current prompt and its section boundaries. An absent candidate
+    /// tool selection keeps the current explicit selection for tools still registered.
     ///
     /// Started sessions finish notifying the old registry of shutdown before
     /// starting the replacement. Once accepted, old shutdown runs to completion
@@ -3225,6 +3233,9 @@ impl AgentSession {
 
         let mut registry = update.registry.clone();
         registry.prepare_session_reload(&self.registry);
+        if update.system_prompt.is_none() {
+            registry.host_system_prompt = self.registry.host_system_prompt.clone();
+        }
         claim_exclusive_extensions(
             &self.registry.extensions,
             &registry.extensions,

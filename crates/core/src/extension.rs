@@ -1175,8 +1175,25 @@ pub enum AgentStartTrigger {
 pub struct BeforeAgentStartEvent {
     #[serde(flatten)]
     pub trigger: AgentStartTrigger,
-    /// The current prompt, including replacements from earlier extensions.
+    /// The current prompt, including edits from earlier extensions.
     pub system_prompt: String,
+}
+
+/// The editable portion of the current structured prompt.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BeforeAgentStartPromptOptions {
+    /// Ordered sections with their outer tags removed. The preamble is reserved.
+    pub sections: indexmap::IndexMap<String, String>,
+}
+
+/// Run-local changes to the structured prompt.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BeforeAgentStartPromptChanges {
+    /// A nonempty string sets the body, an empty string resets it to the base,
+    /// and `None` removes the section.
+    pub sections: indexmap::IndexMap<String, Option<String>>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -1187,6 +1204,23 @@ pub struct BeforeAgentStartResult {
     /// An exact prompt replacement for this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+}
+
+/// Result of preflight with editable prompt sections.
+#[derive(Clone, Debug, Default)]
+pub struct BeforeAgentStartPromptResult {
+    pub result: BeforeAgentStartResult,
+    /// Run-local section edits. An exact replacement takes precedence.
+    pub system_prompt_options: BeforeAgentStartPromptChanges,
+}
+
+impl From<BeforeAgentStartResult> for BeforeAgentStartPromptResult {
+    fn from(result: BeforeAgentStartResult) -> Self {
+        Self {
+            result,
+            system_prompt_options: BeforeAgentStartPromptChanges::default(),
+        }
+    }
 }
 
 /// A shell command entered by the user, before the host executes it.
@@ -1312,6 +1346,11 @@ pub async fn track_tool_result_presence(
 /// Post-hooks prepare state updates and must not perform external operations.
 #[async_trait::async_trait]
 pub trait Extension: Send + Sync {
+    /// Create the instance mounted by this extension's `SetHeaderRenderer` request.
+    fn header_renderer(&self) -> Option<Arc<dyn crate::HeaderRenderer>> {
+        None
+    }
+
     fn id(&self) -> &str;
 
     fn dependencies(&self) -> &[&str] {
@@ -1451,6 +1490,24 @@ pub trait Extension: Send + Sync {
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<BeforeAgentStartResult> {
         Ok(BeforeAgentStartResult::default())
+    }
+
+    /// Advertise prompt section support when served as an executable extension.
+    /// Enable this alongside `handles_before_agent_start` for the richer callback.
+    /// In-process registration only needs `handles_before_agent_start`.
+    fn supports_before_agent_start_prompt_options(&self) -> bool {
+        false
+    }
+
+    /// Run preflight with ordered prompt sections using the existing handler opt-in.
+    /// By default, delegates to the original preflight callback.
+    async fn before_agent_start_with_prompt_options(
+        &self,
+        event: &BeforeAgentStartEvent,
+        _options: &BeforeAgentStartPromptOptions,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<BeforeAgentStartPromptResult> {
+        self.before_agent_start(event, state).await.map(Into::into)
     }
 
     fn handles_user_bash(&self) -> bool {
@@ -2218,6 +2275,7 @@ pub struct Registry {
     pub(crate) publish_tool_attempts: bool,
     branch_models: Arc<RwLock<BranchModels>>,
     branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
+    pub(crate) host_system_prompt: Option<Arc<crate::journal::HostSystemPrompt>>,
 }
 
 impl Registry {
@@ -2242,6 +2300,19 @@ impl Registry {
                     .collect()
             });
         }
+    }
+
+    /// Render the host prompt and retain its section boundaries for preflight.
+    /// Use the returned string as this registry's agent prompt.
+    pub fn compose_system_prompt(
+        &mut self,
+        preamble: String,
+        sections: Vec<(String, String)>,
+    ) -> String {
+        let prompt = crate::journal::HostSystemPrompt::new(preamble, sections);
+        let rendered = prompt.rendered.clone();
+        self.host_system_prompt = Some(Arc::new(prompt));
+        rendered
     }
 
     /// Snapshot resolution order and registered tool ownership for presentation.
@@ -3451,24 +3522,31 @@ impl Registry {
     pub fn registered_tool_info(&self) -> Vec<RegisteredToolInfo> {
         self.tools
             .iter()
-            .map(|(name, tool)| {
-                let source = self
-                    .extensions
-                    .iter()
-                    .find(|extension| extension.id() == tool.owner)
-                    .and_then(|extension| extension.command_source())
-                    .map(std::path::Path::to_path_buf);
-                RegisteredToolInfo {
-                    spec: tool.spec.clone(),
-                    extension_id: tool.owner.clone(),
-                    extension_source_path: source,
-                    active: self
-                        .active
-                        .as_ref()
-                        .is_none_or(|active| active.contains(name)),
-                }
-            })
+            .map(|(name, tool)| self.tool_info(name, tool))
             .collect()
+    }
+
+    /// Look up a configured tool by its exact registered name, including inactive tools.
+    pub fn registered_tool(&self, name: &str) -> Option<RegisteredToolInfo> {
+        self.tools.get(name).map(|tool| self.tool_info(name, tool))
+    }
+
+    fn tool_info(&self, name: &str, tool: &RegisteredTool) -> RegisteredToolInfo {
+        let source = self
+            .extensions
+            .iter()
+            .find(|extension| extension.id() == tool.owner)
+            .and_then(|extension| extension.command_source())
+            .map(std::path::Path::to_path_buf);
+        RegisteredToolInfo {
+            spec: tool.spec.clone(),
+            extension_id: tool.owner.clone(),
+            extension_source_path: source,
+            active: self
+                .active
+                .as_ref()
+                .is_none_or(|active| active.contains(name)),
+        }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -3517,6 +3595,7 @@ impl Registry {
             publish_tool_attempts: self.publish_tool_attempts,
             branch_models: self.branch_models.clone(),
             branch_reservations: self.branch_reservations.clone(),
+            host_system_prompt: None,
         })
     }
 

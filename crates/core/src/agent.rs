@@ -1336,34 +1336,47 @@ impl Agent<'_> {
         mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<()> {
         let (sender, mut incoming) = mpsc::channel(32);
-        let host: Arc<dyn ToolHost> = match &event {
+        let mut agent_start_incoming = None;
+        let host = match &event {
             crate::LifecycleEvent::AgentStart { run_id, .. } => {
                 let phase = crate::extension_boundary::activity_marker_id(session, *run_id)
                     .map_or_else(
                         || "agent_start".to_owned(),
                         |activity| format!("agent_start:{activity}"),
                     );
-                callback_root_host(session, sender, *run_id, phase)
+                let (scoped_sender, receiver) = mpsc::channel(32);
+                agent_start_incoming = Some(receiver);
+                crate::lifecycle::ActiveHost::AgentStart {
+                    scoped: AgentStartHost {
+                        sender: scoped_sender,
+                        run_id: *run_id,
+                        phase: phase.clone(),
+                        cancellation: cancel.clone(),
+                    },
+                    mcp: callback_root_host(session, sender, *run_id, phase),
+                }
             }
-            crate::LifecycleEvent::TurnStart {
-                run_id, turn_index, ..
-            } => callback_root_host(
-                session,
-                sender,
-                *run_id,
-                callback_turn_phase("turn_start", *turn_index),
-            ),
-            crate::LifecycleEvent::TurnEnd {
-                run_id, turn_index, ..
-            } => callback_root_host(
-                session,
-                sender,
-                *run_id,
-                callback_turn_phase("turn_end", *turn_index),
-            ),
-            _ => Arc::new(LifecycleMessageHost {
-                sender,
-                idle: false,
+            _ => crate::lifecycle::ActiveHost::Shared(match &event {
+                crate::LifecycleEvent::TurnStart {
+                    run_id, turn_index, ..
+                } => callback_root_host(
+                    session,
+                    sender,
+                    *run_id,
+                    callback_turn_phase("turn_start", *turn_index),
+                ),
+                crate::LifecycleEvent::TurnEnd {
+                    run_id, turn_index, ..
+                } => callback_root_host(
+                    session,
+                    sender,
+                    *run_id,
+                    callback_turn_phase("turn_end", *turn_index),
+                ),
+                _ => Arc::new(LifecycleMessageHost {
+                    sender,
+                    idle: false,
+                }),
             }),
         };
         let mut errors = Vec::new();
@@ -1378,32 +1391,62 @@ impl Agent<'_> {
             }
         };
         {
-            let notify = crate::lifecycle::notify_with_host(
+            let notify = crate::lifecycle::notify_with_active_host(
                 self.registry,
                 event,
                 states,
                 self.limits.model_timeout,
                 &mut collect,
                 host,
+                None,
             );
             tokio::pin!(notify);
             loop {
-                tokio::select! {
-                    biased;
-                    Some((message, reply)) = incoming.recv() => {
-                        match queue_custom_message(session, message, observer) {
-                            Ok(()) => { let _ = reply.send(Ok(())); }
-                            Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                let (message, reply) = if let Some(scoped) = &mut agent_start_incoming {
+                    tokio::select! {
+                        biased;
+                        // Keep the existing shared lane for MCP change delivery.
+                        Some(request) = incoming.recv() => request,
+                        _ = cancel.cancelled() => break,
+                        _ = &mut notify => break,
+                        // Poll the callback before admitting writes so its return
+                        // or timeout can revoke requests still in the lane.
+                        Some(AgentStartMessage { message, reply, scope }) = scoped.recv() => {
+                            if !scope.is_active() || reply.is_closed() {
+                                let _ = reply.send(Err("callback has finished".into()));
+                                continue;
+                            }
+                            (message, reply)
+                        }
+                        Some(input) = receive_input(&mut inputs) => {
+                            queue_input(session, input.into(), observer)?;
+                            continue;
                         }
                     }
-                    Some(input) = receive_input(&mut inputs) => {
-                        queue_input(session, input.into(), observer)?;
+                } else {
+                    tokio::select! {
+                        biased;
+                        Some(request) = incoming.recv() => request,
+                        Some(input) = receive_input(&mut inputs) => {
+                            queue_input(session, input.into(), observer)?;
+                            continue;
+                        }
+                        _ = cancel.cancelled() => break,
+                        _ = &mut notify => break,
                     }
-                    _ = cancel.cancelled() => break,
-                    _ = &mut notify => break,
+                };
+                match queue_custom_message(session, message, observer) {
+                    Ok(()) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error.to_string()));
+                        return Err(error);
+                    }
                 }
             }
         }
+        drop(agent_start_incoming);
         for (extension, event, message) in &errors {
             observer(Notification::ExtensionLifecycleError {
                 extension,
@@ -3155,17 +3198,32 @@ impl Agent<'_> {
             Some(before) => &branch[..branch.partition_point(|record| record.id < before)],
             None => &branch,
         };
-        let (system_prompt, tools) = crate::journal::system_context(
+        let run_id = session.current_run_id();
+        let run_override =
+            run_id.and_then(|id| crate::before_agent_start::prompt_override(history, id));
+        let section_edits = if run_override.is_none()
+            && let Some(id) = run_id
+        {
+            crate::before_agent_start::prompt_section_edits(history, id)?
+        } else {
+            None
+        };
+        let (mut system_prompt, tools) = crate::journal::resolve_system_context(
             history,
             self.system_prompt,
             self.registry.active_tool_specs(),
+            section_edits
+                .as_ref()
+                .and(self.registry.host_system_prompt.as_deref()),
         );
-        let run_override = session
-            .current_run_id()
-            .and_then(|id| crate::before_agent_start::prompt_override(history, id));
+        if let Some((_, sections)) = &section_edits {
+            system_prompt.apply_sections(sections);
+        }
         let preserve_system_transcript = run_override.is_none();
         let mut messages = vec![Message::System {
-            content: run_override.clone().unwrap_or(system_prompt),
+            content: run_override
+                .clone()
+                .unwrap_or_else(|| system_prompt.render()),
         }];
         if let Some(summary) = summary {
             // Compaction content has the authority of conversation history.
@@ -3183,7 +3241,7 @@ impl Agent<'_> {
                 keep_group
             });
         }
-        let transcript = if purpose == RequestPurpose::Turn && preserve_system_transcript {
+        let mut transcript = if purpose == RequestPurpose::Turn && preserve_system_transcript {
             crate::journal::system_transcript(
                 history,
                 &conversation,
@@ -3193,6 +3251,9 @@ impl Agent<'_> {
         } else {
             None
         };
+        if let (Some(transcript), Some((source, sections))) = (&mut transcript, &section_edits) {
+            transcript.append_section_update(*source, sections, &conversation, messages.len());
+        }
         messages.extend(conversation.into_iter().map(|(_, message)| message));
         if messages.len() == 1 {
             return Err(Error::Session("there is no conversation to resume".into()));
@@ -3362,7 +3423,8 @@ impl Agent<'_> {
         request
             .tools
             .retain(|spec| self.registry.has_tool(&spec.name));
-        let transformed = request.model != original.model
+        let transformed = section_edits.is_some()
+            || request.model != original.model
             || request.messages != original.messages
             || request.tools != original.tools;
         Ok((request, transformed, transcript))
@@ -7007,7 +7069,7 @@ impl ToolHost for CallbackRootHost {
     }
     fn for_extension(&self, extension_id: &str) -> Option<Arc<dyn ToolHost>> {
         Some(Arc::new(ScopedCallbackHost {
-            sender: self.sender.clone(),
+            lane: CallbackMessageLane::Shared(self.sender.clone()),
             run_id: self.run_id,
             phase: self.phase.clone(),
             extension_id: extension_id.to_owned(),
@@ -7018,8 +7080,67 @@ impl ToolHost for CallbackRootHost {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct AgentStartHost {
+    sender: mpsc::Sender<AgentStartMessage>,
+    run_id: Uuid,
+    phase: String,
+    pub(crate) cancellation: CancellationToken,
+}
+
+impl AgentStartHost {
+    pub(crate) fn for_extension(
+        &self,
+        extension_id: &str,
+        lifetime: CancellationToken,
+        started: platform_time::Instant,
+        budget: Duration,
+    ) -> Arc<dyn ToolHost> {
+        Arc::new(ScopedCallbackHost {
+            lane: CallbackMessageLane::AgentStart {
+                sender: self.sender.clone(),
+                scope: AgentStartScope {
+                    lifetime,
+                    started,
+                    budget,
+                },
+            },
+            run_id: self.run_id,
+            phase: self.phase.clone(),
+            extension_id: extension_id.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct AgentStartScope {
+    lifetime: CancellationToken,
+    started: platform_time::Instant,
+    budget: Duration,
+}
+
+impl AgentStartScope {
+    fn is_active(&self) -> bool {
+        !self.lifetime.is_cancelled() && self.started.elapsed() < self.budget
+    }
+}
+
+struct AgentStartMessage {
+    message: crate::QueuedCustomMessage,
+    reply: oneshot::Sender<crate::ExtensionResult<()>>,
+    scope: AgentStartScope,
+}
+
+enum CallbackMessageLane {
+    Shared(CallbackMessageSender),
+    AgentStart {
+        sender: mpsc::Sender<AgentStartMessage>,
+        scope: AgentStartScope,
+    },
+}
+
 struct ScopedCallbackHost {
-    sender: CallbackMessageSender,
+    lane: CallbackMessageLane,
     run_id: Uuid,
     phase: String,
     extension_id: String,
@@ -7037,18 +7158,35 @@ impl ScopedCallbackHost {
         } else {
             delivery
         };
+        let message = crate::QueuedCustomMessage {
+            id,
+            delivery,
+            message,
+        };
         let (reply, response) = oneshot::channel();
-        self.sender
-            .send((
-                crate::QueuedCustomMessage {
-                    id,
-                    delivery,
+        match &self.lane {
+            CallbackMessageLane::Shared(sender) => sender
+                .send((message, reply))
+                .await
+                .map_err(|_| "callback has finished".to_owned())?,
+            CallbackMessageLane::AgentStart { sender, scope } => {
+                if !scope.is_active() {
+                    return Err("callback has finished".into());
+                }
+                let request = AgentStartMessage {
                     message,
-                },
-                reply,
-            ))
-            .await
-            .map_err(|_| "callback has finished".to_owned())?;
+                    reply,
+                    scope: scope.clone(),
+                };
+                tokio::select! {
+                    biased;
+                    _ = scope.lifetime.cancelled() => return Err("callback has finished".into()),
+                    sent = sender.send(request) => sent.map_err(|_| "callback has finished".to_owned())?,
+                }
+                // The journal owner checks expiry at admission and acknowledges
+                // the actual write outcome even if cancellation then arrives.
+            }
+        }
         response
             .await
             .map_err(|_| "callback message acknowledgement was lost".to_owned())?
@@ -13657,6 +13795,401 @@ mod queue_tests {
         );
         assert_eq!(restored.queued_custom_messages().len(), 2);
         assert!(restored.pending_custom_trigger().is_some());
+    }
+
+    #[tokio::test]
+    async fn agent_start_host_expires_between_handlers() {
+        type PendingSend =
+            std::pin::Pin<Box<dyn std::future::Future<Output = crate::ExtensionResult<()>> + Send>>;
+        type Retained = Arc<std::sync::Mutex<Option<(Arc<dyn ToolHost>, PendingSend)>>>;
+
+        struct Hook {
+            id: &'static str,
+            retained: Retained,
+        }
+
+        fn message(text: &str) -> crate::CustomMessage {
+            crate::CustomMessage {
+                custom_type: "agent-start-test".into(),
+                content: crate::ContextContent::Text(text.into()),
+                display: false,
+                details: None,
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                self.id
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> crate::ExtensionResult<()> {
+                if !matches!(event, crate::LifecycleEvent::AgentStart { .. }) {
+                    return Ok(());
+                }
+                use crate::CustomMessageDelivery::NextTurn;
+                if self.id == "first" {
+                    host.send_message_with_key(message("first"), NextTurn, "fixture")
+                        .await?;
+                    let retained_host = host.clone();
+                    let mut queued = Box::pin(async move {
+                        retained_host
+                            .send_message(message("unacknowledged"), NextTurn)
+                            .await
+                    });
+                    // Put a request in the lane, keeping its reply open when the hook returns.
+                    assert!(futures_util::poll!(&mut queued).is_pending());
+                    *self.retained.lock().unwrap() = Some((host, queued));
+                } else {
+                    let (expired, queued) = self.retained.lock().unwrap().take().unwrap();
+                    host.send_message(message("second"), NextTurn).await?;
+                    // The queued request was ahead of the second hook's acknowledged send.
+                    assert!(queued.await.is_err());
+                    assert!(
+                        expired
+                            .send_message(message("late"), NextTurn)
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        expired
+                            .send_message_with_key(message("late keyed"), NextTurn, "fixture")
+                            .await
+                            .is_err()
+                    );
+                }
+                Ok(())
+            }
+        }
+
+        let mut registry = Registry::default();
+        let retained = Retained::default();
+        for id in ["first", "second"] {
+            registry
+                .register(Arc::new(Hook {
+                    id,
+                    retained: retained.clone(),
+                }))
+                .unwrap();
+        }
+        let model = WaitingModel(Arc::new(tokio::sync::Notify::new()));
+        let agent = Agent {
+            model: &model,
+            model_name: "test",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let event = crate::LifecycleEvent::AgentStart {
+            session_id: session.session_id(),
+            run_id: Uuid::new_v4(),
+            model: "test".into(),
+        };
+        let (sender, mut inputs) = mpsc::channel(1);
+        sender.try_send("ordinary input".to_owned()).unwrap();
+        platform_time::timeout(
+            Duration::from_secs(3),
+            agent.observe_active_lifecycle_with_inputs(
+                &mut session,
+                event,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let Notification::ExtensionLifecycleError { message, .. } = event {
+                        panic!("{message}");
+                    }
+                },
+                Some(&mut inputs),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(inputs.try_recv().unwrap(), "ordinary input");
+        let queued: Vec<_> = session
+            .queued_custom_messages()
+            .into_iter()
+            .map(|(_, input)| input.message.content)
+            .collect();
+        assert_eq!(
+            queued,
+            [
+                crate::ContextContent::Text("first".into()),
+                crate::ContextContent::Text("second".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_agent_start_sends_get_the_journal_outcome_after_cancellation() {
+        struct Store {
+            inner: crate::MemoryStore,
+            reject_message: bool,
+        }
+        impl crate::SessionStore for Store {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.inner.load()
+            }
+
+            fn append(&mut self, record: &Record) -> Result<()> {
+                if self.reject_message && matches!(record.event, Event::CustomMessageQueued { .. })
+                {
+                    return Err(Error::Session("fixture append failed".into()));
+                }
+                self.inner.append(record)
+            }
+        }
+
+        use crate::CustomMessageDelivery::NextTurn;
+        for reject_message in [false, true] {
+            let mut session = Session::with_store(Store {
+                inner: crate::MemoryStore::default(),
+                reject_message,
+            })
+            .unwrap();
+            let cancel = CancellationToken::new();
+            let (sender, mut incoming) = mpsc::channel(1);
+            let host = AgentStartHost {
+                sender,
+                run_id: Uuid::new_v4(),
+                phase: "agent_start".into(),
+                cancellation: cancel.clone(),
+            }
+            .for_extension(
+                "fixture",
+                cancel.child_token(),
+                platform_time::Instant::now(),
+                Duration::from_secs(1),
+            );
+            let mut send =
+                Box::pin(host.send_message(custom("admitted", NextTurn).message, NextTurn));
+            assert!(futures_util::poll!(&mut send).is_pending());
+            let request = incoming.try_recv().unwrap();
+            assert!(request.scope.is_active());
+            let result = queue_custom_message(&mut session, request.message, &mut |_| {})
+                .map_err(|error| error.to_string());
+            assert_eq!(result.is_err(), reject_message);
+
+            cancel.cancel();
+            assert!(futures_util::poll!(&mut send).is_pending());
+            request.reply.send(result.clone()).unwrap();
+            assert_eq!(send.await, result);
+            assert_eq!(
+                session.queued_custom_messages().len(),
+                usize::from(!reject_message)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_change_delivery_after_agent_start_retains_its_shared_message_host() {
+        type Retained = Arc<std::sync::Mutex<Option<Arc<dyn ToolHost>>>>;
+        struct Hook {
+            id: &'static str,
+            retained: Retained,
+        }
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                self.id
+            }
+            fn handles_lifecycle(&self) -> bool {
+                self.id == "first"
+            }
+            fn handles_mcp_servers_change(&self) -> bool {
+                true
+            }
+            fn handles_mcp_registry(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_mcp_registry(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                host: Arc<dyn ToolHost>,
+                mcp: Arc<dyn crate::McpRegistryHost>,
+            ) -> crate::ExtensionResult<()> {
+                use crate::CustomMessageDelivery::NextTurn;
+                match event {
+                    crate::LifecycleEvent::AgentStart { .. } => {
+                        *self.retained.lock().unwrap() = Some(host);
+                        mcp.register_mcp_server(crate::McpServerDeclaration {
+                            name: "fixture".into(),
+                            config: serde_json::json!({"url":"https://fixture.example/mcp"}),
+                        })
+                        .await?;
+                    }
+                    crate::LifecycleEvent::McpServersChange { .. } if self.id == "first" => {
+                        let expired = self.retained.lock().unwrap().replace(host.clone()).unwrap();
+                        assert!(
+                            expired
+                                .send_message(custom("expired", NextTurn).message, NextTurn)
+                                .await
+                                .is_err()
+                        );
+                        host.send_message(custom("first change", NextTurn).message, NextTurn)
+                            .await?;
+                    }
+                    crate::LifecycleEvent::McpServersChange { .. } => {
+                        let shared = self.retained.lock().unwrap().take().unwrap();
+                        shared
+                            .send_message_with_key(
+                                custom("second change", NextTurn).message,
+                                NextTurn,
+                                "fixture",
+                            )
+                            .await?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        }
+
+        let mut registry = Registry::default();
+        let retained = Retained::default();
+        for id in ["first", "second"] {
+            registry
+                .register(Arc::new(Hook {
+                    id,
+                    retained: retained.clone(),
+                }))
+                .unwrap();
+        }
+        let model = WaitingModel(Arc::new(tokio::sync::Notify::new()));
+        let agent = Agent {
+            model: &model,
+            model_name: "test",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let event = crate::LifecycleEvent::AgentStart {
+            session_id: session.session_id(),
+            run_id: Uuid::new_v4(),
+            model: "test".into(),
+        };
+        platform_time::timeout(
+            Duration::from_secs(3),
+            agent.observe_active_lifecycle(
+                &mut session,
+                event,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let Notification::ExtensionLifecycleError { message, .. } = event {
+                        panic!("{message}");
+                    }
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let queued: Vec<_> = session
+            .queued_custom_messages()
+            .into_iter()
+            .map(|(_, input)| input.message.content)
+            .collect();
+        assert_eq!(
+            queued,
+            [
+                crate::ContextContent::Text("first change".into()),
+                crate::ContextContent::Text("second change".into()),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn agent_start_host_expires_on_timeout_and_cancellation() {
+        struct Hook(mpsc::Sender<Arc<dyn ToolHost>>);
+
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                "agent-start-waiting"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                _: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> crate::ExtensionResult<()> {
+                self.0.send(host).await.unwrap();
+                std::future::pending().await
+            }
+        }
+
+        for timed_out in [true, false] {
+            let (sender, mut retained) = mpsc::channel(1);
+            let mut registry = Registry::default();
+            registry.register(Arc::new(Hook(sender))).unwrap();
+            let model = WaitingModel(Arc::new(tokio::sync::Notify::new()));
+            let agent = Agent {
+                model: &model,
+                model_name: "test",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            let event = crate::LifecycleEvent::AgentStart {
+                session_id: session.session_id(),
+                run_id: Uuid::new_v4(),
+                model: "test".into(),
+            };
+            let cancel = CancellationToken::new();
+            let states = ExtensionStates::new();
+            let mut errors = Vec::new();
+            let mut observe = |event: Notification<'_>| {
+                if let Notification::ExtensionLifecycleError { message, .. } = event {
+                    errors.push(message.to_owned());
+                }
+            };
+            let (dispatched, (queued_send, late_send)) = tokio::join!(
+                agent.observe_active_lifecycle(&mut session, event, &states, &cancel, &mut observe),
+                async {
+                    use crate::CustomMessageDelivery::NextTurn;
+                    let host = retained.recv().await.unwrap();
+                    let mut queued =
+                        Box::pin(host.send_message(custom("queued", NextTurn).message, NextTurn));
+                    assert!(futures_util::poll!(&mut queued).is_pending());
+                    if timed_out {
+                        tokio::time::advance(Duration::from_secs(1)).await;
+                    } else {
+                        cancel.cancel();
+                    }
+                    tokio::join!(
+                        queued,
+                        host.send_message(custom("late", NextTurn).message, NextTurn)
+                    )
+                },
+            );
+            dispatched.unwrap();
+            assert!(queued_send.is_err());
+            assert!(late_send.is_err());
+            assert!(session.queued_custom_messages().is_empty());
+            if timed_out {
+                assert_eq!(errors, ["lifecycle hook timed out"]);
+            } else {
+                assert!(errors.is_empty());
+            }
+        }
     }
 
     #[tokio::test]

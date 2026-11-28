@@ -165,6 +165,83 @@ fn registry(extensions: Vec<Arc<dyn Extension>>) -> Registry {
 }
 
 #[tokio::test]
+async fn sdk_reload_preserves_or_replaces_structured_prompt_with_its_text() {
+    struct RemoveRules(&'static str);
+
+    #[async_trait::async_trait]
+    impl Extension for RemoveRules {
+        fn id(&self) -> &str {
+            "remove-rules"
+        }
+
+        fn handles_before_agent_start(&self) -> bool {
+            true
+        }
+
+        async fn before_agent_start_with_prompt_options(
+            &self,
+            _: &crate::BeforeAgentStartEvent,
+            options: &crate::BeforeAgentStartPromptOptions,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::BeforeAgentStartPromptResult> {
+            assert_eq!(
+                options.sections.get("rules").map(String::as_str),
+                Some(self.0)
+            );
+            Ok(crate::BeforeAgentStartPromptResult {
+                system_prompt_options: crate::BeforeAgentStartPromptChanges {
+                    sections: [("rules".into(), None)].into_iter().collect(),
+                },
+                ..Default::default()
+            })
+        }
+    }
+
+    let mut original = Registry::default();
+    let original_prompt = original.compose_system_prompt(
+        "original".into(),
+        vec![("rules".into(), "original rules".into())],
+    );
+    let mut session = SessionBuilder::new(Arc::new(ReloadModel("fixture")), "fixture")
+        .registry(original)
+        .system_prompt(original_prompt.clone())
+        .in_memory()
+        .unwrap();
+    session.start().await.unwrap();
+
+    session
+        .reload(&RegistryUpdate {
+            registry: registry(vec![Arc::new(RemoveRules("original rules"))]),
+            system_prompt: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session.prompt("use retained prompt").await.unwrap(),
+        "fixture:original:no tools"
+    );
+    assert_eq!(session.configured_system_prompt(), original_prompt);
+
+    let mut replacement = registry(vec![Arc::new(RemoveRules("replacement rules"))]);
+    let replacement_prompt = replacement.compose_system_prompt(
+        "replacement".into(),
+        vec![("rules".into(), "replacement rules".into())],
+    );
+    session
+        .reload(&RegistryUpdate {
+            registry: replacement,
+            system_prompt: Some(replacement_prompt.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session.prompt("use replacement prompt").await.unwrap(),
+        "fixture:replacement:no tools"
+    );
+    assert_eq!(session.configured_system_prompt(), replacement_prompt);
+}
+
+#[tokio::test]
 async fn sdk_reload_prompts_use_new_tools_and_prompt_with_existing_bindings() {
     let log = LifecycleLog::default();
     let kept = extension(&log, "kept", "kept", None);

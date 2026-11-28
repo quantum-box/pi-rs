@@ -9,24 +9,63 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub fn read(path: &Path) -> Result<Session> {
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(128 * 1024 * 1024 + 1)
-        .read_to_string(&mut text)?;
-    if text.len() > 128 * 1024 * 1024 {
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 128 * 1024 * 1024 {
         return Err(Error::Session("import exceeds 128 MiB".into()));
     }
-    let entries = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            if line.len() > 16 * 1024 * 1024 {
-                return Err(Error::Session("imported entry exceeds 16 MiB".into()));
+    let mut entries = Vec::new();
+    let mut leading_error = None;
+    let mut recover_pi = false;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.len() > 16 * 1024 * 1024 {
+            return Err(Error::Session("imported entry exceeds 16 MiB".into()));
+        }
+        let line = String::from_utf8_lossy(line);
+        if !recover_pi && matches!(line, std::borrow::Cow::Owned(_)) {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "native session import contains invalid UTF-8",
+            );
+            if !entries.is_empty() {
+                return Err(error.into());
             }
-            Ok(serde_json::from_str::<Value>(line)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
+            leading_error.get_or_insert_with(|| error.into());
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(&line) {
+            Ok(entry) if is_pi_falsy(&entry) && (recover_pi || entries.is_empty()) => {
+                if !recover_pi {
+                    leading_error.get_or_insert_with(|| {
+                        Error::Session("native session import contains a non-record value".into())
+                    });
+                }
+            }
+            Ok(entry) => {
+                if entries.is_empty() {
+                    recover_pi = has_pi_header(&entry);
+                    if !recover_pi && let Some(error) = leading_error.take() {
+                        return Err(error);
+                    }
+                }
+                entries.push(entry);
+            }
+            Err(_) if recover_pi => {}
+            Err(error) if entries.is_empty() => {
+                leading_error.get_or_insert_with(|| error.into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     if entries.is_empty() {
+        if let Some(error) = leading_error {
+            return Err(error);
+        }
         return Err(Error::Session("imported session is empty".into()));
     }
     if entries
@@ -36,6 +75,20 @@ pub fn read(path: &Path) -> Result<Session> {
         import_pi(entries)
     } else {
         Session::from_serialized_records(entries)
+    }
+}
+
+pub(super) fn has_pi_header(entry: &Value) -> bool {
+    entry["type"] == "session" && entry["id"].is_string()
+}
+
+pub(super) fn is_pi_falsy(entry: &Value) -> bool {
+    // Pi's JSONL reader only retains truthy JSON.parse results.
+    match entry {
+        Value::Null | Value::Bool(false) => true,
+        Value::Number(number) => number.as_f64() == Some(0.0),
+        Value::String(text) => text.is_empty(),
+        _ => false,
     }
 }
 

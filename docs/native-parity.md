@@ -295,6 +295,15 @@ fail before dispatch when an affinity default is needed; explicit headers win
 without validating an unused default. An ID containing NUL is omitted from the
 child process environment. Internal UUIDs remain accepted for native session
 lookup.
+The read-only importer skips malformed JSON lines and falsy JSON values
+(`null`, `false`, zero, and the empty string) when the first truthy entry is
+a Pi session header with a string ID. Session ID lookup uses the same rule
+within its existing scan limit.
+Invalid UTF-8 in Pi sources is decoded with replacement characters before
+parsing each line. Native import requires valid UTF-8, JSON, and journal records.
+`--continue` selects an existing native journal without a host binding.
+Pi imports retain their entry-size, version, and reference validation.
+[Pinned Pi JSONL parser](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/session-manager.ts#L619-L688)
 
 Fullscreen selector lists accept mouse wheel navigation and click selection,
 including settings and scoped models. Dragging does not activate an item and
@@ -517,10 +526,31 @@ tool turns. Loopback CLI coverage does not replace live Xiaomi acceptance.
 
 ### Ant Ling API key checkpoint
 
-Ant Ling uses the pinned Pi catalog of two Ling models and the reasoning
-Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
-mapped high or xhigh effort in the provider's nested `reasoning` field.
-Live acceptance with an Ant Ling account remains open.
+The [bundled Ant Ling entries](../crates/workbench/assets/builtin-chat-models.json#L464)
+were generated from the five Ling 3.x models in the `bailing` provider snapshot
+of the [models.dev API](https://models.dev/api.json). The
+[Pi generator at `db79712854`](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/catalog/providers/ant-ling.ts)
+reads that provider and maps reasoning to a binary toggle. The
+[published catalog revision pinned by that commit](https://pi.dev/api/models/revisions/sha256-57ce6dc1e9af675259fcdf681bc08deedb0a5f8daf9b16d2eaf596849b864b65?types=chat,image,classifier)
+still contains `Ling-2.6-1T`, `Ling-2.6-flash`, and `Ring-2.6-1T` with the old
+`ant-ling` format. In that published snapshot only Ring reports reasoning,
+with `high` and `xhigh` levels.
+
+The [Pi startup resolver](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/model-resolver.ts)
+prefers `Ling-3.1-flash` for Ant Ling and falls back through authenticated
+models when a saved default is missing. pi-rs applies that fallback to those
+three former bundled IDs when absent from the effective catalog, without
+rewriting settings. Explicit model selections and custom model entries take
+precedence. The resolver also prefers `@cf/zai-org/glm-5.3` for Workers AI and
+`workers-ai/@cf/zai-org/glm-5.3` for AI Gateway.
+
+The official chat endpoint uses `ANT_LING_API_KEY` and accepts `thinking.type`
+set to `enabled` or `disabled`. Following
+[Pi's startup clamp](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/sdk.ts#L269-L277),
+an omitted thinking level starts at `medium` and clamps to `high` for the bundled
+models. The alternative level is `off`, and legacy custom
+`thinkingFormat: ant-ling` uses the same wire toggle. Live acceptance with an Ant
+Ling account remains open.
 
 ### OpenCode Zen and Go
 
@@ -956,10 +986,16 @@ In-process Rust and executable extensions can set, hide or reset the
 session header and footer using bounded styled rows. Both terminal modes
 use the active theme. Fullscreen layout and mouse offsets include the
 actual header height, and footer rows leave room for the editor. Reload
-and session transitions reset the overrides. Upstream Pi can also mount
-arbitrary live components and passes a footer data provider to its
-factory. Native extensions supply updated rows through non-blocking host UI
-requests, including in terminal session and selection callbacks.
+and session transitions reset the overrides. Native extensions can also
+mount a bounded header renderer from terminal session and selection callbacks.
+It receives the terminal's header width and effective theme palette. A change
+to either, or explicit invalidation by the owning extension, requests a new
+render. The terminal uses the normal banner fallback while a render for the
+current mount, width and palette is pending. Each worker admits one render at a time
+and waits for executable cleanup before releasing that slot. Static and
+dynamic header setters share one slot. Pi's arbitrary live components and
+read-only footer data provider remain TypeScript features.
+The native footer still accepts static styled rows.
 
 ### Native extension theme discovery
 
@@ -1245,9 +1281,13 @@ including changed sections and available, added, or removed tools. Tool
 parameters expand to show types, required flags, and descriptions.
 User shell executions appear in HTML exports even when excluded from model
 context. The first ten output lines stay visible, with the rest folded.
-Prompt-template arguments preserve literal backslashes and quoted empty
-values. Positional arguments, defaults and slices use Pi's placeholder
-syntax and expand only once.
+Prompt-template arguments open quotes only at the start of a token. Apostrophes
+inside words and unmatched opening quotes stay literal. Inside a quoted token,
+a backslash escapes its matching quote, while other backslashes stay literal.
+Quoted empty values keep their positions, and JavaScript whitespace separates
+unquoted arguments. Positional arguments, defaults and slices use Pi's
+placeholder syntax and expand only once.
+[Pi's prompt-template argument parser](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/prompt-templates.ts#L25-L76)
 Each directory contributes its first readable context file in Pi order
 (`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`).
 Context files are loaded from outer directories toward the workspace, and a
@@ -1902,8 +1942,19 @@ and shut down cleanly. Fullscreen and regular-mode PTY regression checks pass.
 git and local packages. Builds are cached, serialized per source and validated
 before settings change. User and trusted-project declarations support resource
 filters. Packaged extensions, skills, prompts and themes load through the
-normal terminal/CLI/RPC resource paths. TypeScript/npm runtime compatibility is
-outside the requested native Rust equivalence.
+normal terminal/CLI/RPC resource paths.
+
+Upstream Pi uses the `npmCommand` argv array for npm package lookup and
+installation. Native package management uses Cargo and Git for native builds
+and checks executable extensions against the native protocol. Native settings
+edits preserve `npmCommand` as an unknown key, and package operations ignore
+it in user and project settings. A configured `npm:` source in an active
+settings scope makes native `list`, `update`, and package discovery report an
+unsupported-source error. SDK resource snapshots accept grants for
+individual files and resource-specific directories. The host acquires
+packages and selects which resource paths to grant.
+[Pinned Pi settings schema](https://github.com/earendil-works/pi/blob/524f015b3c951abc4b853ffe4ebd879a9aedd43f/packages/coding-agent/src/core/settings-schema.ts#L301-L305)
+
 Local package theme manifests are read again when resources are resolved, so
 packages indexed by older versions gain their declared themes without a build.
 An explicit Pi `package.json` resource list contributes themes only and prevents
@@ -2123,9 +2174,42 @@ Codemode accepts configured `pi-classifier` models and uses Pi's
 probabilities, provider usage and the classifier retry policy. Native endpoint
 credential binding and image validation apply. Radius classifier models are
 discovered from the active account's gateway configuration during available-model
-lookups and explicit resolution. Unfiltered and offline lists use the matching
-cached catalog when the current account can be identified without running a
-credential command.
+lookups and explicit resolution. They advertise `pi-decision` and append
+`/decision` to the gateway catalog's `baseUrl`, preserving its path prefix.
+Discovery and dispatch share the active gateway credential, and the catalog
+base must match that gateway's origin. Discovery and dispatch reject redirects.
+Each discovered decision sends one POST. A failed POST returns an error without
+retrying or trying a legacy route. Unfiltered and offline lists use the
+matching cached catalog when the current account can be identified without
+running a credential command.
+
+Codemode also accepts explicitly configured `pi-decision` classifiers with a
+provider or model `baseUrl`. This API posts the model and classifier context to
+`<baseUrl>/decision` and preserves typed answers, usage, and an optional response
+ID. Terminal HTTP errors include bounded diagnostics from the decision error
+envelope with echoed request credentials redacted. With cookies, non-Bearer
+authorization, or sensitive custom headers, diagnostics retain the HTTP status
+and recognized error codes. When a server requests a retry delay above the
+60-second cap, the terminal error includes the delay rejection and the same
+sanitized HTTP diagnostic.
+Cancellation covers credential loading and the HTTP operation.
+Provider-level `api: "pi-decision"` and profiles
+that only declare operations with a model-level `pi-decision` keep their defaults
+off bundled chat and the remaining bundled operations. A mixed profile with a
+provider-level `pi-decision` requires each chat model to declare a supported chat
+API and its own `baseUrl`. Without a provider discovery endpoint, the catalog
+lists model-scoped chat routes, including Azure, and omits bundled models with
+no route.
+Azure environment defaults apply to chat. The decision profile's
+credentials and headers stay on its operation routes.
+The legacy `pi-classifier` API keeps its `/classify` route. Explicitly
+configured Pi Decision classifiers use the existing endpoint-bound credentials
+and headers, HTTP limits, and classifier retry policy. A built-in provider name
+supplies neither an implicit decision URL nor ambient credentials for it. An
+explicitly configured Radius classifier with the same ID takes precedence over
+discovery, including a legacy `pi-classifier` entry for `/classify`.
+[Pinned Radius discovery](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/src/providers/radius-config.ts#L87-L102)
+· [Pinned Pi Decision protocol](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/src/api/pi-decision.ts#L151-L178)
 
 Codemode also accepts explicitly configured `pi-decision` classifiers with a
 provider or model `baseUrl`. This API posts the model and classifier context to
@@ -3092,8 +3176,13 @@ status entries, above/below-editor widgets, window titles and editor text.
 Widgets appear in registration order within each position; replacing or moving
 a widget places it last at its destination, as in Pi.
 String-array widgets show at most ten input lines and a truncation notice, as in
-Pi. Native widgets retain the existing 64-widget and 128-line request limits;
-their text styling and fixed fullscreen placement remain to be matched.
+Pi. Native widgets retain the existing 64-widget and 128-line request limits,
+and their text styling can still differ. In fullscreen, both placements stay
+beside the editor while the transcript scrolls. Transcript search, selection,
+scrollbar geometry, and image clipping use only transcript rows. The dock clips
+widgets to make room for the editor and transcript. While search or a picker
+has focus, the layout reserves room for its controls before fitting the widgets.
+[Pinned Pi fullscreen layout](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/modes/interactive/chat-viewport.ts#L21-L44)
 `interactive_review` is a runnable Rust example.
 
 The TUI renders dialogs in fullscreen and regular modes. Escape cancels a
@@ -3101,6 +3190,24 @@ dialog, and abort or timeout removes outstanding requests. RPC forwards
 `extension_ui_request` events with Pi field names and accepts
 `extension_ui_response` with `value`, `confirmed` or `cancelled`. These transient
 interactions are independent of durable tool outcomes.
+
+The native terminal accepts a declarative `setEditorComponent` descriptor
+with an optional single-line `placeholder` and up to 32 `keybindings`.
+Bindings map a key to one of the native movement, deletion, or undo actions
+in `UiEditorAction`. They apply when the main editor owns input. Unmapped keys
+and application and completion bindings continue through the host. Reset by
+omitting `component` or sending `null`. A response-capable interactive callback
+can use `getEditorComponent` to read the descriptor or receive null for the
+default. Headless RPC treats both requests as local no-ops.
+
+Replacement and restoration use the existing draft buffer and callbacks.
+Expanded paste text, cursor, undo history, autocomplete, and open dialog
+ownership survive the change in both terminal modes. Reload and session rebind
+clear the descriptor. Pi's upstream API accepts a runnable `EditorFactory`
+with its own rendering, input handling, and host objects. The native API
+supports only the descriptor above.
+[Pinned Pi editor replacement](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L3074-L3153)
+[Pinned Pi editor factory](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/extensions/types.ts#L150)
 
 Workspace tests and real executable fixtures cover correlated responses,
 multiline editing, cancellation and request timeouts. PTY fixtures cover both
@@ -5715,6 +5822,16 @@ a model turn, except `NextTurn`, which is queued, and
 also its run ID. Reopening a session resumes an interrupted triggered run with
 that same ID and does not redeliver its message or repeat a recorded answer.
 Reentrant sends are serviced by the journal owner while the callback waits.
+
+Pi awaits each `agent_start` handler in extension order before proceeding.
+In pi-rs, each active `agent_start` handler can use its host for plain and keyed
+messages while the callback is live. Return, timeout, or cancellation expires
+that host and rejects requests the journal owner has yet to admit. Once admitted,
+a send receives the journal write's outcome. MCP change callbacks delivered
+after `agent_start` continue to use their shared message host.
+[Pi agent event dispatch](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L1371-L1376)
+[Pi extension runner](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/extensions/runner.ts#L1108-L1136)
+
 Separately built extensions negotiate the individual callback capabilities.
 Messages queued by `session_before_tree` are session-wide: they survive a
 checkout, reopening, and an exported fork, and are consumed once across branch
@@ -5838,17 +5955,23 @@ its existing inline-image display for image blocks when graphics are enabled.
 
 Native and executable `before_agent_start` handlers get the initial user
 prompt and its images or the idle custom trigger, in extension load order.
-The current system prompt reflects earlier handlers' full-prompt replacements.
+The current system prompt reflects earlier handlers' ordered section edits and
+exact full-prompt replacements. Named section edits are supported for CLI
+prompts and imported journal checkpoints. A handler can also add sections to
+an opaque SDK prompt.
 Returned custom messages enter the run after the initial message and next-turn
 messages queued by the end of preflight, including arrivals during handlers.
 The final prompt override applies after request context transforms. A recorded
-preparation plan retains the run-local prompt and deduplicates its appended
+preparation plan retains the run-local prompt edits and deduplicates its appended
 messages when the run resumes before its first model request is journaled.
 
-This API accepts a full text override. Upstream also exposes mutable prompt
-sections, including the tool loadout, and does its incoming-prompt compaction
-before invoking the hook. The native hook currently runs before the existing
-agent loop's automatic compaction checks.
+Rust extensions can opt into the additive `before_agent_start_with_prompt_options`
+callback to read section bodies and return a patch. Executable extensions
+advertise `before_agent_start_prompt_options_v1` to exchange
+`systemPromptOptions.sections` through the v1 request and response. Upstream
+exposes the full mutable prompt builder, including tool selection, and compacts
+incoming prompt context before invoking the hook. The native hook runs before the agent
+loop's automatic compaction checks.
 
 ### Rust extension lifecycle observation
 
@@ -7396,7 +7519,10 @@ provide a configured AWS SDK client through `Bedrock::new`.
 
 The external-editor command follows Pi's configured, `VISUAL`, `EDITOR`, then
 platform-default precedence, ignoring blank configured values and empty
-environment values. On successful return it decodes UTF-8 with replacement,
+environment values. The settings schema checks that `externalEditor` is a
+string. The native `/settings` editor edits the user value and identifies an
+active project override. An empty effective value uses the environment and
+platform defaults. On successful return it decodes UTF-8 with replacement,
 strips one leading BOM and removes exactly one final LF. Failed editors leave
 the draft unchanged. As in Pi, the temporary draft is closed before the editor
 launches, allowing editors that require exclusive file access. Native shell-style
