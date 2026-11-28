@@ -162,6 +162,15 @@ inherit membership and read the same current value. Changing membership or
 replacing a read document fences the transaction. Migration retains the
 incarnation, and retirement replaces the value with definition metadata.
 
+**Current-document history:** The unified conversation cursor includes
+address invalidations for latest-only conversation and shared session documents
+in store commit order. A shared address is visible during the conversation's
+current membership, including writes by peers and retirement. A consumer
+refreshes through the current-value watch or a session transaction. Earlier
+payloads are unavailable, and the current-value watch can coalesce updates.
+Upstream's current-value and retirement semantics are specified in
+[Chord's watch decisions](https://github.com/earendil-works/pi/blob/b2054ce4389ccc84f2a9071d2464b9b2c3a3eaa3/packages/chord/docs/decisions.md#review-round-2-decided-items).
+
 **Text CLI checkpoint:** The opt-in `text-cli` feature builds a dedicated `pi-rs-durable` binary for text-only OpenAI Responses conversations. It reuses the workbench native client with an explicit endpoint and binds saved conversations to the exact provider route. JSON output includes snapshots of committed progress and the settled submission. `pi-rs --durable` starts the companion binary installed beside it. The companion's opt-in `--rpc` mode implements text-only `prompt`, `abort`, `get_state`, and `get_messages`, including text-stream events. Its model projection is limited to the configured ID, provider, and API. During an active run, it supports `steer`, `follow_up` and `prompt.streamingBehavior`. Queue modes are persisted and `clear_queue` atomically withdraws pending text. Each Durable run emits its own agent events. On abort, pending messages are held until the next admission. Idle queue admission, images, and the interactive workbench frontend remain outside this mode.
 
 **Managed background anchors:** First managed send creates the named link, child, completed background anchor and ownership edge in one checked commit, fencing parent abort. Existing compatible explicit links are anchored before managed delivery, and reuse is rejected while the parent abort mark is visible. This check does not atomically fence subsequent reporter or input admission. Reopen reuses the same anchor; stop leaves the child reusable. Reporter intent and child input are still subsequent recoverable commits, unlike the upstream example’s single spawn transaction. Lower-level explicit APIs retain opt-in ownership. See [upstream background example](https://github.com/earendil-works/pi/blob/main/packages/durable/test/examples/22-subagent-background.ts).

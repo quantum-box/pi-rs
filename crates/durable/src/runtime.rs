@@ -3767,6 +3767,12 @@ pub struct UnifiedHistoryCommit {
         crate::document::Address,
         crate::document::DocumentOperationFrame,
     )>,
+    /// Invalidated addresses of latest-only conversation documents. Read their
+    /// current value separately. Old payloads and operations are not retained.
+    pub latest_document_changes: Vec<crate::document::Address>,
+    /// Invalidated addresses in the conversation's current shared session.
+    /// Only commits since the current membership began are visible.
+    pub session_document_changes: Vec<crate::document::Address>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -13645,7 +13651,8 @@ impl Harness {
 
     /// Read at most `limit` complete commits in the captured range. Observation
     /// and application records are snapshots. Document operation and progress
-    /// frames advance the same cursor, including commits without a snapshot.
+    /// frames and latest-only document invalidations advance the same cursor,
+    /// including commits without a snapshot.
     pub fn unified_history(
         &self,
         cursor: &UnifiedHistoryCursor,
@@ -13675,23 +13682,61 @@ impl Harness {
             cursor.through,
             limit.get() + 1,
         )?;
-        // Both sources read the same immutable range. If a sequence is in the
+        let latest_prefix =
+            crate::document::session_current::conversation_prefix(cursor.conversation);
+        let latest_documents = store.scoped_put_commit_positions(
+            &latest_prefix,
+            cursor.after,
+            cursor.through,
+            limit.get() + 1,
+        )?;
+        let session_documents = crate::document::session_current::SessionHistoryScope::capture(
+            store,
+            cursor.conversation,
+            cursor.after,
+            cursor.through,
+            limit.get() + 1,
+        )?;
+        // All sources read the same immutable range. If a sequence is in the
         // first N merged frames, it must be in the first N of each component
         // where it occurs, so the merged page cannot split a commit.
+        #[derive(Default)]
+        struct CommitSources {
+            records: Vec<durable_store::KeyedEntry>,
+            document_revision: Option<u64>,
+            latest_documents: bool,
+            session_documents: bool,
+        }
         let mut frames: std::collections::BTreeMap<_, _> = records
             .into_iter()
-            .map(|(sequence, records)| (sequence, (records, None)))
+            .map(|(sequence, records)| {
+                (
+                    sequence,
+                    CommitSources {
+                        records,
+                        ..CommitSources::default()
+                    },
+                )
+            })
             .collect();
         for (sequence, revision) in document_commits {
-            frames.entry(sequence).or_default().1 = Some(revision);
+            frames.entry(sequence).or_default().document_revision = Some(revision);
+        }
+        for sequence in latest_documents {
+            frames.entry(sequence).or_default().latest_documents = true;
+        }
+        if let Some((_, positions)) = &session_documents {
+            for &sequence in positions {
+                frames.entry(sequence).or_default().session_documents = true;
+            }
         }
         let has_more = frames.len() > limit.get();
         let mut commits = Vec::with_capacity(frames.len().min(limit.get()));
-        for (sequence, (records, document_commit)) in frames.into_iter().take(limit.get()) {
+        for (sequence, sources) in frames.into_iter().take(limit.get()) {
             let mut snapshots = Vec::new();
             let mut applications = None;
             let mut progress = Vec::new();
-            for (key, entry) in records {
+            for (key, entry) in sources.records {
                 if key == app_key {
                     if applications.is_some() {
                         return Err(Error::Invalid("duplicate application snapshot".into()));
@@ -13731,7 +13776,7 @@ impl Harness {
                     });
                 }
             }
-            let documents = if let Some(revision) = document_commit {
+            let documents = if let Some(revision) = sources.document_revision {
                 let changes =
                     store.scoped_document_changes_at_commit(&scope, revision, sequence)?;
                 crate::document::scoped_document_operations(
@@ -13743,13 +13788,38 @@ impl Harness {
             } else {
                 Vec::new()
             };
+            let latest_document_changes = if sources.latest_documents {
+                store
+                    .scoped_put_keys_at_commit(&latest_prefix, sequence)?
+                    .iter()
+                    .map(|key| {
+                        crate::document::session_current::conversation_address(
+                            cursor.conversation,
+                            key,
+                        )
+                    })
+                    .collect::<Result<_, _>>()?
+            } else {
+                Vec::new()
+            };
+            let session_document_changes = match &session_documents {
+                Some((scope, _)) if sources.session_documents => {
+                    scope.addresses(store, sequence)?
+                }
+                _ => Vec::new(),
+            };
             commits.push(UnifiedHistoryCommit {
                 sequence,
                 snapshots,
                 applications,
                 progress,
                 documents,
+                latest_document_changes,
+                session_document_changes,
             });
+        }
+        if let Some((scope, _)) = session_documents {
+            scope.validate(store)?;
         }
         let mut next = cursor.clone();
         if let Some(last) = commits.last() {
