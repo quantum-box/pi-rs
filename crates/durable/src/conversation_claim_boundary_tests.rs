@@ -10945,11 +10945,10 @@ async fn nested_woken_evidence_worker() {
                 name: "policy".into(),
                 ..Default::default()
             });
-            std::fs::write(
+            publish_ready_marker(
                 control.join("pending-held"),
                 format!("{identity_result:?};{selection_result:?}"),
-            )
-            .unwrap();
+            );
             while !control.join("release-pending").exists() {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -10967,7 +10966,7 @@ async fn nested_woken_evidence_worker() {
                 name: "policy".into(),
                 ..Default::default()
             });
-            std::fs::write(control.join("selection-replaced"), format!("{result:?}")).unwrap();
+            publish_ready_marker(control.join("selection-replaced"), format!("{result:?}"));
         });
     }
 
