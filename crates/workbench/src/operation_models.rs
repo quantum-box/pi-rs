@@ -391,6 +391,8 @@ struct Compat {
 pub(super) struct Cost {
     input: f64,
     output: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_output: Option<f64>,
     cache_read: f64,
     cache_write: f64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -405,6 +407,9 @@ impl Cost {
                 .all(|rate| rate.is_finite() && (0.0..=1_000_000.0).contains(rate))
         };
         valid_rates([self.input, self.output, self.cache_read, self.cache_write])
+            && self
+                .image_output
+                .is_none_or(|rate| valid_rates([rate, 0.0, 0.0, 0.0]))
             && self.tiers.iter().all(|tier| {
                 valid_rates([tier.input, tier.output, tier.cache_read, tier.cache_write])
             })
@@ -3290,7 +3295,8 @@ mod tests {
             }
             let body = json!({"id":"fixture-response", "choices":[], "usage":{
                 "prompt_tokens":100, "completion_tokens":10,
-                "prompt_tokens_details":{"cached_tokens":120,"cache_write_tokens":20}
+                "prompt_tokens_details":{"cached_tokens":120,"cache_write_tokens":20},
+                "completion_tokens_details":{"reasoning_tokens":2,"image_tokens":7}
             }})
             .to_string();
             stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -3328,6 +3334,8 @@ mod tests {
         assert_eq!(data["usage"]["output"], 10);
         assert_eq!(data["usage"]["cacheRead"], 100);
         assert_eq!(data["usage"]["cacheWrite"], 20);
+        assert_eq!(data["usage"]["reasoning"], 2);
+        assert_eq!(data["usage"]["imageOutput"], 7);
         assert_eq!(data["usage"]["totalTokens"], 130);
         assert!((data["usage"]["cost"]["total"].as_f64().unwrap() - 0.0004).abs() < 1e-12);
         let request = server.await.unwrap();
@@ -3562,6 +3570,51 @@ mod tests {
         .unwrap();
         assert_eq!(output, vec![json!({"type":"text","text":"description"})]);
     }
+    #[test]
+    fn openrouter_image_usage_exposes_output_breakdown_and_complete_billing() {
+        let config = json!({"relay":{"baseUrl":"https://relay.example/v1", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images", "cost":{"output":2,"imageOutput":8}
+        }]}});
+        let catalog = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalog
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let mut raw = json!({
+            "prompt_tokens": 5, "completion_tokens": 20,
+            "completion_tokens_details": {"reasoning_tokens": 3, "image_tokens": 0},
+            "cost": 0.25, "is_byok": false
+        });
+        let billed = usage(entry, &raw).unwrap();
+        assert_eq!(billed["imageOutput"], 0);
+        assert_eq!(billed["reasoning"], 3);
+        assert_eq!(billed["totalTokens"], 25);
+        assert_eq!(billed["cost"]["total"], 0.25);
+        assert_eq!(billed["cost"]["output"], 0.00004);
+        assert_eq!(billed["cost"]["totalFromProvider"], true);
+
+        raw["is_byok"] = json!(true);
+        raw["cost_details"] = json!({"upstream_inference_cost": 0.5});
+        raw["completion_tokens_details"]["image_tokens"] = json!(14);
+        let byok = usage(entry, &raw).unwrap();
+        assert_eq!(byok["imageOutput"], 14);
+        assert_eq!(byok["totalTokens"], 25);
+        assert_eq!(byok["cost"]["total"], 0.75);
+        assert_eq!(byok["cost"]["output"], 0.000124);
+        assert_eq!(byok["cost"]["totalFromProvider"], true);
+
+        raw.as_object_mut()
+            .unwrap()
+            .remove("completion_tokens_details");
+        raw.as_object_mut().unwrap().remove("cost_details");
+        let estimated = usage(entry, &raw).unwrap();
+        assert!(estimated.get("imageOutput").is_none());
+        assert_eq!(estimated["reasoning"], 0);
+        assert_eq!(estimated["cost"]["totalFromProvider"], false);
+        assert_eq!(estimated["cost"]["total"], 0.00016);
+    }
+
     #[test]
     fn openrouter_image_usage_keeps_reported_cache_counts() {
         let config = json!({"relay":{"baseUrl":"https://relay.example/v1", "models":[{
