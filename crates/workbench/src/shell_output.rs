@@ -1,6 +1,7 @@
 //! Bounded shell output with a recoverable full transcript.
-use std::io::Write;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use encoding_rs::{CoderResult, Decoder, UTF_8};
 use serde_json::{Value, json};
@@ -19,7 +20,8 @@ pub(super) struct Accumulator {
     raw_bytes: u64,
     preserve_bom: bool,
     display: DisplayTail,
-    file: Option<tempfile::NamedTempFile>,
+    file: Option<Spill>,
+    file_error: Option<String>,
 }
 
 pub(super) struct Output {
@@ -28,6 +30,7 @@ pub(super) struct Output {
     pub script: String,
     pub script_truncated: bool,
     pub path: Option<PathBuf>,
+    pub file_error: Option<String>,
     pub details: Option<Value>,
 }
 
@@ -40,6 +43,16 @@ impl Output {
             format!("(no output){}", self.display)
         } else {
             self.display.clone()
+        }
+    }
+    pub fn add_structured_file_details(&self, data: &mut Value) {
+        if !self.script_truncated {
+            return;
+        }
+        if let Some(path) = &self.path {
+            data["full_output_path"] = json!(path.to_string_lossy());
+        } else if let Some(error) = &self.file_error {
+            data["full_output_error"] = json!(error);
         }
     }
 }
@@ -60,15 +73,19 @@ impl Accumulator {
         self.raw_bytes = self.raw_bytes.saturating_add(count as u64);
     }
 
-    pub fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    pub fn append(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
-            return Ok(());
+            return;
         }
         self.bytes += bytes.len() as u64;
         self.display.decode(bytes, false);
-        self.spill(true)?;
-        if let Some(file) = &mut self.file {
-            file.write_all(bytes)?;
+        self.spill(true);
+        if let Some(file) = &mut self.file
+            && let Err(error) = file.file.write_all(bytes)
+        {
+            // Close the incomplete file and keep collecting bounded output.
+            self.file = None;
+            self.file_error = Some(error.to_string());
         }
         let head_remaining = SCRIPT_BYTES.saturating_sub(self.head.len());
         self.head
@@ -90,11 +107,10 @@ impl Accumulator {
             }
             self.tail.extend_from_slice(bytes);
         }
-        Ok(())
     }
 
     /// A bounded, ephemeral view for tool progress subscribers.
-    pub fn partial_result(&self) -> Value {
+    pub fn partial_result(&mut self) -> Value {
         let (display, limit, lines, partial) = self.display.snapshot();
         let mut details = json!({});
         if let Some(limit) = limit {
@@ -111,32 +127,42 @@ impl Accumulator {
                 max_lines: DISPLAY_LINES as u64,
                 max_bytes: DISPLAY_BYTES,
             });
-            if let Some(file) = &self.file {
-                details["fullOutputPath"] = json!(file.path());
+            if let Some(spill) = &self.file
+                && let Err(error) = spill.verify(self.bytes)
+            {
+                self.file = None;
+                self.file_error = Some(error.to_string());
+            }
+            if let Some(spill) = &self.file {
+                details["fullOutputPath"] = json!(spill.path.to_string_lossy());
+            } else if let Some(error) = &self.file_error {
+                details["fullOutputError"] = json!(error);
             }
         }
         json!({"content":[{"type":"text","text":display}], "details":details})
     }
 
-    fn spill(&mut self, include_raw: bool) -> std::io::Result<()> {
+    fn spill(&mut self, include_raw: bool) {
         if self.file.is_none()
+            && self.file_error.is_none()
             && (self.bytes > DISPLAY_BYTES as u64
                 || (include_raw && self.raw_bytes > DISPLAY_BYTES as u64 && self.bytes > 0)
                 || self.display.is_truncated())
         {
-            let mut file = tempfile::Builder::new()
-                .prefix("pi-bash-")
-                .suffix(".log")
-                .tempfile()?;
-            file.write_all(&self.head)?;
-            self.file = Some(file);
+            let result = Spill::create_in(&tempfile::env::temp_dir()).and_then(|mut spill| {
+                spill.file.write_all(&self.head)?;
+                Ok(spill)
+            });
+            match result {
+                Ok(file) => self.file = Some(file),
+                Err(error) => self.file_error = Some(error.to_string()),
+            }
         }
-        Ok(())
     }
 
-    pub fn finish(mut self) -> std::io::Result<Output> {
+    pub fn finish(mut self) -> Output {
         self.display.decode(&[], true);
-        self.spill(false)?;
+        self.spill(false);
         let (display, limit, lines, partial) = self.display.snapshot();
         let script_truncated = self.bytes > SCRIPT_BYTES as u64;
         let script = if script_truncated {
@@ -155,16 +181,19 @@ impl Accumulator {
                 text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()
             }
         };
-        let path = if let Some(mut file) = self.file.take() {
-            file.flush()?;
-            let (_, path) = file.keep().map_err(|error| error.error)?;
-            Some(path)
-        } else {
-            None
-        };
+        let path = self
+            .file
+            .take()
+            .and_then(|spill| match spill.finish(self.bytes) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    self.file_error = Some(error.to_string());
+                    None
+                }
+            });
         let display_without_notice = display.clone();
         let details = limit.map(|limit| {
-            json!({
+            let mut details = json!({
                 "truncation": Truncation {
                     content: &display,
                     truncated: true,
@@ -178,11 +207,23 @@ impl Accumulator {
                     max_lines: DISPLAY_LINES as u64,
                     max_bytes: DISPLAY_BYTES,
                 },
-                "fullOutputPath": path,
-            })
+            });
+            if let Some(path) = &path {
+                details["fullOutputPath"] = json!(path.to_string_lossy());
+            } else if let Some(error) = &self.file_error {
+                details["fullOutputError"] = json!(error);
+            }
+            details
         });
-        let display = match (limit, path.as_ref()) {
-            (Some(limit), Some(path)) => {
+        let file_notice = if let Some(path) = &path {
+            format!("Full output: {}", path.display())
+        } else if let Some(error) = &self.file_error {
+            format!("Could not save the full output: {error}")
+        } else {
+            "Output truncated".into()
+        };
+        let display = match limit {
+            Some(limit) => {
                 let end = self.display.lines();
                 let start = end.saturating_sub(lines as u64) + 1;
                 let notice = if partial {
@@ -199,19 +240,123 @@ impl Accumulator {
                     };
                     format!("Showing lines {start}-{end} of {end}{bytes}")
                 };
-                format!("{display}\n\n[{notice}. Full output: {}]", path.display())
+                format!("{display}\n\n[{notice}. {file_notice}]")
             }
-            _ => display,
+            None => display,
         };
-        Ok(Output {
+        Output {
             display,
             display_without_notice,
             script,
             script_truncated,
             path,
+            file_error: self.file_error,
             details,
+        }
+    }
+}
+
+struct Spill {
+    file: File,
+    path: PathBuf,
+}
+
+impl Spill {
+    fn create_in(directory: &Path) -> io::Result<Self> {
+        // Allocate an exclusive name and open an ordinary file. A later unlink
+        // or tempfile keep() by name could affect a replacement, so the name
+        // has no cleanup guard and needs no path-based change on success.
+        let spill = tempfile::Builder::new()
+            .prefix("pi-bash-")
+            .suffix(".log")
+            .disable_cleanup(true)
+            .make_in(directory, |path| {
+                let mut options = File::options();
+                options.read(true).write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                options.open(path)
+            })?;
+        let (file, path) = spill.into_parts();
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
         })
     }
+
+    fn verify(&self, expected_len: u64) -> io::Result<()> {
+        if spill_file_len(&self.file, &self.path)? != expected_len {
+            return Err(io::Error::other("full output file size changed"));
+        }
+        Ok(())
+    }
+
+    fn finish(self, expected_len: u64) -> io::Result<PathBuf> {
+        self.file.sync_all()?;
+        self.verify(expected_len)?;
+        Ok(self.path)
+    }
+}
+
+#[cfg(unix)]
+fn spill_file_len(file: &File, path: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let original = file.metadata()?;
+    let metadata = path.symlink_metadata()?;
+    checked_spill_len(
+        &metadata,
+        (original.dev(), original.ino()) == (metadata.dev(), metadata.ino()),
+    )
+}
+
+#[cfg(windows)]
+fn spill_file_len(file: &File, path: &Path) -> io::Result<u64> {
+    use crate::windows_file_identity::FileIdentity;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+    let original = FileIdentity::from_file(file)?;
+    // Obtain attributes, size and the full file ID from one open of the
+    // current entry. Opening a reparse point must not resolve its target.
+    let current = File::options()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let metadata = current.metadata()?;
+    if metadata.file_attributes() & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE) != 0 {
+        return Err(io::Error::other(
+            "full output path is no longer a regular file",
+        ));
+    }
+    checked_spill_len(&metadata, original == FileIdentity::from_file(&current)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn spill_file_len(_file: &File, _path: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cannot verify the full output file on this platform",
+    ))
+}
+
+#[cfg(any(unix, windows))]
+fn checked_spill_len(metadata: &std::fs::Metadata, same: bool) -> io::Result<u64> {
+    if !metadata.is_file() {
+        return Err(io::Error::other(
+            "full output path is no longer a regular file",
+        ));
+    }
+    if !same {
+        return Err(io::Error::other(
+            "full output path no longer refers to the spill file",
+        ));
+    }
+    Ok(metadata.len())
 }
 
 struct DisplayTail {
@@ -407,8 +552,8 @@ mod tests {
         let tail_start = bytes.len() - half;
         bytes[tail_start..tail_start + 3].copy_from_slice(&[0xef, 0xbb, 0xbf]);
         let mut accumulator = Accumulator::default();
-        accumulator.append(&bytes).unwrap();
-        let output = accumulator.finish().unwrap();
+        accumulator.append(&bytes);
+        let output = accumulator.finish();
         let (head, tail) = output
             .script
             .split_once("\n\n[... 7 bytes omitted ...]\n\n")
@@ -420,24 +565,144 @@ mod tests {
         assert_eq!(std::fs::read(output.path.as_ref().unwrap()).unwrap(), bytes);
         std::fs::remove_file(output.path.unwrap()).unwrap();
     }
+
+    #[test]
+    fn invalid_spill_at_finish_preserves_bounded_output_and_reports_save_error() {
+        enum Change {
+            Remove,
+            Replace,
+            Truncate,
+            #[cfg(unix)]
+            Symlink,
+        }
+
+        for change in [
+            Change::Remove,
+            Change::Replace,
+            Change::Truncate,
+            #[cfg(unix)]
+            Change::Symlink,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let file = Spill::create_in(directory.path()).unwrap();
+            let path = file.path.clone();
+            let original = directory.path().join("original");
+            let mut output = Accumulator {
+                file: Some(file),
+                ..Accumulator::default()
+            };
+            output.append(b"start\n");
+            output.append(&vec![b'x'; SCRIPT_BYTES + 1]);
+            output.append(b"\ntail\n");
+
+            match change {
+                Change::Remove => std::fs::remove_file(&path).unwrap(),
+                Change::Replace => {
+                    std::fs::rename(&path, &original).unwrap();
+                    // Preserve the original byte count so only identity can reject it.
+                    std::fs::write(&path, vec![b'z'; output.bytes as usize]).unwrap();
+                }
+                Change::Truncate => output.file.as_ref().unwrap().file.set_len(10).unwrap(),
+                #[cfg(unix)]
+                Change::Symlink => {
+                    let replacement = directory.path().join("replacement");
+                    std::fs::rename(&path, &original).unwrap();
+                    std::fs::write(&replacement, b"unrelated contents").unwrap();
+                    std::os::unix::fs::symlink(&replacement, &path).unwrap();
+                }
+            }
+
+            let output = output.finish();
+            assert!(output.path.is_none());
+            assert!(output.display_without_notice.ends_with("tail\n"));
+            assert!(output.display.contains("Could not save the full output:"));
+            assert!(output.script_truncated);
+            assert!(output.script.starts_with("start\n"));
+            assert!(output.script.ends_with("\ntail\n"));
+            let details = output.details.as_ref().unwrap();
+            assert!(details.get("fullOutputPath").is_none());
+            assert!(details["fullOutputError"].is_string());
+            let mut structured = json!({});
+            output.add_structured_file_details(&mut structured);
+            assert!(structured.get("full_output_path").is_none());
+            assert_eq!(structured["full_output_error"], details["fullOutputError"]);
+
+            match change {
+                Change::Remove => assert!(!path.exists()),
+                Change::Truncate => assert_eq!(path.metadata().unwrap().len(), 10),
+                Change::Replace => assert_eq!(std::fs::read(&path).unwrap()[0], b'z'),
+                #[cfg(unix)]
+                Change::Symlink => {
+                    let replacement = directory.path().join("replacement");
+                    assert_eq!(path.read_link().unwrap(), replacement);
+                    assert_eq!(std::fs::read(&replacement).unwrap(), b"unrelated contents");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_a_verified_spill_leaves_a_later_replacement_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let spill = Spill::create_in(directory.path()).unwrap();
+        spill.verify(0).unwrap();
+        let path = spill.path.clone();
+        std::fs::rename(&path, directory.path().join("original")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        drop(spill);
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn progress_rejects_a_same_length_replacement_and_withdraws_the_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = Spill::create_in(directory.path()).unwrap();
+        let path = file.path.clone();
+        let mut output = Accumulator {
+            file: Some(file),
+            ..Accumulator::default()
+        };
+        let bytes = vec![b'x'; DISPLAY_BYTES + 200];
+        output.append(&bytes);
+        assert!(output.partial_result()["details"]["fullOutputPath"].is_string());
+
+        let original = directory.path().join("original");
+        let replacement = vec![b'z'; bytes.len()];
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::write(&path, &replacement).unwrap();
+        let partial = output.partial_result();
+        assert!(partial["details"].get("fullOutputPath").is_none());
+        assert!(partial["details"]["fullOutputError"].is_string());
+        assert_eq!(
+            partial["content"][0]["text"].as_str().unwrap().len(),
+            DISPLAY_BYTES
+        );
+        output.append(b"tail");
+        let result = output.finish();
+        assert!(result.path.is_none());
+        assert!(result.display_without_notice.ends_with("tail"));
+        assert_eq!(std::fs::read(path).unwrap(), replacement);
+        assert_eq!(std::fs::read(original).unwrap(), bytes);
+    }
+
     #[test]
     fn progress_snapshot_is_bounded_and_exposes_complete_output_path() {
         let mut output = Accumulator::default();
         let bytes = vec![b'x'; DISPLAY_BYTES + 200];
-        output.append(&bytes).unwrap();
+        output.append(&bytes);
         let snapshot = output.partial_result();
         assert!(snapshot["content"][0]["text"].as_str().unwrap().len() <= DISPLAY_BYTES);
         assert_eq!(snapshot["details"]["truncation"]["truncated"], true);
         let path = snapshot["details"]["fullOutputPath"].as_str().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), bytes);
-        let finished = output.finish().unwrap();
+        let finished = output.finish();
         std::fs::remove_file(finished.path.unwrap()).unwrap();
     }
     #[test]
     fn small_output_retains_bytes_without_a_file() {
         let mut output = Accumulator::default();
-        output.append("日本語\n".as_bytes()).unwrap();
-        let output = output.finish().unwrap();
+        output.append("日本語\n".as_bytes());
+        let output = output.finish();
         assert_eq!(output.display, "日本語\n");
         assert_eq!(output.script, output.display);
         assert!(!output.script_truncated);
@@ -449,11 +714,11 @@ mod tests {
         let first = vec![b'a'; SCRIPT_BYTES / 2];
         let mut large = vec![b'b'; 8 * SCRIPT_BYTES];
         large.extend_from_slice(b"\nlast line\n");
-        accumulator.append(&first).unwrap();
-        accumulator.append(&large).unwrap();
+        accumulator.append(&first);
+        accumulator.append(&large);
         assert_eq!(accumulator.tail.len(), SCRIPT_BYTES);
         assert!(accumulator.tail.capacity() <= 2 * SCRIPT_BYTES);
-        let output = accumulator.finish().unwrap();
+        let output = accumulator.finish();
         assert!(output.script.starts_with(&"a".repeat(20)));
         assert!(output.script.ends_with("\nlast line\n"));
         assert!(output.display_without_notice.ends_with("last line\n"));
@@ -476,9 +741,9 @@ mod tests {
             .collect::<String>();
         let mut output = Accumulator::default();
         for chunk in input.as_bytes().chunks(97) {
-            output.append(chunk).unwrap();
+            output.append(chunk);
         }
-        let output = output.finish().unwrap();
+        let output = output.finish();
         assert!(output.display.starts_with("101\n102\n"));
         assert!(output.display.contains("lines 101-2100 of 2100"));
         assert_eq!(output.script, input);
@@ -491,8 +756,8 @@ mod tests {
     fn trailing_newline_at_the_byte_limit_uses_the_reference_limit_kind() {
         let input = format!("{}\n", "x".repeat(DISPLAY_BYTES));
         let mut accumulator = Accumulator::default();
-        accumulator.append(input.as_bytes()).unwrap();
-        let output = accumulator.finish().unwrap();
+        accumulator.append(input.as_bytes());
+        let output = accumulator.finish();
         let truncation = &output.details.as_ref().unwrap()["truncation"];
         assert_eq!(truncation["truncatedBy"], "lines");
         assert_eq!(truncation["outputBytes"], DISPLAY_BYTES);
@@ -510,9 +775,9 @@ mod tests {
         let input = format!("{}\nlast\n", "x".repeat(300_000));
         let mut accumulator = Accumulator::default();
         for chunk in input.as_bytes().chunks(8192) {
-            accumulator.append(chunk).unwrap();
+            accumulator.append(chunk);
         }
-        let output = accumulator.finish().unwrap();
+        let output = accumulator.finish();
         let truncation = &output.details.as_ref().unwrap()["truncation"];
         assert_eq!(truncation["truncatedBy"], "bytes");
         assert_eq!(output.display_without_notice, "last\n");
@@ -532,11 +797,11 @@ mod tests {
             let input = format!("{}\n{tail}", "x".repeat(300_000));
             let mut accumulator = Accumulator::default();
             for chunk in input.as_bytes().chunks(8192) {
-                accumulator.append(chunk).unwrap();
+                accumulator.append(chunk);
             }
             let progress = accumulator.partial_result();
             assert_eq!(progress["content"][0]["text"], tail);
-            let output = accumulator.finish().unwrap();
+            let output = accumulator.finish();
             assert_eq!(output.display_without_notice, tail);
             let truncation = &output.details.as_ref().unwrap()["truncation"];
             assert_eq!(truncation["outputBytes"], tail.len());
@@ -556,14 +821,14 @@ mod tests {
             "d".repeat(500)
         );
         let mut accumulator = Accumulator::default();
-        accumulator.append(input.as_bytes()).unwrap();
+        accumulator.append(input.as_bytes());
         assert!(accumulator.display.tail.len() <= 2 * DISPLAY_BYTES);
         assert!(accumulator.display.tail.capacity() <= 8 * DISPLAY_BYTES);
         let expected = format!("{}\n{}\n", "c".repeat(30_000), "d".repeat(500));
         let progress = accumulator.partial_result();
         assert_eq!(progress["content"][0]["text"], expected);
         assert_eq!(progress["details"]["truncation"]["outputBytes"], 30_502);
-        let output = accumulator.finish().unwrap();
+        let output = accumulator.finish();
         assert_eq!(output.display_without_notice, expected);
         let truncation = &output.details.as_ref().unwrap()["truncation"];
         assert_eq!(truncation["outputLines"], 2);
@@ -579,9 +844,9 @@ mod tests {
         let text = "界".repeat(100_000);
         let mut accumulator = Accumulator::default();
         for chunk in text.as_bytes().chunks(313) {
-            accumulator.append(chunk).unwrap();
+            accumulator.append(chunk);
         }
-        let output = accumulator.finish().unwrap();
+        let output = accumulator.finish();
         let details = output.details.unwrap();
         let truncation = &details["truncation"];
         assert_eq!(truncation["truncatedBy"], "bytes");
@@ -609,12 +874,12 @@ mod tests {
             let expected = format!("{}{displayed_suffix}", "界".repeat(retained_chars));
             let mut accumulator = Accumulator::default();
             for chunk in input.as_bytes().chunks(313) {
-                accumulator.append(chunk).unwrap();
+                accumulator.append(chunk);
             }
             let progress = accumulator.partial_result();
             assert_eq!(progress["content"][0]["text"], expected);
             assert_eq!(progress["details"]["truncation"]["outputLines"], lines);
-            let output = accumulator.finish().unwrap();
+            let output = accumulator.finish();
             let details = &output.details.as_ref().unwrap()["truncation"];
             assert_eq!(details["truncatedBy"], "bytes");
             assert_eq!(details["totalLines"], lines);
@@ -639,9 +904,9 @@ mod tests {
         let input = format!("{}\n", "x".repeat(120_000));
         let mut accumulator = Accumulator::default();
         for chunk in input.as_bytes().chunks(313) {
-            accumulator.append(chunk).unwrap();
+            accumulator.append(chunk);
         }
-        let output = accumulator.finish().unwrap();
+        let output = accumulator.finish();
         let details = &output.details.as_ref().unwrap()["truncation"];
         assert_eq!(output.display_without_notice, "x".repeat(DISPLAY_BYTES));
         assert_eq!(details["outputLines"], 1);
@@ -660,9 +925,9 @@ mod tests {
         let input = format!("head\n{}\ntail\n", "界".repeat(SCRIPT_BYTES));
         let mut output = Accumulator::default();
         for chunk in input.as_bytes().chunks(8192) {
-            output.append(chunk).unwrap();
+            output.append(chunk);
         }
-        let output = output.finish().unwrap();
+        let output = output.finish();
         assert!(output.script.starts_with("head\n"));
         assert!(output.script.ends_with("\ntail\n"));
         assert!(!output.script.contains('\u{fffd}'));
