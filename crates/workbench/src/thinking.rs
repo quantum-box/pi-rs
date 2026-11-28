@@ -163,6 +163,18 @@ pub(super) fn clamp<'a>(requested: &str, levels: &'a [String]) -> &'a str {
     levels.first().map_or("off", String::as_str)
 }
 
+pub(super) fn ant_ling_default(args: &Cli) -> Option<String> {
+    if args.provider.id() != "ant-ling" {
+        return None;
+    }
+    let model = args.model_profiles.model(&args.provider, &args.model)?;
+    let adapter = args
+        .model_profiles
+        .model_adapter(&args.provider, &args.model);
+    // Pi uses medium when the setting is omitted, then clamps to the model's levels.
+    Some(clamp("medium", &model.levels(adapter)?).into())
+}
+
 pub(super) fn adjust(args: &mut Cli) {
     if let Some(requested) = args.thinking.clone() {
         let levels = available(args);
@@ -247,6 +259,21 @@ pub(super) fn select(args: &mut Cli, level: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ant_ling_applies_the_clamped_default_before_restoring_a_session() {
+        use clap::Parser;
+
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.provider = args.model_profiles.provider("ant-ling").unwrap();
+        args.model = "Ling-3.1-flash".into();
+        args.apply_model_thinking_defaults();
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+
+        args.thinking = Some("off".into());
+        args.apply_model_thinking_defaults();
+        assert_eq!(args.thinking.as_deref(), Some("off"));
+    }
 
     #[test]
     fn capability_without_levels_preserves_fallback_and_is_not_reported_levels() {

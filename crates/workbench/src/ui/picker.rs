@@ -360,6 +360,12 @@ impl Picker {
         }
     }
 
+    pub fn limit_mouse_height(&self, height: usize) {
+        let (start, visible, rendered_height) = self.mouse_layout.get();
+        self.mouse_layout
+            .set((start, visible, rendered_height.min(height)));
+    }
+
     pub fn clear_mouse_press(&mut self) {
         self.mouse_pressed = None;
     }

@@ -9,24 +9,63 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub fn read(path: &Path) -> Result<Session> {
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(128 * 1024 * 1024 + 1)
-        .read_to_string(&mut text)?;
-    if text.len() > 128 * 1024 * 1024 {
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 128 * 1024 * 1024 {
         return Err(Error::Session("import exceeds 128 MiB".into()));
     }
-    let entries = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            if line.len() > 16 * 1024 * 1024 {
-                return Err(Error::Session("imported entry exceeds 16 MiB".into()));
+    let mut entries = Vec::new();
+    let mut leading_error = None;
+    let mut recover_pi = false;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.len() > 16 * 1024 * 1024 {
+            return Err(Error::Session("imported entry exceeds 16 MiB".into()));
+        }
+        let line = String::from_utf8_lossy(line);
+        if !recover_pi && matches!(line, std::borrow::Cow::Owned(_)) {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "native session import contains invalid UTF-8",
+            );
+            if !entries.is_empty() {
+                return Err(error.into());
             }
-            Ok(serde_json::from_str::<Value>(line)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
+            leading_error.get_or_insert_with(|| error.into());
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(&line) {
+            Ok(entry) if is_pi_falsy(&entry) && (recover_pi || entries.is_empty()) => {
+                if !recover_pi {
+                    leading_error.get_or_insert_with(|| {
+                        Error::Session("native session import contains a non-record value".into())
+                    });
+                }
+            }
+            Ok(entry) => {
+                if entries.is_empty() {
+                    recover_pi = has_pi_header(&entry);
+                    if !recover_pi && let Some(error) = leading_error.take() {
+                        return Err(error);
+                    }
+                }
+                entries.push(entry);
+            }
+            Err(_) if recover_pi => {}
+            Err(error) if entries.is_empty() => {
+                leading_error.get_or_insert_with(|| error.into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     if entries.is_empty() {
+        if let Some(error) = leading_error {
+            return Err(error);
+        }
         return Err(Error::Session("imported session is empty".into()));
     }
     if entries
@@ -36,6 +75,20 @@ pub fn read(path: &Path) -> Result<Session> {
         import_pi(entries)
     } else {
         Session::from_serialized_records(entries)
+    }
+}
+
+pub(super) fn has_pi_header(entry: &Value) -> bool {
+    entry["type"] == "session" && entry["id"].is_string()
+}
+
+pub(super) fn is_pi_falsy(entry: &Value) -> bool {
+    // Pi's JSONL reader only retains truthy JSON.parse results.
+    match entry {
+        Value::Null | Value::Bool(false) => true,
+        Value::Number(number) => number.as_f64() == Some(0.0),
+        Value::String(text) => text.is_empty(),
+        _ => false,
     }
 }
 
@@ -75,7 +128,12 @@ pub(super) fn branch_selection(
             | Event::BranchSummary {
                 fallback_model: Some(_),
                 ..
-            } => Some(None),
+            } => Some(
+                session
+                    .record_metadata(record.id)
+                    .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
+                    .map(str::to_owned),
+            ),
             Event::SourceEntry { format, entry }
                 if format == "pi" && entry["type"] == "thinking_level_change" =>
             {
@@ -1213,10 +1271,15 @@ mod tests {
         assert!(changes.iter().any(|entry| entry["type"] == "model_change"));
         let mut cursor = super::super::rpc_entries::Cursor::default();
         cursor.set_verified_counts(&session.validated_pi_conversion_counts().unwrap());
-        cursor.advance(&session.records()[..(native - 1) as usize]);
+        cursor.advance(
+            &session.records()[..(native - 1) as usize],
+            Some(super::super::rpc_messages::MetadataSource::Session(
+                &session,
+            )),
+        );
         let live = cursor.appended(
             session.records(),
-            session.records().len() - 1,
+            native as usize - 1,
             None,
             &Default::default(),
         );
@@ -1634,7 +1697,15 @@ mod tests {
                 json!({"type":"context_edit","id":"eu","parentId":"a","targetId":"u","replacement":null}),
             ];
             let session = import_pi(entries.clone()).unwrap();
-            assert!(super::super::rpc_messages::snapshot(&session).0.is_empty());
+            let (visible, native) = super::super::rpc_messages::snapshot(&session);
+            assert!(native.is_empty());
+            if reason == "stop" {
+                assert_eq!(visible.len(), 1);
+                assert_eq!(visible[0]["stopReason"], "stop");
+                assert_eq!(visible[0]["content"], json!([]));
+            } else {
+                assert!(visible.is_empty());
+            }
             assert!(
                 super::super::rpc_entries::Entries::new(&session)
                     .has_session_context()
@@ -3479,6 +3550,40 @@ mod tests {
         );
         assert_eq!(checkpoint.2[0].name, "read");
         assert_eq!(checkpoint.3, &["old"]);
+    }
+
+    #[test]
+    fn omitted_pi_session_name_clears_title_across_checkout_and_reopen() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"session_info","id":"named","parentId":null,"name":"Planning"}),
+            json!({"type":"message","id":"work","parentId":"named","message":{"role":"user","content":"work"}}),
+            json!({"type":"session_info","id":"clear","parentId":"named"}),
+        ])
+        .unwrap();
+        assert_eq!(session.name(), None);
+        let work = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::User { .. }))
+            .unwrap()
+            .id;
+        session.checkout(work).unwrap();
+        assert_eq!(session.name(), None, "title follows file order");
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.name(), None);
+        let source = reopened.records().iter().find(|record| {
+            matches!(&record.event, Event::SourceEntry { format, entry }
+                if format == "pi" && entry["id"] == "clear" && entry.get("name").is_none())
+        });
+        assert!(source.is_some(), "the original entry stays unnamed");
+        reopened.set_name("Native rename").unwrap();
+        reopened.set_working_directory(directory.path()).unwrap();
+        assert_eq!(reopened.name(), Some("Native rename"));
     }
 
     #[test]
