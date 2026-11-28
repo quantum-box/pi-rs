@@ -3658,6 +3658,13 @@ impl Agent<'_> {
             })
             .flatten();
         let collect = async {
+            macro_rules! notify_content {
+                ($event:expr) => {
+                    with_assistant_content_request(retain_reply.then_some(request_id), || {
+                        observer($event)
+                    })
+                };
+            }
             macro_rules! message_update {
                 ($update:expr) => {
                     if let Some(hooks) = &mut message_hooks {
@@ -3753,7 +3760,7 @@ impl Agent<'_> {
                             content_index: index
                         });
                         with_text_event_metadata(TextEventMetadata::Start { index }, || {
-                            observer(Notification::Text(""))
+                            notify_content!(Notification::Text(""))
                         });
                     }
                     EnrichedModelEvent::TextDelta { index, delta } => {
@@ -3784,7 +3791,7 @@ impl Agent<'_> {
                             delta: delta.clone(),
                         });
                         with_text_event_metadata(TextEventMetadata::Delta { index }, || {
-                            observer(Notification::Text(&delta))
+                            notify_content!(Notification::Text(&delta))
                         });
                     }
                     EnrichedModelEvent::TextEnd {
@@ -3826,7 +3833,7 @@ impl Agent<'_> {
                                 index,
                                 content: final_content,
                             },
-                            || observer(Notification::Text("")),
+                            || notify_content!(Notification::Text("")),
                         );
                     }
                     EnrichedModelEvent::Legacy(ModelEvent::Reasoning(delta)) => {
@@ -3856,7 +3863,7 @@ impl Agent<'_> {
                             });
                             with_reasoning_event_metadata(
                                 ReasoningEventMetadata::Delta { index },
-                                || observer(Notification::Reasoning(&delta)),
+                                || notify_content!(Notification::Reasoning(&delta)),
                             );
                         }
                     }
@@ -3872,7 +3879,7 @@ impl Agent<'_> {
                         with_redacted_reasoning_start(redacted_start, || {
                             with_reasoning_event_metadata(
                                 ReasoningEventMetadata::Start { index },
-                                || observer(Notification::Reasoning("")),
+                                || notify_content!(Notification::Reasoning("")),
                             );
                         });
                     }
@@ -3896,7 +3903,7 @@ impl Agent<'_> {
                         });
                         with_reasoning_event_metadata(
                             ReasoningEventMetadata::End { index, content },
-                            || observer(Notification::Reasoning("")),
+                            || notify_content!(Notification::Reasoning("")),
                         );
                     }
                     EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(delta)) => {
@@ -7718,6 +7725,7 @@ fn notify_auto_compaction(
 
 thread_local! {
     static TOOL_ATTEMPT_OPERATION_ID: std::cell::Cell<Option<Uuid>> = const { std::cell::Cell::new(None) };
+    static ASSISTANT_CONTENT_REQUEST_ID: std::cell::Cell<Option<Uuid>> = const { std::cell::Cell::new(None) };
     static AUTO_COMPACTION_EVENT: std::cell::RefCell<Vec<(crate::CompactionTrigger, Arc<AutoCompactionUpdate>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TOOL_EVENT_METADATA: std::cell::RefCell<Vec<(Uuid, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static RECORD_EVENT_METADATA: std::cell::RefCell<Vec<(u64, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -7740,6 +7748,22 @@ fn with_tool_attempt<T>(id: Uuid, f: impl FnOnce() -> T) -> T {
         }
     }
     let _restore = Restore(TOOL_ATTEMPT_OPERATION_ID.replace(Some(id)));
+    f()
+}
+
+/// The request producing the current synchronous assistant item notification.
+pub(crate) fn assistant_content_request_id() -> Option<Uuid> {
+    ASSISTANT_CONTENT_REQUEST_ID.get()
+}
+
+fn with_assistant_content_request<T>(id: Option<Uuid>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Uuid>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ASSISTANT_CONTENT_REQUEST_ID.set(self.0);
+        }
+    }
+    let _restore = Restore(ASSISTANT_CONTENT_REQUEST_ID.replace(id));
     f()
 }
 

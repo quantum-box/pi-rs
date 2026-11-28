@@ -393,6 +393,32 @@ The JavaScript browser SDK uses a separate `wasm-bindgen` wrapper around the cor
 session. Its prompt and resume methods return promises for completed answers,
 and its current bindings do not expose this subscription.
 
+### Live assistant content
+
+Subscribe with `AgentSession::subscribe_assistant_content()` before starting
+a prompt, an image prompt, a run, or a run triggered by a cloned control.
+The receiver yields owned `Arc<AssistantContentEvent>` values in provider
+delivery order. Each carries the model request UUID and the provider's item
+index. `AssistantContentUpdate` identifies text and reasoning starts, deltas,
+and ends. Reasoning starts preserve the provider's redaction marker. If the
+final reasoning content exceeds the response budget, the end event carries
+the reasoning already delivered as deltas for that item.
+
+Each model retry or subsequent turn has its own request UUID, even when the
+provider reuses item indices. An interrupted attempt can leave an item without
+an end event. Reconcile provisional display with the committed assistant
+record. Legacy text or reasoning deltas without item metadata continue to
+arrive through `AgentSession::subscribe()`. The item stream forwards provider
+boundaries and excludes summary requests.
+
+This subscription retains up to 64 events per session and reports
+`RecvError::Lagged` to slow consumers. Session close or drop closes the
+stream after buffered items are drained. Reopening a journal doesn't replay
+the stream. Text and reasoning can contain private data. Native hosts can
+forward the serializable events through their own IPC after applying their
+disclosure policy. The Rust API compiles for wasm32. The JavaScript browser
+wrapper continues to return completed prompt and resume results.
+
 ## Native HTML export
 
 Use `pi_rs_workbench::session_html::export_agent_session(&session, &path)`
