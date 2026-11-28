@@ -1,6 +1,8 @@
-//! Retention for the payloads of opted-in checkpointable progress frames.
+//! Retention for the payloads of opted-in progress frames.
 //! Frames are immutable; expiring a payload leaves an authenticated marker at
 //! its locator and preserves the frame's cursor and original commit sequence.
+pub(crate) mod generation;
+
 use durable_store::{Check, Entry, Expected, Mutation, Store};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,11 +30,15 @@ pub(crate) struct Reference {
 }
 
 fn invalid() -> Error {
-    Error::Invalid("invalid published checkpointable progress payload".into())
+    Error::Invalid("invalid published progress payload".into())
 }
 
 pub(crate) fn enabled(store: &Store) -> Result<bool, Error> {
-    match store.get_bounded(ENABLED, 1)? {
+    enabled_at(store, ENABLED)
+}
+
+fn enabled_at(store: &Store, key: &[u8]) -> Result<bool, Error> {
+    match store.get_bounded(key, 1)? {
         None => Ok(false),
         Some(entry) if entry.value == b"1" => Ok(true),
         Some(_) => Err(invalid()),
@@ -40,19 +46,23 @@ pub(crate) fn enabled(store: &Store) -> Result<bool, Error> {
 }
 
 pub(crate) fn enable(store: &Store) -> Result<(), Error> {
-    if !enabled(store)? {
+    enable_at(store, ENABLED)
+}
+
+fn enable_at(store: &Store, key: &[u8]) -> Result<(), Error> {
+    if !enabled_at(store, key)? {
         match store.commit(
             &[Check {
-                key: ENABLED.to_vec(),
+                key: key.to_vec(),
                 expected: Expected::Missing,
             }],
             &[Mutation::Put {
-                key: ENABLED.to_vec(),
+                key: key.to_vec(),
                 value: b"1".to_vec(),
             }],
         ) {
             Ok(()) => (),
-            Err(durable_store::Error::Conflict { .. }) if enabled(store)? => (),
+            Err(durable_store::Error::Conflict { .. }) if enabled_at(store, key)? => (),
             Err(error) => return Err(error.into()),
         }
     }
@@ -89,20 +99,31 @@ fn expired_key(payload: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) fn key(conversation: Uuid, position: u64) -> Vec<u8> {
-    let mut key = PREFIX.to_vec();
+    payload_key(PREFIX, conversation, position)
+}
+
+fn payload_key(prefix: &[u8], conversation: Uuid, position: u64) -> Vec<u8> {
+    let mut key = prefix.to_vec();
     key.extend_from_slice(format!("{conversation}/{position:020}").as_bytes());
     key
 }
 
 fn parse_key(value: &[u8]) -> Result<(Uuid, u64), Error> {
+    parse_payload_key(PREFIX, value)
+}
+
+fn parse_payload_key(prefix: &[u8], value: &[u8]) -> Result<(Uuid, u64), Error> {
     let (conversation, position) = value
-        .strip_prefix(PREFIX)
+        .strip_prefix(prefix)
         .and_then(|suffix| std::str::from_utf8(suffix).ok())
         .and_then(|suffix| suffix.split_once('/'))
         .ok_or_else(invalid)?;
     let conversation = Uuid::parse_str(conversation).map_err(|_| invalid())?;
     let position = position.parse().map_err(|_| invalid())?;
-    if conversation.is_nil() || position == 0 || key(conversation, position) != value {
+    if conversation.is_nil()
+        || position == 0
+        || payload_key(prefix, conversation, position) != value
+    {
         return Err(invalid());
     }
     Ok((conversation, position))
@@ -117,19 +138,39 @@ pub(crate) fn read(
     reference: &Reference,
 ) -> Result<Option<DurableToolProgress>, Error> {
     let key = key(conversation, position);
-    if let Some(payload) = store.get_bounded(&key, MAX_CHECKPOINTABLE_PROGRESS_BYTES)? {
-        if store.commit_for_version(&key, payload.version)? != Some(commit)
-            || !reference.matches(&payload.value)
+    let marker = expired_key(&key);
+    read_payload(
+        store,
+        &key,
+        &marker,
+        MAX_CHECKPOINTABLE_PROGRESS_BYTES,
+        commit,
+        &reference.digest,
+    )?
+    .map(|value| serde_json::from_slice(&value).map_err(Error::from))
+    .transpose()
+}
+
+fn read_payload(
+    store: &Store,
+    key: &[u8],
+    marker: &[u8],
+    limit: usize,
+    commit: u64,
+    digest: &[u8; 32],
+) -> Result<Option<Vec<u8>>, Error> {
+    if let Some(payload) = store.get_bounded(key, limit)? {
+        if store.commit_for_version(key, payload.version)? != Some(commit)
+            || *digest != <[u8; 32]>::from(Sha256::digest(&payload.value))
         {
             return Err(invalid());
         }
-        return Ok(Some(serde_json::from_slice(&payload.value)?));
+        return Ok(Some(payload.value));
     }
-    let marker = expired_key(&key);
-    let entry = store.get_bounded(&marker, 32)?.ok_or_else(invalid)?;
-    if entry.value != reference.digest
+    let entry = store.get_bounded(marker, 32)?.ok_or_else(invalid)?;
+    if entry.value != *digest
         || store
-            .commit_for_version(&marker, entry.version)?
+            .commit_for_version(marker, entry.version)?
             .is_none_or(|sequence| sequence <= commit)
     {
         return Err(invalid());

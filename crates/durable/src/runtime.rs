@@ -3251,6 +3251,8 @@ pub enum ProgressHistoryChange {
         request_id: Uuid,
         state: Box<crate::progress::State>,
     },
+    /// A previously published running partial whose retention period elapsed.
+    ExpiredGeneration { request_id: Uuid },
     Tool {
         attempt: ToolAttempt,
         state: crate::tool_progress::State,
@@ -3287,6 +3289,8 @@ pub(crate) struct ProgressHistoryRecord {
     changes: Vec<ProgressHistoryChange>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     checkpointable: Option<crate::published_progress_retention::Reference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<crate::published_progress_retention::generation::Reference>,
 }
 
 impl ProgressHistoryRecord {
@@ -3300,10 +3304,40 @@ impl ProgressHistoryRecord {
                 self.version == 2
                     && self.conversation == conversation
                     && self.changes.is_empty()
+                    && self.generation.is_none()
                     && !reference.task.is_nil()
                     && !reference.attempt.is_nil()
             })
             .ok_or_else(|| Error::Invalid("invalid checkpointable progress history record".into()))
+    }
+
+    pub(crate) fn published_generation(
+        conversation: Uuid,
+        reference: crate::published_progress_retention::generation::Reference,
+    ) -> Self {
+        Self {
+            version: 3,
+            conversation,
+            changes: Vec::new(),
+            checkpointable: None,
+            generation: Some(reference),
+        }
+    }
+
+    pub(crate) fn generation_reference(
+        &self,
+        conversation: Uuid,
+    ) -> Result<&crate::published_progress_retention::generation::Reference, Error> {
+        self.generation
+            .as_ref()
+            .filter(|reference| {
+                self.version == 3
+                    && self.conversation == conversation
+                    && self.changes.is_empty()
+                    && self.checkpointable.is_none()
+                    && !reference.request_id.is_nil()
+            })
+            .ok_or_else(|| Error::Invalid("invalid generation progress history record".into()))
     }
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -3327,6 +3361,7 @@ fn decode_progress_history_frame(
     }
     let changes = match event.version {
         1 if event.checkpointable.is_none()
+            && event.generation.is_none()
             && !event.changes.is_empty()
             && event.changes.len() <= 2 =>
         {
@@ -3351,6 +3386,24 @@ fn decode_progress_history_frame(
                     task: reference.task,
                     attempt: reference.attempt,
                 },
+            }]
+        }
+        3 => {
+            let reference = event.generation_reference(conversation)?;
+            let partial = crate::published_progress_retention::generation::read(
+                store,
+                conversation,
+                position,
+                commit_sequence,
+                reference,
+            )?;
+            let request_id = reference.request_id;
+            vec![match partial {
+                Some(partial) => ProgressHistoryChange::Generation {
+                    request_id,
+                    state: Box::new(crate::progress::State::Running(partial)),
+                },
+                None => ProgressHistoryChange::ExpiredGeneration { request_id },
             }]
         }
         _ => return Err(Error::Invalid("invalid progress history record".into())),
@@ -3763,16 +3816,27 @@ impl MergedProgressListener {
 }
 
 const MAX_PROGRESS_HISTORY_BYTES: usize = 2 * 1024 * 1024 + 8192;
-fn prepare_progress_history(
+pub(crate) fn prepare_progress_history(
     store: &durable_store::Store,
     conversation: Uuid,
     changes: Vec<ProgressHistoryChange>,
 ) -> Result<crate::observer::Append, Error> {
+    use crate::published_progress_retention::generation as retention;
+    let mut pending_enable = None;
+    if let [ProgressHistoryChange::Generation { request_id, state }] = changes.as_slice()
+        && let crate::progress::State::Running(partial) = state.as_ref()
+    {
+        if retention::enabled(store)? {
+            return retention::prepare(store, conversation, *request_id, partial);
+        }
+        pending_enable = Some(retention::unconfigured_check());
+    }
     let record = ProgressHistoryRecord {
         version: 1,
         conversation,
         changes,
         checkpointable: None,
+        generation: None,
     };
     let value = serde_json::to_value(record)?;
     if serde_json::to_vec(&value)?.len() > MAX_PROGRESS_HISTORY_BYTES {
@@ -3780,7 +3844,10 @@ fn prepare_progress_history(
             "progress history event exceeds size limit".into(),
         ));
     }
-    Ok(crate::observer::Observer::progress_history(store, conversation).prepare_append(&value)?)
+    let mut append =
+        crate::observer::Observer::progress_history(store, conversation).prepare_append(&value)?;
+    append.checks.extend(pending_enable);
+    Ok(append)
 }
 
 /// Stage a report in the same commit as its attempt-local snapshot.
@@ -3800,6 +3867,7 @@ pub(crate) fn prepare_checkpointable_progress_history(
             conversation,
             changes: Vec::new(),
             checkpointable: Some(reference),
+            generation: None,
         };
         let observer = crate::observer::Observer::progress_history(store, conversation);
         let mut append = observer.prepare_append(&serde_json::to_value(record)?)?;
@@ -23265,6 +23333,7 @@ pub struct Scheduler {
     foreground_worker: Option<tokio::task::JoinHandle<()>>,
     progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     published_progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
+    published_generation_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
     worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
     summary_tasks: HashMap<Uuid, SummaryTask>,
@@ -24091,6 +24160,7 @@ impl Scheduler {
             foreground_worker: None,
             progress_retention: None,
             published_progress_retention: None,
+            published_generation_retention: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -25777,6 +25847,42 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Opt into expiry of newly published running model partials after the
+    /// generation's completion or abort is observed. Reattach after reopening.
+    /// Terminal checkpoints and legacy inline frames keep their original data.
+    pub fn start_published_generation_retention(
+        &mut self,
+        retain_for: Duration,
+        interval: Duration,
+    ) -> Result<(), Error> {
+        use crate::published_progress_retention::generation as retention;
+
+        let retain_ms = u64::try_from(retain_for.as_millis())
+            .ok()
+            .filter(|time| *time > 0)
+            .ok_or_else(|| Error::Invalid("invalid generation progress retention".into()))?;
+        if interval.is_zero() || self.published_generation_retention.is_some() {
+            return Err(Error::Invalid(
+                "generation progress retention needs a nonzero interval and one worker".into(),
+            ));
+        }
+        let reader = self.harness.worker();
+        retention::enable(reader.owner.store())?;
+        let cancel = self.reporter_cancel.clone();
+        self.published_generation_retention = Some(tokio::spawn(async move {
+            let mut after = Vec::new();
+            while !cancel.is_cancelled() {
+                retention::sweep(reader.owner.store(), &mut after, unix_ms(), retain_ms)?;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => (),
+                }
+            }
+            Ok(())
+        }));
+        Ok(())
+    }
+
     /// Most recent background reporter failure, if any. Reopen after storage errors.
     pub fn reporter_error(&self) -> Option<String> {
         self.reporter_error
@@ -26066,6 +26172,7 @@ impl Scheduler {
         for worker in [
             self.progress_retention.take(),
             self.published_progress_retention.take(),
+            self.published_generation_retention.take(),
         ]
         .into_iter()
         .flatten()

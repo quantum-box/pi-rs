@@ -105,12 +105,6 @@ pub(crate) fn expire_report(
     now_ms: u64,
     retain_ms: u64,
 ) -> Result<(), Error> {
-    let ReportExpiry {
-        key,
-        payload: progress,
-        mut checks,
-        mut mutations,
-    } = expiry;
     let Some(task) = TaskStore::new(store)
         .load(id)
         .map_err(crate::task_scheduler::Error::from)?
@@ -118,6 +112,23 @@ pub(crate) fn expire_report(
     else {
         return Ok(());
     };
+    expire_after_terminal(store, task_key(id), task.version, expiry, now_ms, retain_ms)
+}
+
+pub(crate) fn expire_after_terminal(
+    store: &Store,
+    terminal_key: Vec<u8>,
+    terminal_version: u64,
+    expiry: ReportExpiry,
+    now_ms: u64,
+    retain_ms: u64,
+) -> Result<(), Error> {
+    let ReportExpiry {
+        key,
+        payload: progress,
+        mut checks,
+        mut mutations,
+    } = expiry;
     let marker = observation_key(&key);
     let prior = store.get_bounded(&marker, MARKER_BYTES)?;
     let observation = prior
@@ -126,8 +137,8 @@ pub(crate) fn expire_report(
         .transpose()?;
     checks.extend([
         Check {
-            key: task_key(id),
-            expected: Expected::Version(task.version),
+            key: terminal_key,
+            expected: Expected::Version(terminal_version),
         },
         Check {
             key: key.clone(),
@@ -141,7 +152,7 @@ pub(crate) fn expire_report(
         },
     ]);
     if let Some(observation) = observation.filter(|entry| {
-        entry.task_version == task.version && entry.progress_version == progress.version
+        entry.task_version == terminal_version && entry.progress_version == progress.version
     }) {
         if now_ms.saturating_sub(observation.observed_ms) >= retain_ms {
             mutations.push(Mutation::Delete { key });
@@ -150,7 +161,7 @@ pub(crate) fn expire_report(
         }
     } else {
         let value = serde_json::to_vec(&TerminalObservation {
-            task_version: task.version,
+            task_version: terminal_version,
             progress_version: progress.version,
             observed_ms: now_ms,
         })?;
