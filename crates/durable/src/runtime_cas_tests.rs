@@ -799,6 +799,100 @@ fn display_entry_fork_uses_end_of_commit_documents_for_ordered_batch() {
 }
 
 #[test]
+fn checkout_inherited_display_entry_keeps_the_archived_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let root = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    harness
+        .reset(root, Some("before the marker".into()))
+        .unwrap();
+    let (first, later) = harness
+        .session_transaction(root, |tx| {
+            Ok((
+                tx.append_entry("marker.first", None)?,
+                tx.append_entry("marker.later", None)?,
+            ))
+        })
+        .unwrap();
+    let (mut state, version) = harness.load(root).unwrap();
+    state.messages.push(Message::User {
+        content: "old branch".into(),
+    });
+    harness.save(&state, Expected::Version(version)).unwrap();
+    let original_tree = harness
+        .session_tree(&harness.session_entries_start(root).unwrap())
+        .unwrap();
+    let old_leaf = original_tree.leaf_id.unwrap();
+    let child = harness.fork_by_entry_id(root, old_leaf).unwrap();
+    let document = crate::document::Address {
+        scope: child.to_string(),
+        name: "checkout".into(),
+        key: "current".into(),
+    };
+    harness
+        .session_transaction(child, |tx| {
+            tx.put_document(
+                &document,
+                serde_json::json!({"value":"current"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+        })
+        .unwrap();
+
+    harness.checkout_session_entry(child, first).unwrap();
+    drop(harness);
+
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        harness.document(&document).unwrap().unwrap().value["value"],
+        "current"
+    );
+    assert_eq!(
+        harness.conversation(child).unwrap().messages,
+        [Message::User {
+            content: "before the marker".into()
+        }]
+    );
+    let tree = harness
+        .session_tree(&harness.session_entries_start(child).unwrap())
+        .unwrap();
+    assert_eq!(tree.leaf_id, Some(first));
+    assert!(tree.entries.iter().any(|node| node.entry.id() == later));
+    assert!(tree.entries.iter().any(|node| node.entry.id() == old_leaf));
+    assert_eq!(
+        harness
+            .session_tree(&harness.session_entries_start(root).unwrap())
+            .unwrap()
+            .leaf_id,
+        Some(old_leaf)
+    );
+
+    let (mut state, version) = harness.load(child).unwrap();
+    state.messages.push(Message::User {
+        content: "new branch".into(),
+    });
+    harness.save(&state, Expected::Version(version)).unwrap();
+    let tree = harness
+        .session_tree(&harness.session_entries_start(child).unwrap())
+        .unwrap();
+    let leaf = tree
+        .entries
+        .iter()
+        .find(|node| Some(node.entry.id()) == tree.leaf_id)
+        .unwrap();
+    assert_eq!(leaf.parent_id, Some(first));
+}
+
+#[test]
 fn custom_session_entries_survive_reopen_and_respect_display_fork_cuts() {
     use std::num::NonZeroUsize;
 
