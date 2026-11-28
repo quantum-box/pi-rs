@@ -2170,6 +2170,11 @@ checkpoints its own handle and receives its direct ended children; conversation
 abort propagates through the ownership chain. This is a separate task-backed
 scheduler path from the multi-level `KeyedHost` nested-call support above.
 
+The ordinary tool progress wrapper preserves the capabilities offered by its
+underlying `ToolHost`, including cancellation-aware nested calls, ordered
+prevalidated call accounting, and extension-scoped entries and messages.
+An extension-scoped handle shares the invocation's progress lifetime.
+
 For task-backed tools, `TaskTool::start_child` stages a keyed child and returns a
 serializable `NestedTaskCall`. The handler can checkpoint the handle and return
 `Step::Wait` with `WaitFor::TasksAny` and the handle's task ID. After a wake,
