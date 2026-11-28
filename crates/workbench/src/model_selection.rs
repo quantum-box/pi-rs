@@ -1229,6 +1229,26 @@ mod tests {
         assert!(catalog.client.is_none());
     }
 
+    #[tokio::test]
+    async fn live_azure_catalog_keeps_model_specific_routes_without_provider_endpoint() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.model_profiles = crate::model_profiles::Profiles::parse_with_azure_env(
+            &json!({"providers":{"azure":{
+                "models":[{"id":"routed","api":"azure-openai-responses","baseUrl":"http://127.0.0.1:2"}]
+            }}}),
+            |_| None,
+        ).unwrap();
+        let catalog = super::catalog(&args, super::Provider::named("azure").unwrap(), true)
+            .await
+            .unwrap();
+        assert_eq!(catalog.models, ["routed"]);
+        assert!(catalog.client.is_none());
+        assert!(catalog.advertised_models.is_none());
+    }
+
     #[test]
     fn copilot_cached_catalog_filters_new_models_by_subscription() {
         use clap::Parser;
