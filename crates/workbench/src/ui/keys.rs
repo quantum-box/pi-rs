@@ -287,6 +287,17 @@ impl Keys {
         .find(|action| self.matches(action, key))
     }
 
+    pub fn interrupt_binding(
+        &self,
+        matches_dispatch: impl Fn(KeyEvent) -> bool,
+    ) -> Option<KeyEvent> {
+        self.bindings
+            .get("app.interrupt")?
+            .iter()
+            .copied()
+            .find(|key| matches_dispatch(*key))
+    }
+
     pub fn first_binding(&self, action: &str) -> Option<KeyEvent> {
         self.bindings
             .get(action)
@@ -543,6 +554,23 @@ mod tests {
                 if windows_keys { 1 } else { 2 }
             );
         }
+    }
+
+    #[test]
+    fn interrupt_binding_skips_keys_claimed_by_other_actions() {
+        let mut keys = Keys::default();
+        let shadowed = parse("ctrl+g").unwrap();
+        let available = parse("f8").unwrap();
+        keys.bindings
+            .insert("app.interrupt".into(), vec![shadowed, available]);
+        let binding = |keys: &Keys| {
+            keys.interrupt_binding(|key| keys.action(key, true) == Some("app.interrupt"))
+        };
+        assert_eq!(keys.action(shadowed, true), Some("app.editor.external"));
+        assert_eq!(binding(&keys), Some(available));
+
+        keys.bindings.insert("app.interrupt".into(), vec![shadowed]);
+        assert_eq!(binding(&keys), None);
     }
 
     #[test]

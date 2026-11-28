@@ -2058,6 +2058,19 @@ impl View {
         format!("{label} {suffix}")
     }
 
+    fn draft_key_action<'a>(&'a self, keys: &'a Keys, key: KeyEvent) -> &'a str {
+        let default = keys
+            .action(
+                key,
+                self.editor.text.is_empty() && self.draft_images.is_empty(),
+            )
+            .unwrap_or("");
+        self.extension_chrome
+            .editor
+            .as_ref()
+            .map_or(default, |editor| editor.action(key, default))
+    }
+
     fn border_status(
         &self,
         busy: bool,
@@ -2078,7 +2091,7 @@ impl View {
             fullscreen,
             now,
             remaining,
-            keys.first_binding("app.interrupt"),
+            keys.interrupt_binding(|key| self.draft_key_action(keys, key) == "app.interrupt"),
         );
         format!("{working}{other}")
     }
@@ -8452,16 +8465,7 @@ pub(super) async fn run(
                 let action = if submit_completion {
                     "tui.input.submit"
                 } else {
-                    let default = keys
-                        .action(
-                            key,
-                            view.editor.text.is_empty() && view.draft_images.is_empty(),
-                        )
-                        .unwrap_or("");
-                    view.extension_chrome
-                        .editor
-                        .as_ref()
-                        .map_or(default, |editor| editor.action(key, default))
+                    view.draft_key_action(&keys, key)
                 };
                 if action != "app.interrupt" || is_busy(&worker) {
                     last_idle_interrupt = None;
@@ -15634,10 +15638,10 @@ exit {exit}
             ..Default::default()
         };
         let now = Instant::now();
-        let interrupt = Some(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        let interrupt = Some(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE));
         for fullscreen in [false, true] {
             let status = view.working_status(true, fullscreen, now, 80, interrupt);
-            assert!(status.contains("Ctrl+Gで取消"), "{status}");
+            assert!(status.contains("F(8)で取消"), "{status}");
             assert!(!status.contains("Esc"), "{status}");
 
             let status = view.working_status(true, fullscreen, now, 80, None);
