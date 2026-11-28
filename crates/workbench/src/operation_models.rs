@@ -347,9 +347,14 @@ async fn send_model_request(
             return Err(Error::Model("OpenAI Decisions error (504): the request timed out at the gateway. Very large inputs (above roughly 600K tokens) currently exceed its time limit.".into()));
         }
         if attempt == retries || !retryable_classifier_response(&response) {
-            if matches!(api, Api::PiDecision) {
+            let label = match api {
+                Api::PiDecision => Some("Pi Decision"),
+                Api::PiImage => Some("Pi Image"),
+                _ => None,
+            };
+            if let Some(label) = label {
                 return Err(Error::Model(
-                    pi_classifier::http_error_message(response, request.headers()).await,
+                    pi_classifier::http_error_message(response, request.headers(), label).await,
                 ));
             }
             return Err(Error::Model(format!(
@@ -360,7 +365,9 @@ async fn send_model_request(
         let delay = match classifier_retry_delay(response.headers(), attempt, chrono::Utc::now()) {
             Ok(delay) => delay,
             Err(Error::Model(reason)) if matches!(api, Api::PiDecision) => {
-                let message = pi_classifier::http_error_message(response, request.headers()).await;
+                let message =
+                    pi_classifier::http_error_message(response, request.headers(), "Pi Decision")
+                        .await;
                 return Err(Error::Model(format!("{message}. {reason}")));
             }
             Err(error) => return Err(error),
@@ -2221,7 +2228,7 @@ mod tests {
                     Outcome::Structured { data, .. } if data["stopReason"] == "error" &&
                         data["errorMessage"].as_str().unwrap().contains("does not support image input")));
                 let Outcome::Structured { data, .. } =
-                    operation.invoke(image_request, context()).await
+                    operation.invoke(image_request.clone(), context()).await
                 else {
                     panic!("Radius image invocation failed");
                 };
@@ -2233,6 +2240,22 @@ mod tests {
                     {"type":"image","mimeType":"image/png","data":"YQ=="}])
                 );
                 assert_eq!(data["usage"]["cost"]["total"], 0.25);
+                for diagnostic in [
+                    "Pi Image returned an invalid image block",
+                    "Pi Image returned HTTP 503 (service_unavailable)",
+                ] {
+                    let Outcome::Structured { data, .. } =
+                        operation.invoke(image_request.clone(), context()).await
+                    else {
+                        panic!("Radius image failure should return a structured result");
+                    };
+                    assert_eq!(data["stopReason"], "error", "{data}");
+                    assert_eq!(data["output"], json!([]));
+                    assert!(
+                        data["errorMessage"].as_str().unwrap().contains(diagnostic),
+                        "{data}"
+                    );
+                }
                 for status in [503, 404, 307] {
                     let Outcome::Structured { data, .. } =
                         operation.invoke(classify.clone(), context()).await
@@ -2349,6 +2372,8 @@ mod tests {
                 (CONFIG, KEY, 200, &base),
                 (DECIDE, KEY, 200, &base),
                 (IMAGE, KEY, 200, &base),
+                (IMAGE, KEY, 201, &base),
+                (IMAGE, KEY, 503, &base),
                 (DECIDE, KEY, 503, &base),
                 (DECIDE, KEY, 404, &base),
                 (DECIDE, KEY, 307, &base),
@@ -2410,13 +2435,17 @@ mod tests {
                             "options":{"size":"1K"}
                         })
                     );
-                    let body = json!({"responseId":"fixture-image",
-                        "usage":{"cost":{"total":0.25,"totalFromProvider":true}},
-                        "output":[{"type":"text","text":"caption"},
-                            {"type":"image","mimeType":"image/png","data":"YQ=="}]})
-                    .to_string();
+                    let body = match status {
+                        200 => json!({"responseId":"fixture-image",
+                            "usage":{"cost":{"total":0.25,"totalFromProvider":true}},
+                            "output":[{"type":"text","text":"caption"},
+                                {"type":"image","mimeType":"image/png","data":"YQ=="}]}),
+                        201 => json!({"output":[{"type":"text","text":"caption"},
+                            {"type":"image","mimeType":"image/png","data":""}]}),
+                        _ => json!({"error":{"code":"service_unavailable","message":format!("rejected token {key}")}}),
+                    }.to_string();
                     request.get_mut().write_all(format!(
-                        "HTTP/1.1 200 Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+                        "HTTP/1.1 {status} Fixture\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
                     ).as_bytes()).await.unwrap();
                 } else {
                     assert_eq!(tenant, method == DECIDE);
