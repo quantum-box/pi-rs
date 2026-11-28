@@ -621,18 +621,16 @@ mod tests {
         let task = tokio::spawn(access_at(path.clone(), service, None, false));
         started.await.unwrap();
         task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
         reply.send(()).unwrap();
         server.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if load(&path).unwrap().unwrap().refresh == "rotated" {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        // The background exchange holds the credential lock through persistence.
+        let guard = super::super::auth_lock::acquire_async(&path).await.unwrap();
+        let persisted = super::super::config::read_auth_object_locked(&guard).unwrap();
+        assert_eq!(
+            parse_credential(&persisted).unwrap().unwrap().refresh,
+            "rotated"
+        );
     }
     #[tokio::test]
     async fn noncooperating_api_key_change_is_not_overwritten() {
