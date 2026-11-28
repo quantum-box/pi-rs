@@ -973,9 +973,11 @@ impl Cli {
         let advertised = self.advertised_models(provider)?;
         let endpoint = self.endpoint_for(provider);
         let mut models: Vec<String> = Vec::new();
-        let bundled = include_bundled
-            .then(|| self.model_profiles.model_ids(provider))
-            .unwrap_or_default();
+        let bundled = if include_bundled {
+            self.model_profiles.model_ids(provider)
+        } else {
+            Vec::new()
+        };
         for id in self
             .model_profiles
             .configured_model_ids(provider)
