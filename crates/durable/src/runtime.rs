@@ -2784,6 +2784,10 @@ pub struct SessionMessageCursor {
     observation: u64,
     consumed: usize,
     cutoff: Option<Uuid>,
+    // A continuation counts entries within a commit. Preserve that count's
+    // projection when deserializing cursors captured before custom entries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    include_custom_entries: bool,
 }
 
 /// One original message, including messages replaced in active model context.
@@ -2823,6 +2827,12 @@ pub struct SessionLabelEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionEntry {
     Message(SessionMessageEntry),
+    /// A placed, display-only application entry. It never enters model context.
+    Custom {
+        entry: ApplicationWrite,
+        origin: Uuid,
+        observation: crate::observer::Cursor,
+    },
     SessionInfo {
         entry: SessionInfoEntry,
         origin: Uuid,
@@ -2839,6 +2849,7 @@ impl SessionEntry {
     pub fn id(&self) -> Uuid {
         match self {
             Self::Message(entry) => entry.history.id,
+            Self::Custom { entry, .. } => entry.id,
             Self::SessionInfo { entry, .. } => entry.id,
             Self::Label { entry, .. } => entry.id,
         }
@@ -10660,6 +10671,7 @@ impl Harness {
             observation,
             consumed: 0,
             cutoff: None,
+            include_custom_entries: false,
         })
     }
 
@@ -10674,21 +10686,30 @@ impl Harness {
             cursor,
             limit,
             false,
-            |source, observation, skip_messages| {
-                if skip_messages {
-                    Ok(Vec::new())
+            |source, observation, skip_messages, cutoff| {
+                let mut entries = if skip_messages {
+                    Vec::new()
                 } else {
-                    self.session_messages_in_observation(source, observation)
+                    self.session_messages_in_observation(source, observation)?
+                };
+                if let Some(cutoff) = cutoff {
+                    let index = entries
+                        .iter()
+                        .position(|entry| entry.history.id == cutoff)
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    entries.truncate(index + 1);
                 }
+                Ok(entries)
             },
-            |entry| entry.history.id,
         )?;
         Ok(SessionMessagePage { entries, older })
     }
 
-    /// Capture the committed session entries, including session-info changes.
+    /// Capture the committed session entries, including metadata and placed custom entries.
     pub fn session_entries_start(&self, id: Uuid) -> Result<SessionEntryCursor, Error> {
-        self.session_messages_start(id).map(SessionEntryCursor)
+        let mut cursor = self.session_messages_start(id)?;
+        cursor.include_custom_entries = true;
+        Ok(SessionEntryCursor(cursor))
     }
 
     /// Page original session entries in reverse commit order across fork cuts.
@@ -10701,10 +10722,15 @@ impl Harness {
             &cursor.0,
             limit,
             true,
-            |source, observation, skip_messages| {
-                self.session_entries_in_observation(source, observation, skip_messages)
+            |source, observation, skip_seed_entries, cutoff| {
+                self.session_entries_in_observation(
+                    source,
+                    observation,
+                    skip_seed_entries,
+                    cursor.0.include_custom_entries,
+                    cutoff,
+                )
             },
-            SessionEntry::id,
         )?;
         Ok(SessionEntryPage {
             entries,
@@ -10781,10 +10807,11 @@ impl Harness {
                 source: cut.source,
                 observation: cut.source_observation,
                 consumed: 0,
+                include_custom_entries: true,
                 cutoff: match cut.boundary {
-                    ForkBoundary::Message { entry_id } | ForkBoundary::Label { entry_id } => {
-                        Some(entry_id)
-                    }
+                    ForkBoundary::Message { entry_id }
+                    | ForkBoundary::Label { entry_id }
+                    | ForkBoundary::Display { entry_id } => Some(entry_id),
                     _ => None,
                 },
             }),
@@ -10820,9 +10847,8 @@ impl Harness {
         &self,
         cursor: &SessionMessageCursor,
         limit: std::num::NonZeroUsize,
-        include_labels: bool,
-        read_entries: impl Fn(Uuid, u64, bool) -> Result<Vec<E>, Error>,
-        entry_id: impl Fn(&E) -> Uuid,
+        include_metadata: bool,
+        read_entries: impl Fn(Uuid, u64, bool, Option<Uuid>) -> Result<Vec<E>, Error>,
     ) -> Result<(Vec<E>, Option<SessionMessageCursor>), Error> {
         if limit.get() > 256 {
             return Err(Error::Invalid(
@@ -10848,23 +10874,25 @@ impl Harness {
                 position.observation = parent.source_observation;
                 position.cutoff = match parent.boundary {
                     ForkBoundary::Message { entry_id } => Some(entry_id),
-                    ForkBoundary::Label { entry_id } if include_labels => Some(entry_id),
+                    ForkBoundary::Label { entry_id } if include_metadata => Some(entry_id),
+                    ForkBoundary::Display { entry_id }
+                        if include_metadata && position.include_custom_entries =>
+                    {
+                        Some(entry_id)
+                    }
                     _ => None,
                 };
             }
-            // A fork's initial record can be a copied context with new
-            // local IDs. Its source supplies the original occurrences.
-            let skip_seed_messages =
+            // A fork's initial record can copy messages and display writes.
+            // Its source supplies the original occurrences.
+            let skip_seed_entries =
                 position.observation == 1 && self.fork_parent(position.source)?.is_some();
-            let mut messages =
-                read_entries(position.source, position.observation, skip_seed_messages)?;
-            if let Some(cutoff) = position.cutoff {
-                let index = messages
-                    .iter()
-                    .position(|entry| entry_id(entry) == cutoff)
-                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                messages.truncate(index + 1);
-            }
+            let mut messages = read_entries(
+                position.source,
+                position.observation,
+                skip_seed_entries,
+                position.cutoff,
+            )?;
             let remaining = messages
                 .len()
                 .checked_sub(position.consumed)
@@ -10975,16 +11003,21 @@ impl Harness {
         &self,
         source: Uuid,
         observation: u64,
-        skip_seed_messages: bool,
+        skip_seed_entries: bool,
+        include_custom_entries: bool,
+        cutoff: Option<Uuid>,
     ) -> Result<Vec<SessionEntry>, Error> {
         let record = self.session_observation(source, observation)?;
         let mut entries = Vec::new();
-        if !skip_seed_messages {
+        if !skip_seed_entries {
             entries.extend(
                 self.session_messages_from_record(source, &record)?
                     .into_iter()
                     .map(SessionEntry::Message),
             );
+            if include_custom_entries {
+                entries.extend(self.session_custom_entries(source, &record)?);
+            }
         }
         if let Some(info) = record.value.get("session_info") {
             self.authenticate_fork_anchor(source, observation)?;
@@ -11002,6 +11035,93 @@ impl Harness {
                 origin: source,
                 observation: record.cursor,
             }));
+        }
+        if let Some(cutoff) = cutoff {
+            let index = entries
+                .iter()
+                .position(|entry| entry.id() == cutoff)
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let mut tail = entries.split_off(index + 1);
+            if let SessionEntry::Message(message) = &entries[index] {
+                tail.retain(|entry| matches!(entry, SessionEntry::Custom { .. }));
+                self.retain_message_cut_writes(source, &record, message, &mut tail)?;
+                entries.extend(tail);
+            }
+        }
+        Ok(entries)
+    }
+
+    // A reset can place custom writes in the same observation as several
+    // message boundaries. Keep the writes from the exact authenticated cut.
+    fn retain_message_cut_writes(
+        &self,
+        source: Uuid,
+        record: &crate::observer::Record,
+        message: &SessionMessageEntry,
+        writes: &mut Vec<SessionEntry>,
+    ) -> Result<(), Error> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let _scope = ResetProofScope::enter();
+        let position = self.original_occurrence_position(&message.history, &message.message)?;
+        let anchor: Option<crate::transcript::Cursor> =
+            serde_json::from_value(record.value.get("_transcript").cloned().unwrap_or_default())?;
+        if anchor.as_ref() != Some(&position.cursor) {
+            let (state, _, _) =
+                self.prove_failure_reset_cut(source, &position.cursor, record.cursor.0)?;
+            let retained: HashSet<_> = state
+                .application_writes
+                .into_iter()
+                .filter(|write| write.placed && !write.withdrawn)
+                .map(|write| write.id)
+                .collect();
+            writes.retain(|entry| retained.contains(&entry.id()));
+        }
+        Ok(())
+    }
+
+    fn session_custom_entries(
+        &self,
+        source: Uuid,
+        record: &crate::observer::Record,
+    ) -> Result<Vec<SessionEntry>, Error> {
+        let Some(writes) = record.value.get("application_writes") else {
+            return Ok(Vec::new());
+        };
+        if writes.as_array().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        let previous = if let Some(observation) = record.cursor.0.checked_sub(1).filter(|n| *n > 0)
+        {
+            let previous = self.session_observation(source, observation)?;
+            let Some(previous) = previous.value.get("application_writes") else {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            };
+            if previous == writes {
+                return Ok(Vec::new());
+            }
+            serde_json::from_value::<Vec<ApplicationWrite>>(previous.clone())?
+        } else {
+            Vec::new()
+        };
+        let mut previously_visible: HashSet<_> = previous
+            .into_iter()
+            .filter(|entry| entry.placed && !entry.withdrawn)
+            .map(|entry| entry.id)
+            .collect();
+        let writes: Vec<ApplicationWrite> = serde_json::from_value(writes.clone())?;
+        let entries: Vec<_> = writes
+            .into_iter()
+            .filter(|entry| entry.placed && !entry.withdrawn && previously_visible.insert(entry.id))
+            .map(|entry| SessionEntry::Custom {
+                entry,
+                origin: source,
+                observation: record.cursor,
+            })
+            .collect();
+        if !entries.is_empty() {
+            self.authenticate_fork_anchor(source, record.cursor.0)?;
         }
         Ok(entries)
     }
@@ -11105,7 +11225,7 @@ impl Harness {
         Ok(batches.into_iter().rev().flatten().collect())
     }
 
-    /// Fork at a bookmark change, session-info entry or original message occurrence.
+    /// Fork at a bookmark change, session-info entry, placed custom entry or original message.
     /// Interior messages require a proven safe append. Inherited entries must
     /// be visible in the shared chain or recorded session ancestry and have a
     /// verified origin snapshot. Local observations are scanned across resets.
@@ -11376,6 +11496,7 @@ impl Harness {
                             &membership,
                         )
                     }
+                    SessionEntry::Custom { .. } => self.fork_by_display_entry_id(id, entry_id),
                     SessionEntry::SessionInfo {
                         origin,
                         observation,

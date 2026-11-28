@@ -2042,12 +2042,34 @@ fn atomic_failure_fork_preserves_writes_at_each_reset() {
     );
     drop(h);
     let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.set_session_label(id, first_write, Some("first")).unwrap();
+    h.set_session_label(id, second_write, Some("second"))
+        .unwrap();
     let fork = h.fork_by_entry_id(id, occurrences[0]).unwrap();
     let writes = h.conversation(fork).unwrap().application_writes;
     assert_eq!(
         writes.iter().map(|w| w.id).collect::<Vec<_>>(),
         vec![first_write]
     );
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let history = h.session_entries_start(fork).unwrap();
+    let labels = h.session_labels(&history).unwrap();
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].target_id, first_write);
+    let mut cursor = Some(history);
+    let mut custom = Vec::new();
+    while let Some(position) = cursor {
+        let page = h
+            .session_entries(&position, std::num::NonZeroUsize::MIN)
+            .unwrap();
+        if let SessionEntry::Custom { entry, origin, .. } = &page.entries[0] {
+            assert_eq!(*origin, id);
+            custom.push(entry.id);
+        }
+        cursor = page.older;
+    }
+    assert_eq!(custom, vec![first_write]);
 }
 
 #[test]

@@ -629,6 +629,11 @@ fn display_entry_fork_rejects_unplaced_reset_writes() {
         .unwrap();
     assert!(!h.conversation(root).unwrap().application_writes[0].placed);
     assert!(h.fork_by_display_entry_id(root, entry).is_err());
+    let capture = h.session_entries_start(root).unwrap();
+    let page = h
+        .session_entries(&capture, std::num::NonZeroUsize::new(8).unwrap())
+        .unwrap();
+    assert!(page.entries.iter().all(|item| item.id() != entry));
     let settled = h
         .create_conversation(Config {
             model: "test".into(),
@@ -791,6 +796,96 @@ fn display_entry_fork_uses_end_of_commit_documents_for_ordered_batch() {
             "batch final"
         );
     }
+}
+
+#[test]
+fn custom_session_entries_survive_reopen_and_respect_display_fork_cuts() {
+    use std::num::NonZeroUsize;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    let root = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (first, second) = harness
+        .session_transaction(root, |tx| {
+            let first =
+                tx.append_entry("extension.bookmark", Some(serde_json::json!({"line": 4})))?;
+            let second = tx.append_entry("extension.other", None)?;
+            Ok((first, second))
+        })
+        .unwrap();
+    let saved = harness.session_entries_start(root).unwrap();
+    let mut previous_format = serde_json::to_value(&saved).unwrap();
+    assert!(
+        previous_format
+            .as_object_mut()
+            .unwrap()
+            .remove("include_custom_entries")
+            .is_some()
+    );
+    let previous_format = serde_json::from_value(previous_format).unwrap();
+    let label = harness
+        .set_session_label(root, first, Some("bookmark"))
+        .unwrap();
+    harness
+        .set_session_label(root, second, Some("outside"))
+        .unwrap();
+    let child = harness.fork_by_entry_id(root, first).unwrap();
+    drop(harness);
+
+    let mut harness = Harness::open_paused(&path, options()).unwrap();
+    assert!(
+        harness
+            .session_entries(&previous_format, NonZeroUsize::MIN)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    let page = harness.session_entries(&saved, NonZeroUsize::MIN).unwrap();
+    assert_eq!(page.entries[0].id(), second);
+    let page = harness
+        .session_entries(&page.older.unwrap(), NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(page.entries[0].id(), first);
+    assert!(page.older.is_none());
+
+    let capture = harness.session_entries_start(child).unwrap();
+    let page = harness
+        .session_entries(&capture, NonZeroUsize::new(8).unwrap())
+        .unwrap();
+    assert_eq!(page.entries.len(), 2);
+    assert!(matches!(
+        &page.entries[1],
+        SessionEntry::Custom { entry, origin, .. }
+            if *origin == root && entry.id == first && entry.kind == "extension.bookmark"
+                && entry.data == Some(serde_json::json!({"line": 4}))
+    ));
+    let labels = harness.session_labels(&capture).unwrap();
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].target_id, first);
+    assert_ne!(labels[0].id, label);
+    assert!(harness.fork_by_entry_id(child, second).is_err());
+    let grandchild = harness.fork_by_entry_id(child, first).unwrap();
+    assert!(
+        harness
+            .conversation(grandchild)
+            .unwrap()
+            .messages
+            .is_empty()
+    );
+    let page = harness
+        .session_messages(
+            &harness.session_messages_start(grandchild).unwrap(),
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+    assert!(page.entries.is_empty());
 }
 
 #[test]
