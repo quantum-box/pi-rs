@@ -90,16 +90,18 @@ pub(super) fn answers(api: Api, questions: &Value, values: &Value) -> Result<Val
 }
 
 pub(super) fn usage(cost: &Cost, usage: &Value) -> Option<Value> {
-    if !usage["input"].is_number() && !usage["output"].is_number() {
+    let supplied = &usage["cost"];
+    let reported_total = supplied["total"].as_f64().filter(|total| total.is_finite());
+    if !usage["input"].is_number() && !usage["output"].is_number() && reported_total.is_none() {
         return None;
     }
-    let amount = |value: &Value| value.as_f64().filter(|n| *n >= 0.0);
+    let amount = |value: &Value| value.as_f64().filter(|n| n.is_finite() && *n >= 0.0);
     let counts: [f64; 4] = ["input", "output", "cacheRead", "cacheWrite"]
         .map(|field| amount(&usage[field]).unwrap_or_default());
     let [input, output, cache_read, cache_write] = counts;
     let total = amount(&usage["totalTokens"]).unwrap_or_else(|| counts.iter().sum());
-    let supplied = &usage["cost"];
-    let cost = if let Some(total) = supplied["total"].as_f64() {
+    let image_output = amount(&usage["imageOutput"]);
+    let cost = if let Some(total) = reported_total {
         let mut priced: Map<String, Value> = ["input", "output", "cacheRead", "cacheWrite"]
             .into_iter()
             .map(|field| {
@@ -115,12 +117,24 @@ pub(super) fn usage(cost: &Cost, usage: &Value) -> Option<Value> {
         }
         Value::Object(priced)
     } else {
-        wire::token_cost(cost, counts, 0.0)
+        let priced_image_tokens = if cost.image_output.is_some() {
+            image_output.unwrap_or(output).min(output)
+        } else {
+            0.0
+        };
+        wire::token_cost(cost, counts, priced_image_tokens)
     };
-    Some(json!({
+    let mut result = json!({
         "input":input,"output":output,"cacheRead":cache_read,"cacheWrite":cache_write,
         "totalTokens":total,"cost":cost,
-    }))
+    });
+    if let Some(reasoning) = amount(&usage["reasoning"]) {
+        result["reasoning"] = json!(reasoning);
+    }
+    if let Some(image_output) = image_output {
+        result["imageOutput"] = json!(image_output);
+    }
+    Some(result)
 }
 
 fn normalize_diagnostic(value: &str) -> String {
@@ -257,6 +271,63 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn usage_preserves_cost_only_responses_and_optional_token_splits() {
+        let cost = Cost::default();
+        let cost_only = usage(
+            &cost,
+            &json!({"cost":{"total":0.12,"totalFromProvider":true}}),
+        )
+        .unwrap();
+        assert_eq!(cost_only["totalTokens"].as_f64(), Some(0.0));
+        assert_eq!(cost_only["cost"]["total"].as_f64(), Some(0.12));
+        assert_eq!(cost_only["cost"]["totalFromProvider"], true);
+        assert!(cost_only.get("reasoning").is_none());
+        assert!(cost_only.get("imageOutput").is_none());
+        assert!(usage(&cost, &json!({"reasoning":7})).is_none());
+
+        let cost = Cost {
+            output: 2.0,
+            image_output: Some(5.0),
+            ..Cost::default()
+        };
+        let estimated = usage(
+            &cost,
+            &json!({
+                "input": 10, "output": 1_000_000, "reasoning": 0, "imageOutput": 200_000
+            }),
+        )
+        .unwrap();
+        assert_eq!(estimated["totalTokens"].as_f64(), Some(1_000_010.0));
+        assert_eq!(estimated["reasoning"].as_f64(), Some(0.0));
+        assert_eq!(estimated["imageOutput"].as_f64(), Some(200_000.0));
+        assert_eq!(estimated["cost"]["output"].as_f64(), Some(2.6));
+    }
+
+    #[test]
+    fn usage_prices_duplicate_tiers_and_large_input_like_pi() {
+        let cost = serde_json::from_value(json!({
+            "tiers": [
+                {"inputTokensAbove":100, "input":1.0},
+                {"inputTokensAbove":100, "input":3.0},
+                {"inputTokensAbove":50, "input":4.0}
+            ]
+        }))
+        .unwrap();
+        let priced = usage(&cost, &json!({"input":200})).unwrap();
+        let total = priced["cost"]["total"].as_f64().unwrap();
+        assert!((total - 0.0002).abs() < 1e-12, "{total}");
+
+        let cost = Cost {
+            input: 10.0,
+            cache_read: 10.0,
+            ..Cost::default()
+        };
+        let priced = usage(&cost, &json!({"input":8e307,"cacheRead":8e307})).unwrap();
+        assert!(priced["cost"]["input"].as_f64().unwrap().is_finite());
+        assert!(priced["cost"]["cacheRead"].as_f64().unwrap().is_finite());
+    }
 
     async fn request(socket: &mut TcpStream) -> (String, BTreeMap<String, String>, Value) {
         let mut reader = BufReader::new(socket);
@@ -699,6 +770,7 @@ mod tests {
                 }
                 let body = json!({"answers":answers, "responseId":"decision-response",
                     "usage":{"input":10,"output":4,"cacheRead":2,"cacheWrite":1,
+                        "reasoning":0,"imageOutput":2,
                         "cost":{"total":0.02,"totalFromProvider":true}}})
                 .to_string();
                 let response = format!(
@@ -720,6 +792,8 @@ mod tests {
         assert_eq!(success["answers"], fixture_answers());
         assert_eq!(success["responseId"], "decision-response");
         assert_eq!(success["usage"]["totalTokens"], 17.0);
+        assert_eq!(success["usage"]["reasoning"], 0.0);
+        assert_eq!(success["usage"]["imageOutput"], 2.0);
         assert_eq!(success["usage"]["cost"]["total"], 0.02);
         assert_eq!(success["usage"]["cost"]["totalFromProvider"], true);
 

@@ -2245,6 +2245,10 @@ The legacy `pi-classifier` API and automatic Radius discovery keep their
 `/classify` route. Pi Decision uses the existing endpoint-bound credentials
 and headers, HTTP limits, and classifier retry policy. A built-in provider name
 supplies neither an implicit decision URL nor ambient credentials for it.
+Decision usage keeps provider-reported totals even when no token counts were
+reported. Optional reasoning and image output counts are included when the
+provider supplies them, including explicit zero. Local cost estimates use
+the separate image output rate when the model declares one.
 [Pinned Pi Decision protocol](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/src/api/pi-decision.ts#L16-L46)
 
 Codemode supports OpenAI Decisions classifier models, including the pinned
