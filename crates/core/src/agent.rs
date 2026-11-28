@@ -450,10 +450,48 @@ pub(crate) struct TreeModelResolution {
     pub fallback: bool,
     pub require_existing: bool,
     pub legacy: bool,
+    pub cycle: Option<crate::journal::CycledModelSelection>,
     pub revoked: Arc<std::sync::atomic::AtomicBool>,
 }
 
+type TreeHandoffModel = (Arc<dyn Model>, Option<Limits>);
+
 impl Agent<'_> {
+    fn tree_handoff_model(
+        &self,
+        session: &Session,
+        name: Option<&str>,
+        previous_provider: Option<&str>,
+        previous_cycle: Option<&crate::journal::CycledModelSelection>,
+    ) -> Result<Option<TreeHandoffModel>> {
+        let cycle = session.cycled_model_at(session.head())?;
+        let provider = session.model_provider();
+        let Some(name) = name.filter(|name| {
+            *name != self.model_name
+                || provider != previous_provider
+                || cycle.as_ref() != previous_cycle
+        }) else {
+            return Ok(None);
+        };
+        let model = if let Some(selection) = cycle {
+            self.registry
+                .cycled_model(session.session_id(), &selection)
+                .map(|model| (model, None))
+        } else if let Some(provider) = provider {
+            self.registry
+                .provider_branch_config(session.session_id(), provider, name)
+        } else {
+            self.registry
+                .branch_model(session.session_id(), name)
+                .map(|model| (model, None))
+        };
+        model.map(Some).ok_or_else(|| {
+            Error::Config(format!(
+                "tree trigger recovery requires registered model {name}"
+            ))
+        })
+    }
+
     pub(crate) async fn settle_recovery_before_hooks(
         &self,
         session: &Session,
@@ -715,6 +753,7 @@ impl Agent<'_> {
             return Err(Error::Cancelled);
         }
         let selected_provider = session.model_provider().map(str::to_owned);
+        let selected_cycle = session.cycled_model_at(session.head())?;
         let handoff = if input.is_none() {
             match session.begin_tree_trigger_handoff(run_id) {
                 Ok(handoff) => handoff,
@@ -762,55 +801,32 @@ impl Agent<'_> {
         let branch_model = handoff
             .as_ref()
             .and_then(|_| session.model_selection().map(|selection| selection.0));
-        let provider_changed =
-            handoff.is_some() && session.model_provider() != selected_provider.as_deref();
-        let model = match branch_model
-            .as_deref()
-            .filter(|name| *name != self.model_name || provider_changed)
-        {
-            Some(name) => match session
-                .model_provider()
-                .and_then(|provider| {
-                    self.registry
-                        .provider_branch_config(session.session_id(), provider, name)
-                })
-                .or_else(|| {
-                    session
-                        .model_provider()
-                        .is_none()
-                        .then(|| {
-                            self.registry
-                                .branch_model(session.session_id(), name)
-                                .map(|model| (model, None))
-                        })
-                        .flatten()
-                }) {
-                Some(model) => Some(model),
-                None => {
-                    let error = if let Some((return_to, _)) = handoff {
-                        finish_tree_handoff(session, return_to, observer)
-                            .err()
-                            .unwrap_or_else(|| {
-                                Error::Config(format!(
-                                    "tree trigger recovery requires registered model {name}"
-                                ))
-                            })
-                    } else {
-                        Error::Config(format!(
-                            "tree trigger recovery requires registered model {name}"
-                        ))
-                    };
-                    observer(Notification::RunStarted { run_id });
-                    let message = error.to_string();
-                    observer(Notification::RunEnded {
-                        run_id,
-                        succeeded: false,
-                        error: Some(&message),
-                    });
-                    return Err(error);
-                }
-            },
-            None => None,
+        let model = match handoff.as_ref().map_or(Ok(None), |_| {
+            self.tree_handoff_model(
+                session,
+                branch_model.as_deref(),
+                selected_provider.as_deref(),
+                selected_cycle.as_ref(),
+            )
+        }) {
+            Ok(model) => model,
+            Err(error) => {
+                let error = if let Some((return_to, _)) = handoff {
+                    finish_tree_handoff(session, return_to, observer)
+                        .err()
+                        .unwrap_or(error)
+                } else {
+                    error
+                };
+                observer(Notification::RunStarted { run_id });
+                let message = error.to_string();
+                observer(Notification::RunEnded {
+                    run_id,
+                    succeeded: false,
+                    error: Some(&message),
+                });
+                return Err(error);
+            }
         };
         session.set_run_id(Some(run_id));
         observer(Notification::RunStarted { run_id });
@@ -850,6 +866,7 @@ impl Agent<'_> {
                 break;
             };
             let selected_provider = session.model_provider().map(str::to_owned);
+            let selected_cycle = session.cycled_model_at(session.head())?;
             let handoff = match session.begin_tree_trigger_handoff(trigger_id) {
                 Ok(Some((return_to, records))) => {
                     for record in &records {
@@ -875,51 +892,32 @@ impl Agent<'_> {
             observer(Notification::RunStarted { run_id: trigger_id });
             let branch_model =
                 handoff.and_then(|_| session.model_selection().map(|selection| selection.0));
-            let provider_changed =
-                handoff.is_some() && session.model_provider() != selected_provider.as_deref();
-            let model = match branch_model
-                .as_deref()
-                .filter(|name| *name != self.model_name || provider_changed)
-            {
-                Some(name) => match session
-                    .model_provider()
-                    .and_then(|provider| {
-                        self.registry
-                            .provider_branch_config(session.session_id(), provider, name)
-                    })
-                    .or_else(|| {
-                        session
-                            .model_provider()
-                            .is_none()
-                            .then(|| {
-                                self.registry
-                                    .branch_model(session.session_id(), name)
-                                    .map(|model| (model, None))
-                            })
-                            .flatten()
-                    }) {
-                    Some(model) => Some(model),
-                    None => {
-                        session.set_run_id(None);
-                        let message =
-                            format!("tree trigger recovery requires registered model {name}");
-                        let error = if let Some(return_to) = handoff {
-                            finish_tree_handoff(session, return_to, observer)
-                                .err()
-                                .map(|error| error.to_string())
-                                .unwrap_or(message)
-                        } else {
-                            message
-                        };
-                        observer(Notification::RunEnded {
-                            run_id: trigger_id,
-                            succeeded: false,
-                            error: Some(&error),
-                        });
-                        break;
-                    }
-                },
-                None => None,
+            let model = match handoff.map_or(Ok(None), |_| {
+                self.tree_handoff_model(
+                    session,
+                    branch_model.as_deref(),
+                    selected_provider.as_deref(),
+                    selected_cycle.as_ref(),
+                )
+            }) {
+                Ok(model) => model,
+                Err(error) => {
+                    session.set_run_id(None);
+                    let error = if let Some(return_to) = handoff {
+                        finish_tree_handoff(session, return_to, observer)
+                            .err()
+                            .unwrap_or(error)
+                    } else {
+                        error
+                    };
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id: trigger_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    break;
+                }
             };
             let branch_agent = Agent {
                 model: model
@@ -1338,34 +1336,47 @@ impl Agent<'_> {
         mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<()> {
         let (sender, mut incoming) = mpsc::channel(32);
-        let host: Arc<dyn ToolHost> = match &event {
+        let mut agent_start_incoming = None;
+        let host = match &event {
             crate::LifecycleEvent::AgentStart { run_id, .. } => {
                 let phase = crate::extension_boundary::activity_marker_id(session, *run_id)
                     .map_or_else(
                         || "agent_start".to_owned(),
                         |activity| format!("agent_start:{activity}"),
                     );
-                callback_root_host(session, sender, *run_id, phase)
+                let (scoped_sender, receiver) = mpsc::channel(32);
+                agent_start_incoming = Some(receiver);
+                crate::lifecycle::ActiveHost::AgentStart {
+                    scoped: AgentStartHost {
+                        sender: scoped_sender,
+                        run_id: *run_id,
+                        phase: phase.clone(),
+                        cancellation: cancel.clone(),
+                    },
+                    mcp: callback_root_host(session, sender, *run_id, phase),
+                }
             }
-            crate::LifecycleEvent::TurnStart {
-                run_id, turn_index, ..
-            } => callback_root_host(
-                session,
-                sender,
-                *run_id,
-                callback_turn_phase("turn_start", *turn_index),
-            ),
-            crate::LifecycleEvent::TurnEnd {
-                run_id, turn_index, ..
-            } => callback_root_host(
-                session,
-                sender,
-                *run_id,
-                callback_turn_phase("turn_end", *turn_index),
-            ),
-            _ => Arc::new(LifecycleMessageHost {
-                sender,
-                idle: false,
+            _ => crate::lifecycle::ActiveHost::Shared(match &event {
+                crate::LifecycleEvent::TurnStart {
+                    run_id, turn_index, ..
+                } => callback_root_host(
+                    session,
+                    sender,
+                    *run_id,
+                    callback_turn_phase("turn_start", *turn_index),
+                ),
+                crate::LifecycleEvent::TurnEnd {
+                    run_id, turn_index, ..
+                } => callback_root_host(
+                    session,
+                    sender,
+                    *run_id,
+                    callback_turn_phase("turn_end", *turn_index),
+                ),
+                _ => Arc::new(LifecycleMessageHost {
+                    sender,
+                    idle: false,
+                }),
             }),
         };
         let mut errors = Vec::new();
@@ -1380,7 +1391,7 @@ impl Agent<'_> {
             }
         };
         {
-            let notify = crate::lifecycle::notify_with_host(
+            let notify = crate::lifecycle::notify_with_active_host(
                 self.registry,
                 event,
                 states,
@@ -1390,22 +1401,51 @@ impl Agent<'_> {
             );
             tokio::pin!(notify);
             loop {
-                tokio::select! {
-                    biased;
-                    Some((message, reply)) = incoming.recv() => {
-                        match queue_custom_message(session, message, observer) {
-                            Ok(()) => { let _ = reply.send(Ok(())); }
-                            Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                let (message, reply) = if let Some(scoped) = &mut agent_start_incoming {
+                    tokio::select! {
+                        biased;
+                        // Keep the existing shared lane for MCP change delivery.
+                        Some(request) = incoming.recv() => request,
+                        _ = cancel.cancelled() => break,
+                        _ = &mut notify => break,
+                        // Poll the callback before admitting writes so its return
+                        // or timeout can revoke requests still in the lane.
+                        Some(AgentStartMessage { message, reply, scope }) = scoped.recv() => {
+                            if !scope.is_active() || reply.is_closed() {
+                                let _ = reply.send(Err("callback has finished".into()));
+                                continue;
+                            }
+                            (message, reply)
+                        }
+                        Some(input) = receive_input(&mut inputs) => {
+                            queue_input(session, input.into(), observer)?;
+                            continue;
                         }
                     }
-                    Some(input) = receive_input(&mut inputs) => {
-                        queue_input(session, input.into(), observer)?;
+                } else {
+                    tokio::select! {
+                        biased;
+                        Some(request) = incoming.recv() => request,
+                        Some(input) = receive_input(&mut inputs) => {
+                            queue_input(session, input.into(), observer)?;
+                            continue;
+                        }
+                        _ = cancel.cancelled() => break,
+                        _ = &mut notify => break,
                     }
-                    _ = cancel.cancelled() => break,
-                    _ = &mut notify => break,
+                };
+                match queue_custom_message(session, message, observer) {
+                    Ok(()) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error.to_string()));
+                        return Err(error);
+                    }
                 }
             }
         }
+        drop(agent_start_incoming);
         for (extension, event, message) in &errors {
             observer(Notification::ExtensionLifecycleError {
                 extension,
@@ -2507,10 +2547,12 @@ impl Agent<'_> {
                         )
                         .await?;
                 }
-                let attempt = active
+                let ReplyAttempt {
+                    outcome: result,
+                    partial_request,
+                } = active
                     .reply(session, attempt, true, cancel, observer, Some(followups))
                     .await?;
-                let result = attempt.outcome;
                 if let Err(Error::Model(message) | Error::RetryableModel(message)) = &result
                     && crate::retry::context_overflow_error(message)
                     && session.auto_compaction_control().enabled()
@@ -2532,6 +2574,18 @@ impl Agent<'_> {
                     && retry_attempt < settings.max_retries
                     && request_index + 1 < active.limits.model_requests
                 {
+                    // Persist the omission before notifying the caller or entering
+                    // cancellable backoff. The failed completion remains in history.
+                    if let Some(request_id) = partial_request {
+                        commit(
+                            session,
+                            Event::SourceEntry {
+                                format: crate::journal::RETRY_SCHEDULED.into(),
+                                entry: serde_json::json!({"requestId": request_id}),
+                            },
+                            observer,
+                        )?;
+                    }
                     retry_attempt += 1;
                     let delay_ms = settings.delay_ms(retry_attempt);
                     let retry_wait = control.begin_wait();
@@ -3143,17 +3197,32 @@ impl Agent<'_> {
             Some(before) => &branch[..branch.partition_point(|record| record.id < before)],
             None => &branch,
         };
-        let (system_prompt, tools) = crate::journal::system_context(
+        let run_id = session.current_run_id();
+        let run_override =
+            run_id.and_then(|id| crate::before_agent_start::prompt_override(history, id));
+        let section_edits = if run_override.is_none()
+            && let Some(id) = run_id
+        {
+            crate::before_agent_start::prompt_section_edits(history, id)?
+        } else {
+            None
+        };
+        let (mut system_prompt, tools) = crate::journal::resolve_system_context(
             history,
             self.system_prompt,
             self.registry.active_tool_specs(),
+            section_edits
+                .as_ref()
+                .and(self.registry.host_system_prompt.as_deref()),
         );
-        let run_override = session
-            .current_run_id()
-            .and_then(|id| crate::before_agent_start::prompt_override(history, id));
+        if let Some((_, sections)) = &section_edits {
+            system_prompt.apply_sections(sections);
+        }
         let preserve_system_transcript = run_override.is_none();
         let mut messages = vec![Message::System {
-            content: run_override.clone().unwrap_or(system_prompt),
+            content: run_override
+                .clone()
+                .unwrap_or_else(|| system_prompt.render()),
         }];
         if let Some(summary) = summary {
             // Compaction content has the authority of conversation history.
@@ -3171,7 +3240,7 @@ impl Agent<'_> {
                 keep_group
             });
         }
-        let transcript = if purpose == RequestPurpose::Turn && preserve_system_transcript {
+        let mut transcript = if purpose == RequestPurpose::Turn && preserve_system_transcript {
             crate::journal::system_transcript(
                 history,
                 &conversation,
@@ -3181,6 +3250,9 @@ impl Agent<'_> {
         } else {
             None
         };
+        if let (Some(transcript), Some((source, sections))) = (&mut transcript, &section_edits) {
+            transcript.append_section_update(*source, sections, &conversation, messages.len());
+        }
         messages.extend(conversation.into_iter().map(|(_, message)| message));
         if messages.len() == 1 {
             return Err(Error::Session("there is no conversation to resume".into()));
@@ -3350,7 +3422,8 @@ impl Agent<'_> {
         request
             .tools
             .retain(|spec| self.registry.has_tool(&spec.name));
-        let transformed = request.model != original.model
+        let transformed = section_edits.is_some()
+            || request.model != original.model
             || request.messages != original.messages
             || request.tools != original.tools;
         Ok((request, transformed, transcript))
@@ -3364,7 +3437,10 @@ impl Agent<'_> {
         transformed: bool,
         configuration: Option<&str>,
     ) -> u64 {
-        let Some(anchor) = estimate.last_usage_record.filter(|_| !transformed) else {
+        let Some(anchor) = estimate
+            .last_usage_record
+            .filter(|_| !transformed && self.model.can_reuse_measured_context(request))
+        else {
             return self.model.estimate_request_tokens(request);
         };
         let branch = session.branch();
@@ -3957,11 +4033,12 @@ impl Agent<'_> {
         };
         // Only turn replies are displayable. Summary requests can contain
         // private prompt material and must never enter the RPC transcript.
-        if retain_reply && matches!(result, Err(Error::Cancelled)) && !content.is_empty() {
+        let partial_failure = failure.filter(|_| retain_reply && !content.is_empty());
+        if let Some(failure) = partial_failure {
             commit(
                 session,
                 Event::SourceEntry {
-                    format: "pi-rs:aborted-turn-partial".into(),
+                    format: crate::journal::turn_partial_marker(failure).into(),
                     entry: serde_json::json!({"requestId": request_id}),
                 },
                 observer,
@@ -4028,7 +4105,10 @@ impl Agent<'_> {
             observer(Notification::Committed(record));
         });
         self.settle_usage(request_id, &usage, &metadata).await?;
-        Ok(ReplyAttempt { outcome: result })
+        Ok(ReplyAttempt {
+            outcome: result,
+            partial_request: partial_failure.map(|_| request_id),
+        })
     }
 
     async fn settle_usage(
@@ -5177,8 +5257,21 @@ impl Agent<'_> {
         }
         if let Some(resolved) = resolution {
             let session_id = session.session_id();
-            let commit = || session.append(transition).cloned();
-            let (record, revoked) = if resolved.legacy {
+            let commit = || match &resolved.cycle {
+                Some(selection) if resolved.fallback => session
+                    .append_cycled_model_transition(transition, selection)
+                    .cloned(),
+                _ => session.append(transition).cloned(),
+            };
+            let (record, revoked) = if let Some(selection) = &resolved.cycle {
+                self.registry.commit_cycled_model(
+                    session_id,
+                    selection,
+                    resolved.client,
+                    resolved.require_existing,
+                    commit,
+                )?
+            } else if resolved.legacy {
                 self.registry.commit_existing_legacy_model(
                     session_id,
                     &resolved.model,
@@ -6978,7 +7071,7 @@ impl ToolHost for CallbackRootHost {
     }
     fn for_extension(&self, extension_id: &str) -> Option<Arc<dyn ToolHost>> {
         Some(Arc::new(ScopedCallbackHost {
-            sender: self.sender.clone(),
+            lane: CallbackMessageLane::Shared(self.sender.clone()),
             run_id: self.run_id,
             phase: self.phase.clone(),
             extension_id: extension_id.to_owned(),
@@ -6989,8 +7082,67 @@ impl ToolHost for CallbackRootHost {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct AgentStartHost {
+    sender: mpsc::Sender<AgentStartMessage>,
+    run_id: Uuid,
+    phase: String,
+    pub(crate) cancellation: CancellationToken,
+}
+
+impl AgentStartHost {
+    pub(crate) fn for_extension(
+        &self,
+        extension_id: &str,
+        lifetime: CancellationToken,
+        started: platform_time::Instant,
+        budget: Duration,
+    ) -> Arc<dyn ToolHost> {
+        Arc::new(ScopedCallbackHost {
+            lane: CallbackMessageLane::AgentStart {
+                sender: self.sender.clone(),
+                scope: AgentStartScope {
+                    lifetime,
+                    started,
+                    budget,
+                },
+            },
+            run_id: self.run_id,
+            phase: self.phase.clone(),
+            extension_id: extension_id.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct AgentStartScope {
+    lifetime: CancellationToken,
+    started: platform_time::Instant,
+    budget: Duration,
+}
+
+impl AgentStartScope {
+    fn is_active(&self) -> bool {
+        !self.lifetime.is_cancelled() && self.started.elapsed() < self.budget
+    }
+}
+
+struct AgentStartMessage {
+    message: crate::QueuedCustomMessage,
+    reply: oneshot::Sender<crate::ExtensionResult<()>>,
+    scope: AgentStartScope,
+}
+
+enum CallbackMessageLane {
+    Shared(CallbackMessageSender),
+    AgentStart {
+        sender: mpsc::Sender<AgentStartMessage>,
+        scope: AgentStartScope,
+    },
+}
+
 struct ScopedCallbackHost {
-    sender: CallbackMessageSender,
+    lane: CallbackMessageLane,
     run_id: Uuid,
     phase: String,
     extension_id: String,
@@ -7008,18 +7160,35 @@ impl ScopedCallbackHost {
         } else {
             delivery
         };
+        let message = crate::QueuedCustomMessage {
+            id,
+            delivery,
+            message,
+        };
         let (reply, response) = oneshot::channel();
-        self.sender
-            .send((
-                crate::QueuedCustomMessage {
-                    id,
-                    delivery,
+        match &self.lane {
+            CallbackMessageLane::Shared(sender) => sender
+                .send((message, reply))
+                .await
+                .map_err(|_| "callback has finished".to_owned())?,
+            CallbackMessageLane::AgentStart { sender, scope } => {
+                if !scope.is_active() {
+                    return Err("callback has finished".into());
+                }
+                let request = AgentStartMessage {
                     message,
-                },
-                reply,
-            ))
-            .await
-            .map_err(|_| "callback has finished".to_owned())?;
+                    reply,
+                    scope: scope.clone(),
+                };
+                tokio::select! {
+                    biased;
+                    _ = scope.lifetime.cancelled() => return Err("callback has finished".into()),
+                    sent = sender.send(request) => sent.map_err(|_| "callback has finished".to_owned())?,
+                }
+                // The journal owner checks expiry at admission and acknowledges
+                // the actual write outcome even if cancellation then arrives.
+            }
+        }
         response
             .await
             .map_err(|_| "callback message acknowledgement was lost".to_owned())?
@@ -7448,6 +7617,7 @@ impl PreparedAttempt<'_> {
 
 struct ReplyAttempt {
     outcome: Result<Reply>,
+    partial_request: Option<Uuid>,
 }
 
 struct Reply {
@@ -8422,6 +8592,77 @@ fn request_configuration_hash(model: &dyn Model, request: &ModelRequest) -> Opti
 #[cfg(test)]
 mod retention_estimate_tests {
     use super::*;
+
+    #[test]
+    fn omitted_replay_bypasses_matching_measured_context() {
+        struct MeasuredModel(bool);
+
+        #[async_trait::async_trait]
+        impl Model for MeasuredModel {
+            fn can_reuse_measured_context(&self, _: &ModelRequest) -> bool {
+                self.0
+            }
+
+            async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+                unreachable!()
+            }
+        }
+
+        let (mut session, _) = session_with_reasoning("earlier reasoning");
+        let request_id = Uuid::new_v4();
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 2,
+                tools: 0,
+                max_output_tokens: 9000,
+                request_id: Some(request_id),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: Some(false),
+                context_configuration_sha256: Some("same configuration".into()),
+                tool_decision: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "visible".into(),
+                invocations: vec![],
+                request_id: Some(request_id),
+                usage: Some(Usage {
+                    input_tokens: 1000,
+                    output_tokens: 8000,
+                }),
+            })
+            .unwrap();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: session.current_messages(),
+            tools: vec![],
+            max_output_tokens: 1024,
+        };
+        let registry = Registry::default();
+        for reuse in [true, false] {
+            let model = MeasuredModel(reuse);
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            let actual = agent.request_budget_tokens(
+                &session,
+                &request,
+                session.context_budget_estimate(),
+                false,
+                Some("same configuration"),
+            );
+            let projected = model.estimate_request_tokens(&request);
+            assert!(projected < 9000);
+            assert_eq!(actual, if reuse { 9000 } else { projected });
+        }
+    }
 
     fn session_with_reasoning(reasoning: &str) -> (Session, u64) {
         let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
@@ -9838,7 +10079,15 @@ mod tree_tests {
         async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
             assert!(request.max_output_tokens >= self.minimum_output_tokens);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 || self.always_fail {
+            if call == 0 {
+                return Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("overflow partial".into())),
+                    Err(Error::Model(
+                        "prompt is too long: private-fixture-secret".into(),
+                    )),
+                ])));
+            }
+            if self.always_fail {
                 return Err(Error::Model(
                     "prompt is too long: private-fixture-secret".into(),
                 ));
@@ -9920,6 +10169,27 @@ mod tree_tests {
                     &mut |_| {},
                 )
                 .await;
+            let failed = session
+                .records()
+                .iter()
+                .find(|record| {
+                    matches!(&record.event,
+                Event::ModelFinished { partial, .. } if partial == "overflow partial")
+                })
+                .unwrap();
+            assert!(
+                session
+                    .records()
+                    .iter()
+                    .any(
+                        |record| crate::superseded_turn_partial(session.records(), record)
+                            == Some(failed.id)
+                    )
+            );
+            assert_ne!(
+                session.last_assistant_text().as_deref(),
+                Some("overflow partial")
+            );
             if !provide && run_budget == 16 {
                 assert!(matches!(result, Err(Error::Budget)));
                 assert_eq!(model.calls.load(Ordering::SeqCst), 1);
@@ -9935,10 +10205,12 @@ mod tree_tests {
                 model.calls.load(Ordering::SeqCst),
                 if provide { 2 } else { 3 }
             );
-            let events = seen.lock().unwrap();
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0]["reason"], "overflow");
-            assert_eq!(events[0]["willRetry"], true);
+            {
+                let events = seen.lock().unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0]["reason"], "overflow");
+                assert_eq!(events[0]["willRetry"], true);
+            }
             if !provide {
                 assert!(!session.records().iter().any(|record| matches!(&record.event,
                     Event::ModelFinished { partial, failure: None, reply: None, .. } if partial == "model summary")),
@@ -9955,6 +10227,54 @@ mod tree_tests {
                     .unwrap()
                     .contains("private-fixture-secret")
             );
+            if always_fail {
+                // Reopen exactly after the durable failure, before recovery
+                // could persist its marker. The next attempt has no text.
+                let run_id = failed.run_id.unwrap();
+                let prefix =
+                    Session::from_records(session.records()[..failed.id as usize].to_vec())
+                        .unwrap();
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory
+                    .path()
+                    .join("interrupted-before-overflow-marker.jsonl");
+                prefix.export_jsonl(&path).unwrap();
+                let mut reopened = Session::open(&path).unwrap();
+                assert_eq!(
+                    reopened.last_assistant_text().as_deref(),
+                    Some("overflow partial")
+                );
+                assert!(
+                    agent
+                        .run_correlated(
+                            &mut reopened,
+                            run_id,
+                            None,
+                            &mut inputs,
+                            &CancellationToken::new(),
+                            &mut |_| {}
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    reopened.branch().iter().any(|record| matches!(record.event,
+                    Event::Compacted { retain_from: Some(boundary), .. } if boundary <= failed.id))
+                );
+                assert!(
+                    reopened
+                        .branch()
+                        .iter()
+                        .any(
+                            |record| crate::superseded_turn_partial(reopened.records(), record)
+                                == Some(failed.id)
+                        )
+                );
+                assert_ne!(
+                    reopened.last_assistant_text().as_deref(),
+                    Some("overflow partial")
+                );
+            }
         }
     }
 
@@ -9995,6 +10315,10 @@ mod tree_tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("prompt is too long"), "{error}");
+        assert_eq!(
+            session.last_assistant_text().as_deref(),
+            Some("overflow partial")
+        );
         assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert!(
             !session
@@ -13544,6 +13868,401 @@ mod queue_tests {
         );
         assert_eq!(restored.queued_custom_messages().len(), 2);
         assert!(restored.pending_custom_trigger().is_some());
+    }
+
+    #[tokio::test]
+    async fn agent_start_host_expires_between_handlers() {
+        type PendingSend =
+            std::pin::Pin<Box<dyn std::future::Future<Output = crate::ExtensionResult<()>> + Send>>;
+        type Retained = Arc<std::sync::Mutex<Option<(Arc<dyn ToolHost>, PendingSend)>>>;
+
+        struct Hook {
+            id: &'static str,
+            retained: Retained,
+        }
+
+        fn message(text: &str) -> crate::CustomMessage {
+            crate::CustomMessage {
+                custom_type: "agent-start-test".into(),
+                content: crate::ContextContent::Text(text.into()),
+                display: false,
+                details: None,
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                self.id
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> crate::ExtensionResult<()> {
+                if !matches!(event, crate::LifecycleEvent::AgentStart { .. }) {
+                    return Ok(());
+                }
+                use crate::CustomMessageDelivery::NextTurn;
+                if self.id == "first" {
+                    host.send_message_with_key(message("first"), NextTurn, "fixture")
+                        .await?;
+                    let retained_host = host.clone();
+                    let mut queued = Box::pin(async move {
+                        retained_host
+                            .send_message(message("unacknowledged"), NextTurn)
+                            .await
+                    });
+                    // Put a request in the lane, keeping its reply open when the hook returns.
+                    assert!(futures_util::poll!(&mut queued).is_pending());
+                    *self.retained.lock().unwrap() = Some((host, queued));
+                } else {
+                    let (expired, queued) = self.retained.lock().unwrap().take().unwrap();
+                    host.send_message(message("second"), NextTurn).await?;
+                    // The queued request was ahead of the second hook's acknowledged send.
+                    assert!(queued.await.is_err());
+                    assert!(
+                        expired
+                            .send_message(message("late"), NextTurn)
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        expired
+                            .send_message_with_key(message("late keyed"), NextTurn, "fixture")
+                            .await
+                            .is_err()
+                    );
+                }
+                Ok(())
+            }
+        }
+
+        let mut registry = Registry::default();
+        let retained = Retained::default();
+        for id in ["first", "second"] {
+            registry
+                .register(Arc::new(Hook {
+                    id,
+                    retained: retained.clone(),
+                }))
+                .unwrap();
+        }
+        let model = WaitingModel(Arc::new(tokio::sync::Notify::new()));
+        let agent = Agent {
+            model: &model,
+            model_name: "test",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let event = crate::LifecycleEvent::AgentStart {
+            session_id: session.session_id(),
+            run_id: Uuid::new_v4(),
+            model: "test".into(),
+        };
+        let (sender, mut inputs) = mpsc::channel(1);
+        sender.try_send("ordinary input".to_owned()).unwrap();
+        platform_time::timeout(
+            Duration::from_secs(3),
+            agent.observe_active_lifecycle_with_inputs(
+                &mut session,
+                event,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let Notification::ExtensionLifecycleError { message, .. } = event {
+                        panic!("{message}");
+                    }
+                },
+                Some(&mut inputs),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(inputs.try_recv().unwrap(), "ordinary input");
+        let queued: Vec<_> = session
+            .queued_custom_messages()
+            .into_iter()
+            .map(|(_, input)| input.message.content)
+            .collect();
+        assert_eq!(
+            queued,
+            [
+                crate::ContextContent::Text("first".into()),
+                crate::ContextContent::Text("second".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_agent_start_sends_get_the_journal_outcome_after_cancellation() {
+        struct Store {
+            inner: crate::MemoryStore,
+            reject_message: bool,
+        }
+        impl crate::SessionStore for Store {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.inner.load()
+            }
+
+            fn append(&mut self, record: &Record) -> Result<()> {
+                if self.reject_message && matches!(record.event, Event::CustomMessageQueued { .. })
+                {
+                    return Err(Error::Session("fixture append failed".into()));
+                }
+                self.inner.append(record)
+            }
+        }
+
+        use crate::CustomMessageDelivery::NextTurn;
+        for reject_message in [false, true] {
+            let mut session = Session::with_store(Store {
+                inner: crate::MemoryStore::default(),
+                reject_message,
+            })
+            .unwrap();
+            let cancel = CancellationToken::new();
+            let (sender, mut incoming) = mpsc::channel(1);
+            let host = AgentStartHost {
+                sender,
+                run_id: Uuid::new_v4(),
+                phase: "agent_start".into(),
+                cancellation: cancel.clone(),
+            }
+            .for_extension(
+                "fixture",
+                cancel.child_token(),
+                platform_time::Instant::now(),
+                Duration::from_secs(1),
+            );
+            let mut send =
+                Box::pin(host.send_message(custom("admitted", NextTurn).message, NextTurn));
+            assert!(futures_util::poll!(&mut send).is_pending());
+            let request = incoming.try_recv().unwrap();
+            assert!(request.scope.is_active());
+            let result = queue_custom_message(&mut session, request.message, &mut |_| {})
+                .map_err(|error| error.to_string());
+            assert_eq!(result.is_err(), reject_message);
+
+            cancel.cancel();
+            assert!(futures_util::poll!(&mut send).is_pending());
+            request.reply.send(result.clone()).unwrap();
+            assert_eq!(send.await, result);
+            assert_eq!(
+                session.queued_custom_messages().len(),
+                usize::from(!reject_message)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_change_delivery_after_agent_start_retains_its_shared_message_host() {
+        type Retained = Arc<std::sync::Mutex<Option<Arc<dyn ToolHost>>>>;
+        struct Hook {
+            id: &'static str,
+            retained: Retained,
+        }
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                self.id
+            }
+            fn handles_lifecycle(&self) -> bool {
+                self.id == "first"
+            }
+            fn handles_mcp_servers_change(&self) -> bool {
+                true
+            }
+            fn handles_mcp_registry(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_mcp_registry(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                host: Arc<dyn ToolHost>,
+                mcp: Arc<dyn crate::McpRegistryHost>,
+            ) -> crate::ExtensionResult<()> {
+                use crate::CustomMessageDelivery::NextTurn;
+                match event {
+                    crate::LifecycleEvent::AgentStart { .. } => {
+                        *self.retained.lock().unwrap() = Some(host);
+                        mcp.register_mcp_server(crate::McpServerDeclaration {
+                            name: "fixture".into(),
+                            config: serde_json::json!({"url":"https://fixture.example/mcp"}),
+                        })
+                        .await?;
+                    }
+                    crate::LifecycleEvent::McpServersChange { .. } if self.id == "first" => {
+                        let expired = self.retained.lock().unwrap().replace(host.clone()).unwrap();
+                        assert!(
+                            expired
+                                .send_message(custom("expired", NextTurn).message, NextTurn)
+                                .await
+                                .is_err()
+                        );
+                        host.send_message(custom("first change", NextTurn).message, NextTurn)
+                            .await?;
+                    }
+                    crate::LifecycleEvent::McpServersChange { .. } => {
+                        let shared = self.retained.lock().unwrap().take().unwrap();
+                        shared
+                            .send_message_with_key(
+                                custom("second change", NextTurn).message,
+                                NextTurn,
+                                "fixture",
+                            )
+                            .await?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        }
+
+        let mut registry = Registry::default();
+        let retained = Retained::default();
+        for id in ["first", "second"] {
+            registry
+                .register(Arc::new(Hook {
+                    id,
+                    retained: retained.clone(),
+                }))
+                .unwrap();
+        }
+        let model = WaitingModel(Arc::new(tokio::sync::Notify::new()));
+        let agent = Agent {
+            model: &model,
+            model_name: "test",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let event = crate::LifecycleEvent::AgentStart {
+            session_id: session.session_id(),
+            run_id: Uuid::new_v4(),
+            model: "test".into(),
+        };
+        platform_time::timeout(
+            Duration::from_secs(3),
+            agent.observe_active_lifecycle(
+                &mut session,
+                event,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let Notification::ExtensionLifecycleError { message, .. } = event {
+                        panic!("{message}");
+                    }
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let queued: Vec<_> = session
+            .queued_custom_messages()
+            .into_iter()
+            .map(|(_, input)| input.message.content)
+            .collect();
+        assert_eq!(
+            queued,
+            [
+                crate::ContextContent::Text("first change".into()),
+                crate::ContextContent::Text("second change".into()),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn agent_start_host_expires_on_timeout_and_cancellation() {
+        struct Hook(mpsc::Sender<Arc<dyn ToolHost>>);
+
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                "agent-start-waiting"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                _: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> crate::ExtensionResult<()> {
+                self.0.send(host).await.unwrap();
+                std::future::pending().await
+            }
+        }
+
+        for timed_out in [true, false] {
+            let (sender, mut retained) = mpsc::channel(1);
+            let mut registry = Registry::default();
+            registry.register(Arc::new(Hook(sender))).unwrap();
+            let model = WaitingModel(Arc::new(tokio::sync::Notify::new()));
+            let agent = Agent {
+                model: &model,
+                model_name: "test",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            let event = crate::LifecycleEvent::AgentStart {
+                session_id: session.session_id(),
+                run_id: Uuid::new_v4(),
+                model: "test".into(),
+            };
+            let cancel = CancellationToken::new();
+            let states = ExtensionStates::new();
+            let mut errors = Vec::new();
+            let mut observe = |event: Notification<'_>| {
+                if let Notification::ExtensionLifecycleError { message, .. } = event {
+                    errors.push(message.to_owned());
+                }
+            };
+            let (dispatched, (queued_send, late_send)) = tokio::join!(
+                agent.observe_active_lifecycle(&mut session, event, &states, &cancel, &mut observe),
+                async {
+                    use crate::CustomMessageDelivery::NextTurn;
+                    let host = retained.recv().await.unwrap();
+                    let mut queued =
+                        Box::pin(host.send_message(custom("queued", NextTurn).message, NextTurn));
+                    assert!(futures_util::poll!(&mut queued).is_pending());
+                    if timed_out {
+                        tokio::time::advance(Duration::from_secs(1)).await;
+                    } else {
+                        cancel.cancel();
+                    }
+                    tokio::join!(
+                        queued,
+                        host.send_message(custom("late", NextTurn).message, NextTurn)
+                    )
+                },
+            );
+            dispatched.unwrap();
+            assert!(queued_send.is_err());
+            assert!(late_send.is_err());
+            assert!(session.queued_custom_messages().is_empty());
+            if timed_out {
+                assert_eq!(errors, ["lifecycle hook timed out"]);
+            } else {
+                assert!(errors.is_empty());
+            }
+        }
     }
 
     #[tokio::test]

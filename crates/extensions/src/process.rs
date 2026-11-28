@@ -7,13 +7,15 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use pi_rs_core::{
-    CacheWarmingAction, CacheWarmingDecision, CancellationToken, Compaction, CustomMessage,
-    Decision, Error, Extension, ExtensionFlag, ExtensionFlagValue, ExtensionResult, ExtensionState,
-    InputAction, InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RenderedExtensionRows,
-    RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolRenderContext,
-    ToolRenderShell, ToolRendererMatch, ToolRendererOverride, ToolRendererOverrideCallback,
-    ToolRendererOverrideMode, ToolRendererOverrideSection, ToolRenderers, ToolReply,
-    ToolSectionRenderer, ToolSpec, TreeDecision, TreePreparation,
+    BeforeAgentStartEvent, BeforeAgentStartPromptChanges, BeforeAgentStartPromptOptions,
+    BeforeAgentStartPromptResult, BeforeAgentStartResult, CacheWarmingAction, CacheWarmingDecision,
+    CancellationToken, Compaction, CustomMessage, Decision, Error, Extension, ExtensionFlag,
+    ExtensionFlagValue, ExtensionResult, ExtensionState, InputAction, InputEvent, LifecycleEvent,
+    Message, ModelRequest, Outcome, RenderedExtensionRows, RequestPurpose, Result, Tool,
+    ToolContext, ToolExecution, ToolHost, ToolRenderContext, ToolRenderShell, ToolRendererMatch,
+    ToolRendererOverride, ToolRendererOverrideCallback, ToolRendererOverrideMode,
+    ToolRendererOverrideSection, ToolRenderers, ToolReply, ToolSectionRenderer, ToolSpec,
+    TreeDecision, TreePreparation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,8 +60,20 @@ impl Endpoint {
         &self,
         request: ProtocolRequest,
     ) -> ExtensionResult<T> {
+        self.request_with_cancellation(request, CancellationToken::new())
+            .await
+    }
+
+    async fn request_with_cancellation<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        request: ProtocolRequest,
+        cancellation: CancellationToken,
+    ) -> ExtensionResult<T> {
+        if cancellation.is_cancelled() {
+            return Err("native extension operation cancelled".into());
+        }
         let path = self.clone();
-        let guard = CancelOnDrop(CancellationToken::new());
+        let guard = CancelOnDrop(cancellation);
         let cancelled = guard.0.clone();
         tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
             .await
@@ -157,6 +171,34 @@ fn restore_legacy_tool_metadata(
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeforeAgentStartWireEvent {
+    #[serde(flatten)]
+    event: BeforeAgentStartEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_prompt_options: Option<BeforeAgentStartPromptOptions>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeforeAgentStartWireResult {
+    #[serde(flatten)]
+    result: BeforeAgentStartResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_prompt_options: Option<BeforeAgentStartPromptChanges>,
+}
+
+impl From<BeforeAgentStartPromptResult> for BeforeAgentStartWireResult {
+    fn from(value: BeforeAgentStartPromptResult) -> Self {
+        Self {
+            result: value.result,
+            system_prompt_options: (!value.system_prompt_options.sections.is_empty())
+                .then_some(value.system_prompt_options),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ProtocolRequest {
     Describe,
@@ -186,7 +228,7 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
     },
     BeforeAgentStart {
-        event: pi_rs_core::BeforeAgentStartEvent,
+        event: BeforeAgentStartWireEvent,
         state: Option<ExtensionState>,
     },
     Input {
@@ -249,6 +291,9 @@ enum ProtocolRequest {
         section: ToolSection,
         context: ToolRenderContext,
         next: Option<RenderedExtensionRows>,
+    },
+    RenderHeader {
+        context: pi_rs_core::HeaderRenderContext,
     },
     RenderToolSection {
         section: ToolSection,
@@ -418,6 +463,8 @@ struct Description {
     command_failure_classification_v1: bool,
     #[serde(default)]
     before_agent_start_hook: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    before_agent_start_prompt_options_v1: bool,
     #[serde(default)]
     input_hook: bool,
     #[serde(default)]
@@ -951,6 +998,10 @@ impl ExecutableExtension {
 
 #[async_trait::async_trait]
 impl Extension for ExecutableExtension {
+    fn header_renderer(&self) -> Option<Arc<dyn pi_rs_core::HeaderRenderer>> {
+        Some(Arc::new(ExecutableHeaderRenderer(self.endpoint.clone())))
+    }
+
     fn handles_turn_end_boundary(&self) -> bool {
         self.description.turn_end_boundary_hook
     }
@@ -1028,16 +1079,49 @@ impl Extension for ExecutableExtension {
         self.description.before_agent_start_hook
     }
 
+    fn supports_before_agent_start_prompt_options(&self) -> bool {
+        self.description.before_agent_start_prompt_options_v1
+    }
+
     async fn before_agent_start(
         &self,
-        event: &pi_rs_core::BeforeAgentStartEvent,
+        event: &BeforeAgentStartEvent,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<pi_rs_core::BeforeAgentStartResult> {
-        self.request_async(ProtocolRequest::BeforeAgentStart {
-            event: event.clone(),
-            state: state.cloned(),
-        })
+    ) -> ExtensionResult<BeforeAgentStartResult> {
+        self.before_agent_start_with_prompt_options(
+            event,
+            &BeforeAgentStartPromptOptions::default(),
+            state,
+        )
         .await
+        .map(|value| value.result)
+    }
+
+    async fn before_agent_start_with_prompt_options(
+        &self,
+        event: &BeforeAgentStartEvent,
+        options: &BeforeAgentStartPromptOptions,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<BeforeAgentStartPromptResult> {
+        let supports_options = self.supports_before_agent_start_prompt_options();
+        let request = ProtocolRequest::BeforeAgentStart {
+            event: BeforeAgentStartWireEvent {
+                event: event.clone(),
+                system_prompt_options: supports_options.then(|| options.clone()),
+            },
+            state: state.cloned(),
+        };
+        if !supports_options {
+            return self
+                .request_async::<BeforeAgentStartResult>(request)
+                .await
+                .map(Into::into);
+        }
+        let response: BeforeAgentStartWireResult = self.request_async(request).await?;
+        Ok(BeforeAgentStartPromptResult {
+            result: response.result,
+            system_prompt_options: response.system_prompt_options.unwrap_or_default(),
+        })
     }
 
     fn handles_input(&self) -> bool {
@@ -2515,6 +2599,37 @@ impl ToolRendererOverrideCallback for ExecutableToolOverride {
                 context: context.clone(),
                 next: next.cloned(),
             })
+            .await
+    }
+}
+
+struct ExecutableHeaderRenderer(Endpoint);
+
+#[async_trait::async_trait]
+impl pi_rs_core::HeaderRenderer for ExecutableHeaderRenderer {
+    async fn render(
+        &self,
+        context: &pi_rs_core::HeaderRenderContext,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        self.0
+            .request_async(ProtocolRequest::RenderHeader {
+                context: context.clone(),
+            })
+            .await
+    }
+
+    async fn render_with_cancellation(
+        &self,
+        context: &pi_rs_core::HeaderRenderContext,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        self.0
+            .request_with_cancellation(
+                ProtocolRequest::RenderHeader {
+                    context: context.clone(),
+                },
+                cancellation.child_token(),
+            )
             .await
     }
 }
@@ -4220,6 +4335,8 @@ async fn dispatch_inner(
             command_effects: extension.supports_command_effects(),
             command_failure_classification_v1: true,
             before_agent_start_hook: extension.handles_before_agent_start(),
+            before_agent_start_prompt_options_v1: extension.handles_before_agent_start()
+                && extension.supports_before_agent_start_prompt_options(),
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
             result_presence_v1: true,
@@ -4330,7 +4447,24 @@ async fn dispatch_inner(
             }))
         }
         ProtocolRequest::BeforeAgentStart { event, state } => {
-            encode(extension.before_agent_start(&event, state.as_ref()).await)
+            if extension.supports_before_agent_start_prompt_options() {
+                encode(
+                    extension
+                        .before_agent_start_with_prompt_options(
+                            &event.event,
+                            &event.system_prompt_options.unwrap_or_default(),
+                            state.as_ref(),
+                        )
+                        .await
+                        .map(BeforeAgentStartWireResult::from),
+                )
+            } else {
+                encode(
+                    extension
+                        .before_agent_start(&event.event, state.as_ref())
+                        .await,
+                )
+            }
         }
         ProtocolRequest::Input { event, state } => {
             if host.supports_custom_messages() {
@@ -4494,6 +4628,19 @@ async fn dispatch_inner(
                 }
                 None => Ok(Value::Null),
             }
+        }
+        ProtocolRequest::RenderHeader { context } => {
+            let rows = match extension.header_renderer() {
+                Some(renderer) => renderer.render(&context).await?,
+                None => None,
+            };
+            if rows
+                .as_ref()
+                .is_some_and(|rows| !rows.within_header_limits())
+            {
+                return Err("extension header exceeds its rendering limits".into());
+            }
+            encode(Ok(rows))
         }
         ProtocolRequest::RenderToolSection { section, context } => {
             let renderers = extension
@@ -5638,6 +5785,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_header_dispatch_projects_width_theme_and_bounded_rows() {
+        struct Header;
+        #[async_trait::async_trait]
+        impl pi_rs_core::HeaderRenderer for Header {
+            async fn render(
+                &self,
+                context: &pi_rs_core::HeaderRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                let text = format!("{}:{}", context.theme.name, context.width);
+                Ok(Some(RenderedExtensionRows {
+                    lines: vec![
+                        vec![pi_rs_core::UiComponentSpan {
+                            text,
+                            ..Default::default()
+                        }];
+                        if context.width == 1 { 17 } else { 1 }
+                    ],
+                    ..Default::default()
+                }))
+            }
+        }
+
+        struct Fixture;
+        impl Extension for Fixture {
+            fn id(&self) -> &str {
+                "dynamic-header"
+            }
+            fn header_renderer(&self) -> Option<Arc<dyn pi_rs_core::HeaderRenderer>> {
+                Some(Arc::new(Header))
+            }
+        }
+
+        let request = |width| {
+            serde_json::from_value(serde_json::json!({
+            "type":"render_header", "context":{"width":width,"theme":{"name":"dark","colors":{},"dimmed":[]}}
+        })).unwrap()
+        };
+        let output = dispatch(Arc::new(Fixture), request(73)).await.unwrap();
+        assert_eq!(output["lines"][0][0]["text"], "dark:73");
+        let error = dispatch(Arc::new(Fixture), request(1)).await.unwrap_err();
+        assert!(error.contains("rendering limits"));
+    }
+
+    #[tokio::test]
     async fn lifecycle_dispatch_exposes_a_ui_only_host() {
         struct UiHost;
         #[async_trait::async_trait]
@@ -6272,12 +6463,12 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
     }
 
     #[tokio::test]
-    async fn before_agent_start_negotiates_and_transports_prompt_replacement() {
-        struct Hook;
+    async fn before_agent_start_negotiates_and_transports_prompt_edits() {
+        struct LegacyHook;
         #[async_trait::async_trait]
-        impl Extension for Hook {
+        impl Extension for LegacyHook {
             fn id(&self) -> &str {
-                "run-preflight"
+                "legacy-preflight"
             }
 
             fn handles_before_agent_start(&self) -> bool {
@@ -6286,27 +6477,86 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
 
             async fn before_agent_start(
                 &self,
-                event: &pi_rs_core::BeforeAgentStartEvent,
+                event: &BeforeAgentStartEvent,
                 _: Option<&ExtensionState>,
-            ) -> ExtensionResult<pi_rs_core::BeforeAgentStartResult> {
+            ) -> ExtensionResult<BeforeAgentStartResult> {
                 let pi_rs_core::AgentStartTrigger::User { prompt, images } = &event.trigger else {
                     panic!("expected a user prompt");
                 };
                 assert_eq!(prompt, "question");
                 assert!(images.is_empty());
                 assert_eq!(event.system_prompt, "host prompt");
-                Ok(pi_rs_core::BeforeAgentStartResult {
+                Ok(BeforeAgentStartResult {
+                    message: None,
                     system_prompt: Some(String::new()),
+                })
+            }
+        }
+
+        struct SectionHook;
+        #[async_trait::async_trait]
+        impl Extension for SectionHook {
+            fn id(&self) -> &str {
+                "section-preflight"
+            }
+
+            fn handles_before_agent_start(&self) -> bool {
+                true
+            }
+
+            fn supports_before_agent_start_prompt_options(&self) -> bool {
+                true
+            }
+
+            async fn before_agent_start_with_prompt_options(
+                &self,
+                event: &BeforeAgentStartEvent,
+                options: &BeforeAgentStartPromptOptions,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<BeforeAgentStartPromptResult> {
+                assert_eq!(event.system_prompt, "host prompt");
+                if options.sections.is_empty() {
+                    return Ok(Default::default());
+                }
+                assert_eq!(options.sections["rules"], "host rules");
+                assert_eq!(options.sections["cwd"], "workspace");
+                Ok(BeforeAgentStartPromptResult {
+                    system_prompt_options: BeforeAgentStartPromptChanges {
+                        sections: [
+                            ("z-first".into(), Some("new section".into())),
+                            ("cwd".into(), None),
+                            ("rules".into(), Some("new rules".into())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
                     ..Default::default()
                 })
             }
         }
 
-        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let legacy: Arc<dyn Extension> = Arc::new(LegacyHook);
+        let legacy_description = dispatch(legacy.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(legacy_description["before_agent_start_hook"], true);
+        assert!(
+            legacy_description
+                .get("before_agent_start_prompt_options_v1")
+                .is_none()
+        );
+        assert!(
+            !serde_json::from_value::<Description>(legacy_description)
+                .unwrap()
+                .before_agent_start_prompt_options_v1
+        );
+
+        let extension: Arc<dyn Extension> = Arc::new(SectionHook);
         let mut description = dispatch(extension.clone(), ProtocolRequest::Describe)
             .await
             .unwrap();
         assert_eq!(description["before_agent_start_hook"], true);
+        assert_eq!(description["before_agent_start_prompt_options_v1"], true);
         description
             .as_object_mut()
             .unwrap()
@@ -6317,17 +6567,142 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
                 .before_agent_start_hook
         );
 
-        let request = serde_json::from_value(serde_json::json!({
+        let legacy_request = serde_json::json!({
             "type": "before_agent_start",
             "event": {
                 "messageType": "user",
                 "prompt": "question",
                 "systemPrompt": "host prompt"
-            }
-        }))
-        .unwrap();
-        let response = dispatch(extension, request).await.unwrap();
+            },
+            "state": null
+        });
+        let request = serde_json::from_value::<ProtocolRequest>(legacy_request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), legacy_request);
+        let response = dispatch(extension.clone(), request).await.unwrap();
+        assert_eq!(response, serde_json::json!({}));
+
+        let mut structured_request = legacy_request;
+        structured_request["event"]["systemPromptOptions"] =
+            serde_json::json!({"sections": {"rules": "host rules", "cwd": "workspace"}});
+        let request =
+            serde_json::from_value::<ProtocolRequest>(structured_request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), structured_request);
+        let response = dispatch(legacy, request).await.unwrap();
         assert_eq!(response, serde_json::json!({"systemPrompt": ""}));
+        let legacy_result: BeforeAgentStartWireResult = serde_json::from_value(response).unwrap();
+        assert_eq!(legacy_result.result.system_prompt.as_deref(), Some(""));
+        assert!(legacy_result.system_prompt_options.is_none());
+
+        let request = serde_json::from_value::<ProtocolRequest>(structured_request).unwrap();
+        let response = dispatch(extension, request).await.unwrap();
+        let result: BeforeAgentStartWireResult = serde_json::from_value(response).unwrap();
+        assert!(result.result.system_prompt.is_none());
+        assert_eq!(
+            result
+                .system_prompt_options
+                .unwrap()
+                .sections
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [
+                ("z-first".into(), Some("new section".into())),
+                ("cwd".into(), None),
+                ("rules".into(), Some("new rules".into())),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_before_agent_start_sends_prompt_options_only_after_opt_in() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+request = json.load(sys.stdin)
+name = os.path.basename(sys.argv[0])
+if request["type"] == "describe":
+    response = {
+        "id": name, "dependencies": [], "commands": [], "tools": [],
+        "before_agent_start_hook": True,
+    }
+    if name != "legacy":
+        response["before_agent_start_prompt_options_v1"] = name in ("sections", "empty-sections")
+else:
+    expected = {
+        "type": "before_agent_start",
+        "event": {"messageType": "user", "prompt": "question", "systemPrompt": "host prompt"},
+        "state": {"version": 1, "data": {"saved": True}},
+    }
+    response = {"systemPrompt": "legacy override"}
+    if name in ("sections", "empty-sections"):
+        sections = {"rules": "host rules"} if name == "sections" else {}
+        expected["event"]["systemPromptOptions"] = {"sections": sections}
+        response = {"systemPromptOptions": {"sections": {"rules": "new rules", "cwd": None}}}
+    assert request == expected, request
+print(json.dumps({"version": 1, "response": {"Ok": response}}))
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let event = BeforeAgentStartEvent {
+            trigger: pi_rs_core::AgentStartTrigger::User {
+                prompt: "question".into(),
+                images: Vec::new(),
+            },
+            system_prompt: "host prompt".into(),
+        };
+        let options = BeforeAgentStartPromptOptions {
+            sections: [("rules".into(), "host rules".into())]
+                .into_iter()
+                .collect(),
+        };
+        let empty_options = BeforeAgentStartPromptOptions::default();
+        let state = ExtensionState {
+            version: 1,
+            data: serde_json::json!({"saved": true}),
+        };
+        for (name, opted_in, options) in [
+            ("legacy", false, &options),
+            ("disabled", false, &options),
+            ("sections", true, &options),
+            ("empty-sections", true, &empty_options),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let extension = ExecutableExtension::load(&path).unwrap();
+            assert!(extension.handles_before_agent_start());
+            assert_eq!(
+                extension.supports_before_agent_start_prompt_options(),
+                opted_in
+            );
+            let result = extension
+                .before_agent_start_with_prompt_options(&event, options, Some(&state))
+                .await
+                .unwrap();
+            if opted_in {
+                assert!(result.result.system_prompt.is_none());
+                assert_eq!(
+                    result
+                        .system_prompt_options
+                        .sections
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    [
+                        ("rules".into(), Some("new rules".into())),
+                        ("cwd".into(), None)
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    result.result.system_prompt.as_deref(),
+                    Some("legacy override")
+                );
+                assert!(result.system_prompt_options.sections.is_empty());
+            }
+        }
     }
 
     #[tokio::test]

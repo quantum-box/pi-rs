@@ -33,6 +33,7 @@ NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
 "#;
 const MODEL_OPERATION: &str = "pi_model_operation";
+const GENERATE_IMAGES: &str = "models.generateImages";
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 100_000;
 const MAX_PREVIEW_UNITS: usize = 100 * 1024;
@@ -142,15 +143,29 @@ impl NestedProgress {
         }
         let call = &mut self.calls[index];
         call.duration_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
-        call.status = if !outcome.is_error() {
-            CallStatus::Ok
-        } else if cancelled {
-            CallStatus::Cancelled
+        if call.name == GENERATE_IMAGES
+            && let Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } =
+                outcome
+        {
+            call.status = match data["stopReason"].as_str() {
+                Some("aborted") => CallStatus::Cancelled,
+                Some("error") => CallStatus::Error,
+                _ => CallStatus::Ok,
+            };
+            call.error = data["errorMessage"]
+                .as_str()
+                .map(|message| progress_preview(message, ERROR_PREVIEW_UNITS));
         } else {
-            CallStatus::Error
-        };
-        if outcome.is_error() {
-            call.error = Some(nested_error_preview(outcome));
+            call.status = if !outcome.is_error() {
+                CallStatus::Ok
+            } else if cancelled {
+                CallStatus::Cancelled
+            } else {
+                CallStatus::Error
+            };
+            if outcome.is_error() {
+                call.error = Some(nested_error_preview(outcome));
+            }
         }
         self.publish(host, false).await;
     }
@@ -987,6 +1002,7 @@ fn install_globals(
     )?;
     globals.set("__initial_store", ctx.json_parse(store.to_string())?)?;
     let model_output = sink.clone();
+    let model_progress = progress.clone();
     let tool_output = sink.clone();
     let output_cancel = cancellation.clone();
     let model_cancel = cancellation.clone();
@@ -1013,6 +1029,7 @@ fn install_globals(
             let model_host = model_host.clone();
             let slots = model_slots.clone();
             let model_output = model_output.clone();
+            let progress = model_progress.clone();
             let cancellation = model_cancel.clone();
             async move {
                 let result = match serde_json::from_str::<Value>(&arguments) {
@@ -1021,6 +1038,22 @@ fn install_globals(
                         // Discovery and model resolution must remain available
                         // while slow classifier or image requests are in flight.
                         let generates_images = args["action"] == "generateImages";
+                        let index = if generates_images && let Some(progress) = &progress {
+                            let provider = args["provider"].as_str().unwrap_or_default();
+                            let model = args["id"].as_str().unwrap_or_default();
+                            progress
+                                .lock()
+                                .await
+                                .start(
+                                    model_host.as_ref(),
+                                    GENERATE_IMAGES,
+                                    &format!("{provider}/{model}"),
+                                )
+                                .await
+                        } else {
+                            None
+                        };
+                        let started = Instant::now();
                         let _permit = if matches!(
                             args["action"].as_str(),
                             Some("classify" | "generateImages")
@@ -1036,19 +1069,22 @@ fn install_globals(
                             );
                         }
                         let outcome = model_host
-                            .call_with_cancellation(MODEL_OPERATION, args, cancellation)
+                            .call_with_cancellation(MODEL_OPERATION, args, cancellation.clone())
                             .await;
                         let usage = ModelUsage::from_outcome(&outcome);
-                        let value = tool_value(outcome);
-                        let generated_images = if generates_images {
-                            value["value"]["output"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter(|block| block["type"] == "image")
-                                .count()
-                        } else {
-                            0
+                        let generated_images = match &outcome {
+                            Outcome::Structured { data, .. }
+                            | Outcome::StructuredWithDetails { data, .. }
+                                if generates_images && !outcome.is_error() =>
+                            {
+                                data["output"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|block| block["type"] == "image")
+                                    .count()
+                            }
+                            _ => 0,
                         };
                         if usage.is_some() || generated_images != 0 {
                             let mut output = model_output.lock().expect("codemode output");
@@ -1058,7 +1094,20 @@ fn install_globals(
                                 output.model_usage.add(&usage);
                             }
                         }
-                        value
+                        if let Some((progress, index)) = progress.as_ref().zip(index) {
+                            progress
+                                .lock()
+                                .await
+                                .complete(
+                                    model_host.as_ref(),
+                                    index,
+                                    started,
+                                    &outcome,
+                                    cancellation.is_cancelled(),
+                                )
+                                .await;
+                        }
+                        tool_value(outcome)
                     }
                     Ok(args) if args["action"] == "list" => json!({"ok":true,"value":[]}),
                     Ok(_) => json!({"ok":false,"error":"native model operations are unavailable"}),
