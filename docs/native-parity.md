@@ -4844,6 +4844,15 @@ Model cycling leaves the current selection intact for lists with fewer than
 two choices. If the current model is outside the list, forward and backward
 cycling start from the first slot, as in Pi.
 
+The Rust SDK also supports standalone thinking changes on the active
+provider-qualified model. Hosts supply the ordered capabilities, clamp policy,
+and an explicitly identified client. An effective change journals the exact
+binding and emits only the thinking selection hook. Native journals preserve a
+binding ID so hosts can restore distinct clients for repeated selections at the
+same level. The SDK leaves global defaults to the host. Native RPC retains its
+host-managed capability and provider resolution.
+[Pinned Pi thinking-level implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2782-L2857)
+
 Scope diagnostics warn about unmatched patterns and invalid thinking suffixes.
 The resolver keeps valid candidates and falls back to normal model selection
 when every pattern misses. Pattern order and the first occurrence of each

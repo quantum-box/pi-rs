@@ -202,17 +202,26 @@ factory can prepare clients using `ModelClientFactory` before passing the
 snapshot. The SDK performs no discovery or credential lookup during selection.
 Each cycled journal selection retains its own client binding, including across
 in-process forks and checkouts. Native journal records carry a binding marker,
-so cycling requires a session store with atomic record metadata. When reopening
-a native journal, use `SessionBuilder::cycled_model_resolver` to resolve the
-exact provider, model, and recorded thinking level. The host applies its normal
-credential and capability policy. If it cannot supply that exact client, the
-SDK leaves the selection unresolved and cannot dispatch requests with it.
+so cycling requires a session store with atomic record metadata. When different
+clients can share a provider, model, and thinking level, read the identifier
+with `Session::model_binding_id_at(record_id)` and associate it with the client's
+configuration in host-owned storage. Use `SessionBuilder::cycled_model_resolver_with_id`
+to look up that mapping on reopen or historical checkout. Check the recorded
+provider, model, and level against the host mapping before returning a client.
+The opaque UUID follows the selection through native forks and checkout.
+The journal stores the ID and selection details. Credentials remain with the host.
+
+`SessionBuilder::cycled_model_resolver` supports hosts that resolve solely by
+provider, model, and effective thinking level. Both callbacks apply the host's
+authorization policy and can return `None` to leave the selection unresolved.
 On reopen, a configured cycle resolver reauthorizes the active SDK binding,
-even when the supplied registry has cached clients for the journal. It also
-reauthorizes the bindings needed to resume pending tree triggers. Other cycled
-bindings are resolved when their branches are selected. A malformed or
-incomplete SDK binding on the active selection causes reopen to fail.
-Explicit SDK model setters keep their existing identity-based behavior.
+even when the registry has a cached client for the journal. It also reauthorizes
+the bindings needed to resume pending tree triggers. Reopen reserves those
+bindings during authorization so a concurrent revocation prevents publishing
+the clients. Other SDK bindings are resolved when their branches are selected.
+A malformed or incomplete SDK binding on the active selection causes reopen to fail.
+`HistoricalModelResolver` still handles ordinary provider-qualified model
+history. Explicit SDK model setters keep their existing identity-based behavior.
 
 The SDK records the chosen model and effective thinking level together in the
 session journal, then delivers selection hooks with source `cycle`. A host owns
@@ -220,6 +229,30 @@ the scope and any application-wide defaults, including whether to persist the
 new model to settings. See the
 [pinned upstream cycling implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2701-L2774)
 for the reference ordering and scope behavior.
+
+## Thinking level
+
+`AgentSession::set_thinking_level` and `cycle_thinking_level` use
+`ThinkingLevelCapabilities` for the current registered provider and model.
+For a legacy provider-less selection, select an explicit provider model first.
+Supply unique, case-sensitive effective levels in forward cycle order. Cycling
+wraps and starts at the first level if the current level is absent. An empty
+list means thinking changes are unsupported. The SDK treats an unset level
+as `off`. An unsupported or unchanged selection returns `Ok(None)`.
+
+The synchronous binding callback receives the exact provider, model, and
+requested level. Return a `ThinkingLevelBinding` from the host's authorized
+configuration, with the client set up for the effective level after any
+provider clamp. The SDK checks the returned identity against the selected
+model and the effective level against the supplied capabilities. An already
+effective request skips the callback. If a clamp leaves the level unchanged,
+the SDK discards the returned binding and performs no selection.
+
+A change atomically commits the effective level and its historical client
+binding, then emits `thinking_level_select`. This uses the same native binding IDs
+and reopen callbacks as model cycling. Capability policy, client authorization,
+and any application-wide default persistence belong to the host.
+[Pinned Pi thinking-level implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2782-L2857)
 
 ## Native state and Tauri
 

@@ -143,6 +143,24 @@ pub struct ModelCycleResult {
     pub is_scoped: bool,
 }
 
+/// Host-authorized effective thinking levels for one exact provider and model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThinkingLevelCapabilities<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    /// Unique, case-sensitive levels in forward cycle order. Empty means unsupported.
+    pub levels: &'a [&'a str],
+}
+
+/// A host client configured for one provider, model, and effective thinking level.
+pub struct ThinkingLevelBinding {
+    pub provider: String,
+    pub model: String,
+    /// The level after applying the host's provider clamp.
+    pub level: String,
+    pub client: Arc<dyn Model>,
+}
+
 struct ModelSelection {
     client: Arc<dyn Model>,
     provider: Option<String>,
@@ -1297,14 +1315,20 @@ fn selected_branch_client(
     })
 }
 
-type CycledModelResolver = dyn Fn(&str, &str, &str) -> Result<Option<Arc<dyn Model>>> + Send + Sync;
+type CycledModelResolver =
+    dyn Fn(Uuid, &str, &str, &str) -> Result<Option<Arc<dyn Model>>> + Send + Sync;
 
 fn resolve_cycled_client(
     resolver: Option<&CycledModelResolver>,
     selection: &CycledModelSelection,
 ) -> Result<Option<Arc<dyn Model>>> {
     resolver.map_or(Ok(None), |resolve| {
-        resolve(&selection.provider, &selection.model, &selection.thinking)
+        resolve(
+            selection.id,
+            &selection.provider,
+            &selection.model,
+            &selection.thinking,
+        )
     })
 }
 
@@ -1454,12 +1478,30 @@ impl SessionBuilder {
         self.historical_model_resolver = Some(resolver);
         self
     }
-    /// Resolve a previously cycled selection using its recorded effective
-    /// thinking level. Return a host-authorized client configured for that
-    /// exact level, or `None` if unavailable. This callback runs synchronously.
+    /// Resolve a historical model cycle or thinking change by provider, model,
+    /// and effective thinking level. Use [Self::cycled_model_resolver_with_id]
+    /// when multiple selections with the same values need distinct clients.
     pub fn cycled_model_resolver(
-        mut self,
+        self,
         resolver: impl Fn(&str, &str, &str) -> Result<Option<Arc<dyn Model>>> + Send + Sync + 'static,
+    ) -> Self {
+        self.cycled_model_resolver_with_id(move |_, provider, model, level| {
+            resolver(provider, model, level)
+        })
+    }
+
+    /// Resolve a historical SDK selection by its journal binding ID, provider,
+    /// model, and effective thinking level. The ID is available when recording
+    /// the host mapping through [Session::model_binding_id_at].
+    ///
+    /// This synchronous callback returns a client authorized for the exact
+    /// selection, or `None` if unavailable.
+    pub fn cycled_model_resolver_with_id(
+        mut self,
+        resolver: impl Fn(Uuid, &str, &str, &str) -> Result<Option<Arc<dyn Model>>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.cycled_model_resolver = Some(Arc::new(resolver));
         self
@@ -1516,9 +1558,7 @@ impl SessionBuilder {
                 }
             }
             for selection in required_cycles {
-                if let Some(client) =
-                    resolve(&selection.provider, &selection.model, &selection.thinking)?
-                {
+                if let Some(client) = resolve_cycled_client(Some(resolve), &selection)? {
                     refreshed_cycles.push((selection, client));
                 }
             }
@@ -2364,13 +2404,14 @@ impl AgentSession {
         let mut journal = session
             .try_lock()
             .map_err(|_| Error::Session("session journal is in use".into()))?;
-        self.commit_model_selection(&mut journal, selection)
+        self.commit_model_selection(&mut journal, selection, false)
     }
 
     fn commit_model_selection(
         &mut self,
         journal: &mut Session,
         selection: &ModelSelection,
+        thinking_only: bool,
     ) -> Result<()> {
         let ModelSelection {
             client,
@@ -2392,7 +2433,7 @@ impl AgentSession {
                 &exact,
                 client.clone(),
                 false,
-                || journal.select_cycled_model(&exact),
+                || journal.select_cycled_model(&exact, thinking_only),
             )?;
             revoked
         } else {
@@ -2574,6 +2615,167 @@ impl AgentSession {
         Ok(Some(result))
     }
 
+    /// Change the current model's thinking level and return the new effective level.
+    ///
+    /// The host binds the requested level for the exact current identity and can
+    /// clamp it to a listed level. An unsupported model or an unchanged level
+    /// returns `Ok(None)`. A request for the current listed level skips binding.
+    /// The client must already be authorized and configured by the host.
+    pub async fn set_thinking_level(
+        &mut self,
+        capabilities: ThinkingLevelCapabilities<'_>,
+        requested: &str,
+        bind: impl FnOnce(&str, &str, &str) -> Result<ThinkingLevelBinding>,
+    ) -> Result<Option<String>> {
+        self.update_thinking_level(capabilities, Some(requested), bind)
+            .await
+    }
+
+    /// Advance through the current model's host-authorized levels, wrapping at the end.
+    ///
+    /// If the current level is absent, start at the first level. Return the
+    /// changed effective level after any host clamp, or `Ok(None)` for a no-op.
+    pub async fn cycle_thinking_level(
+        &mut self,
+        capabilities: ThinkingLevelCapabilities<'_>,
+        bind: impl FnOnce(&str, &str, &str) -> Result<ThinkingLevelBinding>,
+    ) -> Result<Option<String>> {
+        self.update_thinking_level(capabilities, None, bind).await
+    }
+
+    async fn update_thinking_level(
+        &mut self,
+        capabilities: ThinkingLevelCapabilities<'_>,
+        requested: Option<&str>,
+        bind: impl FnOnce(&str, &str, &str) -> Result<ThinkingLevelBinding>,
+    ) -> Result<Option<String>> {
+        self.ensure_open()?;
+        if self.control.shutdown.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let ThinkingLevelCapabilities {
+            provider,
+            model,
+            levels,
+        } = capabilities;
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return Err(Error::Config("provider or model name is empty".into()));
+        }
+        let mut seen = HashSet::new();
+        if levels
+            .iter()
+            .any(|level| level.trim().is_empty() || !seen.insert(*level))
+            || requested.is_some_and(|level| level.trim().is_empty())
+        {
+            return Err(Error::Config(
+                "thinking levels must be nonempty and capabilities must be unique".into(),
+            ));
+        }
+        let (previous_level, requested, supports_metadata) = {
+            let journal = self.journal()?;
+            let previous = self.thinking_level_for(&journal, capabilities)?;
+            let requested = requested.or_else(|| {
+                let current = levels.iter().position(|level| *level == previous);
+                next_cycle_index(current, levels.len(), ModelCycleDirection::Forward)
+                    .map(|index| levels[index])
+            });
+            let Some(requested) =
+                requested.filter(|requested| !levels.is_empty() && *requested != previous)
+            else {
+                return Ok(None);
+            };
+            (previous, requested, journal.supports_record_metadata())
+        };
+
+        let binding = bind(provider, model, requested)?;
+        if binding.provider != provider || binding.model != model {
+            return Err(Error::Config(
+                "thinking client must match the current provider and model".into(),
+            ));
+        }
+        if !levels.contains(&binding.level.as_str()) {
+            return Err(Error::Config(
+                "effective thinking level is outside the host capabilities".into(),
+            ));
+        }
+        let level = binding.level;
+        if previous_level == level {
+            return Ok(None);
+        }
+
+        if !supports_metadata {
+            return Err(Error::Session(
+                "thinking level changes require a store with record metadata".into(),
+            ));
+        }
+        self.start().await?;
+        if self.control.shutdown.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        // Startup can recover a transient branch. Check the effective selection
+        // again under the journal guard used for the commit and notification.
+        let session = self.session.clone();
+        let mut journal = session
+            .try_lock()
+            .map_err(|_| Error::Session("session journal is in use".into()))?;
+        if journal.pending_tree_trigger_handoff().is_some()
+            || self.thinking_level_for(&journal, capabilities)? != previous_level
+        {
+            return Err(Error::Session(
+                "thinking selection changed during startup".into(),
+            ));
+        }
+        self.commit_model_selection(
+            &mut journal,
+            &ModelSelection {
+                client: binding.client,
+                provider: Some(binding.provider),
+                name: binding.model,
+                thinking: Some(level.clone()),
+            },
+            true,
+        )?;
+        if self.registry.has_model_selection_hooks() {
+            self.notify_selection_in_journal(
+                &mut journal,
+                crate::LifecycleEvent::ThinkingLevelSelect {
+                    level: level.clone(),
+                    previous_level,
+                },
+            )
+            .await?;
+        }
+        drop(journal);
+        let _ = self.drain_idle_triggers().await?;
+        Ok(Some(level))
+    }
+
+    fn thinking_level_for(
+        &self,
+        journal: &Session,
+        capabilities: ThinkingLevelCapabilities<'_>,
+    ) -> Result<String> {
+        let target = journal
+            .pending_tree_trigger_handoff()
+            .map_or(journal.head(), |(_, return_to)| return_to);
+        let (provider, model, level) = journal
+            .model_identity_at(target)
+            .unwrap_or_else(|| (self.model_provider.clone(), self.model_name.clone(), None));
+        if provider.as_deref() != Some(capabilities.provider) || model != capabilities.model {
+            return Err(Error::Config(
+                "thinking capabilities must match the current provider and model".into(),
+            ));
+        }
+        if selected_branch_client(&self.registry, journal, target, provider.as_deref(), &model)?
+            .is_none()
+        {
+            return Err(Error::Config(
+                "current session model binding is unavailable".into(),
+            ));
+        }
+        Ok(level.unwrap_or_else(|| "off".into()))
+    }
+
     async fn select_model_with_hooks(
         &mut self,
         selection: ModelSelection,
@@ -2655,20 +2857,26 @@ impl AgentSession {
 
     async fn notify_selection_event(&mut self, event: crate::LifecycleEvent) -> Result<()> {
         if self.registry.has_model_selection_hooks() {
-            let events = self.events.as_ref().expect("open session");
-            crate::lifecycle::notify_idle_with_host(
-                &self.registry,
-                &mut *self
-                    .session
-                    .try_lock()
-                    .map_err(|_| Error::Session("session journal is in use".into()))?,
-                event,
-                self.limits.tool_timeout,
-                &mut |notification| emit(events, &notification),
-            )
-            .await?;
+            self.notify_selection_in_journal(&mut *self.journal()?, event)
+                .await?;
         }
         Ok(())
+    }
+
+    async fn notify_selection_in_journal(
+        &self,
+        journal: &mut Session,
+        event: crate::LifecycleEvent,
+    ) -> Result<()> {
+        let events = self.events.as_ref().expect("open session");
+        crate::lifecycle::notify_idle_with_host(
+            &self.registry,
+            journal,
+            event,
+            self.limits.tool_timeout,
+            &mut |notification| emit(events, &notification),
+        )
+        .await
     }
     /// The host-configured base prompt used when preparing future requests.
     /// Extension context hooks can change the actual prompt for each request;
@@ -3294,7 +3502,7 @@ impl AgentSession {
             {
                 self.restore_branch_model(&journal, provider.as_deref(), name)?;
             } else if let Some(selection) = fallback {
-                self.commit_model_selection(&mut journal, selection)?;
+                self.commit_model_selection(&mut journal, selection, false)?;
                 replaced = Some((provider, name, level.unwrap_or_else(|| "off".into())));
             } else if !missing_legacy {
                 self.restore_branch_model(&journal, provider.as_deref(), name)?;
@@ -3528,7 +3736,7 @@ impl AgentSession {
         } = &resolution
         {
             if *inherited {
-                session.select_cycled_model(selection)?;
+                session.select_cycled_model(selection, false)?;
             }
             let (fork, revoked) = self.registry.commit_cycled_model(
                 self.session_id,
@@ -5344,6 +5552,403 @@ mod tests {
         }
     }
 
+    fn thinking_capabilities<'a>(levels: &'a [&'a str]) -> ThinkingLevelCapabilities<'a> {
+        ThinkingLevelCapabilities {
+            provider: "fixture",
+            model: "shared",
+            levels,
+        }
+    }
+
+    fn thinking_client(provider: &str, model: &str, level: &str) -> ThinkingLevelBinding {
+        ThinkingLevelBinding {
+            provider: provider.into(),
+            model: model.into(),
+            level: level.into(),
+            client: Arc::new(WaitingModel),
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_thinking_level_cycles_in_host_order_and_emits_only_thinking_changes() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "shared")
+            .provider("fixture")
+            .unwrap()
+            .extension(Arc::new(SelectionHook(observed.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let capabilities = thinking_capabilities(&["off", "high", "low"]);
+        for (old, new) in [("off", "high"), ("high", "low"), ("low", "off")] {
+            let changed = session
+                .cycle_thinking_level(capabilities, |provider, model, requested| {
+                    assert_eq!((provider, model, requested), ("fixture", "shared", new));
+                    Ok(thinking_client(provider, model, requested))
+                })
+                .await
+                .unwrap();
+            assert_eq!(changed.as_deref(), Some(new));
+            let journal = session.journal().unwrap();
+            assert_eq!(
+                journal.model_selection(),
+                Some(("shared".into(), Some(new.into())))
+            );
+            assert_eq!(
+                journal.record_metadata(journal.head()).unwrap()["sdkThinkingOnly"],
+                true
+            );
+            assert!(
+                matches!(observed.lock().unwrap().last(), Some(crate::LifecycleEvent::ThinkingLevelSelect {
+                previous_level, level
+            }) if previous_level == old && level == new)
+            );
+        }
+        assert_eq!(observed.lock().unwrap().len(), 3);
+        let before = session.journal().unwrap().records().len();
+        assert_eq!(
+            session
+                .set_thinking_level(capabilities, "off", |_, _, _| panic!("already effective"))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            session
+                .set_thinking_level(capabilities, "max", |provider, model, requested| {
+                    assert_eq!(requested, "max");
+                    Ok(thinking_client(provider, model, "off"))
+                })
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            session
+                .cycle_thinking_level(thinking_capabilities(&[]), |_, _, _| panic!("unsupported"))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            session
+                .cycle_thinking_level(thinking_capabilities(&["off"]), |_, _, _| panic!(
+                    "only current level"
+                ))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(session.journal().unwrap().records().len(), before);
+        assert_eq!(observed.lock().unwrap().len(), 3);
+        let changed = session
+            .cycle_thinking_level(
+                thinking_capabilities(&["low", "high"]),
+                |provider, model, level| {
+                    assert_eq!(level, "low");
+                    Ok(thinking_client(provider, model, "high"))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed.as_deref(), Some("high"));
+        assert_eq!(observed.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn sdk_thinking_level_rejects_unauthorized_identity_and_busy_or_closed_session() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "shared")
+            .provider("fixture")
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let capabilities = thinking_capabilities(&["off", "high"]);
+        let before = session.journal().unwrap().records().len();
+        for (provider, model) in [("other", "shared"), ("fixture", "other")] {
+            let unauthorized = ThinkingLevelCapabilities {
+                provider,
+                model,
+                ..capabilities
+            };
+            assert!(
+                session
+                    .set_thinking_level(unauthorized, "high", |_, _, _| panic!(
+                        "wrong capabilities"
+                    ))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                session
+                    .set_thinking_level(capabilities, "high", |_, _, level| {
+                        Ok(thinking_client(provider, model, level))
+                    })
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            session
+                .set_thinking_level(capabilities, "high", |provider, model, _| {
+                    Ok(thinking_client(provider, model, "low"))
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(session.journal().unwrap().records().len(), before);
+        assert_eq!(session.model_provider().unwrap(), Some("fixture"));
+
+        let holder = session.session.clone();
+        let guard = holder.lock().await;
+        let error = session
+            .cycle_thinking_level(capabilities, |_, _, _| panic!("busy"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("journal is in use"));
+        drop(guard);
+        session.close().await.unwrap();
+        let error = session
+            .set_thinking_level(capabilities, "high", |_, _, _| panic!("closed"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("session is closed"));
+    }
+
+    #[tokio::test]
+    async fn sdk_thinking_level_history_keeps_distinct_clients_through_checkout_fork_and_load() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("thinking.jsonl");
+        let fork_path = root.path().join("fork.jsonl");
+        let registry = Registry::default();
+        let builder = || {
+            SessionBuilder::new(Arc::new(ProviderBranchModel("initial")), "shared")
+                .provider("fixture")
+                .unwrap()
+        };
+        let mut session = builder().registry(registry.clone()).open(&path).unwrap();
+        let capabilities = thinking_capabilities(&["off", "high", "low"]);
+        let mut targets = Vec::new();
+        let mut bindings = std::collections::BTreeMap::new();
+        for (level, reply, reauthorized_reply) in [
+            ("low", "old-low", "reauthorized-old-low"),
+            ("high", "high", "reauthorized-high"),
+            ("low", "new-low", "reauthorized-new-low"),
+        ] {
+            session
+                .set_thinking_level(capabilities, level, |provider, model, level| {
+                    Ok(ThinkingLevelBinding {
+                        client: Arc::new(ProviderBranchModel(reply)),
+                        ..thinking_client(provider, model, level)
+                    })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let journal = session.journal().unwrap();
+            let target = journal.head();
+            let binding_id = journal.model_binding_id_at(target).unwrap();
+            assert!(
+                bindings
+                    .insert(binding_id, (level, reauthorized_reply))
+                    .is_none()
+            );
+            targets.push(target);
+        }
+        assert_eq!(session.prompt("latest").await.unwrap(), "new-low");
+        session.checkout(targets[0]).unwrap();
+        let checkout_id = {
+            let journal = session.journal().unwrap();
+            let checkout = journal.records().last().unwrap();
+            assert!(
+                matches!(checkout.event, crate::Event::Checkout { target } if target == targets[0])
+            );
+            let previous_id = journal
+                .model_binding_id_at(checkout.parent.unwrap())
+                .unwrap();
+            let destination_id = journal.model_binding_id_at(targets[0]).unwrap();
+            assert_ne!(previous_id, destination_id);
+            assert_eq!(
+                journal.model_binding_id_at(checkout.id),
+                Some(destination_id)
+            );
+            checkout.id
+        };
+        assert_eq!(session.prompt("checkout").await.unwrap(), "old-low");
+        let mut fork = session.fork_to(targets[1], &fork_path).unwrap();
+        {
+            let journal = fork.journal().unwrap();
+            let binding_id = journal.model_binding_id_at(journal.head()).unwrap();
+            assert_eq!(bindings[&binding_id], ("high", "reauthorized-high"));
+        }
+        assert_eq!(fork.prompt("fork").await.unwrap(), "high");
+        fork.checkout(targets[0]).unwrap();
+        assert_eq!(fork.prompt("fork history").await.unwrap(), "old-low");
+        fork.close().await.unwrap();
+        drop(fork);
+        session.close().await.unwrap();
+        drop(session);
+
+        let mut unresolved = builder().open(&path).unwrap();
+        assert!(unresolved.prompt("missing exact client").await.is_err());
+        drop(unresolved);
+        let mut reopened = builder()
+            .registry(registry)
+            .cycled_model_resolver_with_id(move |id, provider, model, level| {
+                let (bound_level, reply) = bindings[&id];
+                assert_eq!((provider, model, level), ("fixture", "shared", bound_level));
+                Ok(Some(Arc::new(ProviderBranchModel(reply))))
+            })
+            .open(&path)
+            .unwrap();
+        {
+            let journal = reopened.journal().unwrap();
+            assert_eq!(
+                journal.model_binding_id_at(checkout_id),
+                journal.model_binding_id_at(targets[0])
+            );
+        }
+        assert_eq!(
+            reopened.prompt("reopened old low").await.unwrap(),
+            "reauthorized-old-low"
+        );
+        reopened.checkout(targets[2]).unwrap();
+        assert_eq!(
+            reopened.prompt("reopened new low").await.unwrap(),
+            "reauthorized-new-low"
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_thinking_level_checks_the_logical_model_during_handoff() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("temporary"), "shared", Some("off"))
+            .unwrap();
+        let temporary = journal.head();
+        journal.checkout(1).unwrap();
+        journal
+            .select_provider_model(Some("fixture"), "shared", Some("high"))
+            .unwrap();
+        let selected = journal.head();
+        journal
+            .append(crate::Event::TreeTriggerHandoff {
+                run_id: Uuid::new_v4(),
+                return_to: selected,
+            })
+            .unwrap();
+        journal.checkout(temporary).unwrap();
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "shared")
+            .provider("fixture")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let capabilities = thinking_capabilities(&["off", "high", "low"]);
+        let wrong = ThinkingLevelCapabilities {
+            provider: "temporary",
+            ..capabilities
+        };
+        assert!(
+            session
+                .cycle_thinking_level(wrong, |_, _, _| panic!("temporary model"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session
+                .set_thinking_level(capabilities, "high", |_, _, _| panic!("already effective"))
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_tree_trigger_handoff()
+                .is_some()
+        );
+        let changed = session
+            .cycle_thinking_level(capabilities, |provider, model, level| {
+                assert_eq!(level, "low");
+                Ok(thinking_client(provider, model, level))
+            })
+            .await
+            .unwrap();
+        assert_eq!(changed.as_deref(), Some("low"));
+        assert_eq!(session.model_provider().unwrap(), Some("fixture"));
+        let journal = session.journal().unwrap();
+        assert!(journal.pending_tree_trigger_handoff().is_none());
+        assert!(journal.branch().iter().any(|record| record.id == selected));
+        assert!(!journal.branch().iter().any(|record| record.id == temporary));
+    }
+
+    struct AbortThinkingStartup(Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl Extension for AbortThinkingStartup {
+        fn id(&self) -> &str {
+            "abort-thinking-startup"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                self.0.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_thinking_level_abort_during_startup_preserves_selection() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "shared")
+            .provider("fixture")
+            .unwrap()
+            .extension(Arc::new(AbortThinkingStartup(entered.clone())))
+            .unwrap()
+            .extension(Arc::new(SelectionHook(observed.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let capabilities = thinking_capabilities(&["off", "high"]);
+        let before = session.journal().unwrap().head();
+        let (result, ()) = tokio::join!(
+            session.set_thinking_level(capabilities, "high", |provider, model, level| {
+                Ok(thinking_client(provider, model, level))
+            }),
+            async {
+                entered.notified().await;
+                control.abort();
+            }
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(session.journal().unwrap().head(), before);
+        assert!(observed.lock().unwrap().is_empty());
+        assert_eq!(
+            session
+                .set_thinking_level(capabilities, "high", |provider, model, level| {
+                    Ok(thinking_client(provider, model, level))
+                })
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(observed.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn sdk_model_cycle_filters_scopes_and_commits_effective_level_before_hooks() {
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -5715,7 +6320,7 @@ mod tests {
             model: "shared".into(),
             thinking: "high".into(),
         };
-        journal.select_cycled_model(&selection).unwrap();
+        journal.select_cycled_model(&selection, false).unwrap();
         let session_id = journal.session_id();
         drop(journal);
 
@@ -5780,10 +6385,9 @@ mod tests {
             };
             let selected = CycledModelSelection {
                 id: Uuid::new_v4(),
-                thinking: "low".into(),
                 ..origin.clone()
             };
-            journal.select_cycled_model(&origin).unwrap();
+            journal.select_cycled_model(&origin, false).unwrap();
             let id = Uuid::new_v4();
             let message = crate::CustomMessage {
                 custom_type: "tree-trigger".into(),
@@ -5812,7 +6416,7 @@ mod tests {
                 .unwrap();
             journal.set_run_id(None);
             journal.checkout(1).unwrap();
-            journal.select_cycled_model(&selected).unwrap();
+            journal.select_cycled_model(&selected, true).unwrap();
             let return_to = journal.head();
             journal.begin_tree_trigger_handoff(id).unwrap().unwrap();
             let session_id = journal.session_id();
@@ -5830,25 +6434,27 @@ mod tests {
             }
             let calls = Arc::new(Mutex::new(Vec::new()));
             let seen = calls.clone();
+            let expected_ids = [selected.id, origin.id];
+            let [selected_id, origin_id] = expected_ids;
             let reopened = SessionBuilder::new(Arc::new(ProviderBranchModel("generic")), "shared")
                 .provider("provider")
                 .unwrap()
                 .registry(registry.clone())
-                .cycled_model_resolver(move |provider, model, level| {
-                    assert_eq!((provider, model), ("provider", "shared"));
-                    seen.lock().unwrap().push(level.to_owned());
-                    match level {
-                        "low" => Ok(Some(Arc::new(ProviderBranchModel("selected authorized")))),
-                        "high" if outcome == "resolver error" => {
-                            Err(Error::Config("origin resolver failed".into()))
-                        }
-                        "high" if outcome == "refused" => Ok(None),
-                        "high" => Ok(Some(Arc::new(ProviderBranchModel("origin authorized")))),
-                        _ => panic!("unexpected thinking level {level}"),
+                .cycled_model_resolver_with_id(move |binding_id, provider, model, level| {
+                    assert_eq!((provider, model, level), ("provider", "shared", "high"));
+                    seen.lock().unwrap().push(binding_id);
+                    if binding_id == selected_id {
+                        return Ok(Some(Arc::new(ProviderBranchModel("selected authorized"))));
+                    }
+                    assert_eq!(binding_id, origin_id);
+                    match outcome {
+                        "resolver error" => Err(Error::Config("origin resolver failed".into())),
+                        "refused" => Ok(None),
+                        _ => Ok(Some(Arc::new(ProviderBranchModel("origin authorized")))),
                     }
                 })
                 .open(&path);
-            assert_eq!(*calls.lock().unwrap(), ["low", "high"]);
+            assert_eq!(*calls.lock().unwrap(), expected_ids);
 
             if outcome == "resolver error" {
                 assert!(
@@ -5878,7 +6484,7 @@ mod tests {
             }
             let started = session.start().await;
             if outcome != "authorized" {
-                assert_eq!(*calls.lock().unwrap(), ["low", "high"]);
+                assert_eq!(*calls.lock().unwrap(), expected_ids);
                 assert!(started.is_err());
                 let journal = session.journal().unwrap();
                 assert_eq!(journal.head(), return_to);
@@ -5896,7 +6502,7 @@ mod tests {
             started.unwrap();
             let answer = session.prompt("selected prompt").await.unwrap();
             assert_eq!(answer, "selected authorized");
-            assert_eq!(*calls.lock().unwrap(), ["low", "high"]);
+            assert_eq!(*calls.lock().unwrap(), expected_ids);
             let journal = session.journal().unwrap();
             assert!(journal.pending_custom_trigger().is_none());
             assert!(journal.pending_tree_trigger_handoff().is_none());
@@ -5938,6 +6544,7 @@ mod tests {
                 model: "shared".into(),
                 thinking: Some("high".into()),
             }, metadata).unwrap().id;
+            assert!(journal.model_binding_id_at(invalid).is_none());
             drop(journal);
             let builder = || SessionBuilder::new(Arc::new(ProviderBranchModel("legacy")), "shared")
                 .historical_model_resolver(Arc::new(|_: &str, _: &str| panic!("legacy fallback")))
