@@ -9,7 +9,7 @@ use pi_rs_durable::images::{BuiltinImageProcessor, UserImageAdmission};
 use pi_rs_durable::progress;
 use pi_rs_durable::runtime::{
     AdmissionError, AdmissionOptions, Conversation, Error, InputMode, OnAbort, QueueMode,
-    Scheduler, Status, Submission,
+    Scheduler, Status, Submission, WithdrawnInput,
 };
 use pi_rs_durable::worker_activity::WorkerKind;
 use serde_json::{Value, json};
@@ -320,34 +320,9 @@ async fn respond(
                 Some(json!({"disposition": if started { "started" } else { "queued" }}))
             })
         },
-        "clear_queue" => scheduler.clear_input_queue(id).map(|withdrawn| {
-            let (mut steering, mut follow_up) = (Vec::new(), Vec::new());
-            let mut inputs = Vec::new();
-            let include_content = request["includeContent"] == true;
-            for input in withdrawn {
-                seen.insert(input.submission.id);
-                let (queue, mode) = match input.mode {
-                    InputMode::Steer => (&mut steering, "steer"),
-                    InputMode::FollowUp => (&mut follow_up, "followUp"),
-                };
-                if include_content {
-                    let mut message = submission_message(&input.submission);
-                    message["inputMode"] = json!(mode);
-                    inputs.push(message);
-                }
-                let text = input.submission.input_blocks.as_ref()
-                    .and_then(|value| value.blocks.first())
-                    .and_then(|block| block["text"].as_str())
-                    .map(str::to_owned)
-                    .unwrap_or(input.submission.content);
-                queue.push(text);
-            }
-            let mut result = json!({"steering": steering, "followUp": follow_up});
-            if include_content {
-                result["inputs"] = json!(inputs);
-            }
-            Some(result)
-        }).map_err(|error| error.to_string()),
+        "clear_queue" => scheduler.clear_input_queue(id)
+            .map(|withdrawn| Some(queue_response(withdrawn, seen, request["includeContent"] == true)))
+            .map_err(|error| error.to_string()),
         "set_steering_mode" | "set_follow_up_mode" => {
             set_queue_mode(scheduler, id, command, &request)
         }
@@ -359,7 +334,16 @@ async fn respond(
                     &state, active, seen, None, false,
                     settled.as_ref().err().map(ToString::to_string),
                 )?;
-                settled.map(|_| None).map_err(|error| error.to_string())
+                settled.and_then(|_| {
+                    if request["restoreQueue"] == true {
+                        // RPC inputs survive abort. Once the scheduler is stopped,
+                        // the same RPC handler can withdraw them before another admission.
+                        let withdrawn = scheduler.clear_input_queue(id)?;
+                        Ok(Some(queue_response(withdrawn, seen, true)))
+                    } else {
+                        Ok(None)
+                    }
+                }).map_err(|error| error.to_string())
             }
             Err(error) => Err(error.to_string()),
         },
@@ -386,6 +370,41 @@ async fn respond(
     };
     reply(&request, result)?;
     Ok(admitted)
+}
+
+fn queue_response(
+    withdrawn: Vec<WithdrawnInput>,
+    seen: &mut HashSet<Uuid>,
+    include_content: bool,
+) -> Value {
+    let (mut steering, mut follow_up) = (Vec::new(), Vec::new());
+    let mut inputs = Vec::new();
+    for input in withdrawn {
+        seen.insert(input.submission.id);
+        let (queue, mode) = match input.mode {
+            InputMode::Steer => (&mut steering, "steer"),
+            InputMode::FollowUp => (&mut follow_up, "followUp"),
+        };
+        if include_content {
+            let mut message = submission_message(&input.submission);
+            message["inputMode"] = json!(mode);
+            inputs.push(message);
+        }
+        let text = input
+            .submission
+            .input_blocks
+            .as_ref()
+            .and_then(|value| value.blocks.first())
+            .and_then(|block| block["text"].as_str())
+            .map(str::to_owned)
+            .unwrap_or(input.submission.content);
+        queue.push(text);
+    }
+    let mut result = json!({"steering": steering, "followUp": follow_up});
+    if include_content {
+        result["inputs"] = json!(inputs);
+    }
+    result
 }
 
 fn prepare_input_adapter(

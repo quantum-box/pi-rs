@@ -154,7 +154,7 @@ impl Conversation {
                     Some("prompt") if event["data"]["disposition"] == "started" => {
                         self.active = true;
                     }
-                    Some("clear_queue") => restore_queue(view, &event["data"]),
+                    Some("clear_queue" | "abort") => restore_queue(view, &event["data"]),
                     _ => {}
                 }
             }
@@ -472,8 +472,7 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                         worker.send(json!({"type":"clear_queue","includeContent":true}))?
                     }
                     "app.interrupt" if conversation.busy() => {
-                        worker.send(json!({"type":"clear_queue","includeContent":true}))?;
-                        worker.send(json!({"type":"abort"}))?;
+                        worker.send(json!({"type":"abort","restoreQueue":true}))?;
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
                     "tui.input.submit" | "app.message.followUp" => {

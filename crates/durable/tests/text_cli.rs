@@ -238,6 +238,12 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         r#"{{"type":"prompt","id":"cancel-test","message":"cancel this request"}}"#
     )
     .unwrap();
+    let mut png = Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let image_data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+    let queued_image = json!({"type":"image", "mimeType":"image/png", "data":image_data});
     let stdout = BufReader::new(rpc.stdout.take().unwrap());
     let mut sent_abort = false;
     let mut ended = false;
@@ -250,12 +256,31 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
                 "partial before abort"
             );
             sent_abort = true;
-            writeln!(stdin, r#"{{"type":"abort","id":"cancel"}}"#).unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                json!({"type":"follow_up","id":"held","message":"held input","images":[queued_image]})
+            )
+            .unwrap();
+        } else if frame["id"] == "held" {
+            assert_eq!(frame["data"]["disposition"], "queued");
+            writeln!(
+                stdin,
+                r#"{{"type":"abort","id":"cancel","restoreQueue":true}}"#
+            )
+            .unwrap();
+            writeln!(stdin, r#"{{"type":"get_state","id":"after-cancel"}}"#).unwrap();
         } else if frame["id"] == "cancel" {
             assert!(ended, "abort must respond after the active turn ends");
             assert_eq!(frame["success"], true);
-            finish_first_tx.send(()).unwrap();
+            assert_eq!(frame["data"]["followUp"], json!(["held input"]));
+            assert_eq!(frame["data"]["inputs"][0]["inputMode"], "followUp");
+            assert_eq!(frame["data"]["inputs"][0]["content"][1], queued_image);
             acknowledged = true;
+        } else if frame["id"] == "after-cancel" {
+            assert!(acknowledged);
+            assert_eq!(frame["data"]["pendingMessageCount"], 0);
+            finish_first_tx.send(()).unwrap();
             break;
         } else if frame["type"] == "agent_end" {
             assert_eq!(frame["success"], false);
