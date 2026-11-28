@@ -537,6 +537,16 @@ impl Settings {
             .as_bool()
             .unwrap_or(true)
     }
+    pub fn terminal_image_override(&self) -> crate::ui::images::ProtocolOverride {
+        use crate::ui::images::{Protocol, ProtocolOverride};
+
+        match &self.value["terminal"]["images"] {
+            Value::Bool(false) => ProtocolOverride::Disabled,
+            Value::String(value) if value == "kitty" => ProtocolOverride::Forced(Protocol::Kitty),
+            Value::String(value) if value == "iterm2" => ProtocolOverride::Forced(Protocol::Iterm2),
+            _ => ProtocolOverride::Auto,
+        }
+    }
     pub fn terminal_image_width(&self) -> usize {
         self.value["terminal"]["imageWidthCells"]
             .as_f64()
@@ -1488,6 +1498,48 @@ mod tests {
         assert_eq!(load(true).terminal_true_color(), Some(false));
         std::fs::write(project, br#"{"terminal":{"trueColor":"auto"}}"#).unwrap();
         assert_eq!(load(true).terminal_true_color(), None);
+    }
+
+    #[test]
+    fn terminal_image_setting_uses_the_effective_layer_and_exact_pi_values() {
+        use crate::ui::images::{Protocol, ProtocolOverride};
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("settings.json");
+        let workspace = directory.path().join("project");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        let project = workspace.join(".pi/settings.json");
+        std::fs::write(
+            &user,
+            br#"{"terminal":{"images":"kitty","showImages":false}}"#,
+        )
+        .unwrap();
+        let load = |trusted| super::Settings::load_from_paths(&workspace, trusted, &user).unwrap();
+        for (value, expected) in [
+            (json!("iterm2"), ProtocolOverride::Forced(Protocol::Iterm2)),
+            (json!(false), ProtocolOverride::Disabled),
+            (json!(true), ProtocolOverride::Auto),
+            (json!("KITTY"), ProtocolOverride::Auto),
+            (json!("auto"), ProtocolOverride::Auto),
+            (json!("other"), ProtocolOverride::Auto),
+            (json!(null), ProtocolOverride::Auto),
+        ] {
+            let layer = json!({"terminal": {"images": value}});
+            std::fs::write(&project, layer.to_string()).unwrap();
+            let untrusted = load(false);
+            assert_eq!(
+                untrusted.terminal_image_override(),
+                ProtocolOverride::Forced(Protocol::Kitty)
+            );
+            let trusted = load(true);
+            assert_eq!(trusted.terminal_image_override(), expected, "{layer}");
+            assert!(!trusted.show_terminal_images());
+        }
+        assert_eq!(
+            super::Settings::default().terminal_image_override(),
+            ProtocolOverride::Auto
+        );
     }
 
     #[test]
