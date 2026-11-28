@@ -684,6 +684,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_websocket_keeps_reasoning_removals_from_response_done() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let removal = json!({"type":"reasoning","id":"rs_other_user","action":"removed","reason":"end_user_mismatch"});
+        let terminal = json!({"type":"response.done","response":{
+            "status":"completed","output":[],"input_transformations":[removal]
+        }});
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            assert_eq!(read_request(&mut socket).await["type"], "response.create");
+            socket
+                .send(Message::Text(terminal.to_string().into()))
+                .await
+                .unwrap();
+        });
+        let client = client(
+            format!("http://{address}/backend-api/codex/responses"),
+            CodexTransport::WebSocket,
+        );
+        let events: Vec<_> = client
+            .stream(request(vec![prompt("hello")]))
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let metadata = events
+            .iter()
+            .find_map(|event| match event {
+                ModelEvent::Metadata(metadata) => Some(metadata),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            json!(metadata.diagnostics)[0]["details"]["transformations"],
+            json!([removal])
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn codex_websocket_transmits_grammar_and_decodes_raw_input() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
