@@ -471,6 +471,16 @@ pub struct Record {
 }
 
 impl Record {
+    /// Whether this record and its metadata encode an SDK thinking-only change.
+    pub fn is_sdk_thinking_selection(&self, metadata: &serde_json::Value) -> bool {
+        matches!(self.event, Event::ModelSelected { .. })
+            && metadata
+                .get("sdkThinkingOnly")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && self.sdk_model_binding_thinking(metadata).is_some()
+    }
+
     /// Read current summary billing, or recover it from an older journal's adjacent completion.
     pub fn summary_usage(&self, records: &[Self]) -> Option<(Usage, Option<SummaryUsageMetadata>)> {
         let (usage, metadata) = match &self.event {
@@ -1945,6 +1955,23 @@ impl Session {
             .map(|(_, model, thinking)| (model, thinking))
     }
 
+    /// The SDK client binding active at this journal record, if one was recorded.
+    ///
+    /// A checkout record resolves to its destination's binding. The ID follows
+    /// the selection through native fork and reopen. Hosts can use it to look
+    /// up client configuration in their own storage. Invalid bindings have no ID.
+    pub fn model_binding_id_at(&self, record_id: u64) -> Option<Uuid> {
+        let index = usize::try_from(record_id.checked_sub(1)?).ok()?;
+        let target = match self.records.get(index)?.event {
+            Event::Checkout { target } => target,
+            _ => record_id,
+        };
+        self.cycled_model_at(target)
+            .ok()
+            .flatten()
+            .map(|selection| selection.id)
+    }
+
     fn selection_history(&self, target: u64) -> impl Iterator<Item = &Record> {
         std::iter::successors(
             target
@@ -2027,14 +2054,19 @@ impl Session {
         Some((id, provider, model, thinking))
     }
 
-    pub(crate) fn select_cycled_model(&mut self, selection: &CycledModelSelection) -> Result<()> {
-        self.append_cycled_model_transition(
+    pub(crate) fn select_cycled_model(
+        &mut self,
+        selection: &CycledModelSelection,
+        thinking_only: bool,
+    ) -> Result<()> {
+        self.append_sdk_model_binding(
             Event::ModelSelected {
                 provider: Some(selection.provider.clone()),
                 model: selection.model.clone(),
                 thinking: Some(selection.thinking.clone()),
             },
             selection,
+            thinking_only,
         )?;
         Ok(())
     }
@@ -2044,12 +2076,23 @@ impl Session {
         event: Event,
         selection: &CycledModelSelection,
     ) -> Result<&Record> {
-        self.append_inner_with_metadata(
-            event,
-            false,
-            Some(serde_json::json!({"sdkCycleBinding": selection.id, "sdkCycleThinking": selection.thinking})),
-            false,
-        )
+        self.append_sdk_model_binding(event, selection, false)
+    }
+
+    fn append_sdk_model_binding(
+        &mut self,
+        event: Event,
+        selection: &CycledModelSelection,
+        thinking_only: bool,
+    ) -> Result<&Record> {
+        let mut metadata = serde_json::json!({
+            "sdkCycleBinding": selection.id,
+            "sdkCycleThinking": selection.thinking,
+        });
+        if thinking_only {
+            metadata["sdkThinkingOnly"] = true.into();
+        }
+        self.append_inner_with_metadata(event, false, Some(metadata), false)
     }
 
     /// The provider belongs to the same selection record as the model. Older
@@ -4686,8 +4729,78 @@ pub(crate) fn system_context(
     fallback: &str,
     available: Vec<crate::ToolSpec>,
 ) -> (String, Vec<crate::ToolSpec>) {
-    let mut content = Vec::new();
-    let mut sections: Vec<(String, String)> = Vec::new();
+    let (prompt, tools) = resolve_system_context(path, fallback, available, None);
+    (prompt.render(), tools)
+}
+
+pub(crate) struct HostSystemPrompt {
+    prompt: SystemPromptState,
+    pub(crate) rendered: String,
+}
+
+impl HostSystemPrompt {
+    pub(crate) fn new(preamble: String, sections: Vec<(String, String)>) -> Self {
+        let prompt = SystemPromptState {
+            content: vec![preamble],
+            sections: sections
+                .into_iter()
+                .map(|(name, body)| {
+                    let text = wrap_system_prompt_section(&name, &body);
+                    (name, text)
+                })
+                .collect(),
+        };
+        let rendered = prompt.render();
+        Self { prompt, rendered }
+    }
+}
+
+pub(crate) fn wrap_system_prompt_section(name: &str, body: &str) -> String {
+    format!("<{name}>\n{body}\n</{name}>")
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SystemPromptState {
+    content: Vec<String>,
+    pub(crate) sections: Vec<(String, String)>,
+}
+
+impl SystemPromptState {
+    pub(crate) fn apply_sections(&mut self, changes: &[(String, Option<String>)]) {
+        for (name, value) in changes {
+            match (self.sections.iter().position(|(key, _)| key == name), value) {
+                (Some(index), Some(value)) => self.sections[index].1 = value.clone(),
+                (Some(index), None) => {
+                    self.sections.remove(index);
+                }
+                (None, Some(value)) => self.sections.push((name.clone(), value.clone())),
+                (None, None) => {}
+            }
+        }
+    }
+
+    pub(crate) fn render(&self) -> String {
+        self.content
+            .iter()
+            .map(String::as_str)
+            .chain(
+                self.sections
+                    .iter()
+                    .map(|(_, text)| text.as_str())
+                    .filter(|text| !text.is_empty()),
+            )
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+pub(crate) fn resolve_system_context(
+    path: &[&Record],
+    fallback: &str,
+    available: Vec<crate::ToolSpec>,
+    host_prompt: Option<&HostSystemPrompt>,
+) -> (SystemPromptState, Vec<crate::ToolSpec>) {
+    let mut prompt = SystemPromptState::default();
     let mut tools = Vec::new();
     let mut found = false;
     for record in path {
@@ -4702,8 +4815,7 @@ pub(crate) fn system_context(
                 system_prompt: Some(snapshot),
                 ..
             } => {
-                content.clear();
-                sections.clear();
+                prompt = SystemPromptState::default();
                 tools.clear();
                 (
                     &snapshot.content,
@@ -4716,18 +4828,9 @@ pub(crate) fn system_context(
         };
         found = true;
         if !text.is_empty() {
-            content.push(text.clone());
+            prompt.content.push(text.clone());
         }
-        for (name, value) in changes {
-            match (sections.iter().position(|(key, _)| key == name), value) {
-                (Some(index), Some(value)) => sections[index].1 = value.clone(),
-                (Some(index), None) => {
-                    sections.remove(index);
-                }
-                (None, Some(value)) => sections.push((name.clone(), value.clone())),
-                (None, None) => {}
-            }
-        }
+        prompt.apply_sections(changes);
         tools.retain(|tool: &crate::ToolSpec| !tools_removed.contains(&tool.name));
         for declared in tools_added {
             // Imported declarations select current native implementations and schemas.
@@ -4741,15 +4844,18 @@ pub(crate) fn system_context(
         }
     }
     if !found {
-        return (fallback.into(), available);
+        let prompt = host_prompt
+            .filter(|host| host.rendered == fallback)
+            .map_or_else(
+                || SystemPromptState {
+                    content: vec![fallback.into()],
+                    sections: Vec::new(),
+                },
+                |host| host.prompt.clone(),
+            );
+        return (prompt, available);
     }
-    content.extend(
-        sections
-            .into_iter()
-            .map(|(_, text)| text)
-            .filter(|text| !text.is_empty()),
-    );
-    (content.join("\n\n"), tools)
+    (prompt, tools)
 }
 
 /// System checkpoints projected onto the request before provider serialization.
@@ -4766,6 +4872,23 @@ pub(crate) struct SystemTranscriptFallback {
 }
 
 impl SystemTranscript {
+    pub(crate) fn append_section_update(
+        &mut self,
+        source: u64,
+        sections: &[(String, Option<String>)],
+        conversation: &[(u64, Message)],
+        conversation_start: usize,
+    ) {
+        let boundary = conversation
+            .iter()
+            .position(|(id, message)| *id >= source && !matches!(message, Message::Tool { .. }))
+            .unwrap_or(conversation.len());
+        let position = (conversation_start + boundary)
+            .max(self.updates.last().map_or(0, |(position, _)| *position));
+        let content = system_checkpoint_text("", sections);
+        self.updates.push((position, Message::System { content }));
+    }
+
     pub(crate) fn apply(self, messages: &mut Vec<Message>) -> Option<SystemTranscriptFallback> {
         let Some(Message::System { content }) = messages.first_mut() else {
             return None;
@@ -4798,6 +4921,18 @@ fn system_messages(messages: &[Message]) -> impl Iterator<Item = &str> {
         Message::System { content } => Some(content.as_str()),
         _ => None,
     })
+}
+
+fn system_checkpoint_text(content: &str, sections: &[(String, Option<String>)]) -> String {
+    let mut parts = Vec::with_capacity(sections.len() + 1);
+    if !content.is_empty() {
+        parts.push(content.to_owned());
+    }
+    parts.extend(sections.iter().map(|(name, value)| match value {
+        Some(text) => format!("Updated system prompt section \"{name}\":\n\n{text}"),
+        None => format!("Removed system prompt section \"{name}\"."),
+    }));
+    parts.join("\n\n")
 }
 
 impl SystemTranscriptFallback {
@@ -4920,22 +5055,9 @@ pub(crate) fn system_transcript(
             let position = boundaries
                 .peek()
                 .map_or(conversation.len(), |(index, _)| *index);
-            let mut parts = Vec::with_capacity(sections.len() + 1);
-            if !content.is_empty() {
-                parts.push(content.clone());
-            }
-            parts.extend(sections.iter().map(|(name, value)| match value {
-                Some(text) => format!("Updated system prompt section \"{name}\":\n\n{text}"),
-                None => format!("Removed system prompt section \"{name}\"."),
-            }));
-            (!parts.is_empty()).then(|| {
-                (
-                    conversation_start + position,
-                    Message::System {
-                        content: parts.join("\n\n"),
-                    },
-                )
-            })
+            let content = system_checkpoint_text(content, sections);
+            (!content.is_empty())
+                .then_some((conversation_start + position, Message::System { content }))
         })
         .collect();
     Some(SystemTranscript { leading, updates })

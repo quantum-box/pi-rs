@@ -42,7 +42,7 @@ pub fn qualified_model<'a>(
 // The order is Pi's startup preference across authenticated providers.
 const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
     ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
-    ("ant-ling", "Ring-2.6-1T"),
+    ("ant-ling", "Ling-3.1-flash"),
     ("anthropic", "claude-opus-5-5"),
     ("openai", "gpt-6.2-sol"),
     ("azure", "gpt-6.2-sol"),
@@ -73,11 +73,8 @@ const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
     ("opencode-go", "kimi-k3.1-pro"),
     ("kimi-coding", "kimi-for-coding"),
     ("meta", "muse-spark-1.3"),
-    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.7-code"),
-    (
-        "cloudflare-ai-gateway",
-        "workers-ai/@cf/moonshotai/kimi-k2.7-code",
-    ),
+    ("cloudflare-workers-ai", "@cf/zai-org/glm-5.3"),
+    ("cloudflare-ai-gateway", "workers-ai/@cf/zai-org/glm-5.3"),
     ("qwen-token-plan", "qwen3.8-max"),
     ("qwen-token-plan-cn", "qwen3.8-max"),
     ("qwen-token-plan-individual", "qwen3.8-max"),
@@ -98,6 +95,16 @@ pub(super) fn default_for_provider<'a>(
         .find(|(id, _)| *id == provider.id())
         .and_then(|(_, preferred)| models.iter().find(|model| model == preferred))
         .or_else(|| models.first())
+}
+
+pub(super) fn is_unconfigured_retired_ant_ling_model(
+    profiles: &super::model_profiles::Profiles,
+    provider: &Provider,
+    id: &str,
+) -> bool {
+    provider.id() == "ant-ling"
+        && matches!(id, "Ling-2.6-flash" | "Ling-2.6-1T" | "Ring-2.6-1T")
+        && profiles.model(provider, id).is_none()
 }
 
 /// Choose from known catalog entries without resolving credential commands
@@ -1102,6 +1109,23 @@ pub fn fuzzy(query: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Choice, Scope};
+
+    #[test]
+    fn updated_provider_defaults_exist_in_the_builtin_catalog() {
+        for (id, expected) in [
+            ("ant-ling", "Ling-3.1-flash"),
+            ("cloudflare-workers-ai", "@cf/zai-org/glm-5.3"),
+            ("cloudflare-ai-gateway", "workers-ai/@cf/zai-org/glm-5.3"),
+        ] {
+            let profiles = crate::model_profiles::Profiles::default();
+            let provider = profiles.provider(id).unwrap();
+            let models = profiles.model_ids(&provider);
+            assert_eq!(
+                super::default_for_provider(&provider, &models).map(String::as_str),
+                Some(expected),
+            );
+        }
+    }
 
     #[tokio::test]
     async fn unqueried_dynamic_catalog_is_not_complete() {

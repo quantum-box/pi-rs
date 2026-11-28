@@ -275,6 +275,7 @@ struct ModelCompatibility {
     session_affinity_format: Option<AffinityFormat>,
     prompt_cache_key_mode: Option<PromptCacheKeyMode>,
     supports_long_cache_retention: Option<bool>,
+    supports_reasoning_replay: Option<bool>,
     supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
     supports_eager_tool_input_streaming: Option<bool>,
@@ -319,6 +320,9 @@ impl ModelCompatibility {
             supports_long_cache_retention: newer
                 .supports_long_cache_retention
                 .or(self.supports_long_cache_retention),
+            supports_reasoning_replay: newer
+                .supports_reasoning_replay
+                .or(self.supports_reasoning_replay),
             supports_explicit_prompt_cache_mode: newer
                 .supports_explicit_prompt_cache_mode
                 .or(self.supports_explicit_prompt_cache_mode),
@@ -562,18 +566,9 @@ impl ModelMetadata {
         {
             return None;
         }
-        Some(
-            super::thinking::LEVELS
-                .iter()
-                .copied()
-                .filter(|level| {
-                    self.thinking_level_map
-                        .get(*level)
-                        .map_or(!matches!(*level, "xhigh" | "max"), Option::is_some)
-                })
-                .map(str::to_owned)
-                .collect(),
-        )
+        Some(super::model_thinking_levels::mapped_levels(
+            &self.thinking_level_map,
+        ))
     }
 
     pub fn apply_catalog_metadata(&self, model: &mut Value) {
@@ -1454,6 +1449,15 @@ impl Profiles {
             Some(model) => base.overlay(model.compat.clone()),
             None => base,
         }
+    }
+
+    pub fn bedrock_reasoning_replay_override(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> Option<bool> {
+        self.cache_compatibility(provider, model)
+            .supports_reasoning_replay
     }
 
     pub fn bedrock_long_cache_override(
@@ -2997,6 +3001,25 @@ mod tests {
         let cost = sol.cost.unwrap().value();
         assert_eq!(cost["tiers"][0]["inputTokensAbove"], 272_000);
         assert_eq!(cost["tiers"][0]["output"], 15.0);
+
+        for (id, off, replay) in [
+            ("global.moonshotai.kimi-k3", Some("none"), Some(false)),
+            ("us.moonshotai.kimi-k3.1", Some("none"), Some(false)),
+            ("global.zai.glm-5.3", None, None),
+        ] {
+            let model = profiles.model(&provider, id).unwrap();
+            assert_eq!(model.mapped_effort("off"), Some(off), "{id}");
+            assert_eq!(model.mapped_effort("minimal"), Some(None), "{id}");
+            assert_eq!(model.mapped_effort("xhigh"), Some(Some("xhigh")), "{id}");
+            assert_eq!(
+                profiles.bedrock_reasoning_replay_override(&provider, Some(&model)),
+                replay,
+                "{id}"
+            );
+            let levels = model.levels(Adapter::Bedrock).unwrap();
+            assert_eq!(levels.iter().any(|level| level == "off"), off.is_some());
+            assert!(!levels.iter().any(|level| level == "minimal"));
+        }
     }
 
     #[test]
@@ -3322,20 +3345,17 @@ mod tests {
             builtin_chat::find("ant-ling").unwrap().env(),
             "ANT_LING_API_KEY"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 3);
-        let ring = profiles.model(&provider, "Ring-2.6-1T").unwrap();
+        assert_eq!(profiles.model_ids(&provider).len(), 5);
+        let model = profiles.model(&provider, "Ling-3.1-flash").unwrap();
         assert_eq!(
-            ring.levels(Adapter::ChatCompletions).unwrap(),
-            ["high", "xhigh"]
+            model.levels(Adapter::ChatCompletions).unwrap(),
+            ["off", "high"]
         );
-        assert_eq!(ring.mapped_effort("high"), Some(Some("high")));
-        assert_eq!(
-            profiles
-                .model(&provider, "Ling-2.6-flash")
-                .unwrap()
-                .reasoning,
-            Some(false)
-        );
+        assert_eq!(model.mapped_effort("off"), Some(Some("off")));
+        assert_eq!(model.mapped_effort("high"), Some(Some("high")));
+        assert_eq!(model.mapped_effort("medium"), Some(None));
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert!(profiles.model(&provider, "Ring-2.6-1T").is_none());
     }
 
     #[test]

@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pi_rs_core::{
-    AgentSession, ContextContent, CustomMessage, CustomMessageDelivery, Extension, ExtensionState,
-    InputAction, InputEvent, Message, Model, ModelEvent, ModelRequest, ModelStream, Outcome,
-    SessionBuilder, Tool, ToolCall, ToolContext, ToolHost, ToolSpec,
+    AgentSession, ContextContent, CustomMessage, CustomMessageDelivery, Event, Extension,
+    ExtensionState, InputAction, InputEvent, Message, Model, ModelEvent, ModelRequest, ModelStream,
+    Outcome, SessionBuilder, SessionEvent, ThinkingLevelBinding, ThinkingLevelCapabilities, Tool,
+    ToolCall, ToolContext, ToolHost, ToolSpec,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
@@ -176,6 +177,65 @@ async fn progress_before_finish() {
     let records = serde_json::to_string(journal.records()).unwrap();
     assert!(records.contains("settled"));
     assert!(!records.contains("transient-preview"));
+}
+
+#[tokio::test]
+async fn thinking_change_preserves_progress_results_and_assistant_reply() {
+    let mut session = progress_session(None, false);
+    session
+        .set_provider_model(Arc::new(ProgressModel("unused")), "provider", "fixture")
+        .unwrap();
+    let mut events = session.subscribe();
+    let mut progress = session.subscribe_tool_progress();
+
+    let level = session
+        .set_thinking_level(
+            ThinkingLevelCapabilities {
+                provider: "provider",
+                model: "fixture",
+                levels: &["off", "high"],
+            },
+            "high",
+            |provider, model, level| {
+                Ok(ThinkingLevelBinding {
+                    provider: provider.into(),
+                    model: model.into(),
+                    level: level.into(),
+                    client: Arc::new(ProgressModel("child")),
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(level.as_deref(), Some("high"));
+    let SessionEvent::Record(selection) = events.try_recv().unwrap() else {
+        panic!("expected the committed thinking selection");
+    };
+    {
+        let journal = session.journal().unwrap();
+        assert!(
+            selection.is_sdk_thinking_selection(journal.record_metadata(selection.id).unwrap())
+        );
+    }
+    assert_eq!(
+        progress.try_recv().unwrap_err(),
+        broadcast::error::TryRecvError::Empty
+    );
+
+    assert_eq!(session.prompt("run with thinking").await.unwrap(), "done");
+    assert_eq!(progress.try_recv().unwrap().tool_name, "child");
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+        matches!(
+            event,
+            SessionEvent::Record(record)
+                if matches!(&record.event, Event::ToolFinished { outcome: Outcome::Succeeded(text), .. }
+                    if text == "settled")
+        )
+    }));
+    assert_eq!(
+        session.get_last_assistant_text().unwrap().as_deref(),
+        Some("done")
+    );
 }
 
 #[tokio::test]

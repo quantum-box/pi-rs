@@ -2004,6 +2004,93 @@ fn kimi_coding_models_send_their_specific_reasoning_options() {
 }
 
 #[test]
+fn ant_ling_print_sends_binary_thinking_for_the_default_model() {
+    let root = tempfile::tempdir().unwrap();
+    for (settings, level, expected) in [
+        (json!({}), Some("high"), "enabled"),
+        (json!({}), Some("off"), "disabled"),
+        (json!({}), None, "enabled"),
+        (
+            json!({"defaultProvider":"ant-ling","defaultModel":"Ring-2.6-1T"}),
+            None,
+            "enabled",
+        ),
+    ] {
+        std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, mut request) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            if request.starts_with("GET /v1/models ") {
+                // The loopback endpoint enables discovery. An empty list leaves
+                // selection to the bundled Ant Ling catalog.
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").unwrap();
+                (socket, reader, request) = accept_proxy_request(listener);
+            }
+            assert!(
+                request.starts_with("POST /v1/chat/completions "),
+                "{request}"
+            );
+            let mut length = None;
+            for line in reader.by_ref().lines() {
+                let line = line.unwrap();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = Some(value.trim().parse().unwrap());
+                }
+            }
+            let mut body = vec![0; length.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            let events = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            body
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(level.into_iter().flat_map(|level| ["--thinking", level]))
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                "ant-ling",
+                "--api-key",
+                "fixture",
+                "--endpoint",
+                &endpoint,
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+        let request = server.join().unwrap();
+        assert_eq!(request["model"], "Ling-3.1-flash");
+        assert_eq!(request["thinking"], json!({"type":expected}));
+        assert!(request.get("reasoning").is_none());
+        assert!(request.get("reasoning_effort").is_none());
+    }
+}
+
+#[test]
 fn qwen_token_plans_use_model_specific_thinking_and_tool_format() {
     for (provider, model, level, effort) in [
         ("qwen-token-plan", "qwen3.7-plus", "high", None),
@@ -6717,6 +6804,104 @@ fn native_notes_extension_is_saved_and_restored() {
 }
 
 #[test]
+fn cli_prompt_template_preserves_argument_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    let template = root.path().join("audit.md");
+    std::fs::write(&template, "$1|$2|$3|$4|$5|${6:-fallback}").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        loop {
+            let (mut socket, mut reader, first) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            let mut size = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    size = Some(value.trim().parse().unwrap());
+                }
+            }
+            if first.starts_with("GET /api/ps ") {
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut body = vec![0; size.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            return request;
+        }
+    });
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command.env_clear();
+    for name in ["PATH", "SystemRoot", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let output = command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--offline",
+            "--no-session",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--endpoint",
+            &endpoint,
+            "--prompt-template",
+        ])
+        .arg(&template)
+        .args([
+            "--print",
+            "/audit doesn't  \"say \\\"hi\\\"\"\u{a0}日本語 \"open tail",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "fixture answer\n"
+    );
+    let request = server.join().unwrap();
+    let message = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap();
+    assert_eq!(
+        message["content"],
+        "doesn't|say \"hi\"|日本語|\"open|tail|fallback"
+    );
+}
+
+#[test]
 fn print_and_json_modes_accept_positional_prompts() {
     let (endpoint, server) = model_fixture();
     for mode in ["--print", "--mode"] {
@@ -8567,6 +8752,150 @@ fn default_model_and_provider_are_read_as_separate_fields() {
         let after = events.iter().find(|event| event["id"] == "after").unwrap();
         assert_eq!(after["data"]["model"]["provider"], provider);
         assert_eq!(after["data"]["model"]["id"], model);
+    }
+}
+
+#[test]
+fn ant_ling_startup_replaces_only_missing_retired_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let settings_path = root.path().join("settings.json");
+    let models_path = root.path().join("models.json");
+    for (settings, credential, models, extra, saved_session_model, expected) in [
+        (
+            json!({"defaultProvider":"ant-ling","defaultModel":"Ring-2.6-1T"}),
+            "ANT_LING_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("ant-ling", "Ling-3.1-flash", "high"),
+        ),
+        (
+            json!({"defaultModel":"ant-ling/Ling-2.6-1T","defaultThinkingLevel":"off"}),
+            "ANT_LING_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("ant-ling", "Ling-3.1-flash", "off"),
+        ),
+        (
+            json!({"defaultProvider":"ant-ling","defaultModel":"Ling-2.6-flash"}),
+            "GEMINI_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("google", "gemini-4-argon", "medium"),
+        ),
+        (
+            json!({"defaultProvider":"ant-ling","defaultModel":"Ring-2.6-1T","defaultThinkingLevel":"off"}),
+            "ANT_LING_API_KEY",
+            json!({"providers":{"ant-ling":{"models":[{"id":"Ring-2.6-1T"}]}}}),
+            vec![],
+            None,
+            ("ant-ling", "Ring-2.6-1T", "off"),
+        ),
+        (
+            json!({"defaultProvider":"ant-ling","defaultModel":"Ring-2.6-1T"}),
+            "ANT_LING_API_KEY",
+            json!({}),
+            vec![
+                "--provider",
+                "ant-ling",
+                "--model",
+                "Ring-2.6-1T",
+                "--thinking",
+                "high",
+            ],
+            None,
+            ("ant-ling", "Ring-2.6-1T", "high"),
+        ),
+        (
+            json!({"defaultProvider":"ant-ling","defaultModel":"private-ling","defaultThinkingLevel":"off"}),
+            "ANT_LING_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("ant-ling", "private-ling", "off"),
+        ),
+        (
+            json!({"defaultProvider":"ant-ling","defaultModel":"Ling-3.2-flash",
+                "modelThinkingLevels":{"ant-ling/Ling-3.2-flash":"off"}}),
+            "ANT_LING_API_KEY",
+            json!({}),
+            vec![],
+            None,
+            ("ant-ling", "Ling-3.2-flash", "off"),
+        ),
+        (
+            json!({"defaultProvider":"ant-ling","defaultModel":"Ling-3.1-flash"}),
+            "ANT_LING_API_KEY",
+            json!({}),
+            vec![],
+            Some("Ring-2.6-1T"),
+            ("ant-ling", "Ling-3.1-flash", "high"),
+        ),
+    ] {
+        let saved_settings = settings.to_string();
+        std::fs::write(&settings_path, &saved_settings).unwrap();
+        std::fs::write(&models_path, models.to_string()).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command.env_clear();
+        for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        if let Some(model) = saved_session_model {
+            let path = root.path().join("resume.jsonl");
+            let mut session = pi_rs::Session::open(&path).unwrap();
+            session
+                .select_provider_model(Some("ant-ling"), model, None)
+                .unwrap();
+            session
+                .append_user_with_images("saved conversation".into(), vec![], None)
+                .unwrap();
+            command.arg("--session").arg(path);
+        } else {
+            command.arg("--no-session");
+        }
+        let mut process = command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env(credential, "fixture-key")
+            .args(["--mode", "rpc", "--no-mcp", "--no-trust", "--offline"])
+            .args(extra)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{settings}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let events: Vec<Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["id"] == "new" && event["success"] == true),
+            "{settings}: {stdout}"
+        );
+        for id in ["state", "after"] {
+            let data = &events.iter().find(|event| event["id"] == id).unwrap()["data"];
+            assert_eq!(data["model"]["provider"], expected.0, "{settings}: {data}");
+            assert_eq!(data["model"]["id"], expected.1, "{settings}: {data}");
+            assert_eq!(data["thinkingLevel"], expected.2, "{settings}: {data}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&settings_path).unwrap(),
+            saved_settings
+        );
     }
 }
 
@@ -11547,9 +11876,13 @@ async fn mcp_oauth_login_uses_workbench_proxy_setting_and_no_proxy() {
 }
 
 #[test]
-fn before_agent_start_cli_resumes_legacy_plan_on_the_same_run_id() {
+fn before_agent_start_cli_resumes_saved_plans_on_the_same_run_id() {
     use pi_rs::{Event, Record, RunState};
-    for invocation in [&["--mode", "text", "resume"][..], &["--print"][..]] {
+    for (invocation, structured) in [
+        (&["--mode", "text", "resume"][..], false),
+        (&["--print"][..], false),
+        (&["--print"][..], true),
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let path = root.join("session.jsonl");
@@ -11597,7 +11930,14 @@ fn before_agent_start_cli_resumes_legacy_plan_on_the_same_run_id() {
                 Some(run_id),
                 Event::SourceEntry {
                     format: "pi-rs:before-agent-start-v1".into(),
-                    entry: json!({"systemPrompt":"saved override", "messages":[]}),
+                    entry: if structured {
+                        json!({"systemPromptSections":[
+                            ["rules", "<rules>\nsaved rules\n</rules>"],
+                            ["extra", "<extra>\nsaved extra\n</extra>"]
+                        ], "messages":[]})
+                    } else {
+                        json!({"systemPrompt":"saved override", "messages":[]})
+                    },
                 },
             ),
         ])
@@ -11647,7 +11987,15 @@ fn before_agent_start_cli_resumes_legacy_plan_on_the_same_run_id() {
             String::from_utf8_lossy(&output.stderr)
         );
         let body = server.join().unwrap();
-        assert_eq!(body["messages"][0]["content"], "saved override");
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        if structured {
+            assert_eq!(system.matches("<rules>").count(), 1);
+            assert!(system.contains("<rules>\nsaved rules\n</rules>"));
+            assert!(system.contains("<tools>"));
+            assert!(system.find("<cwd>").unwrap() < system.find("<extra>").unwrap());
+        } else {
+            assert_eq!(system, "saved override");
+        }
         assert_eq!(body["messages"][1]["content"], "original input");
         let journal = Session::open(&path).unwrap();
         assert!(

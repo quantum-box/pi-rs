@@ -46,6 +46,11 @@ enum Request {
     },
     CacheWarmingChanged,
     TransportChanged,
+    RenderHeader {
+        id: Uuid,
+        renderer: Uuid,
+        context: pi_rs::HeaderRenderContext,
+    },
     RenderTool {
         id: Uuid,
         operation: Uuid,
@@ -1009,14 +1014,14 @@ async fn run_worker(
     let (shell_completed, mut shell_results) = mpsc::channel(1);
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
+    let discover_resources = runtime.registry.has_resource_discovery_hooks();
     let snapshot = Arc::new(Mutex::new(open_initial_snapshot(
         &args.session,
         args.mode == Some(super::OutputMode::Rpc),
     )?));
     let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
-    let (resources_ready, ready_receiver) =
-        tokio::sync::watch::channel(!runtime.registry.has_resource_discovery_hooks());
+    let (resources_ready, ready_receiver) = tokio::sync::watch::channel(!discover_resources);
     let (share_ready, share_receiver) = tokio::sync::watch::channel(false);
     read_requests(
         commands,
@@ -1070,7 +1075,9 @@ async fn run_worker(
     )
     .await;
     let mut session = Session::snapshot(&args.session)?;
-    if session.host_binding().is_none() {
+    // The terminal recovers its journal before spawning this worker. Only
+    // reopen for writing when a discovery hook may save state.
+    if (!args.terminal_managed_worker || discover_resources) && session.host_binding().is_none() {
         session = Session::open(&args.session)?;
     }
     let discovered = runtime
@@ -1326,6 +1333,7 @@ async fn run_worker(
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
+                ui.clear_header_renderer().await;
                 share_ready.send_replace(false);
                 if runtime.registry.has_resource_discovery_hooks() {
                     resources_ready.send_replace(false);
@@ -2032,6 +2040,7 @@ async fn run_worker(
                 .await;
         }
     }
+    ui.clear_header_renderer().await;
     cancel_active(&active);
     let shell_pending = active.lock().expect("worker control").shell.is_some();
     if shell_pending && let Some(shell) = shell_results.recv().await {
@@ -2361,6 +2370,23 @@ fn read_requests(
                 }
             };
             match request {
+                Request::RenderHeader {
+                    id,
+                    renderer,
+                    context,
+                } => {
+                    if !terminal_managed {
+                        continue;
+                    }
+                    if let Some(render) = ui.admit_header_render(renderer, context) {
+                        runtime.spawn(async move {
+                            let rendered = render.await;
+                            output(json!({"type":"header_rendered","id":id,"rendered":rendered}));
+                        });
+                    } else {
+                        output(json!({"type":"header_rendered","id":id,"rendered":null}));
+                    }
+                }
                 Request::RenderTool {
                     id,
                     operation,

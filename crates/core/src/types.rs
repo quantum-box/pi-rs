@@ -1143,6 +1143,11 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// Whether the previous measured input and output can anchor this request's budget.
+    fn can_reuse_measured_context(&self, _request: &ModelRequest) -> bool {
+        true
+    }
+
     /// Estimate a message in the form this adapter sends to its provider.
     fn estimate_message_tokens(&self, _request: &ModelRequest, message: &Message) -> u64 {
         crate::estimate_message_tokens(message)

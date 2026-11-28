@@ -2347,14 +2347,19 @@ mod tests {
     fn settings_validation_reports_all_invalid_fields_without_rewriting_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let original = r#"{"hideThinkingBlock":"yes","httpIdleTimeoutMs":"later","retry":{"enabled":"yes"},"extension":{"unknown":true}}"#;
+        let original = r#"{"hideThinkingBlock":"yes","httpIdleTimeoutMs":"later","externalEditor":false,"retry":{"enabled":"yes"},"extension":{"unknown":true}}"#;
         std::fs::write(&path, original).unwrap();
 
         let error = super::Settings::load_from_paths(dir.path(), false, &path)
             .err()
             .unwrap()
             .to_string();
-        for field in ["/hideThinkingBlock", "/httpIdleTimeoutMs", "/retry/enabled"] {
+        for field in [
+            "/externalEditor",
+            "/hideThinkingBlock",
+            "/httpIdleTimeoutMs",
+            "/retry/enabled",
+        ] {
             assert!(
                 error.contains(&format!("{}{field}:", path.display())),
                 "{error}"
