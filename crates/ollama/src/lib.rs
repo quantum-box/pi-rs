@@ -564,6 +564,21 @@ impl Ollama {
                 reasoning.as_deref().unwrap_or_default()
             });
         }
+        let edited_opaque = copilot
+            .then(|| {
+                edited_reasoning.iter().rev().find(|block| {
+                    block["opaque"]
+                        .as_str()
+                        .is_some_and(|opaque| !opaque.is_empty())
+                })
+            })
+            .flatten();
+        let has_details = !details.is_empty();
+        if let Some(block) = edited_opaque
+            && !has_details
+        {
+            first["reasoning_opaque"] = block["opaque"].clone();
+        }
         if !details.is_empty() {
             first["reasoning_details"] = Value::Array(details);
         } else if let Some(block) = &copilot_reasoning {
@@ -640,22 +655,36 @@ impl Ollama {
                                 .is_some_and(|items| items.iter().any(reasoning_details::is_valid))
                     })
                     .collect();
-                let text = ordinary
-                    .iter()
-                    .filter_map(|b| b["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let field = ordinary
-                    .first()
-                    .and_then(|b| b["field"].as_str())
-                    .or(self.compatibility.reasoning_field.as_deref())
-                    .unwrap_or("reasoning_content");
-                if !text.is_empty()
-                    && matches!(field, "reasoning_content" | "reasoning" | "reasoning_text")
+                let field = if let Some(block) = edited_opaque {
+                    (!has_details).then(|| block["field"].as_str()).flatten()
+                } else {
+                    ordinary
+                        .first()
+                        .and_then(|b| b["field"].as_str())
+                        .or(self.compatibility.reasoning_field.as_deref())
+                        .or(Some("reasoning_content"))
+                };
+                if let Some(field @ ("reasoning_content" | "reasoning" | "reasoning_text")) = field
                 {
-                    first[field] = json!(text);
+                    let text = ordinary
+                        .iter()
+                        .filter_map(|b| b["text"].as_str())
+                        .filter(|text| edited_opaque.is_none() || !text.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        first[field] = json!(text);
+                    }
                 }
             }
+        }
+        if edited_opaque.is_some()
+            && first["content"]
+                .as_str()
+                .is_some_and(|text| text.trim().is_empty())
+            && first.get("tool_calls").is_none()
+        {
+            return Vec::new();
         }
         if first["role"] == "assistant"
             && first["content"].as_str().is_some_and(str::is_empty)

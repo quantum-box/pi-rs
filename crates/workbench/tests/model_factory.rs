@@ -1854,6 +1854,95 @@ async fn copilot_opaque_reasoning_survives_reopen_and_stays_on_its_route() {
 }
 
 #[tokio::test]
+async fn copilot_context_replacement_replays_legacy_opaque_signatures_only_on_the_origin_route() {
+    use pi_rs::{Event, Model, ModelRequest, SessionBuilder};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+    let other_endpoint = format!(
+        "http://{}/other/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let factory = ModelClientFactory::new(HostAuthBuilder::new().build());
+    let copilot = Arc::new(factory.anonymous_chat("github-copilot", &endpoint).unwrap());
+    let mut session = SessionBuilder::new(copilot, "fixture")
+        .provider("github-copilot")
+        .unwrap()
+        .in_memory()
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let reply = [json!({"content":"Original."})];
+        let (_, result) = tokio::join!(
+            serve_chat_deltas(&listener, &reply, Some("stop")),
+            session.prompt("start")
+        );
+        assert_eq!(result.unwrap(), "Original.");
+        let target = session
+            .journal()
+            .unwrap()
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Assistant { .. }))
+            .unwrap()
+            .id;
+
+        for (thinking, signature, expected) in [
+            (
+                "Plan.",
+                r#"{"field":"reasoning_text","reasoning_opaque":"edited-state"}"#,
+                json!({"role":"assistant","content":"Edited.","reasoning_text":"Plan.","reasoning_opaque":"edited-state"}),
+            ),
+            (
+                "",
+                r#"{"reasoning_opaque":"edited-state"}"#,
+                json!({"role":"assistant","content":"Edited.","reasoning_opaque":"edited-state"}),
+            ),
+        ] {
+            let replacement = serde_json::from_value(json!([
+                {"type":"thinking","thinking":thinking,"thinkingSignature":signature},
+                {"type":"text","text":"Edited."}
+            ])).unwrap();
+            session.edit_context(target, Some(replacement)).unwrap();
+            let history = {
+                let journal = session.journal().unwrap();
+                journal.model_conversation_at(journal.head()).unwrap()
+            };
+            for (provider, route, model) in [
+                ("github-copilot", endpoint.as_str(), "fixture"),
+                ("github-copilot", other_endpoint.as_str(), "fixture"),
+                ("github-copilot", endpoint.as_str(), "other-model"),
+                ("other-provider", endpoint.as_str(), "fixture"),
+            ] {
+                let client = factory.anonymous_chat(provider, route).unwrap();
+                let request = ModelRequest {
+                    model: model.into(),
+                    messages: history.clone(),
+                    tools: vec![],
+                    max_output_tokens: 32,
+                };
+                let (body, stream) = tokio::join!(
+                    serve_chat_deltas(&listener, &reply, Some("stop")),
+                    client.stream(request)
+                );
+                drop(stream.unwrap());
+                let assistant = body["messages"].as_array().unwrap().iter()
+                    .find(|message| message["role"] == "assistant").unwrap();
+                if provider == "github-copilot" && route == endpoint && model == "fixture" {
+                    assert_eq!(assistant, &expected);
+                } else {
+                    assert_eq!(assistant, &json!({"role":"assistant","content":"Edited."}));
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn copilot_replays_opaque_reasoning_on_a_tool_only_assistant_turn() {
     use futures_util::StreamExt;
     use pi_rs::{Message, Model, ModelEvent, ModelRequest};
