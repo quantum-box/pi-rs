@@ -63,6 +63,8 @@ mod text_page;
 pub mod theme_parser;
 pub mod theme_resources;
 mod tool_output;
+#[cfg(windows)]
+mod windows_file_identity;
 
 pub fn agent_dir() -> PathBuf {
     std::env::var_os("PI_RS_HOME")

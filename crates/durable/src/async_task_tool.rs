@@ -1011,6 +1011,7 @@ pub fn checkpointable_leaf(tool: Arc<dyn Tool>) -> Arc<dyn DurableAsyncTool> {
     Arc::new(CheckpointableTool {
         tool,
         child_timeout: None,
+        foreground: None,
     })
 }
 
@@ -1024,12 +1025,91 @@ pub fn checkpointable_tool(
     Arc::new(CheckpointableTool {
         tool,
         child_timeout: Some(child_timeout),
+        foreground: None,
     })
+}
+
+/// Wrap an ordinary replay-safe conversation tool with an explicitly configured
+/// foreground subagent capability. The tool can call `foreground_subagent`
+/// with a stable `key` and `prompt`. Child configuration and its tool allowlist
+/// are fixed by the registration. Register the returned tool with
+/// `register_conversation_replay_safe_durable_tool`.
+pub fn checkpointable_tool_with_foreground_subagent(
+    tool: Arc<dyn Tool>,
+    child_timeout: std::time::Duration,
+    config: crate::runtime::Config,
+    allowed_tools: Vec<String>,
+) -> Arc<dyn DurableAsyncTool> {
+    Arc::new(CheckpointableTool {
+        tool,
+        child_timeout: Some(child_timeout),
+        foreground: Some(ForegroundSubagent {
+            config,
+            allowed_tools,
+        }),
+    })
+}
+
+const FOREGROUND_SUBAGENT: &str = "foreground_subagent";
+
+struct ForegroundSubagent {
+    config: crate::runtime::Config,
+    allowed_tools: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForegroundArguments {
+    key: String,
+    prompt: String,
+}
+
+enum OrdinaryChild {
+    Task(AsyncTaskCall),
+    Foreground(Box<crate::owned_subagent::Admission>),
+}
+
+impl ForegroundSubagent {
+    fn spec() -> ToolSpec {
+        ToolSpec {
+            name: FOREGROUND_SUBAGENT.into(),
+            description: "Start or reattach to a foreground subagent and wait for its answer."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "prompt": {"type": "string", "minLength": 1, "maxLength": 65536}
+                },
+                "required": ["key", "prompt"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn request(&self, arguments: serde_json::Value) -> Result<ForegroundSubagentRequest, String> {
+        let arguments: ForegroundArguments = serde_json::from_value(arguments)
+            .map_err(|_| "foreground subagent requires a key and prompt")?;
+        if arguments.key.trim().is_empty()
+            || arguments.key.len() > 128
+            || arguments.prompt.trim().is_empty()
+            || arguments.prompt.len() > 65536
+        {
+            return Err("invalid foreground subagent key or prompt".into());
+        }
+        Ok(ForegroundSubagentRequest {
+            key: arguments.key,
+            prompt: arguments.prompt,
+            config: self.config.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+        })
+    }
 }
 
 struct CheckpointableTool {
     tool: Arc<dyn Tool>,
     child_timeout: Option<std::time::Duration>,
+    foreground: Option<ForegroundSubagent>,
 }
 
 enum ToolHostRequest {
@@ -1185,9 +1265,15 @@ impl DurableAsyncTool for CheckpointableTool {
         use futures_util::{StreamExt, stream::FuturesUnordered};
 
         let (requests, mut incoming) = tokio::sync::mpsc::channel(1);
-        let tools = self
+        let mut tools = self
             .child_timeout
             .map_or_else(Vec::new, |_| host.child_tools());
+        if self.foreground.is_some() {
+            if tools.iter().any(|tool| tool.name == FOREGROUND_SUBAGENT) {
+                return Err("foreground_subagent conflicts with a registered child tool".into());
+            }
+            tools.push(ForegroundSubagent::spec());
+        }
         let invocation = self.tool.invoke_with_host(
             arguments,
             context,
@@ -1221,12 +1307,19 @@ impl DurableAsyncTool for CheckpointableTool {
                             let _ = reply.send(Outcome::Skipped("cancelled before nested dispatch".into()));
                             continue;
                         }
-                        match host.start_child_now(&key, &name, arguments).await {
-                            Ok(call) => calls.push(async move {
+                        let child = match self.foreground.as_ref().filter(|_| name == FOREGROUND_SUBAGENT) {
+                            Some(foreground) => match foreground.request(arguments) {
+                                Ok(request) => host.start_foreground_subagent(request).await.map(|child| OrdinaryChild::Foreground(Box::new(child))),
+                                Err(reason) => Err(reason),
+                            },
+                            None => host.start_child_now(&key, &name, arguments).await.map(OrdinaryChild::Task),
+                        };
+                        match child {
+                            Ok(child) => calls.push(async move {
                                 let outcome = tokio::select! {
                                     biased;
                                     _ = cancellation.cancelled() => Outcome::Unknown("nested call was cancelled after admission".into()),
-                                    result = host.wait_child_result(&call, timeout) => ordinary_child_outcome(result),
+                                    outcome = child.wait(host, timeout) => outcome,
                                 };
                                 let _ = reply.send(outcome);
                             }),
@@ -1240,6 +1333,29 @@ impl DurableAsyncTool for CheckpointableTool {
             }
         };
         Ok(DurableToolStep::Complete(outcome))
+    }
+}
+
+impl OrdinaryChild {
+    async fn wait(self, host: &dyn DurableTaskHost, timeout: std::time::Duration) -> Outcome {
+        use crate::runtime::Status;
+
+        match self {
+            Self::Task(call) => {
+                ordinary_child_outcome(host.wait_child_result(&call, timeout).await)
+            }
+            Self::Foreground(child) => match host.wait_foreground_subagent(&child, timeout).await {
+                Ok(Some(Status::Done { answer })) => Outcome::SucceededWithDetails {
+                    output: answer,
+                    details: serde_json::json!({"conversationId": child.child}),
+                },
+                Ok(Some(Status::Unanswered { reason })) => Outcome::Failed(reason),
+                Ok(_) => Outcome::Unknown(
+                    "foreground subagent did not settle before its deadline".into(),
+                ),
+                Err(reason) => Outcome::Unknown(reason),
+            },
+        }
     }
 }
 
