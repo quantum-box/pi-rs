@@ -2069,8 +2069,12 @@ impl View {
     }
 
     fn draft_receives_interrupt(&self, args: &Cli, keys: &Keys, key: KeyEvent) -> bool {
-        // Both picker types and dialogs handle input before draft dispatch.
-        if self.picker.is_some() || self.dialog().is_some() {
+        // These states handle input before draft dispatch.
+        if self.picker.is_some()
+            || self.dialog().is_some()
+            || self.share_blocks_input()
+            || self.remote_task.is_some()
+        {
             return false;
         }
         if args.tui_mode != Some(TuiMode::Regular)
@@ -15710,6 +15714,37 @@ exit {exit}
         args.tui_mode = Some(TuiMode::Regular);
         assert!(view.draft_receives_interrupt(&args, &keys, key));
         args.tui_mode = Some(TuiMode::Fullscreen);
+        assert!(!view.draft_receives_interrupt(&args, &keys, key));
+    }
+
+    #[tokio::test]
+    async fn share_preparation_and_upload_hide_the_shell_interrupt_hint() {
+        use clap::Parser;
+
+        let args = Cli::parse_from(["pi"]);
+        let keys = Keys::default();
+        let key = keys.first_binding("app.interrupt").unwrap();
+        let mut view = View {
+            shell_running: true,
+            ..Default::default()
+        };
+        assert!(view.draft_receives_interrupt(&args, &keys, key));
+
+        view.pending_share = Some(PendingShare {
+            id: uuid::Uuid::new_v4(),
+            destination: sessions::ShareDestination::Gist,
+            path: Default::default(),
+            workspace: Default::default(),
+            started: Instant::now(),
+        });
+        assert!(!view.draft_receives_interrupt(&args, &keys, key));
+
+        view.pending_share = None;
+        view.remote_task = Some(RemoteTask::start(
+            "Uploading share",
+            "Share cancelled",
+            |_| async { std::future::pending::<pi_rs::Result<Vec<String>>>().await },
+        ));
         assert!(!view.draft_receives_interrupt(&args, &keys, key));
     }
 
