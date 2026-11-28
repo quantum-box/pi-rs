@@ -33111,6 +33111,105 @@ mod scheduler_tests {
         }
     }
 
+    #[cfg(feature = "openai-responses")]
+    #[tokio::test]
+    async fn responses_http_context_overflow_compacts_and_retries_durable_input() {
+        use serde_json::json;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let provider = tokio::spawn(async move {
+            let mut payloads = Vec::new();
+            for attempt in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = tokio::io::BufReader::new(socket);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = Some(value.trim().parse().unwrap());
+                    }
+                }
+                let mut bytes = vec![0; length.unwrap()];
+                socket.read_exact(&mut bytes).await.unwrap();
+                payloads.push(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+                let (status, content_type, body) = if attempt == 0 {
+                    (
+                        "400 Bad Request",
+                        "application/json",
+                        r#"{"error":{"code":"context_length_exceeded","message":"private-provider-detail"}}"#.to_owned(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        format!(
+                            "data: {}\n\ndata: {}\n\n",
+                            json!({"type":"response.output_text.delta","output_index":0,"delta":"recovered"}),
+                            json!({
+                                "type":"response.completed",
+                                "response":{
+                                    "status":"completed",
+                                    "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recovered"}]}],
+                                    "usage":{"input_tokens":1,"output_tokens":1}
+                                }
+                            })
+                        ),
+                    )
+                };
+                socket.get_mut().write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()
+                ).await.unwrap();
+            }
+            payloads
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(AutoBlockModel {
+            window: None,
+            summaries: std::sync::Mutex::new(vec![]),
+        });
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), auto_options(model.clone())).unwrap();
+        h.install_provider_adapter(Arc::new(
+            crate::openai_responses::OpenAiResponsesAdapter::new(&endpoint, "test-key".into())
+                .unwrap(),
+        ))
+        .unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        h.append_user_blocks(id, vec![json!({"type":"text","text":"old context"})])
+            .unwrap();
+        let submission = h.submit(id, None, "latest request".into()).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            h.resume_conversation(id, &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let state = h.conversation(id).unwrap();
+        assert!(
+            state.submissions.iter().any(|item| item.id == submission
+                && matches!(&item.status, Status::Done { answer } if answer == "recovered")),
+            "{:?}",
+            state.submissions
+        );
+        assert_eq!(model.summaries.lock().unwrap().len(), 1);
+        let payloads = provider.await.unwrap();
+        let first = payloads[0]["input"].to_string();
+        let retry = payloads[1]["input"].to_string();
+        assert!(first.contains("old context"));
+        assert!(!retry.contains("old context"));
+        for expected in ["checkpoint", "latest request"] {
+            assert!(retry.contains(expected), "missing {expected}: {retry}");
+        }
+    }
+
     #[tokio::test]
     async fn automatic_block_compaction_runs_from_public_submission() {
         use serde_json::json;
