@@ -23,6 +23,37 @@ host-supplied metadata. They do not load config, access credentials, probe
 providers, or infer a default route. Listings are ordered by the registered
 identities, and lookup is case-sensitive.
 
+A host can register the model's selectable reasoning levels with
+`ModelCatalogBuilder::set_thinking_levels`. Use
+`catalog.thinking_levels(provider, model)` to populate a picker in the host's
+order. An empty list means the host declared no selectable levels. `None`
+means that no list is available. This is the host-owned catalog equivalent
+of [Pi's available thinking levels](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2827-L2838).
+The list describes capability metadata. The host still chooses a client
+configured for the selected level.
+
+For native hosts, `ModelFileReadGrants::load` and `load_with_api_keys`
+populate those choices from an explicit `thinkingLevelMap` on an exactly
+granted chat declaration. A `modelOverrides` map replaces only the keys it
+specifies. For reasoning models, `null` disables a choice, omitted ordinary
+levels stay available, and `xhigh` and `max` require a non-null mapping. An
+explicit map on a non-reasoning model yields only `off`. A declaration with
+no map retains `None`.
+
+The granted file loader binds the default `ModelClientFactory::client` for
+each route and shares that client across its model declarations. It publishes
+the selectable levels without passing the provider effort strings to the
+client. A host that owns the effort mapping and credentials can obtain a
+typed `chat_client` and call `with_mapped_reasoning_effort`, or obtain a
+typed Responses client and call `with_mapped_thinking`. The binding callbacks
+for [model cycling](https://github.com/quantum-box/pi-rs/pull/833) and
+[thinking selection](https://github.com/quantum-box/pi-rs/pull/846) take the
+configured client from the host. For historical branches the host supplies
+it through `cycled_model_resolver`. Automatic dispatch from a granted file
+would need to retain the merged effort map per exact model and build those
+level-specific clients through the same authorized route and credential
+resolution. The browser WASM SDK does not read native model files.
+
 For older journals that recorded a model name without its provider, the host
 may explicitly authorize that name with `session_builder_with_legacy_model`.
 Use this only when the host knows which provider the old name represents; the
@@ -43,6 +74,11 @@ fn session_builder(client: Arc<dyn Model>) -> pi_rs::Result<pi_rs::SessionBuilde
             ..Default::default()
         },
     )?;
+    models.set_thinking_levels(
+        "my-provider",
+        "my-model",
+        ["off", "low", "high"].map(str::to_owned),
+    )?;
     let catalog = models.build();
     let model = catalog
         .find("my-provider", "my-model")
@@ -59,6 +95,55 @@ policy. Share the replacement snapshot for new lookups and sessions. Previously
 cloned catalogs and existing sessions retain their original bindings. Hosts
 needing automatic fallback can provide their own `HistoricalModelResolver`.
 This provider-neutral API does not depend on Tauri or a desktop runtime.
+
+### Reload saved keys and model routes
+
+Native hosts using the workspace's `pi-rs-workbench` crate can rebuild a live
+catalog with `AuthFileReadGrants` and `ModelClientFactory`. Prepare the exact
+provider and endpoint grants and the complete set of model definitions for
+each reload. Read the granted file once, then build every client from that
+credential snapshot.
+
+```rust,no_run
+use pi_rs::ModelCatalog;
+use pi_rs_workbench::{
+    auth_factory::AuthFileReadGrants,
+    model_factory::{ModelClientFactory, NativeModelDefinition},
+};
+
+fn reload<'a>(
+    live: &mut ModelCatalog,
+    grants: &AuthFileReadGrants,
+    definitions: impl IntoIterator<Item = NativeModelDefinition<'a>>,
+) -> pi_rs::Result<()> {
+    let factory = ModelClientFactory::new(grants.load()?);
+    let candidate = factory.catalog(definitions)?;
+    *live = candidate;
+    Ok(())
+}
+```
+
+If the load or build fails, the previous catalog remains published. A missing
+auth file yields an empty credential snapshot, so building a defined route
+that requires a key fails. For a shared catalog, build the candidate on a
+blocking worker, then take the host's state lock only to publish the completed
+catalog. Serialize reloads or check a host-owned revision before publishing
+so an older rebuild cannot overwrite a newer one.
+
+Use the replacement catalog to start new sessions. Retained sessions, clients,
+and catalog clones keep their original credentials and routes. Release or
+close them when they should stop using those routes. Revoke a retired key at
+the provider if it must stop working regardless of the client's lifetime.
+
+For explicitly granted `models.json` entries, a host can use
+`ModelFileReadGrants::load(&factory)` to build the candidate. That loader can
+return an empty catalog for a missing file, so check any required model
+identities before publishing. These file reads capture separate inputs.
+
+OAuth acquisition and refresh stay with the host. Use `HostAuthBuilder` to
+bind a host-supplied bearer credential to an exact supported route. In Tauri,
+keep the grants, rebuild, and credential values in the Rust backend. Browser
+Wasm clients continue to use the host-configured gateway.
 
 ## Native quickstart
 
@@ -93,6 +178,48 @@ session UUID. This includes alternate branches and compacted history. The
 workbench RPC counts Pi-projected message entries and adds usage from its
 native model operations, so message counts and usage totals can differ from
 the SDK snapshot.
+
+## Model cycling
+
+Call `AgentSession::cycle_model` with the current ordered snapshot of models
+your host authorizes and, optionally, its ordered scope. A nonempty scope is
+filtered by exact, case-sensitive provider and model pairs. It stays in effect
+even if every scoped entry is unavailable. An empty scope uses snapshot order.
+Cycling wraps in either direction. If the current model is absent, forward
+selects the first eligible model and backward selects the last, even when only
+one is eligible. The active journal selection supplies the current identity.
+An empty list or a lone current model returns `Ok(None)` without binding a
+client, writing a selection, or running selection hooks.
+
+The SDK asks the host to bind only the chosen model. It passes the requested
+thinking level with the explicit scoped level first, followed by the snapshot's
+per-model default, the host global default, and the current session level. The
+SDK uses its implicit `off` when none is set. The binding callback should return
+a client configured for the effective level and that level after applying
+provider capabilities. A host can use
+`ModelCatalog::get` for a prebuilt client. Hosts that use the native workbench
+factory can prepare clients using `ModelClientFactory` before passing the
+snapshot. The SDK performs no discovery or credential lookup during selection.
+Each cycled journal selection retains its own client binding, including across
+in-process forks and checkouts. Native journal records carry a binding marker,
+so cycling requires a session store with atomic record metadata. When reopening
+a native journal, use `SessionBuilder::cycled_model_resolver` to resolve the
+exact provider, model, and recorded thinking level. The host applies its normal
+credential and capability policy. If it cannot supply that exact client, the
+SDK leaves the selection unresolved and cannot dispatch requests with it.
+On reopen, a configured cycle resolver reauthorizes the active SDK binding,
+even when the supplied registry has cached clients for the journal. It also
+reauthorizes the bindings needed to resume pending tree triggers. Other cycled
+bindings are resolved when their branches are selected. A malformed or
+incomplete SDK binding on the active selection causes reopen to fail.
+Explicit SDK model setters keep their existing identity-based behavior.
+
+The SDK records the chosen model and effective thinking level together in the
+session journal, then delivers selection hooks with source `cycle`. A host owns
+the scope and any application-wide defaults, including whether to persist the
+new model to settings. See the
+[pinned upstream cycling implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2701-L2774)
+for the reference ordering and scope behavior.
 
 ## Native state and Tauri
 
@@ -188,6 +315,35 @@ choose which frontend callers may invoke them and enforce its own workspace,
 credential, and network policies. The SDK's session state is not a sandbox.
 See [Tauri's state guide](https://v2.tauri.app/develop/state-management/) and
 [command guide](https://v2.tauri.app/develop/calling-rust/).
+
+### Live tool results
+
+Subscribe with `AgentSession::subscribe_tool_progress()` before starting work.
+Direct prompts and runs started through cloned controls publish owned
+`Arc<ToolProgressUpdate>` values with the tool call ID, name, argument preview,
+partial result, and parent call ID for nested tools. The payload
+keeps the result format supplied by the tool. Hosts can use it to update their
+tool renderer while the call is running. Final results still arrive as
+committed records on `AgentSession::subscribe()`.
+
+The progress stream retains up to 32 updates per session. A slow subscription
+reports `RecvError::Lagged` and can then continue with the retained updates.
+Closing or dropping the session closes the stream after buffered updates are
+drained. Progress is transient and reopening the journal cannot replay it.
+
+In Tauri, create the receiver while you have access to the managed session,
+then release the state lock before reading the stream. An authorized frontend
+can provide a `tauri::ipc::Channel<ToolProgressUpdate>` to a host command.
+The forwarding task can send `update.as_ref().clone()` through that channel
+after applying the host's disclosure policy. Arguments and partial results may
+contain private data. Handle lag by resuming with the newest available updates
+and reconcile the display with the final committed result. Stop forwarding
+when the channel disconnects or the SDK receiver closes.
+
+This is a Rust API in `pi-rs-core` and also compiles for `wasm32-unknown-unknown`.
+The JavaScript browser SDK uses a separate `wasm-bindgen` wrapper around the core
+session. Its prompt and resume methods return promises for completed answers,
+and its current bindings do not expose this subscription.
 
 ## Browser WASM status
 
