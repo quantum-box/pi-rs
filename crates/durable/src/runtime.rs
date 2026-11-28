@@ -2799,6 +2799,14 @@ pub struct SessionMessageEntry {
     pub blocks: Option<Vec<serde_json::Value>>,
     /// Posted as part of a context replacement instead of an ordinary append.
     pub context_replacement: bool,
+    /// The summary and first retained identity for a recorded compaction.
+    pub compaction: Option<SessionCompaction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionCompaction {
+    pub summary: String,
+    pub first_kept_entry_id: Option<Uuid>,
 }
 
 pub struct SessionMessagePage {
@@ -11424,6 +11432,9 @@ impl Harness {
                 let histories = change
                     .compacted_histories()?
                     .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let Message::User { content } = &messages[*system_end] else {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                };
                 vec![SessionMessageEntry {
                     history: histories[*system_end]
                         .clone()
@@ -11431,6 +11442,15 @@ impl Harness {
                     message: messages[*system_end].clone(),
                     blocks: blocks_for(*summary_id),
                     context_replacement: true,
+                    compaction: Some(SessionCompaction {
+                        summary: crate::compact::summary_text(content)
+                            .unwrap_or(content)
+                            .to_owned(),
+                        first_kept_entry_id: histories
+                            .get(system_end + 1)
+                            .and_then(Option::as_ref)
+                            .map(|history| history.id),
+                    }),
                 }]
             } else {
                 let (messages, base, metadata) = change.parts()?;
@@ -11455,6 +11475,7 @@ impl Harness {
                         message,
                         blocks: blocks_for(id),
                         context_replacement: base,
+                        compaction: None,
                     })
                     .collect()
             };

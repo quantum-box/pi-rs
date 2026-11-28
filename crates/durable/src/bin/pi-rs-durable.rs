@@ -17,7 +17,7 @@ use pi_rs_durable::{
     worker_activity::WorkerKind,
 };
 use pi_rs_workbench::model_factory::{ModelClientFactory, NativeModelApi};
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -227,7 +227,7 @@ async fn run(
     Ok(())
 }
 
-fn emit(object: &Value) -> io::Result<()> {
+fn emit(object: &impl serde::Serialize) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     serde_json::to_writer(&mut stdout, object)?;
     writeln!(stdout)?;

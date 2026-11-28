@@ -563,20 +563,56 @@ fn rpc_session_name_is_sanitized_and_retained_on_reopen() {
         &["--model", "fixture"],
         &[
             json!({"type":"get_state"}),
+            json!({"id":"empty","type":"get_tree"}),
             json!({"type":"set_session_name","name":"  Test\r\nTitle  "}),
             json!({"type":"set_session_name","name":"   "}),
             json!({"type":"get_state"}),
+            json!({"id":"history","type":"get_entries"}),
+            json!({"type":"get_entries","since":"unknown"}),
+            json!({"id":"tree","type":"get_tree"}),
         ],
     );
-    assert_eq!(responses.len(), 4);
+    assert_eq!(responses.len(), 8);
     assert!(responses[0]["data"].get("sessionName").is_none());
-    assert_eq!(responses[1]["success"], true);
-    assert_eq!(responses[2]["success"], false);
-    assert_eq!(responses[3]["data"]["sessionName"], "Test Title");
-    let id = responses[3]["data"]["sessionId"].as_str().unwrap();
-    let reopened = rpc(&["--conversation", id], &[json!({"type":"get_state"})]);
+    assert_eq!(responses[1]["data"], json!({"tree": [], "leafId": null}));
+    assert_eq!(responses[2]["success"], true);
+    assert_eq!(responses[3]["success"], false);
+    assert_eq!(responses[4]["data"]["sessionName"], "Test Title");
+    let history = &responses[5]["data"];
+    let first = &history["entries"][0];
+    let leaf = history["leafId"].as_str().unwrap();
+    assert_eq!(first["id"], leaf);
+    assert_eq!(first["type"], "session_info");
+    assert_eq!(first["parentId"], Value::Null);
+    assert_eq!(first["name"], "Test Title");
+    assert_eq!(responses[6]["error"], "Entry not found: unknown");
+    assert_eq!(responses[7]["id"], "tree");
+    assert_eq!(
+        responses[7]["data"]["tree"],
+        json!([{"entry": first, "children": []}])
+    );
+    assert_eq!(responses[7]["data"]["leafId"], leaf);
+
+    let id = responses[4]["data"]["sessionId"].as_str().unwrap();
+    let reopened = rpc(
+        &["--conversation", id],
+        &[
+            json!({"type":"get_state"}),
+            json!({"type":"set_session_name","name":"Updated"}),
+            json!({"type":"get_entries","since":leaf}),
+            json!({"type":"get_tree"}),
+        ],
+    );
     assert_eq!(reopened[0]["data"]["sessionName"], "Test Title");
     assert_eq!(reopened[0]["data"]["messageCount"], 0);
+    let new_entry = &reopened[2]["data"]["entries"][0];
+    assert_eq!(reopened[2]["data"]["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(new_entry["parentId"], leaf);
+    assert_eq!(new_entry["name"], "Updated");
+    assert_eq!(
+        reopened[3]["data"]["tree"][0]["children"][0]["entry"],
+        *new_entry
+    );
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock

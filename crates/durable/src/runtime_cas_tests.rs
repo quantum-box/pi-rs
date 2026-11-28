@@ -4248,6 +4248,12 @@ async fn repeated_compaction_retains_original_provenance() {
         .unwrap();
     assert_eq!(tree.entries.len(), 5);
     assert_eq!(tree.entries[1].entry.id(), history.id);
+    let SessionEntry::Message(summary) = &tree.entries[4].entry else {
+        panic!("expected compaction summary");
+    };
+    let compaction = summary.compaction.as_ref().unwrap();
+    assert_eq!(compaction.summary, "summary");
+    assert_eq!(compaction.first_kept_entry_id, Some(history.id));
     for edges in tree.entries.windows(2) {
         assert_eq!(edges[1].parent_id, Some(edges[0].entry.id()));
     }
