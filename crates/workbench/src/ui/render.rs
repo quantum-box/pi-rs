@@ -924,11 +924,20 @@ fn extension_rows(
     theme: &Theme,
     width: usize,
 ) -> Vec<Line> {
+    extension_rows_bounded(rendered, theme, width, usize::MAX)
+}
+
+pub(crate) fn extension_rows_bounded(
+    rendered: &pi_rs::RenderedExtensionRows,
+    theme: &Theme,
+    width: usize,
+    limit: usize,
+) -> Vec<Line> {
     let pad = rendered.padding.min(width.saturating_sub(1) / 2);
     let inner = width.saturating_sub(2 * pad).max(1);
     let padding = " ".repeat(pad);
     let background = rendered.background.as_deref().map(|role| theme.color(role));
-    let mut rows = component_lines(&rendered.lines, theme, inner);
+    let mut rows = component_lines_bounded(&rendered.lines, theme, inner, limit);
     for row in &mut rows {
         if pad != 0 && !row.spans.is_empty() {
             row.spans.insert(0, Span::new(&padding, Color::Reset));

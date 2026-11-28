@@ -200,10 +200,10 @@ impl Dialog {
                 let max = self.scroll_max.get();
                 let position = self.selected.min(max);
                 self.selected = match key.code {
+                    _ if keys.matches("tui.select.pageUp", key) => position.saturating_sub(8),
+                    _ if keys.matches("tui.select.pageDown", key) => (position + 8).min(max),
                     KeyCode::Up => position.saturating_sub(1),
                     KeyCode::Down => (position + 1).min(max),
-                    KeyCode::PageUp => position.saturating_sub(8),
-                    KeyCode::PageDown => (position + 8).min(max),
                     KeyCode::Home => 0,
                     KeyCode::End => max,
                     _ => position,
@@ -649,6 +649,62 @@ mod tests {
         assert!(Dialog::validate_keys(&request(&["escape"])).is_err());
         assert!(Dialog::validate_keys(&request(&["ctrl+shift+c"])).is_err());
         assert!(Dialog::validate_keys(&request(&["enter", "return"])).is_err());
+    }
+
+    #[test]
+    fn custom_dialog_scroll_uses_configured_page_keys() {
+        let mut keys = Keys::default();
+        keys.set_test_binding("tui.select.pageUp", "alt+v");
+        keys.set_test_binding("tui.select.pageDown", "ctrl+v");
+        let request = |actions| UiRequest::Custom {
+            title: "Component".into(),
+            lines: (0..24)
+                .map(|row| {
+                    vec![pi_rs::UiComponentSpan {
+                        text: format!("component row {row}"),
+                        ..Default::default()
+                    }]
+                })
+                .collect(),
+            actions,
+            timeout: None,
+        };
+        let mut dialog = Dialog::new(Uuid::new_v4(), request(vec![]));
+        let theme = Theme::system();
+        dialog.render(&theme, 80, 8, &keys);
+
+        let down = keys::parse("ctrl+v").unwrap();
+        let up = keys::parse("alt+v").unwrap();
+        assert!(dialog.input(down, &keys).is_none());
+        let lines = dialog.render(&theme, 80, 8, &keys);
+        assert_eq!(lines[1].spans[0].text, "component row 8");
+        for _ in 0..3 {
+            assert!(dialog.input(down, &keys).is_none());
+        }
+        assert_eq!(dialog.selected, dialog.scroll_max.get());
+        assert!(dialog.input(up, &keys).is_none());
+        assert_eq!(dialog.selected, dialog.scroll_max.get() - 8);
+        assert!(
+            dialog
+                .input(keys::parse("pagedown").unwrap(), &keys)
+                .is_none()
+        );
+        assert_eq!(dialog.selected, dialog.scroll_max.get() - 8);
+
+        let mut action_dialog = Dialog::new(
+            Uuid::new_v4(),
+            request(vec![pi_rs::UiComponentAction {
+                key: "ctrl+v".into(),
+                value: "extension action".into(),
+                label: None,
+            }]),
+        );
+        action_dialog.render(&theme, 80, 8, &keys);
+        assert_eq!(
+            action_dialog.input(down, &keys),
+            Some(UiResponse::Text("extension action".into()))
+        );
+        assert_eq!(action_dialog.selected, 0);
     }
 
     #[test]
