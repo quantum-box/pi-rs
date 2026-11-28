@@ -2218,11 +2218,10 @@ fn stop_at_unsafe_park_boundary(stage: &str, state: &Conversation) {
     let Some(root) = std::env::var_os("PI_UNSAFE_BOUNDARY_DIR") else {
         return;
     };
-    std::fs::write(
+    crate::publish_ready_marker(
         std::path::PathBuf::from(root).join("boundary"),
         serde_json::to_vec(&state.tool_attempt()).unwrap(),
-    )
-    .unwrap();
+    );
     loop {
         std::thread::park();
     }

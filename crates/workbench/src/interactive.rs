@@ -2716,6 +2716,12 @@ impl View {
         };
         *output = crate::ui::render::strip_shell_ansi(&display_tool_blocks(blocks));
         *parts = tool_result_parts(&update["content"], self.graphics.enabled());
+        if name == "codemode"
+            && let Some(text) = codemode_progress_text(&update["details"])
+        {
+            output.clone_from(&text);
+            parts.push(ToolPart::Text(text));
+        }
         records.progress = records.progress.wrapping_add(1);
         self.partial_tool_results.insert(
             id.clone(),
@@ -3633,6 +3639,11 @@ impl View {
             }
             return;
         }
+        let nested_progress = self
+            .partial_tool_results
+            .get(operation)
+            .and_then(|partial| partial.details.as_ref())
+            .and_then(codemode_progress_text);
         let mut rendered_parts = match outcome {
             pi_rs::Outcome::Structured { data, .. }
             | pi_rs::Outcome::StructuredWithDetails { data, .. } => {
@@ -3675,6 +3686,15 @@ impl View {
             };
             *numbered_diff = diff.is_some();
             *output = diff.map_or_else(|| display_tool_result(outcome), str::to_owned);
+            if name == "codemode"
+                && let Some(text) = nested_progress
+            {
+                if parts.is_empty() {
+                    parts.push(ToolPart::Text(output.clone()));
+                }
+                output.insert_str(0, &format!("{text}\n"));
+                parts.insert(0, ToolPart::Text(text));
+            }
             *failed = !matches!(
                 outcome,
                 pi_rs::Outcome::Succeeded(_)
@@ -3972,15 +3992,12 @@ render_call_id: None,
                     }
                     Some("tool_finished" | "tool_reconciled") => {
                         self.phase = Some("処理を継続中");
-                        if let Some(record) = value["record"]["id"].as_u64() {
-                            self.track_tool_render(event["operation_id"].as_str().unwrap_or_default(), record, false);
-                        }
+                        let operation = event["operation_id"].as_str().unwrap_or_default();
                         if let Ok(outcome) = serde_json::from_value(event["outcome"].clone()) {
-                            self.finish_tool(
-                                event["operation_id"].as_str().unwrap_or_default(),
-                                &outcome,
-                                None,
-                            );
+                            self.finish_tool(operation, &outcome, None);
+                        }
+                        if let Some(record) = value["record"]["id"].as_u64() {
+                            self.track_tool_render(operation, record, false);
                         }
                     }
                     Some("compacted" | "branch_summary") => self.summarizing = false,
@@ -5045,6 +5062,38 @@ fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
             _ => None,
         })
         .collect()
+}
+
+fn codemode_progress_text(details: &Value) -> Option<String> {
+    const VISIBLE_CALLS: usize = 6;
+    let calls = details["calls"].as_array()?;
+    if calls.is_empty() {
+        return None;
+    }
+    let hidden = calls.len().saturating_sub(VISIBLE_CALLS);
+    let mut lines = Vec::new();
+    if hidden > 0 {
+        lines.push(format!("… {hidden} earlier calls"));
+    }
+    for call in &calls[hidden..] {
+        let status = match call["status"].as_str()? {
+            "running" => "…",
+            "ok" => "✓",
+            "error" => "✗",
+            "cancelled" => "⊘",
+            _ => continue,
+        };
+        let name = call["name"].as_str()?;
+        let args = call["args"].as_str().unwrap_or_default();
+        let duration = call["durationMs"]
+            .as_u64()
+            .map_or(String::new(), |ms| format!(" {ms}ms"));
+        lines.push(format!("{status} {name} {args}{duration}"));
+    }
+    if let Some(omitted) = details["omittedCalls"].as_u64().filter(|count| *count > 0) {
+        lines.push(format!("… {omitted} additional calls omitted"));
+    }
+    Some(crate::ui::render::strip_shell_ansi(&lines.join("\n")))
 }
 
 fn display_tool_blocks(blocks: &[Value]) -> String {
@@ -15380,6 +15429,44 @@ exit {exit}
         view.track_tool_render(&operation, 4, false);
         view.tool_render_cursor = Some(0);
         assert_eq!(view.next_journal_tool_render().unwrap().0, 1);
+    }
+
+    #[test]
+    fn codemode_displays_live_and_cancelled_calls_alongside_script_output() {
+        let mut view = super::View::default();
+        let operation_id = uuid::Uuid::new_v4();
+        let operation = operation_id.to_string();
+        view.add_tool(
+            &pi_rs::Invocation {
+                operation_id,
+                call: pi_rs::ToolCall {
+                    id: "script".into(),
+                    name: "codemode".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            Some(1),
+        );
+        view.track_tool_render(&operation, 2, true);
+        let update = |status| {
+            json!({
+                "toolCallId":"script","toolName":"codemode",
+                "partialResult":{"content":[],"details":{"calls":[{"name":"echo","args":"{}","status":status}]}}
+            })
+        };
+        assert!(view.render_tool_progress(&update("running")));
+        assert!(matches!(&view.lines[0], Entry::Tool { output, .. } if output.contains("… echo")));
+        assert!(view.render_tool_progress(&update("cancelled")));
+        view.finish_tool(
+            &operation,
+            &pi_rs::Outcome::Failed("retained output".into()),
+            None,
+        );
+        view.track_tool_render(&operation, 3, false);
+        assert!(
+            matches!(&view.lines[0], Entry::Tool { output, finished: true, .. }
+            if output.contains("⊘ echo") && output.contains("retained output"))
+        );
     }
 
     #[test]
