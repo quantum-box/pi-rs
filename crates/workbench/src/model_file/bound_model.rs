@@ -48,7 +48,7 @@ impl Model for BoundModel<'_> {
     }
 
     fn can_reuse_measured_context(&self, request: &ModelRequest) -> bool {
-        request.model == &*self.model && self.client.can_reuse_measured_context(request)
+        request.model == *self.model && self.client.can_reuse_measured_context(request)
     }
 
     async fn prepare_context<'a>(
