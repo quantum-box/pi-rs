@@ -1292,6 +1292,152 @@ fn session_checkout_projects_an_interior_append_and_keeps_the_old_path() {
     );
 }
 
+#[tokio::test]
+async fn extension_branch_summary_fences_replacement_and_persists_label() {
+    use crate::extension::{BranchSummaryRequest, Extension, Hook};
+    use pi_rs_core::{TreeDecision, TreeSummary, Usage};
+
+    struct Summarizer;
+    #[async_trait::async_trait]
+    impl Hook for Summarizer {
+        async fn before_branch_summary(
+            &self,
+            request: &BranchSummaryRequest<'_>,
+            _cancel: &CancellationToken,
+        ) -> Result<Option<TreeDecision>, String> {
+            if request.instructions == Some("cancel") {
+                return Ok(Some(TreeDecision {
+                    cancel: true,
+                    ..Default::default()
+                }));
+            }
+            assert_eq!(request.instructions, Some("keep the decision"));
+            assert!(!request.replace_instructions);
+            assert_eq!(request.common_ancestor, Some(request.target));
+            assert_eq!(request.messages.len(), 1);
+            assert_eq!(request.old_leaf, Some(request.messages[0].history.id));
+            Ok(Some(TreeDecision {
+                summary: Some(TreeSummary {
+                    summary: "Extension chose this summary".into(),
+                    details: Some(serde_json::json!({"abandoned": request.old_leaf})),
+                    usage: Some(Usage {
+                        input_tokens: 19,
+                        output_tokens: 4,
+                    }),
+                }),
+                label: Some("decision".into()),
+                ..Default::default()
+            }))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let install = |h: &Harness| {
+        h.install_extension(Extension {
+            name: "summary-extension".into(),
+            hooks: vec![Arc::new(Summarizer)],
+            ..Default::default()
+        })
+        .unwrap();
+    };
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    install(&h);
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["summary-extension".into()])
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.extend(
+        ["shared", "edit me", "abandoned"].map(|content| Message::User {
+            content: content.into(),
+        }),
+    );
+    h.save(&state, Expected::Version(version)).unwrap();
+
+    let tree = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap();
+    let target = tree.entries[1].entry.id();
+    let original = tree.leaf_id.unwrap();
+    let token = CancellationToken::new();
+    let plan = h.plan_session_branch_summary(id, target).unwrap();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(plan.before_summary(None, false, &cancelled).await.is_err());
+    assert!(matches!(
+        plan.before_summary(Some("cancel"), false, &token).await,
+        Err(reason) if reason == "Branch summary cancelled"
+    ));
+    let decision = plan
+        .before_summary(Some("keep the decision"), false, &token)
+        .await
+        .unwrap();
+    h.uninstall_extension("summary-extension").unwrap();
+    install(&h);
+    assert!(matches!(
+        h.finish_session_branch_summary_with_decision(plan, None, decision),
+        Err(Error::Invalid(reason)) if reason == "Extensions changed during branch summarization"
+    ));
+    assert_eq!(
+        h.session_tree(&h.session_entries_start(id).unwrap())
+            .unwrap()
+            .leaf_id,
+        Some(original)
+    );
+
+    let plan = h.plan_session_branch_summary(id, target).unwrap();
+    let decision = plan
+        .before_summary(Some("keep the decision"), false, &token)
+        .await
+        .unwrap();
+    let draft = h
+        .finish_session_branch_summary_with_decision(plan, None, decision)
+        .unwrap()
+        .unwrap();
+    assert_eq!(draft.history.id, target);
+    drop(h);
+
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let history = h.session_entries_start(id).unwrap();
+    let tree = h.session_tree(&history).unwrap();
+    let head = tree
+        .entries
+        .iter()
+        .find(|node| Some(node.entry.id()) == tree.leaf_id)
+        .unwrap();
+    let SessionEntry::Label { entry: label, .. } = &head.entry else {
+        panic!("expected the extension's label after the summary");
+    };
+    assert_eq!(head.parent_id, Some(label.target_id));
+    let summary = tree
+        .entries
+        .iter()
+        .find_map(|node| match &node.entry {
+            SessionEntry::Message(entry) if entry.history.id == label.target_id => {
+                entry.branch_summary.as_deref()
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(summary.from_extension);
+    assert_eq!(summary.summary, "Extension chose this summary");
+    assert_eq!(
+        summary.details,
+        Some(serde_json::json!({"abandoned": original}))
+    );
+    assert_eq!(summary.usage.unwrap().output_tokens, 4);
+    let labels = h.session_labels(&history).unwrap();
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].target_id, summary.id);
+    assert_eq!(labels[0].label.as_deref(), Some("decision"));
+}
+
 #[test]
 fn session_branch_summary_reopens_at_proven_interior_cut_and_fences_stale_plan() {
     let dir = tempfile::tempdir().unwrap();

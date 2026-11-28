@@ -404,8 +404,28 @@ pub enum BeforeCompact {
     Summary(String),
 }
 
+/// Immutable history captured before selecting a branch summary.
+pub struct BranchSummaryRequest<'a> {
+    pub conversation: uuid::Uuid,
+    pub target: uuid::Uuid,
+    pub old_leaf: Option<uuid::Uuid>,
+    pub common_ancestor: Option<uuid::Uuid>,
+    pub messages: &'a [crate::runtime::SessionMessageEntry],
+    pub instructions: Option<&'a str>,
+    pub replace_instructions: bool,
+}
+
 #[async_trait]
 pub trait Hook: Send + Sync {
+    /// Supply a summary or adjust its instructions and bookmark before navigation.
+    async fn before_branch_summary(
+        &self,
+        _request: &BranchSummaryRequest<'_>,
+        _cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<Option<pi_rs_core::TreeDecision>, String> {
+        Ok(None)
+    }
+
     /// Opt in only when `before_compact` handles ordered block bindings and
     /// never treats the associated empty message placeholder as its content.
     fn supports_compaction_blocks(&self) -> bool {
@@ -1479,6 +1499,36 @@ impl Resolved {
                 .unwrap_or(false)
             })
     }
+    pub(crate) async fn before_branch_summary(
+        &self,
+        request: &BranchSummaryRequest<'_>,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<pi_rs_core::TreeDecision, String> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut decision = pi_rs_core::TreeDecision::default();
+        for extension in &self.extensions {
+            for hook in &extension.hooks {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err("Branch summary cancelled".into()),
+                    result = tokio::time::timeout_at(
+                        deadline, protect(async { hook.before_branch_summary(request, cancel).await })
+                    ) => result,
+                };
+                let result = result
+                    .map_err(|_| format!("{} branch summary hook timed out", extension.name))?
+                    .map_err(|error| format!("{} branch summary hook: {error}", extension.name))?;
+                if let Some(next) = result {
+                    if next.cancel {
+                        return Err("Branch summary cancelled".into());
+                    }
+                    decision = next;
+                }
+            }
+        }
+        Ok(decision)
+    }
+
     /// First decision wins; ordinary hook errors are collected and skipped.
     pub async fn before_compact(
         &self,
