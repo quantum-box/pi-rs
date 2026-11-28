@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
 const PATH_LIMIT: usize = 4096;
@@ -128,10 +128,41 @@ fn command(program: &str, arguments: &[&str]) -> Command {
     command
         .args(arguments)
         .current_dir("/")
-        .process_group(0)
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .stderr(Stdio::null());
     command
+}
+
+struct ClipboardProcess {
+    child: Child,
+    group: Option<libc::pid_t>,
+}
+
+impl ClipboardProcess {
+    fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        let child = command.process_group(0).kill_on_drop(true).spawn()?;
+        let group = child.id().map(|id| id as libc::pid_t);
+        Ok(Self { child, group })
+    }
+
+    async fn wait(mut self) -> std::io::Result<bool> {
+        let success = self.child.wait().await?.success();
+        if success {
+            // Native writers can leave a clipboard owner running after
+            // the parent exits successfully.
+            self.group = None;
+        }
+        Ok(success)
+    }
+}
+
+impl Drop for ClipboardProcess {
+    fn drop(&mut self) {
+        if let Some(group) = self.group {
+            // The child starts a fresh process group. The leader may already
+            // have exited while a descendant still holds an output pipe.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+    }
 }
 
 async fn run(
@@ -141,17 +172,17 @@ async fn run(
     deadline: Duration,
 ) -> Option<Vec<u8>> {
     timeout(deadline, async {
-        let mut child = command(program, arguments)
-            .stdin(Stdio::null())
-            .stdout(if output_limit == 0 {
-                Stdio::null()
-            } else {
-                Stdio::piped()
-            })
-            .spawn()
+        let mut process =
+            ClipboardProcess::spawn(command(program, arguments).stdin(Stdio::null()).stdout(
+                if output_limit == 0 {
+                    Stdio::null()
+                } else {
+                    Stdio::piped()
+                },
+            ))
             .ok()?;
         let mut output = Vec::new();
-        if let Some(stdout) = child.stdout.take() {
+        if let Some(stdout) = process.child.stdout.take() {
             stdout
                 .take(output_limit as u64 + 1)
                 .read_to_end(&mut output)
@@ -161,7 +192,7 @@ async fn run(
                 return None;
             }
         }
-        child.wait().await.ok()?.success().then_some(output)
+        process.wait().await.ok()?.then_some(output)
     })
     .await
     .ok()
@@ -186,24 +217,26 @@ pub(super) fn read_text() -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn copy_text_sync(text: &str, candidates: &[(&str, &[&str])]) -> pi_rs::Result<()> {
+pub(super) fn copy_text_sync(text: &str) -> pi_rs::Result<()> {
     // Sync callers can already be inside the main Tokio runtime.
     std::thread::scope(|scope| {
         scope
-            .spawn(|| runtime()?.block_on(copy_text(text, candidates)))
+            .spawn(|| runtime()?.block_on(copy_text(text)))
             .join()
             .map_err(|_| pi_rs::Error::Config("clipboard worker stopped".into()))?
     })
 }
 
 #[cfg(target_os = "linux")]
-pub(super) async fn copy_text(text: &str, candidates: &[(&str, &[&str])]) -> pi_rs::Result<()> {
+pub(super) async fn copy_text(text: &str) -> pi_rs::Result<()> {
     let has_env = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
     let remote = ["SSH_CONNECTION", "SSH_CLIENT", "MOSH_CONNECTION"]
         .into_iter()
         .any(has_env)
         || std::env::var_os("PI_CLIPBOARD_OSC52").is_some_and(|value| value == "1");
-    if copy_native(text, candidates).await {
+    let wayland = has_env("WAYLAND_DISPLAY");
+    let x11 = has_env("DISPLAY");
+    if copy_native(text, wsl_native_commands(wayland, x11)).await {
         if remote {
             emit_osc52(text);
         }
@@ -211,9 +244,7 @@ pub(super) async fn copy_text(text: &str, candidates: &[(&str, &[&str])]) -> pi_
     }
 
     let windows_terminal = has_env("WT_SESSION");
-    let headless = !["DISPLAY", "WAYLAND_DISPLAY", "TERMUX_VERSION"]
-        .into_iter()
-        .any(has_env);
+    let headless = !wayland && !x11 && !has_env("TERMUX_VERSION");
     if copy_fallback(
         &WINDOWS,
         text,
@@ -232,6 +263,23 @@ pub(super) async fn copy_text(text: &str, candidates: &[(&str, &[&str])]) -> pi_
     }
 }
 
+fn wsl_native_commands(
+    wayland: bool,
+    x11: bool,
+) -> &'static [(&'static str, &'static [&'static str])] {
+    const COMMANDS: &[(&str, &[&str])] = &[
+        ("wl-copy", &["-t", "text/plain"]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    match (wayland, x11) {
+        (false, false) => &[],
+        (true, false) => &COMMANDS[..1],
+        (false, true) => &COMMANDS[1..],
+        (true, true) => COMMANDS,
+    }
+}
+
 async fn copy_native(text: &str, candidates: &[(&str, &[&str])]) -> bool {
     for (program, arguments) in candidates {
         if write_native(program, arguments, text).await {
@@ -243,16 +291,15 @@ async fn copy_native(text: &str, candidates: &[(&str, &[&str])]) -> bool {
 
 async fn write_native(program: &str, arguments: &[&str], text: &str) -> bool {
     timeout(CLIPBOARD_TIMEOUT, async {
-        let mut child = command(program, arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()?;
-        let mut stdin = child.stdin.take().expect("piped clipboard");
-        let written = stdin.write_all(text.as_bytes()).await;
+        let mut process = ClipboardProcess::spawn(
+            command(program, arguments)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null()),
+        )?;
+        let mut stdin = process.child.stdin.take().expect("piped clipboard");
+        stdin.write_all(text.as_bytes()).await?;
         drop(stdin);
-        let status = child.wait().await?;
-        written?;
-        Ok::<_, std::io::Error>(status.success())
+        process.wait().await
     })
     .await
     .is_ok_and(|result| result.unwrap_or(false))
@@ -406,8 +453,31 @@ cat "$(cat {})" > {}"#,
         assert!(!Path::new(&std::fs::read_to_string(source).unwrap()).exists());
     }
 
+    fn process_running(pid: libc::pid_t) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8(output.stdout).unwrap();
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    async fn assert_descendant_stopped(pid: libc::pid_t) {
+        let stopped = timeout(Duration::from_secs(2), async {
+            while process_running(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if stopped.is_err() {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("clipboard descendant {pid} survived cleanup");
+        }
+    }
+
     #[tokio::test]
-    async fn cancelled_copy_removes_the_private_input_file() {
+    async fn cancelled_copy_kills_descendants_and_removes_private_input() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
         let ready = dir.path().join("ready");
@@ -424,8 +494,9 @@ printf 'fixture\\n'",
             dir.path(),
             "powershell.exe",
             &format!(
-                ": > {}
-exec sleep 30",
+                r#"( sleep 10; exit 0 ) &
+printf '%s\n' "$!" > {}
+wait"#,
                 shell_path(&ready)
             ),
         );
@@ -434,19 +505,26 @@ exec sleep 30",
             wslpath: &wslpath,
         };
         let mut copy = Box::pin(bridge.write_text("private"));
-        tokio::select! {
+        let pid = tokio::select! {
             _ = &mut copy => panic!("copy ended before cancellation"),
-            result = timeout(Duration::from_secs(3), async {
-                while !ready.exists() {
+            pid = timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Ok(contents) = std::fs::read_to_string(&ready)
+                        && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+                    {
+                        break pid;
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-            }) => result.unwrap(),
-        }
+            }) => pid.unwrap(),
+        };
+        assert!(process_running(pid));
         let path = std::fs::read_to_string(source).unwrap();
         let permissions = std::fs::metadata(&path).unwrap().permissions();
         assert_eq!(permissions.mode() & 0o777, 0o600);
         drop(copy);
         assert!(!Path::new(&path).exists());
+        assert_descendant_stopped(pid).await;
     }
 
     #[tokio::test]
@@ -489,6 +567,82 @@ exec sleep 30",
         }
     }
 
+    #[tokio::test]
+    async fn deadline_kills_descendant_holding_stdout_after_leader_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        // The background subshell stays alive across the sleep and keeps stdout open.
+        let script = format!(
+            r#"( sleep 10; printf 'late' ) &
+printf '%s\n' "$!" > {}
+exit 0"#,
+            shell_path(&pid_file),
+        );
+        assert!(
+            run("/bin/sh", &["-c", &script], 4, Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_descendant_stopped(pid).await;
+    }
+
+    #[tokio::test]
+    async fn successful_native_writer_leaves_its_clipboard_owner_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        let owned = dir.path().join("owned");
+        let writer = fake_command(
+            dir.path(),
+            "writer",
+            &format!(
+                r#"cat >/dev/null
+(
+    attempts=0
+    while [ ! -f {release} ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 100 ] || exit 1
+        sleep 0.05
+    done
+    printf 'owner ran' > {owned}
+) &
+exit 0"#,
+                release = shell_path(&release),
+                owned = shell_path(&owned),
+            ),
+        );
+        let copied = write_native(&writer, &[], "text").await;
+        std::fs::write(release, "").unwrap();
+        assert!(copied);
+        timeout(Duration::from_secs(2), async {
+            while std::fs::read_to_string(&owned).as_deref().ok() != Some("owner ran") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("clipboard owner should survive successful copy");
+    }
+
+    #[test]
+    fn native_copy_commands_require_their_display() {
+        for (wayland, x11, expected) in [
+            (false, false, &[][..]),
+            (true, false, &["wl-copy"][..]),
+            (false, true, &["xclip", "xsel"][..]),
+            (true, true, &["wl-copy", "xclip", "xsel"][..]),
+        ] {
+            let programs: Vec<_> = wsl_native_commands(wayland, x11)
+                .iter()
+                .map(|(program, _)| *program)
+                .collect();
+            assert_eq!(programs, expected);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn wsl_entrypoints_with_fake_interop() {
@@ -513,6 +667,9 @@ esac"#,
             r#"/bin/cp "$2" "$FIXTURE_PNG.source"
 printf '%s\n' 'C:\test\clip.txt'"#,
         );
+        for program in ["wl-copy", "xclip", "xsel"] {
+            fake_command(dir.path(), program, r#": > "$FIXTURE_PNG.native"; exit 1"#);
+        }
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "clipboard_wsl::tests::wsl_entrypoint_in_child"])
             .env_clear()
@@ -529,6 +686,7 @@ printf '%s\n' 'C:\test\clip.txt'"#,
             String::from_utf8_lossy(&result.stderr)
         );
         assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+        assert!(!dir.path().join("clipboard.png.native").exists());
     }
 
     #[cfg(target_os = "linux")]

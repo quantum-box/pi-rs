@@ -1049,12 +1049,11 @@ fn clipboard_write_commands() -> &'static [(&'static str, &'static [&'static str
 }
 
 pub fn copy_text(text: &str) -> Result<()> {
-    let candidates = clipboard_write_commands();
     #[cfg(target_os = "linux")]
     if crate::platform::is_wsl() {
-        return super::clipboard_wsl::copy_text_sync(text, candidates);
+        return super::clipboard_wsl::copy_text_sync(text);
     }
-    for (program, arguments) in candidates {
+    for (program, arguments) in clipboard_write_commands() {
         let child = Command::new(program)
             .args(*arguments)
             .stdin(Stdio::piped())
@@ -1084,12 +1083,11 @@ pub fn copy_text(text: &str) -> Result<()> {
 // terminates an in-progress clipboard process rather than leaving a late write.
 pub(super) async fn copy_text_async(text: &str) -> Result<()> {
     use tokio::io::AsyncWriteExt;
-    let candidates = clipboard_write_commands();
     #[cfg(target_os = "linux")]
     if crate::platform::is_wsl() {
-        return super::clipboard_wsl::copy_text(text, candidates).await;
+        return super::clipboard_wsl::copy_text(text).await;
     }
-    for (program, arguments) in candidates {
+    for (program, arguments) in clipboard_write_commands() {
         let mut command = tokio::process::Command::new(program);
         command
             .args(*arguments)
