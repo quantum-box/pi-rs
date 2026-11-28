@@ -1552,6 +1552,9 @@ impl View {
         }
         let mut models = std::mem::take(&mut self.available_models);
         self.invalidate_model_catalog();
+        if models.is_empty() {
+            return Ok(());
+        }
         models.retain(|reference| {
             let Some((provider, model)) =
                 super::model_selection::qualified_model(reference, &previous.model_profiles)
@@ -1559,6 +1562,9 @@ impl View {
                 return false;
             };
             args.model_profiles.provider(provider.id()).as_ref() == Some(&provider)
+                && !previous
+                    .model_profiles
+                    .has_model_definition(&provider, model)
                 && previous.model_profiles.model_adapter(&provider, model)
                     == args.model_profiles.model_adapter(&provider, model)
                 && [None, Some(model)].into_iter().all(|model| {
@@ -1577,6 +1583,16 @@ impl View {
                         )
                 })
         });
+        // Configured IDs come from the new profiles. Keep discovery-only IDs
+        // on their revalidated routes and include newly configured providers.
+        for catalog in super::model_selection::configured_catalogs(args) {
+            for model in catalog.models {
+                let reference = format!("{}/{model}", catalog.provider.id());
+                if !models.contains(&reference) {
+                    models.push(reference);
+                }
+            }
+        }
         self.available_models = models;
         Ok(())
     }
@@ -5637,7 +5653,7 @@ fn slash(
             if super::model_selection::qualified_model(rest, &args.model_profiles).is_some() {
                 select_model_input(args, view, active, rest, false)?;
             } else if let Some((provider, model)) =
-                exact_model_query(args, rest, &view.available_models)
+                exact_model_query(args, rest, &view.available_models)?
             {
                 select_model(
                     args,
@@ -6894,23 +6910,30 @@ pub(super) async fn run(
                             }
                             ModelListIntent::Select { query } => {
                                 view.available_models = models.clone();
-                                let selection = exact_model_query(&args, &query, &models);
-                                if let Some((provider, model)) = selection {
-                                    if let Err(error) = select_model(
-                                        &mut args,
-                                        &mut view,
-                                        worker.as_mut(),
-                                        provider,
-                                        super::model_selection::Choice {
-                                            model,
-                                            thinking: None,
-                                        },
-                                        false,
-                                    ) {
-                                        view.append(&error.to_string());
+                                match exact_model_query(&args, &query, &models) {
+                                    Ok(Some((provider, model))) => {
+                                        if let Err(error) = select_model(
+                                            &mut args,
+                                            &mut view,
+                                            worker.as_mut(),
+                                            provider,
+                                            super::model_selection::Choice {
+                                                model,
+                                                thinking: None,
+                                            },
+                                            false,
+                                        ) {
+                                            view.append(&error.to_string());
+                                        }
+                                        dirty = true;
+                                        continue;
                                     }
-                                    dirty = true;
-                                    continue;
+                                    Err(error) => {
+                                        view.append(&error.to_string());
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    Ok(None) => {}
                                 }
                                 let mut picker = Picker::new(
                                     "Select model",
@@ -9281,9 +9304,9 @@ fn exact_model_query(
     args: &Cli,
     query: &str,
     catalog: &[String],
-) -> Option<(super::Provider, String)> {
+) -> Result<Option<(super::Provider, String)>> {
     if query.is_empty() {
-        return None;
+        return Ok(None);
     }
     let scoped;
     let models = if args.model_scope.is_empty() {
@@ -9303,10 +9326,15 @@ fn exact_model_query(
             .eq_ignore_ascii_case(query)
             .then_some((provider, model))
     });
-    let first = matches.next()?;
-    matches
-        .all(|candidate| candidate == first)
-        .then(|| (first.0, first.1.to_owned()))
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.any(|candidate| candidate != first) {
+        return Err(Error::Config(format!(
+            "Model {query:?} is ambiguous. Use provider/model to choose one."
+        )));
+    }
+    Ok(Some((first.0, first.1.to_owned())))
 }
 
 fn select_model_input(
@@ -12155,19 +12183,19 @@ mod tests {
             "openai/company/literal:high",
         ]
         .map(str::to_owned);
-        assert_eq!(super::exact_model_query(&args, "chat", &models), None);
-        assert_eq!(super::exact_model_query(&args, "chat-model", &models), None);
         assert_eq!(
-            super::exact_model_query(&args, "OTHER-MODEL", &models),
+            super::exact_model_query(&args, "chat", &models).unwrap(),
+            None
+        );
+        assert!(super::exact_model_query(&args, "chat-model", &models).is_err());
+        assert_eq!(
+            super::exact_model_query(&args, "OTHER-MODEL", &models).unwrap(),
             Some((
                 super::super::Provider::named("openai").unwrap(),
                 "other-model".into()
             ))
         );
-        assert_eq!(
-            super::exact_model_query(&args, "company/literal:high", &models),
-            None
-        );
+        assert!(super::exact_model_query(&args, "company/literal:high", &models).is_err());
         args.model_scope
             .push(super::super::model_selection::ScopedChoice {
                 provider: super::super::Provider::Ollama,
@@ -12175,7 +12203,7 @@ mod tests {
                 thinking: Some("low".into()),
             });
         assert_eq!(
-            super::exact_model_query(&args, "chat-model", &models),
+            super::exact_model_query(&args, "chat-model", &models).unwrap(),
             Some((super::super::Provider::Ollama, "chat-model".into()))
         );
     }

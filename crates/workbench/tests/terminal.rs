@@ -900,7 +900,13 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
                 break;
             }
         }
-        let body = r#"{"data":[{"id":"qwen2.5:7b"},{"id":"company/private-model"},{"id":"company/private-model:high"}]}"#;
+        let body = r#"{"data":[
+            {"id":"qwen2.5:7b"},
+            {"id":"company/private-model"},
+            {"id":"company/private-model:high"},
+            {"id":"company/ambiguous:high"},
+            {"id":"company/shared"}
+        ]}"#;
         write!(
             socket,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -967,27 +973,49 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
         text.contains("models.json error:") && text.contains("Enter to send")
     });
 
-    std::fs::write(
-        &models,
-        serde_json::json!({
-            "providers": {
-                "anthropic": {
-                    "baseUrl": "http://127.0.0.1:1",
-                    "apiKey": "fixture-key",
-                    "models": [
-                        {"id": "company/literal:high"},
-                        {"id": "inactive/stale-model"},
-                        {"id": "ollama/qwen2.5:7b"}
-                    ]
-                }
+    let mut profiles = serde_json::json!({
+        "providers": {
+            "anthropic": {
+                "baseUrl": "http://127.0.0.1:1",
+                "apiKey": "fixture-key",
+                "models": [
+                    {"id": "company/literal:high"},
+                    {"id": "company/ambiguous:high"},
+                    {"id": "inactive/stale-model"},
+                    {"id": "ollama/qwen2.5:7b"}
+                ]
             }
-        })
-        .to_string(),
-    )
-    .unwrap();
+        }
+    });
+    std::fs::write(&models, profiles.to_string()).unwrap();
     master.write_all(b"/model qwen2.5:7b\r").unwrap();
     output_until(&mut master, |text| text.contains("Model: qwen2.5:7b"));
     server.join().unwrap();
+
+    master
+        .write_all(b"/model company/ambiguous:high\r")
+        .unwrap();
+    output_until(&mut master, |text| {
+        text.contains(r#"Model "company/ambiguous:high" is ambiguous"#)
+    });
+    master
+        .write_all(b"/model ollama/company/ambiguous:high\r")
+        .unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Model: company/ambiguous:high")
+    });
+
+    master.write_all(b"/model company/shared\r").unwrap();
+    output_until(&mut master, |text| text.contains("Model: company/shared"));
+    profiles["providers"]["anthropic"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"id": "company/shared"}));
+    std::fs::write(&models, profiles.to_string()).unwrap();
+    master.write_all(b"/model company/shared\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains(r#"Model "company/shared" is ambiguous"#)
+    });
 
     master.write_all(b"/model inactive/stale-model\r").unwrap();
     output_until(&mut master, |text| {
