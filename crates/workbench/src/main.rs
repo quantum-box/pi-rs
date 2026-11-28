@@ -45,6 +45,7 @@ mod model_auth;
 mod model_listing;
 mod model_profiles;
 mod model_selection;
+mod model_thinking_levels;
 mod openrouter_auth;
 mod operation_models;
 mod packages;
@@ -65,6 +66,7 @@ mod rpc_entries;
 mod rpc_events;
 mod rpc_messages;
 mod runtime;
+mod session_html_output;
 mod session_import;
 mod sessions;
 mod share_refresh;
@@ -780,7 +782,8 @@ impl Cli {
                     .thinking_for_model(self.provider.id(), &self.model)
                     .map(str::to_owned)
             })
-            .or_else(|| self.thinking.clone());
+            .or_else(|| self.thinking.clone())
+            .or_else(|| thinking::ant_ling_default(self));
     }
     fn recorded_provider(&self) -> Option<&str> {
         (self.provider != Provider::Ollama).then(|| self.provider.id())
@@ -869,7 +872,7 @@ impl Cli {
                         .thinking_for_model(self.provider.id(), &self.model)
                         .map(str::to_owned)
                 })
-                .or_else(|| Some("medium".into()));
+                .or_else(|| Some(self.implicit_branch_thinking()));
         }
         true
     }
@@ -905,7 +908,11 @@ impl Cli {
                     .thinking_for_model(self.provider.id(), &self.model)
                     .map(str::to_owned)
             })
-            .unwrap_or_else(|| "medium".into())
+            .unwrap_or_else(|| self.implicit_branch_thinking())
+    }
+
+    fn implicit_branch_thinking(&self) -> String {
+        thinking::ant_ling_default(self).unwrap_or_else(|| "medium".into())
     }
 
     fn restore_branch_selection(
@@ -943,7 +950,12 @@ impl Cli {
                         .complete_catalogs
                         .iter()
                         .any(|(p, e)| p == provider.id() && e == endpoint);
-                (known, complete)
+                let retired = model_selection::is_unconfigured_retired_ant_ling_model(
+                    &self.model_profiles,
+                    &provider,
+                    &model,
+                );
+                (known, complete || retired)
             });
         let unavailable = availability.is_none_or(|(known, complete)| !known && complete);
         if unavailable || !self.restore_model_selection(model, thinking.clone(), provider, true) {
@@ -967,8 +979,8 @@ impl Cli {
                 self.thinking = Some(if self.model_explicit {
                     self.settings
                         .thinking_for_model(self.provider.id(), &self.model)
-                        .unwrap_or("medium")
-                        .to_owned()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| self.implicit_branch_thinking())
                 } else {
                     self.default_branch_thinking()
                 });
@@ -1008,8 +1020,8 @@ impl Cli {
             self.thinking = Some(branch_thinking.unwrap_or_else(|| {
                 self.settings
                     .string("defaultThinkingLevel")
-                    .unwrap_or("medium")
-                    .to_owned()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.implicit_branch_thinking())
             }));
         }
         Ok(())
@@ -1180,15 +1192,50 @@ impl Cli {
                     .unwrap_or_default()
                     == provider
         });
-        let model = configured_for_provider
-            .map(|value| {
-                qualified
-                    .as_ref()
-                    .filter(|(candidate, _)| *candidate == provider)
-                    .map_or(value, |(_, id)| *id)
-                    .to_owned()
-            })
-            .or_else(|| (provider == fallback.provider).then(|| fallback.model.clone()))
+        let configured_model = configured_for_provider.map(|value| {
+            let id = qualified
+                .as_ref()
+                .filter(|(candidate, _)| *candidate == provider)
+                .map_or(value, |(_, id)| *id);
+            if id != value
+                && model_selection::is_unconfigured_retired_ant_ling_model(
+                    &self.model_profiles,
+                    &provider,
+                    id,
+                )
+                && self.model_profiles.model(&provider, value).is_some()
+            {
+                value
+            } else {
+                id
+            }
+        });
+        let missing_retired_default = configured_model.is_some_and(|model| {
+            model_selection::is_unconfigured_retired_ant_ling_model(
+                &self.model_profiles,
+                &provider,
+                model,
+            ) && !self
+                .discovered_models
+                .iter()
+                .any(|(id, discovered)| id == provider.id() && model == discovered)
+        });
+        let provider = if missing_retired_default && !self.connection_explicit {
+            fallback.provider.clone()
+        } else {
+            provider
+        };
+        let keep_fallback = provider == fallback.provider
+            && !(missing_retired_default
+                && model_selection::is_unconfigured_retired_ant_ling_model(
+                    &self.model_profiles,
+                    &provider,
+                    &fallback.model,
+                ));
+        let model = configured_model
+            .filter(|_| !missing_retired_default)
+            .map(str::to_owned)
+            .or_else(|| keep_fallback.then(|| fallback.model.clone()))
             .or_else(|| {
                 catalogs
                     .iter()
@@ -1852,7 +1899,7 @@ fn export_from_file(paths: &[PathBuf], protected_inputs: &[PathBuf]) -> Result<(
             let path = std::path::absolute(normalize(path)?)?;
             match path.canonicalize() {
                 Ok(input) => {
-                    if same_export_file(&input, &output)? {
+                    if sessions::same_export_file(&input, &output)? {
                         return Err(Error::Config(
                             "Cannot export HTML over an input session file".into(),
                         ));
@@ -1876,21 +1923,6 @@ fn export_from_file(paths: &[PathBuf], protected_inputs: &[PathBuf]) -> Result<(
         output_path.display()
     );
     Ok(())
-}
-
-fn same_export_file(input: &Path, output: &Path) -> std::io::Result<bool> {
-    if input == output {
-        return Ok(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let input = input.metadata()?;
-        let output = output.metadata()?;
-        Ok(input.dev() == output.dev() && input.ino() == output.ino())
-    }
-    #[cfg(not(unix))]
-    Ok(false)
 }
 
 async fn read_piped_stdin() -> Result<Vec<u8>> {
@@ -1954,7 +1986,32 @@ async fn execute(
                 | Command::Review { .. }
         )
     );
-    let needs_default_model = args.model.is_empty() && starts_model_session;
+    let can_select_automatically = starts_model_session
+        && !args.connection_explicit
+        && args.api_key.is_none()
+        && std::env::var_os("PI_RS_MODEL_TOKEN").is_none();
+    // A paired defaultProvider makes defaultModel a literal ID. Older settings
+    // also accepted provider-qualified defaults when defaultProvider was absent.
+    let saved_model = if args.model_is_literal {
+        args.model.as_str()
+    } else {
+        model_selection::qualified_model(&args.model, &args.model_profiles)
+            .filter(|(provider, _)| *provider == args.provider)
+            .map_or(args.model.as_str(), |(_, id)| id)
+    };
+    let retired_default = starts_model_session
+        && !args.model_explicit
+        && model_selection::is_unconfigured_retired_ant_ling_model(
+            &args.model_profiles,
+            &args.provider,
+            saved_model,
+        )
+        && (saved_model == args.model
+            || args
+                .model_profiles
+                .model(&args.provider, &args.model)
+                .is_none());
+    let mut retired_catalog_error = None;
     let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
     let catalogs = if has_patterns {
         if matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }))
@@ -1966,11 +2023,17 @@ async fn execute(
         } else {
             model_selection::catalogs(&args, true).await?
         }
-    } else if needs_default_model {
-        vec![
-            model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes())
-                .await?,
-        ]
+    } else if (starts_model_session && args.model.is_empty()) || retired_default {
+        match model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes())
+            .await
+        {
+            Ok(catalog) => vec![catalog],
+            Err(error) if retired_default && can_select_automatically => {
+                retired_catalog_error = Some(error);
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         Vec::new()
     };
@@ -1978,6 +2041,13 @@ async fn execute(
         .iter()
         .find(|catalog| catalog.provider == args.provider)
         .map_or(&[][..], |catalog| catalog.models.as_slice());
+    let missing_retired_default = retired_default
+        && !available
+            .iter()
+            .any(|id| id == saved_model || id == &args.model);
+    if missing_retired_default {
+        args.model.clear();
+    }
     args.discovered_models = catalogs
         .iter()
         .flat_map(|catalog| {
@@ -2031,12 +2101,10 @@ async fn execute(
             })
             .cloned();
         let selected = if selected.is_none()
-            && starts_model_session
-            && !args.connection_explicit
-            && args.settings.string("defaultProvider").is_none()
-            && args.settings.string("defaultModel").is_none()
-            && args.api_key.is_none()
-            && std::env::var_os("PI_RS_MODEL_TOKEN").is_none()
+            && can_select_automatically
+            && (missing_retired_default
+                || (args.settings.string("defaultProvider").is_none()
+                    && args.settings.string("defaultModel").is_none()))
         {
             model_selection::automatic_startup_model(&args).await
         } else {
@@ -2054,7 +2122,10 @@ async fn execute(
             }
         }
     }
-    if needs_default_model && args.model.is_empty() {
+    if starts_model_session && args.model.is_empty() {
+        if let Some(error) = retired_catalog_error {
+            return Err(error);
+        }
         args.model = model_selection::default_for_provider(&args.provider, available)
             .cloned()
             .ok_or_else(|| {

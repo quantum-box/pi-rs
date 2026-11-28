@@ -44,7 +44,7 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
         models.sort_by(|left, right| compare(left, right));
         let mut details = catalog.details(&models, &args.model_profiles).await;
         let radius = if json_mode {
-            catalog.client.discovered_radius_catalog().await
+            catalog.discovered_radius_catalog().await
         } else {
             None
         };

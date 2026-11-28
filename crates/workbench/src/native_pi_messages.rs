@@ -507,9 +507,11 @@ fn endpoint_hash(endpoint: &Url) -> String {
     format!("{:x}", Sha256::digest(endpoint.as_str()))
 }
 
+#[derive(Clone)]
 pub(crate) struct HostModel {
     transport: Transport,
     token: String,
+    thinking: Option<String>,
 }
 
 impl HostModel {
@@ -517,7 +519,13 @@ impl HostModel {
         Ok(Self {
             transport: Transport::new(provider, endpoint)?,
             token,
+            thinking: None,
         })
+    }
+
+    pub(crate) fn with_thinking(mut self, level: Option<&str>) -> Self {
+        self.thinking = level.map(str::to_owned);
+        self
     }
 }
 
@@ -529,7 +537,14 @@ impl Model for HostModel {
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         self.transport
-            .stream(&self.token, request, RequestOptions::default())
+            .stream(
+                &self.token,
+                request,
+                RequestOptions {
+                    thinking: self.thinking.clone(),
+                    ..RequestOptions::default()
+                },
+            )
             .await
     }
 }

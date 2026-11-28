@@ -9,6 +9,55 @@ use super::editor_layout::Layout;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+pub(crate) struct ExtensionEditor {
+    pub(crate) component: pi_rs::UiEditorComponent,
+    bindings: Vec<(KeyEvent, &'static str)>,
+}
+
+impl ExtensionEditor {
+    pub(crate) fn new(component: pi_rs::UiEditorComponent) -> pi_rs::Result<Self> {
+        use pi_rs::UiEditorAction;
+        let mut bindings = Vec::with_capacity(component.keybindings.len());
+        for binding in &component.keybindings {
+            let key = super::keys::parse(&binding.key)?;
+            if bindings.iter().any(|(existing, _)| *existing == key) {
+                return Err(pi_rs::Error::Config(
+                    "extension editor component repeats a keybinding".into(),
+                ));
+            }
+            let action = match binding.action {
+                UiEditorAction::CursorLeft => "tui.editor.cursorLeft",
+                UiEditorAction::CursorRight => "tui.editor.cursorRight",
+                UiEditorAction::CursorWordLeft => "tui.editor.cursorWordLeft",
+                UiEditorAction::CursorWordRight => "tui.editor.cursorWordRight",
+                UiEditorAction::CursorLineStart => "tui.editor.cursorLineStart",
+                UiEditorAction::CursorLineEnd => "tui.editor.cursorLineEnd",
+                UiEditorAction::DeleteCharBackward => "tui.editor.deleteCharBackward",
+                UiEditorAction::DeleteCharForward => "tui.editor.deleteCharForward",
+                UiEditorAction::DeleteWordBackward => "tui.editor.deleteWordBackward",
+                UiEditorAction::DeleteWordForward => "tui.editor.deleteWordForward",
+                UiEditorAction::Undo => "tui.editor.undo",
+            };
+            bindings.push((key, action));
+        }
+        Ok(Self {
+            component,
+            bindings,
+        })
+    }
+
+    pub(crate) fn action<'a>(&self, key: KeyEvent, default: &'a str) -> &'a str {
+        if !default.is_empty() && !default.starts_with("tui.editor.") {
+            return default;
+        }
+        let key = super::keys::normalize(key);
+        self.bindings
+            .iter()
+            .find(|(binding, _)| binding.code == key.code && binding.modifiers == key.modifiers)
+            .map_or(default, |(_, action)| *action)
+    }
+}
+
 static PASTE_CTRL_LETTER: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\x1b\[([0-9]+);5u").expect("paste Ctrl-letter pattern"));
 

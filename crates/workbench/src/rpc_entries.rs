@@ -23,6 +23,7 @@ struct Position {
     model: Option<u64>,
     response_model: Option<u64>,
     explicit_model_seen: bool,
+    nearest_completion: Option<u64>,
 }
 
 pub(super) struct Entries {
@@ -153,7 +154,14 @@ impl Entries {
         let values = session
             .records()
             .iter()
-            .flat_map(|record| cursor.append(session.records(), record, Some(session), None, None))
+            .flat_map(|record| {
+                cursor.append(
+                    session.records(),
+                    record,
+                    Some(MetadataSource::Session(session)),
+                    None,
+                )
+            })
             .collect();
         Self {
             values,
@@ -445,12 +453,12 @@ impl Cursor {
     pub(super) fn processed(&self) -> usize {
         self.positions.len() - 1
     }
-    pub(super) fn advance(&mut self, records: &[Record]) {
+    pub(super) fn advance(&mut self, records: &[Record], metadata: Option<MetadataSource<'_>>) {
         if self.invalid {
             return;
         }
         for record in records.iter().skip(self.positions.len() - 1) {
-            self.append(records, record, None, None, None);
+            self.append(records, record, metadata, None);
         }
     }
 
@@ -458,7 +466,7 @@ impl Cursor {
         &mut self,
         records: &[Record],
         index: usize,
-        metadata: Option<&Value>,
+        live_metadata: Option<&Value>,
         record_metadata: &std::collections::BTreeMap<u64, Value>,
     ) -> Vec<Value> {
         if self.invalid {
@@ -467,29 +475,45 @@ impl Cursor {
         let Some(record) = records.get(index) else {
             return Vec::new();
         };
+        let metadata = Some(MetadataSource::Snapshot(record_metadata));
         for prior in records.iter().take(index).skip(self.processed()) {
-            self.append(records, prior, None, None, None);
+            self.append(records, prior, metadata, None);
         }
         if record.id as usize != self.positions.len() {
             return Vec::new();
         }
-        self.append(records, record, None, metadata, Some(record_metadata))
+        self.append(records, record, metadata, live_metadata)
     }
 
     fn append(
         &mut self,
         records: &[Record],
         record: &Record,
-        session: Option<&Session>,
+        metadata: Option<MetadataSource<'_>>,
         live_metadata: Option<&Value>,
-        record_metadata: Option<&std::collections::BTreeMap<u64, Value>>,
     ) -> Vec<Value> {
+        let record_metadata = |id| metadata.and_then(|source| source.get(id));
+        let current_metadata = live_metadata.or_else(|| record_metadata(record.id));
+        let current_branch_thinking = || {
+            current_metadata
+                .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
+                .unwrap_or("off")
+        };
+        let branch_thinking = |id: u64| {
+            let record = records.get(id.checked_sub(1)? as usize)?;
+            record.sdk_model_binding_thinking(record_metadata(id)?)
+        };
         let mut entries = Vec::new();
         self.messages.record(record);
         let parent = record
             .parent
             .map_or_else(Position::default, |id| self.positions[id as usize]);
         let mut position = parent;
+        position.nearest_completion = pi_rs::nearest_completion_before(
+            record,
+            record.parent.map(|id| &records[id as usize - 1]),
+            parent.nearest_completion,
+        );
         let entry = match &record.event {
             Event::SourceEntry { format, entry } if format == "pi" => {
                 if entry["type"] == "model_change" {
@@ -555,10 +579,23 @@ impl Cursor {
                 position.imported = None;
                 None
             }
-            Event::ModelFinished { .. } if pi_rs::is_aborted_turn_partial(records, record) => self
-                .messages
-                .aborted_partial(records, record)
-                .map(|message| json!({"type":"message", "message":message})),
+            Event::SourceEntry { .. } => pi_rs::superseded_turn_partial_with_completion(
+                records,
+                record,
+                position.nearest_completion,
+            )
+            .and_then(|target| self.positions[target as usize].visible)
+            .map(|target| {
+                json!({"type":"context_edit","targetId":target.to_string(),"replacement":null,
+                    (pi_rs::pi_import::SUPERSEDED_PARTIAL_FIELD):true})
+            }),
+            Event::ModelFinished { .. }
+                if pi_rs::turn_partial_failure(records, record).is_some() =>
+            {
+                self.messages
+                    .turn_partial(records, record)
+                    .map(|message| json!({"type":"message", "message":message}))
+            }
             Event::CacheWarm {
                 metadata,
                 usage,
@@ -609,7 +646,7 @@ impl Cursor {
                     record,
                 ));
                 entries.push(with_identity(
-                    json!({"type":"thinking_level_change","thinkingLevel":"off"}),
+                    json!({"type":"thinking_level_change","thinkingLevel":current_branch_thinking()}),
                     &record.id.to_string(),
                     Some(model_id),
                     record,
@@ -629,8 +666,15 @@ impl Cursor {
             } => {
                 let current = selection(model, provider.as_deref(), thinking.as_deref());
                 position.model = Some(record.id);
-                let thinking_only = record.parent.and_then(|id| records.get(id as usize - 1)).is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection"));
-                if thinking_only {
+                let sdk_thinking_only = current_metadata
+                    .is_some_and(|metadata| record.is_sdk_thinking_selection(metadata));
+                let legacy_thinking_only = record
+                    .parent
+                    .and_then(|id| records.get(id as usize - 1))
+                    .is_some_and(|parent| {
+                        matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")
+                    });
+                if sdk_thinking_only || legacy_thinking_only {
                     let entry = json!({"type":"thinking_level_change","thinkingLevel":current.2});
                     entries.push(with_identity(
                         entry,
@@ -654,11 +698,15 @@ impl Cursor {
                         } => Some(selection(model, provider.as_deref(), thinking.as_deref())),
                         Event::BranchModelSelected {
                             model, provider, ..
-                        } => Some(selection(model, Some(provider), None)),
+                        } => Some(selection(model, Some(provider), branch_thinking(id))),
                         Event::BranchSummary {
                             fallback_model: Some(model),
                             ..
-                        } => Some(selection(&model.model, Some(&model.provider), None)),
+                        } => Some(selection(
+                            &model.model,
+                            Some(&model.provider),
+                            branch_thinking(id),
+                        )),
                         _ => None,
                     });
                 // A response may have been routed by a virtual selection. An
@@ -744,7 +792,7 @@ impl Cursor {
                     .unwrap_or(record.id);
                 let mut entry = json!({
                     "type":"compaction","summary":summary,"firstKeptEntryId":first.to_string(),
-                    "tokensBefore":compaction_tokens(records, record, session)
+                    "tokensBefore":compaction_tokens(records, record, metadata)
                 });
                 if let Some(system) = system_prompt {
                     let mut sections: Vec<Option<(String, Option<String>)>> = Vec::new();
@@ -774,9 +822,7 @@ impl Cursor {
                         &[],
                     );
                 }
-                if let Some(metadata) = live_metadata
-                    .or_else(|| session.and_then(|session| session.record_metadata(record.id)))
-                {
+                if let Some(metadata) = current_metadata {
                     if let Some(details) = metadata.get("details") {
                         entry["details"] = details.clone();
                     }
@@ -824,7 +870,7 @@ impl Cursor {
                     ));
                     entries.push(with_identity(json!({"type":"model_change","provider":model.provider,"modelId":model.model}), &model_id, Some(summary_id), record));
                     entries.push(with_identity(
-                        json!({"type":"thinking_level_change","thinkingLevel":"off"}),
+                        json!({"type":"thinking_level_change","thinkingLevel":current_branch_thinking()}),
                         &record.id.to_string(),
                         Some(model_id),
                         record,
@@ -858,13 +904,7 @@ impl Cursor {
             }
             _ => self
                 .messages
-                .raw_message(
-                    records,
-                    record,
-                    session
-                        .map(MetadataSource::Session)
-                        .or_else(|| record_metadata.map(MetadataSource::Snapshot)),
-                )
+                .raw_message(records, record, metadata)
                 .map(|message| json!({"type":"message","message":message})),
         };
         if let Some(entry) = entry {
@@ -884,7 +924,11 @@ impl Cursor {
     }
 }
 
-fn compaction_tokens(records: &[Record], record: &Record, session: Option<&Session>) -> u64 {
+fn compaction_tokens(
+    records: &[Record],
+    record: &Record,
+    metadata: Option<MetadataSource<'_>>,
+) -> u64 {
     if let Event::Compacted {
         tokens_before: Some(tokens),
         ..
@@ -892,7 +936,7 @@ fn compaction_tokens(records: &[Record], record: &Record, session: Option<&Sessi
     {
         return *tokens;
     }
-    if let Some(session) = session {
+    if let Some(MetadataSource::Session(session)) = metadata {
         return super::rpc_messages::compaction_tokens(session, record);
     }
     Session::from_records(records[..record.id as usize].to_vec()).map_or(0, |session| {
@@ -982,10 +1026,17 @@ pub(super) fn changes(session: &Session, previous: usize) -> Result<Vec<Value>> 
     }
     let mut cursor = Cursor::default();
     cursor.set_verified_counts(&session.validated_pi_conversion_counts()?);
-    cursor.advance(prefix);
+    cursor.advance(prefix, Some(MetadataSource::Session(session)));
     Ok(appended
         .iter()
-        .flat_map(|record| cursor.append(records, record, Some(session), None, None))
+        .flat_map(|record| {
+            cursor.append(
+                records,
+                record,
+                Some(MetadataSource::Session(session)),
+                None,
+            )
+        })
         .collect())
 }
 
@@ -1021,6 +1072,161 @@ pub(super) fn add_summary_usage(entry: &mut Value, records: &[Record], record: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sdk_thinking_selection_projects_without_a_synthetic_model_change() {
+        use super::*;
+
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .select_provider_model(Some("fixture"), "shared", Some("high"))
+            .unwrap();
+        let selected = session.head();
+        session
+            .append_user_with_images("next".into(), vec![], None)
+            .unwrap();
+        let metadata = std::collections::BTreeMap::from([(
+            selected,
+            json!({"sdkThinkingOnly":true, "sdkCycleThinking":"high", "sdkCycleBinding":uuid::Uuid::new_v4()}),
+        )]);
+        let session =
+            Session::from_records_with_metadata(session.records().to_vec(), metadata.clone())
+                .unwrap();
+        let entries = Entries::new(&session);
+        let [thinking, message] = entries.values.as_slice() else {
+            panic!("expected only a thinking change and a user message");
+        };
+        assert_eq!(thinking["type"], "thinking_level_change");
+        assert_eq!(thinking["thinkingLevel"], "high");
+        assert_eq!(message["parentId"], thinking["id"]);
+        assert_eq!(
+            Cursor::default().appended(
+                session.records(),
+                selected as usize - 1,
+                metadata.get(&selected),
+                &Default::default(),
+            ),
+            vec![thinking.clone()]
+        );
+        assert_eq!(
+            changes(&session, selected as usize).unwrap(),
+            vec![message.clone()]
+        );
+        let mut cursor = Cursor::default();
+        assert_eq!(
+            cursor.appended(
+                session.records(),
+                session.records().len() - 1,
+                None,
+                &metadata,
+            ),
+            vec![message.clone()]
+        );
+    }
+
+    #[test]
+    fn malformed_sdk_thinking_marker_preserves_the_ordinary_model_projection() {
+        use super::*;
+
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .select_provider_model(Some("fixture"), "shared", Some("high"))
+            .unwrap();
+        let selected = session.head();
+        let directory = tempfile::tempdir().unwrap();
+        let entries = Entries::new(&session);
+        let expected = entries.values.clone();
+        let expected_export = entries
+            .write_share_branch(&session, directory.path())
+            .unwrap();
+        assert_eq!(expected[0]["type"], "model_change");
+        let binding = uuid::Uuid::new_v4();
+        for metadata in [
+            json!({"sdkThinkingOnly":true}),
+            json!({"sdkThinkingOnly":true, "sdkCycleThinking":"high", "sdkCycleBinding":"invalid"}),
+            json!({"sdkThinkingOnly":true, "sdkCycleThinking":"high", "sdkCycleBinding":uuid::Uuid::nil()}),
+            json!({"sdkThinkingOnly":true, "sdkCycleBinding":binding}),
+            json!({"sdkThinkingOnly":true, "sdkCycleThinking":"low", "sdkCycleBinding":binding}),
+            json!({"sdkThinkingOnly":"true", "sdkCycleThinking":"high", "sdkCycleBinding":binding}),
+        ] {
+            let restored = Session::from_records_with_metadata(
+                session.records().to_vec(),
+                [(selected, metadata.clone())].into_iter().collect(),
+            )
+            .unwrap();
+            let entries = Entries::new(&restored);
+            assert_eq!(entries.values, expected);
+            assert_eq!(
+                entries
+                    .write_share_branch(&restored, directory.path())
+                    .unwrap(),
+                expected_export
+            );
+            assert_eq!(
+                Cursor::default().appended(
+                    restored.records(),
+                    selected as usize - 1,
+                    Some(&metadata),
+                    &Default::default(),
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn sdk_thinking_only_change_round_trips_through_pi_export() {
+        use super::*;
+        use crate::session_import::{BranchSelection, branch_selection, read};
+
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .select_provider_model(Some("fixture"), "shared", Some("off"))
+            .unwrap();
+        session
+            .select_provider_model(Some("fixture"), "shared", Some("high"))
+            .unwrap();
+        let selected = session.head();
+        let metadata = [(
+            selected,
+            json!({
+                "sdkCycleBinding": uuid::Uuid::new_v4(),
+                "sdkCycleThinking": "high",
+                "sdkThinkingOnly": true,
+            }),
+        )]
+        .into_iter()
+        .collect();
+        let session =
+            Session::from_records_with_metadata(session.records().to_vec(), metadata).unwrap();
+        let entries = Entries::new(&session);
+        assert_eq!(
+            entries
+                .values
+                .iter()
+                .filter(|entry| entry["type"] == "model_change")
+                .count(),
+            1
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("thinking.jsonl");
+        std::fs::write(
+            &path,
+            entries
+                .write_share_branch(&session, directory.path())
+                .unwrap(),
+        )
+        .unwrap();
+        let imported = read(&path).unwrap();
+        assert_eq!(
+            branch_selection(&imported, |_, _| None),
+            BranchSelection::Selected {
+                provider: "fixture".into(),
+                model: "shared".into(),
+                thinking: Some("high".into()),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn unsigned_anthropic_entries_and_share_preserve_layout_and_context() {
         use super::*;
@@ -1515,9 +1721,194 @@ mod tests {
         assert_eq!(header["id"], fork.session_id().to_string());
     }
 
+    #[tokio::test]
+    async fn sdk_cycle_branch_transitions_preserve_thinking_in_journal_and_pi_export() {
+        use super::*;
+        use crate::session_import::{BranchSelection, branch_selection, read};
+        use std::sync::Arc;
+
+        struct Fixture;
+        #[async_trait::async_trait]
+        impl pi_rs::Model for Fixture {
+            async fn stream(&self, _: pi_rs::ModelRequest) -> pi_rs::Result<pi_rs::ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(pi_rs::ModelEvent::Text("fixture response".into())),
+                    Ok(pi_rs::ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+
+        for summarize in [false, true] {
+            let mut sdk = pi_rs::SessionBuilder::new(Arc::new(Fixture), "initial")
+                .provider("fixture")
+                .unwrap()
+                .in_memory()
+                .unwrap();
+            sdk.cycle_model(
+                pi_rs::ModelCycleDirection::Forward,
+                &[pi_rs::ModelCycleEntry {
+                    provider: "fixture",
+                    model: "reasoning",
+                    thinking: Some("high"),
+                }],
+                &[],
+                None,
+                |_, _, level| Ok((Arc::new(Fixture), level.into())),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if summarize {
+                sdk.prompt("summarize this branch").await.unwrap();
+                sdk.navigate_tree(
+                    1,
+                    pi_rs::TreeNavigationOptions {
+                        summary: Some(pi_rs::BranchSummaryOptions {
+                            instructions: None,
+                            reserve_tokens: 1024,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            } else {
+                sdk.checkout(1).unwrap();
+            }
+
+            let journal = sdk.journal().unwrap();
+            let transition = journal.branch().last().copied().unwrap();
+            if summarize {
+                assert!(matches!(
+                    transition.event,
+                    Event::BranchSummary {
+                        fallback_model: Some(_),
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    transition.event,
+                    Event::BranchModelSelected { target: 1, .. }
+                ));
+            }
+            let id = transition.id;
+            let marker = journal.record_metadata(id).unwrap();
+            assert_eq!(marker["sdkCycleThinking"], "high");
+            let expected = BranchSelection::Selected {
+                provider: "fixture".into(),
+                model: "reasoning".into(),
+                thinking: Some("high".into()),
+            };
+            assert_eq!(branch_selection(&journal, |_, _| None), expected);
+
+            let directory = tempfile::tempdir().unwrap();
+            let exact_path = directory.path().join("exact.jsonl");
+            journal.export_jsonl(&exact_path).unwrap();
+            let exact = read(&exact_path).unwrap();
+            assert_eq!(
+                serde_json::to_value(exact.records()).unwrap(),
+                serde_json::to_value(journal.records()).unwrap(),
+            );
+            assert_eq!(exact.record_metadata(id), Some(marker));
+            assert_eq!(branch_selection(&exact, |_, _| None), expected);
+
+            let entries = Entries::new(&exact);
+            let projected = entries.values.last().unwrap();
+            assert_eq!(projected["id"], id.to_string());
+            assert_eq!(projected["parentId"], format!("{id}-model"));
+            assert_eq!(projected["type"], "thinking_level_change");
+            assert_eq!(projected["thinkingLevel"], "high");
+            assert_eq!(
+                changes(&exact, id as usize - 1).unwrap().last(),
+                Some(projected)
+            );
+            assert_eq!(
+                Cursor::default()
+                    .appended(
+                        exact.records(),
+                        id as usize - 1,
+                        Some(marker),
+                        &Default::default(),
+                    )
+                    .last(),
+                Some(projected)
+            );
+            let metadata = [(id, marker.clone())].into_iter().collect();
+            let mut cursor = Cursor::default();
+            assert_eq!(
+                cursor
+                    .appended(exact.records(), id as usize - 1, Some(marker), &metadata)
+                    .last(),
+                Some(projected)
+            );
+
+            let pi_path = directory.path().join("pi.jsonl");
+            let bytes = entries
+                .write_share_branch(&exact, directory.path())
+                .unwrap();
+            std::fs::write(&pi_path, bytes).unwrap();
+            let imported = read(&pi_path).unwrap();
+            assert_eq!(branch_selection(&imported, |_, _| None), expected);
+
+            let start = exact.records().len();
+            let mut records = exact.records().to_vec();
+            records.push(Record {
+                id: id + 1,
+                parent: Some(id),
+                version: transition.version,
+                timestamp: None,
+                run_id: None,
+                event: Event::ModelSelected {
+                    provider: Some("fixture".into()),
+                    model: "reasoning".into(),
+                    thinking: Some("high".into()),
+                },
+            });
+            let mut repeated =
+                Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+            assert!(changes(&repeated, start).unwrap().is_empty());
+            assert!(
+                cursor
+                    .appended(
+                        repeated.records(),
+                        repeated.records().len() - 1,
+                        None,
+                        &metadata
+                    )
+                    .is_empty()
+            );
+
+            repeated
+                .select_provider_model(Some("fixture"), "reasoning", Some("off"))
+                .unwrap();
+            let delta = changes(&repeated, start).unwrap();
+            assert_eq!(
+                delta,
+                cursor.appended(
+                    repeated.records(),
+                    repeated.records().len() - 1,
+                    None,
+                    &metadata
+                )
+            );
+            assert_eq!(delta.len(), 1);
+            assert_eq!(delta[0]["parentId"], id.to_string());
+            assert_eq!(delta[0]["type"], "thinking_level_change");
+            assert_eq!(delta[0]["thinkingLevel"], "off");
+        }
+    }
+
     #[test]
     fn branch_fallback_projects_selection_and_summary() {
         use super::*;
+        use crate::session_import::{BranchSelection, branch_selection, read};
+
+        let directory = tempfile::tempdir().unwrap();
+        let pi_path = directory.path().join("pi.jsonl");
         for summary in [false, true] {
             let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
             session
@@ -1556,13 +1947,131 @@ mod tests {
             });
             let restored = Session::from_records(records).unwrap();
             assert_eq!(
-                super::super::session_import::branch_selection(&restored, |_, _| None),
-                super::super::session_import::BranchSelection::Selected {
+                branch_selection(&restored, |_, _| None),
+                BranchSelection::Selected {
                     provider: "new".into(),
                     model: "shared".into(),
                     thinking: None
                 }
             );
+            let binding = uuid::Uuid::new_v4();
+            for (marker, thinking) in [
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":"high","sdkThinkingOnly":"true"}),
+                    None,
+                ),
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":"high","sdkThinkingOnly":false}),
+                    None,
+                ),
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":"high","sdkThinkingOnly":null}),
+                    None,
+                ),
+                (json!({"sdkCycleThinking":"high"}), None),
+                (
+                    json!({"sdkCycleBinding":"invalid","sdkCycleThinking":"high"}),
+                    None,
+                ),
+                (
+                    json!({"sdkCycleBinding":uuid::Uuid::nil(),"sdkCycleThinking":"high"}),
+                    None,
+                ),
+                (json!({"sdkCycleBinding":binding}), None),
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":42}),
+                    None,
+                ),
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":" "}),
+                    None,
+                ),
+                (
+                    json!({"sdkCycleBinding":binding,"sdkCycleThinking":"high","sdkThinkingOnly":true}),
+                    Some("high"),
+                ),
+            ] {
+                let metadata = std::collections::BTreeMap::from([(3, marker.clone())]);
+                let session = Session::from_records_with_metadata(
+                    restored.records().to_vec(),
+                    metadata.clone(),
+                )
+                .unwrap();
+                let projected_level = thinking.unwrap_or("off");
+                assert_eq!(
+                    branch_selection(&session, |_, _| None),
+                    BranchSelection::Selected {
+                        provider: "new".into(),
+                        model: "shared".into(),
+                        thinking: thinking.map(str::to_owned),
+                    },
+                    "summary={summary}, metadata={marker}"
+                );
+                let entries = Entries::new(&session);
+                let projected =
+                    &entries.values[entries.values.len() - if summary { 3 } else { 2 }..];
+                assert_eq!(projected.last().unwrap()["thinkingLevel"], projected_level);
+                assert_eq!(changes(&session, 2).unwrap(), projected);
+                let mut cursor = Cursor::default();
+                assert_eq!(
+                    cursor.appended(session.records(), 2, Some(&marker), &metadata),
+                    projected
+                );
+                assert_eq!(
+                    Cursor::default().appended(
+                        session.records(),
+                        2,
+                        Some(&marker),
+                        &Default::default()
+                    ),
+                    projected
+                );
+                assert_eq!(session.model_selection().unwrap().1.as_deref(), thinking);
+
+                let bytes = entries
+                    .write_share_branch(&session, directory.path())
+                    .unwrap();
+                std::fs::write(&pi_path, bytes).unwrap();
+                let imported = read(&pi_path).unwrap();
+                assert_eq!(
+                    branch_selection(&imported, |_, _| None),
+                    BranchSelection::Selected {
+                        provider: "new".into(),
+                        model: "shared".into(),
+                        thinking: Some(projected_level.into()),
+                    }
+                );
+
+                let mut records = session.records().to_vec();
+                records.push(Record {
+                    id: 4,
+                    parent: Some(3),
+                    version: records[2].version,
+                    run_id: None,
+                    timestamp: None,
+                    event: Event::ModelSelected {
+                        provider: Some("new".into()),
+                        model: "shared".into(),
+                        thinking: Some("high".into()),
+                    },
+                });
+                let repeated =
+                    Session::from_records_with_metadata(records, metadata.clone()).unwrap();
+                let delta = changes(&repeated, 3).unwrap();
+                assert_eq!(
+                    cursor.appended(repeated.records(), 3, None, &metadata),
+                    delta
+                );
+                if thinking.is_some() {
+                    assert!(delta.is_empty());
+                } else {
+                    let [entry] = delta.as_slice() else {
+                        panic!("expected one thinking change, got {delta:?}");
+                    };
+                    assert_eq!(entry["type"], "thinking_level_change");
+                    assert_eq!(entry["thinkingLevel"], "high");
+                }
+            }
             let entries = Entries::new(&restored);
             let last = &entries.values[entries.values.len() - 1];
             let model = &entries.values[entries.values.len() - 2];

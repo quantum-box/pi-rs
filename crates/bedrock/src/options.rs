@@ -96,6 +96,17 @@ impl ReasoningLevel {
             ))),
         }
     }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
     fn budget(self) -> u32 {
         match self {
             Self::Off => 0,
@@ -242,6 +253,40 @@ pub(crate) fn cache_point(
     })?))
 }
 
+pub(crate) fn is_claude(model: &str, name: Option<&str>) -> bool {
+    has_any(&candidates(model, name), &["claude"])
+}
+
+pub(crate) fn uses_flat_mapped_effort(model: &str, name: Option<&str>) -> bool {
+    !has_any(&candidates(model, name), &["claude", "gpt-"])
+}
+
+pub(crate) fn validate_explicit_reasoning(
+    model: &str,
+    name: Option<&str>,
+    level: ReasoningLevel,
+    effort: Option<&str>,
+) -> Result<()> {
+    let items = candidates(model, name);
+    let claude = has_any(&items, &["claude"]);
+    let gpt = has_any(&items, &["gpt-"]);
+    let unsupported = if claude {
+        if level == ReasoningLevel::Off {
+            effort.is_some() || requires_thinking(model, name)
+        } else {
+            effort.is_some() && !has_any(&items, ADAPTIVE)
+        }
+    } else {
+        !gpt && level != ReasoningLevel::Off && effort.is_none()
+    };
+    if unsupported {
+        return Err(Error::Config(
+            "model cannot represent this Bedrock effort".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn reasoning_fields(
     model: &str,
     name: Option<&str>,
@@ -335,6 +380,11 @@ pub(crate) fn reasoning_fields(
         }
         return Ok(Some(fields));
     }
+    if !has_any(&items, &["gpt-"]) {
+        // These models declare supported values through their thinking level map.
+        // Converse forwards model-specific fields without validating them.
+        return Ok(mapped.map(|effort| json!({"reasoning_effort":effort})));
+    }
     let Some(level) = level else { return Ok(None) };
     if level == ReasoningLevel::Off && mapped.is_none() {
         return Ok(None);
@@ -344,12 +394,9 @@ pub(crate) fn reasoning_fields(
             json!({"reasoning_effort":mapped.unwrap_or(level.oss_effort())}),
         ));
     }
-    if has_any(&items, &["gpt-"]) {
-        return Ok(Some(
-            json!({"reasoning":{"effort":mapped.unwrap_or(level.gpt_effort())}}),
-        ));
-    }
-    Ok(None)
+    Ok(Some(
+        json!({"reasoning":{"effort":mapped.unwrap_or(level.gpt_effort())}}),
+    ))
 }
 
 #[cfg(test)]
