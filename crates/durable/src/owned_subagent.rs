@@ -59,6 +59,63 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+const VISIBLE_FOREGROUND_CHILDREN: usize = 16;
+
+fn foreground_view_key(task: Uuid) -> Vec<u8> {
+    format!("durable/foreground-child-view/{task}").into_bytes()
+}
+
+fn decode_foreground_view(entry: Option<&durable_store::Entry>) -> Result<Vec<Uuid>, Error> {
+    let Some(entry) = entry else {
+        return Ok(Vec::new());
+    };
+    let children: Vec<Uuid> = serde_json::from_slice(&entry.value)?;
+    let unique: std::collections::HashSet<_> = children.iter().collect();
+    if children.len() > VISIBLE_FOREGROUND_CHILDREN
+        || children.iter().any(Uuid::is_nil)
+        || unique.len() != children.len()
+    {
+        return Err(invalid());
+    }
+    Ok(children)
+}
+
+pub(crate) fn foreground_view(
+    store: &durable_store::Store,
+    task: Uuid,
+) -> Result<Vec<Uuid>, Error> {
+    let entry = store.get_bounded(&foreground_view_key(task), 1024)?;
+    decode_foreground_view(entry.as_ref())
+}
+
+fn record_foreground_view(
+    store: &durable_store::Store,
+    task: Uuid,
+    child: Uuid,
+    checks: &mut Vec<Check>,
+    mutations: &mut Vec<Mutation>,
+) -> Result<(), Error> {
+    let key = foreground_view_key(task);
+    let entry = store.get_bounded(&key, 1024)?;
+    let mut children = decode_foreground_view(entry.as_ref())?;
+    if children.contains(&child) {
+        return Err(invalid());
+    }
+    if children.len() == VISIBLE_FOREGROUND_CHILDREN {
+        children.remove(0);
+    }
+    children.push(child);
+    checks.push(Check {
+        key: key.clone(),
+        expected: entry.map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+    });
+    mutations.push(Mutation::Put {
+        key,
+        value: serde_json::to_vec(&children)?,
+    });
+    Ok(())
+}
+
 fn reservation_key(task: Uuid, name: &str) -> Vec<u8> {
     let mut key = format!("durable/owned-subagent/{task}/").into_bytes();
     key.extend_from_slice(name.as_bytes());
@@ -254,6 +311,34 @@ thread_local! {
 impl Harness {
     /// Scan at most `scan_budget` (1..=256) ownership edges for one task.
     /// Each page is a separate snapshot and must not authorize graph writes.
+    /// Read a direct tool-owned foreground conversation, including after
+    /// its tool has settled. Ownership is checked independently of the live view.
+    pub fn foreground_subagent_view(
+        &self,
+        parent: Uuid,
+        child: Uuid,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::runtime::ConversationView, Error> {
+        let store = self.subagent_store()?;
+        let edge = ownership_edge::EdgeStore::new(store)
+            .get(child)
+            .map_err(|error| Error::Invalid(error.to_string()))?
+            .ok_or(Error::NotFound)?
+            .edge;
+        let expected_owner = TaskOwner::Conversation(parent);
+        if edge.mode != Mode::Foreground || edge.task_owner != expected_owner {
+            return Err(Error::NotFound);
+        }
+        let task = task_store::TaskStore::new(store)
+            .load(edge.task)
+            .map_err(crate::task_scheduler::Error::from)?
+            .ok_or(Error::NotFound)?;
+        if !task.task.is_task_tool() || task.task.owner() != &expected_owner {
+            return Err(Error::NotFound);
+        }
+        self.view(child, limit)
+    }
+
     pub fn scan_task_owned_subagents(
         &self,
         task: Uuid,
@@ -996,6 +1081,9 @@ impl Harness {
                     key: notification_binding_key(notify.as_ref().ok_or_else(invalid)?),
                     value: serde_json::to_vec(&(child, initial.id))?,
                 });
+            }
+            if mode == Mode::Foreground && t.is_task_tool() {
+                record_foreground_view(store, task, child, &mut checks, &mut mutations)?;
             }
             prepared.checks.extend(checks);
             prepared.mutations.extend(mutations);

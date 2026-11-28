@@ -1158,7 +1158,13 @@ struct ModelStub {
 #[tokio::test]
 async fn checkpointable_tool_starts_and_reattaches_to_a_foreground_subagent() {
     let directory = tempfile::tempdir().unwrap();
-    exercise_foreground_delegation(directory.path(), false, None, false).await;
+    exercise_foreground_delegation(directory.path(), false, None, false, false).await;
+}
+
+#[tokio::test]
+async fn ordinary_tool_publishes_live_foreground_child_before_answer() {
+    let directory = tempfile::tempdir().unwrap();
+    exercise_foreground_delegation(directory.path(), false, None, true, true).await;
 }
 
 #[tokio::test]
@@ -1169,6 +1175,7 @@ async fn checkpointable_foreground_subagent_crash_fixture() {
             true,
             None,
             std::env::var_os("PI_FOREGROUND_ORDINARY_TOOL").is_some(),
+            false,
         )
         .await;
     }
@@ -1213,7 +1220,7 @@ async fn exercise_foreground_process_loss(ordinary: bool) {
         .unwrap()
         .parse()
         .unwrap();
-    exercise_foreground_delegation(directory.path(), false, Some(root), ordinary).await;
+    exercise_foreground_delegation(directory.path(), false, Some(root), ordinary, false).await;
 }
 
 async fn exercise_foreground_delegation(
@@ -1221,6 +1228,7 @@ async fn exercise_foreground_delegation(
     hold_after_answer: bool,
     resume: Option<uuid::Uuid>,
     ordinary: bool,
+    observe_live: bool,
 ) {
     use pi_rs_durable::{
         async_task_tool::{
@@ -1327,16 +1335,22 @@ async fn exercise_foreground_delegation(
         }
     }
 
-    struct DelegateModel(std::path::PathBuf);
+    struct DelegateModel {
+        directory: std::path::PathBuf,
+        answer_gate: Option<Arc<tokio::sync::Semaphore>>,
+    }
     #[async_trait]
     impl Model for DelegateModel {
         async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
             if request.model == "child" {
+                if let Some(gate) = &self.answer_gate {
+                    gate.acquire().await.unwrap().forget();
+                }
                 use std::io::Write;
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(self.0.join("model-invocations"))
+                    .open(self.directory.join("model-invocations"))
                     .unwrap()
                     .write_all(b"x")
                     .unwrap();
@@ -1386,10 +1400,14 @@ async fn exercise_foreground_delegation(
         ReplaySafeAuthorization::host_attests_replay_safe(),
     )
     .unwrap();
+    let answer_gate = observe_live.then(|| Arc::new(tokio::sync::Semaphore::new(0)));
     let mut scheduler = Scheduler::open_paused(
         directory.join("db"),
         Options {
-            model: Arc::new(DelegateModel(directory.to_owned())),
+            model: Arc::new(DelegateModel {
+                directory: directory.to_owned(),
+                answer_gate: answer_gate.clone(),
+            }),
             tools: vec![tool.register()],
             restart_limit: 3,
             max_turns: 2,
@@ -1410,9 +1428,45 @@ async fn exercise_foreground_delegation(
             })
             .unwrap();
         std::fs::write(directory.join("parent"), root.to_string()).unwrap();
+        let mut watch = answer_gate.as_ref().map(|_| {
+            scheduler
+                .watch_view(root, NonZeroUsize::MIN, Duration::from_millis(5))
+                .unwrap()
+        });
         scheduler
             .submit(root, None, "delegate work".into())
             .unwrap();
+        if let Some(gate) = answer_gate {
+            let watch = watch.as_mut().unwrap();
+            assert!(watch.initial.foreground_subagents.is_empty());
+            let child = tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let snapshot = watch.next().await.unwrap().unwrap();
+                    if let [child] = snapshot.foreground_subagents.as_slice() {
+                        assert!(
+                            snapshot
+                                .state
+                                .submissions
+                                .iter()
+                                .any(|entry| entry.status == Status::Running)
+                        );
+                        break *child;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let child_view = scheduler
+                .foreground_subagent_view(root, child, NonZeroUsize::MIN)
+                .unwrap();
+            assert_eq!(child_view.state.submissions.len(), 1);
+            assert!(!matches!(
+                child_view.state.submissions[0].status,
+                Status::Done { .. }
+            ));
+            assert!(!directory.join("model-invocations").exists());
+            gate.add_permits(1);
+        }
         root
     };
     tokio::time::timeout(Duration::from_secs(20), scheduler.wait(root))
@@ -1420,6 +1474,13 @@ async fn exercise_foreground_delegation(
         .unwrap()
         .unwrap();
     let result = scheduler.conversation(root).unwrap();
+    assert!(
+        scheduler
+            .view(root, NonZeroUsize::MIN)
+            .unwrap()
+            .foreground_subagents
+            .is_empty()
+    );
     assert!(result.messages.iter().any(
         |message| matches!(message, Message::Tool { content, .. } if content == "child answer")
     ));
@@ -1428,6 +1489,21 @@ async fn exercise_foreground_delegation(
     )
     .unwrap();
     assert_eq!(scheduler.conversation(child).unwrap().submissions.len(), 1);
+    let settled = scheduler
+        .foreground_subagent_view(root, child, NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(
+        settled.state.submissions[0].status,
+        Status::Done {
+            answer: "child answer".into()
+        }
+    );
+    assert!(
+        scheduler
+            .foreground_subagent_view(uuid::Uuid::new_v4(), child, NonZeroUsize::MIN)
+            .is_err()
+    );
+
     let page = scheduler
         .scan_task_owned_subagents(result.tool_results[0].operation_id, None, 16)
         .unwrap();

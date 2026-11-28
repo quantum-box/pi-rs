@@ -497,6 +497,15 @@ calling task owns the child and reopening reuses the same conversation and
 submission. A successful result includes the answer and `conversationId`.
 The call uses the registered wait timeout and parent abort drains the child.
 
+`ConversationView::foreground_subagents` lists the active tool's 16 most
+recently admitted foreground conversations. `watch_view` reports changes to
+that list, including before a child answers. A host can attach a separate view
+watch to a listed ID. The Durable RPC stream sends
+`durable_foreground_subagents` with `conversationIds`. Its
+`get_foreground_subagent` request takes a tool-owned foreground `conversationId` of the parent, including
+a settled child, and returns
+up to 32 recent native messages with the child's live model and tool output.
+
 Ordinary nested calls support `ToolHost::call_with_cancellation`. Cancelling a
 new call during preparation records a skipped result at its original position.
 Replay reuses that result and the positions of later siblings. Cancellation
