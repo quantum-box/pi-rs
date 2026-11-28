@@ -489,6 +489,14 @@ so do omitted recorded calls in a replayed scope, unlike upstream. Calls are
 serialized, bounded in depth, and cannot update extension state. A safe replay
 still requires destination-level idempotency for external effects.
 
+Register a replay-safe ordinary tool through
+`checkpointable_tool_with_foreground_subagent` to expose `foreground_subagent`
+on its invocation's `ToolHost`. Call it with a stable `key` and a `prompt`.
+The host configures the child model and tool allowlist at registration. The
+calling task owns the child and reopening reuses the same conversation and
+submission. A successful result includes the answer and `conversationId`.
+The call uses the registered wait timeout and parent abort drains the child.
+
 `StandaloneNoHooksHost` constructs a standalone scheduler with an explicit
 host assertion that no hook policy applies. It cannot prove policy outside this
 runtime; do not use it when hooks are required. It cannot attach to a conversation
@@ -2152,6 +2160,11 @@ multiple independently owned task levels under a model-issued root. Each level
 checkpoints its own handle and receives its direct ended children; conversation
 abort propagates through the ownership chain. This is a separate task-backed
 scheduler path from the multi-level `KeyedHost` nested-call support above.
+
+The ordinary tool progress wrapper preserves the capabilities offered by its
+underlying `ToolHost`, including cancellation-aware nested calls, ordered
+prevalidated call accounting, and extension-scoped entries and messages.
+An extension-scoped handle shares the invocation's progress lifetime.
 
 For task-backed tools, `TaskTool::start_child` stages a keyed child and returns a
 serializable `NestedTaskCall`. The handler can checkpoint the handle and return
