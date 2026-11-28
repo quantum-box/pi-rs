@@ -15,7 +15,7 @@ test-hooks = []
 coding-tools = ["dep:pi-rs-workbench"]
 builtin-images = ["dep:image"]
 openai-responses = ["dep:async-stream", "dep:eventsource-stream", "dep:reqwest"]
-text-cli = ["builtin-images", "openai-responses", "dep:clap", "dep:pi-rs-workbench", "tokio/signal"]
+text-cli = ["builtin-images", "coding-tools", "openai-responses", "dep:clap", "dep:pi-rs-workbench", "tokio/signal"]
 
 [[bin]]
 name = "pi-rs-durable"

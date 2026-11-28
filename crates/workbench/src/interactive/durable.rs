@@ -160,6 +160,13 @@ impl Conversation {
             }
             Some("agent_start") => self.active = true,
             Some("agent_end") => self.active = false,
+            Some("tool_execution_start") => {
+                show_tool(view, &event["durableInvocation"], &Value::Null);
+            }
+            Some("tool_execution_update") => view.update_tool_progress(&event),
+            Some("tool_execution_end") => {
+                show_tool(view, &event["durableInvocation"], &event["durableOutcome"]);
+            }
             Some("message_start") if event["message"]["role"] == "user" => {
                 append_message(view, &event["message"]);
                 view.viewport.follow();
@@ -246,8 +253,42 @@ fn append_message(view: &mut View, message: &Value) {
                 view.add_images(&attachments);
             }
         }
-        Some("assistant") if !text.is_empty() => view.append_entry(Entry::Assistant(text.into())),
+        Some("assistant") => {
+            if !text.is_empty() {
+                view.append_entry(Entry::Assistant(text.into()));
+            }
+            if let Some(invocations) = message["durableInvocations"].as_array() {
+                for invocation in invocations {
+                    show_tool(view, invocation, &Value::Null);
+                }
+            }
+        }
+        Some("toolResult") => {
+            show_tool(
+                view,
+                &message["durableInvocation"],
+                &message["durableOutcome"],
+            );
+        }
         _ => {}
+    }
+}
+
+fn show_tool(view: &mut View, invocation: &Value, outcome: &Value) {
+    let Ok(invocation) = serde_json::from_value::<pi_rs::Invocation>(invocation.clone()) else {
+        return;
+    };
+    let operation = invocation.operation_id.to_string();
+    if !view
+        .lines
+        .iter()
+        .rev()
+        .any(|row| matches!(row, Entry::Tool { id, .. } if id == &operation))
+    {
+        view.add_tool(&invocation, None);
+    }
+    if let Ok(outcome) = serde_json::from_value::<pi_rs::Outcome>(outcome.clone()) {
+        view.finish_tool(&operation, &outcome, None);
     }
 }
 
@@ -458,6 +499,7 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                         view.editor.take();
                         view.draft_images.clear();
                     }
+                    "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
                     "app.message.dequeue" => {
                         worker.send(json!({"type":"clear_queue","includeContent":true}))?
@@ -720,6 +762,62 @@ mod tests {
             &view.lines[..],
             [Entry::Notice(text), Entry::User(_)] if text == &format!("Durable session ID {session}")
         ));
+    }
+
+    #[test]
+    fn durable_tool_cards_use_the_native_result_renderer_without_duplicates() {
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        let mut view = View::default();
+        let mut conversation = Conversation::default();
+        let invocation = pi_rs::Invocation {
+            operation_id: Uuid::new_v4(),
+            call: pi_rs::ToolCall {
+                id: "call".into(),
+                name: "edit".into(),
+                arguments: r#"{"path":"file"}"#.into(),
+            },
+        };
+        let outcome = pi_rs::Outcome::StructuredWithDetails {
+            data: json!({"content":[{"type":"text","text":"edited"}], "isError":false}),
+            attachments: Vec::new(),
+            details: json!({"diff":"- old\n+ new"}),
+        };
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({
+                "type":"message_end",
+                "message":{"role":"assistant","content":[], "durableInvocations":[invocation]}
+            }),
+        );
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({
+                "type":"tool_execution_start","durableInvocation":invocation
+            }),
+        );
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({
+                "type":"tool_execution_update","toolCallId":"call","toolName":"edit",
+                "partialResult":{"content":[{"type":"text","text":"working"}]}
+            }),
+        );
+        assert!(
+            matches!(&view.lines[..], [Entry::Tool {output, finished: false, ..}] if output == "working")
+        );
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({
+                "type":"tool_execution_end","durableInvocation":invocation,"durableOutcome":outcome
+            }),
+        );
+        assert!(
+            matches!(&view.lines[..], [Entry::Tool {output, numbered_diff: true, finished: true, ..}] if output == "- old\n+ new")
+        );
     }
 
     #[test]

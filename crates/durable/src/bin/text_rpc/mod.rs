@@ -1,16 +1,17 @@
 //! Companion implementation of the line-delimited Pi RPC protocol.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, Read};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pi_rs_core::{CancellationToken, Message};
+use pi_rs_core::{CancellationToken, Invocation, Message, Outcome, ToolCall};
 use pi_rs_durable::images::{BuiltinImageProcessor, UserImageAdmission};
 use pi_rs_durable::progress;
 use pi_rs_durable::runtime::{
     AdmissionError, AdmissionOptions, Conversation, Error, InputMode, OnAbort, QueueMode,
-    Scheduler, Status, Submission,
+    Scheduler, Status, Submission, ToolAttempt,
 };
+use pi_rs_durable::tool_progress;
 use pi_rs_durable::worker_activity::WorkerKind;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -45,8 +46,7 @@ impl Turn {
 
     fn emit_user(&mut self, input: &Submission) -> io::Result<()> {
         let user = submission_message(input);
-        emit(&json!({"type":"message_start","message":user}))?;
-        emit(&json!({"type":"message_end","message":user}))?;
+        emit_committed_message(&user)?;
         self.users.push(user);
         Ok(())
     }
@@ -116,8 +116,18 @@ impl Turn {
     }
 
     fn end_attempt(&mut self, text: &str, failure: Option<&str>) -> io::Result<Value> {
+        let message = self.finish_attempt(text, failure, text_message("assistant", text))?;
+        emit_turn_end(&message, &[])?;
+        Ok(message)
+    }
+
+    fn finish_attempt(
+        &mut self,
+        text: &str,
+        failure: Option<&str>,
+        mut message: Value,
+    ) -> io::Result<Value> {
         self.update(text)?;
-        let mut message = text_message("assistant", text);
         if !text.is_empty() {
             message_update(
                 message.clone(),
@@ -135,7 +145,6 @@ impl Turn {
             message["errorMessage"] = json!(reason);
         }
         emit(&json!({"type":"message_end","message":message}))?;
-        emit(&json!({"type":"turn_end","message":message,"toolResults":[]}))?;
         self.partial.clear();
         self.assistant_open = false;
         self.attempt = None;
@@ -219,6 +228,7 @@ pub(super) async fn run(
         scheduler.schedule(id);
     }
     let mut active = None;
+    let mut tools = model.has_coding_tools.then(|| ToolEvents::new(&state));
     let mut input = input_reader();
     let mut input_open = true;
     let mut poll = tokio::time::interval(Duration::from_millis(50));
@@ -234,13 +244,13 @@ pub(super) async fn run(
             received = input.recv(), if input_open => {
                 match received {
                     Some(request) => {
-                        watching |= respond(scheduler, id, &provider_model, model.has_image_adapter, &mut active, &mut seen, request).await?;
+                        watching |= respond(scheduler, id, &provider_model, model.has_image_adapter, &mut active, &mut seen, &mut tools, request).await?;
                     }
                     None => input_open = false,
                 }
             }
             _ = poll.tick(), if watching => {
-                watching = advance(scheduler, id, &mut active, &mut seen).await?;
+                watching = advance(scheduler, id, &mut active, &mut seen, &mut tools).await?;
             }
         }
     }
@@ -279,6 +289,7 @@ fn input_reader() -> tokio::sync::mpsc::Receiver<Result<Value, String>> {
     receiver
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn respond(
     scheduler: &mut Scheduler,
     id: Uuid,
@@ -286,6 +297,7 @@ async fn respond(
     has_image_adapter: bool,
     active: &mut Option<Turn>,
     seen: &mut HashSet<Uuid>,
+    tools: &mut Option<ToolEvents>,
     request: Result<Value, String>,
 ) -> io::Result<bool> {
     let request = match request {
@@ -301,7 +313,7 @@ async fn respond(
         "prompt" | "steer" | "follow_up" => {
             let state = prepare_input_adapter(scheduler, id, has_image_adapter)
                 .map_err(io::Error::other)?;
-            publish_turns(&state, active, seen, None, true, None)?;
+            publish_turns(&state, active, seen, tools, None, true, None)?;
             let mut result = submit_input(scheduler, &state, command, &request, false).await;
             if matches!(result, Err(Error::Admission(AdmissionError::Idle)))
                 && state.input_run_active()
@@ -311,7 +323,7 @@ async fn respond(
                 // before admission can clear its persisted failure record.
                 let settled = prepare_input_adapter(scheduler, id, has_image_adapter)
                     .map_err(io::Error::other)?;
-                publish_turns(&settled, active, seen, None, true, None)?;
+                publish_turns(&settled, active, seen, tools, None, true, None)?;
                 result = submit_input(scheduler, &settled, command, &request, true)
                     .await.map(|_| false);
             }
@@ -354,7 +366,7 @@ async fn respond(
                 let settled = scheduler.wait(id).await;
                 let state = scheduler.conversation(id).map_err(io::Error::other)?;
                 publish_turns(
-                    &state, active, seen, None, false,
+                    &state, active, seen, tools, None, false,
                     settled.as_ref().err().map(ToString::to_string),
                 )?;
                 settled.map(|_| None).map_err(|error| error.to_string())
@@ -516,6 +528,7 @@ async fn advance(
     id: Uuid,
     active: &mut Option<Turn>,
     seen: &mut HashSet<Uuid>,
+    tools: &mut Option<ToolEvents>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let running = scheduler
         .worker_activity()
@@ -532,14 +545,26 @@ async fn advance(
             .map(|error| error.to_string())
     };
     let view = scheduler.view_status(id)?;
-    publish_turns(
-        &view.state,
-        active,
-        seen,
-        view.live.as_ref(),
-        running,
-        failure,
-    )?;
+    let tool_attempt = view.state.tool_attempt();
+    let tool_progress = view.tool_progress.as_ref();
+    let live = view.live.as_ref();
+    let (state, live) = if tools.is_some() {
+        let state = scheduler.conversation(id)?;
+        let model_request = |state: &Conversation| {
+            state
+                .submissions
+                .iter()
+                .find_map(|input| state.model_request_id(input.id))
+        };
+        let matches_request = model_request(&state) == model_request(&view.state);
+        (state, live.filter(|_| matches_request))
+    } else {
+        (view.state, live)
+    };
+    publish_turns(&state, active, seen, tools, live, running, failure)?;
+    if let Some(tools) = tools {
+        tools.publish_progress(&state, tool_attempt, tool_progress)?;
+    }
     Ok(running)
 }
 
@@ -547,6 +572,7 @@ fn publish_turns(
     state: &Conversation,
     active: &mut Option<Turn>,
     seen: &mut HashSet<Uuid>,
+    tools: &mut Option<ToolEvents>,
     live: Option<&progress::State>,
     running: bool,
     failure: Option<String>,
@@ -577,6 +603,9 @@ fn publish_turns(
             .ok_or_else(|| io::Error::other("active RPC input disappeared"))?
             .status;
         turn.emit_joined_inputs(state, seen, status)?;
+        if let Some(tools) = tools {
+            tools.publish(state, turn)?;
+        }
         if running && !matches!(status, Status::Done { .. } | Status::Unanswered { .. }) {
             turn.emit_retried_attempts(state)?;
             if let Some(request_id) = state.model_request_id(turn.submission)
@@ -586,6 +615,9 @@ fn publish_turns(
                 turn.update(&partial.text)?;
             }
             return Ok(());
+        }
+        if let Some(tools) = tools {
+            tools.finish_pending_turn()?;
         }
         turn.settle(state, failure.clone())?;
         *active = None;
@@ -601,7 +633,162 @@ fn message_update(message: Value, mut event: Value) -> io::Result<()> {
     }))
 }
 
+fn emit_committed_message(message: &Value) -> io::Result<()> {
+    emit(&json!({"type":"message_start","message":message}))?;
+    emit(&json!({"type":"message_end","message":message}))
+}
+
+fn emit_turn_end(message: &Value, results: &[Value]) -> io::Result<()> {
+    emit(&json!({"type":"turn_end", "message":message, "toolResults":results}))
+}
+
+struct PendingToolTurn {
+    assistant: Value,
+    results: Vec<Value>,
+    remaining: usize,
+}
+
+struct ToolEvents {
+    delivered: usize,
+    answered_submission: Option<Uuid>,
+    partial: Option<(ToolAttempt, Value)>,
+    pending_turn: Option<PendingToolTurn>,
+}
+
+impl ToolEvents {
+    fn new(state: &Conversation) -> Self {
+        Self {
+            delivered: messages(state).len(),
+            answered_submission: None,
+            partial: None,
+            pending_turn: None,
+        }
+    }
+
+    fn finish_pending_turn(&mut self) -> io::Result<()> {
+        if let Some(turn) = self.pending_turn.take() {
+            emit_turn_end(&turn.assistant, &turn.results)?;
+        }
+        Ok(())
+    }
+
+    fn publish_progress(
+        &mut self,
+        state: &Conversation,
+        observed_attempt: Option<ToolAttempt>,
+        progress: Option<&tool_progress::State>,
+    ) -> io::Result<()> {
+        let (Some(attempt), Some(call), Some(tool_progress::State::Running(Some(partial)))) =
+            (state.tool_attempt(), state.active_tool_call(), progress)
+        else {
+            self.partial = None;
+            return Ok(());
+        };
+        if Some(attempt) != observed_attempt
+            || self
+                .partial
+                .as_ref()
+                .is_some_and(|(previous, result)| *previous == attempt && result == partial)
+        {
+            return Ok(());
+        }
+        emit(&json!({
+            "type":"tool_execution_update",
+            "toolCallId":call.id,
+            "toolName":call.name,
+            "args":serde_json::from_str::<Value>(&call.arguments).ok(),
+            "partialResult":partial
+        }))?;
+        self.partial = Some((attempt, partial.clone()));
+        Ok(())
+    }
+
+    fn publish(&mut self, state: &Conversation, turn: &mut Turn) -> io::Result<()> {
+        if self.answered_submission == Some(turn.submission) {
+            return Ok(());
+        }
+        let history = messages(state);
+        for (index, message) in history.iter().enumerate().skip(self.delivered) {
+            self.delivered = index + 1;
+            if let Some(invocations) = message["durableInvocations"].as_array() {
+                self.finish_pending_turn()?;
+                let text = message["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| block["type"] == "text")
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !turn.assistant_open || !text.starts_with(&turn.partial) {
+                    turn.begin_attempt(None)?;
+                }
+                let assistant = turn.finish_attempt(&text, None, message.clone())?;
+                turn.users.push(assistant.clone());
+                self.pending_turn = Some(PendingToolTurn {
+                    assistant,
+                    results: Vec::with_capacity(invocations.len()),
+                    remaining: invocations.len(),
+                });
+                for invocation in invocations {
+                    let call = &invocation["call"];
+                    let args = call["arguments"]
+                        .as_str()
+                        .and_then(|args| serde_json::from_str::<Value>(args).ok());
+                    emit(&json!({
+                        "type":"tool_execution_start",
+                        "toolCallId":call["id"],
+                        "toolName":call["name"],
+                        "args":args,
+                        "durableInvocation":invocation
+                    }))?;
+                }
+            } else if message["role"] == "toolResult" {
+                emit(&json!({
+                    "type":"tool_execution_end",
+                    "toolCallId":message["toolCallId"],
+                    "toolName":message["toolName"],
+                    "result":{"content":message["content"],"details":message["details"]},
+                    "isError":message["isError"],
+                    "durableInvocation":message["durableInvocation"],
+                    "durableOutcome":message["durableOutcome"]
+                }))?;
+                emit_committed_message(message)?;
+                turn.users.push(message.clone());
+                if let Some(pending) = &mut self.pending_turn {
+                    pending.results.push(message.clone());
+                    pending.remaining -= 1;
+                    if pending.remaining == 0 {
+                        self.finish_pending_turn()?;
+                    }
+                }
+            } else if message["role"] == "assistant" {
+                self.finish_pending_turn()?;
+                // The terminal assistant message belongs to this submission.
+                // Leave later tool frames for the next queued run if both
+                // runs completed between two polling ticks.
+                self.answered_submission = Some(turn.submission);
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn messages(state: &Conversation) -> Vec<Value> {
+    let mut pending: HashMap<&str, VecDeque<Invocation>> = HashMap::new();
+    let mut metadata_by_block = HashMap::new();
+    let mut legacy_metadata: HashMap<&str, VecDeque<_>> = HashMap::new();
+    for result in &state.tool_results {
+        if let Some(id) = result.content_block_id {
+            metadata_by_block.insert(id, result);
+        } else {
+            legacy_metadata
+                .entry(&result.call_id)
+                .or_default()
+                .push_back(result);
+        }
+    }
     state
         .messages
         .iter()
@@ -611,10 +798,96 @@ fn messages(state: &Conversation) -> Vec<Value> {
                 || text_message("user", content),
                 |value| user_message(&value.blocks),
             )),
-            Message::Assistant { content, .. } => Some(text_message("assistant", content)),
+            Message::Assistant { content, calls, .. } => {
+                let mut message = text_message("assistant", content);
+                if !calls.is_empty() {
+                    let invocations: Vec<_> = calls
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, call)| {
+                            // A transcript-occurrence identity for rendering. Provider
+                            // call IDs may repeat in one conversation.
+                            let invocation = Invocation {
+                                operation_id: Uuid::from_u128(
+                                    ((index as u128) << 64) | (ordinal as u128 + 1),
+                                ),
+                                call: call.clone(),
+                            };
+                            pending
+                                .entry(&call.id)
+                                .or_default()
+                                .push_back(invocation.clone());
+                            invocation
+                        })
+                        .collect();
+                    let blocks = message["content"].as_array_mut().unwrap();
+                    blocks.extend(calls.iter().map(tool_call_block));
+                    message["stopReason"] = json!("toolUse");
+                    message["durableInvocations"] = json!(invocations);
+                }
+                Some(message)
+            }
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+                ..
+            } => {
+                let invocation = pending.get_mut(call_id.as_str())?.pop_front()?;
+                let blocks = state.content_blocks.get(&index);
+                let result = match blocks {
+                    Some(blocks) => metadata_by_block
+                        .get(&blocks.message_id)
+                        .copied()
+                        .filter(|result| result.call_id == *call_id),
+                    None => legacy_metadata
+                        .get_mut(call_id.as_str())
+                        .and_then(VecDeque::pop_front),
+                };
+                let is_error = result.map_or(*is_error, |result| result.is_error);
+                let details = result.and_then(|result| result.details.clone());
+                let mut message = text_message("toolResult", content);
+                let outcome = if let Some(blocks) = blocks {
+                    message["content"] = json!(blocks.blocks);
+                    let data = json!({"content":blocks.blocks, "isError":is_error});
+                    let attachments = result
+                        .map(|value| value.attachments.clone())
+                        .unwrap_or_default();
+                    match details.clone() {
+                        Some(details) => Outcome::StructuredWithDetails {
+                            data,
+                            attachments,
+                            details,
+                        },
+                        None => Outcome::Structured { data, attachments },
+                    }
+                } else {
+                    Outcome::TextResult {
+                        output: content.clone(),
+                        details: details.clone(),
+                        is_error,
+                    }
+                };
+                message["toolCallId"] = json!(call_id);
+                message["toolName"] = json!(invocation.call.name);
+                message["isError"] = json!(is_error);
+                message["details"] = json!(details);
+                message["durableInvocation"] = json!(invocation);
+                message["durableOutcome"] = json!(outcome);
+                Some(message)
+            }
             _ => None,
         })
         .collect()
+}
+
+fn tool_call_block(call: &ToolCall) -> Value {
+    json!({
+        "type":"toolCall",
+        "id":call.id,
+        "name":call.name,
+        "arguments":serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::Null)
+    })
 }
 
 fn submission_message(input: &Submission) -> Value {
