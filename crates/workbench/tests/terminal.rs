@@ -1736,10 +1736,15 @@ fn terminal_image_visibility_reflows_the_regular_screen_after_fullscreen_reload(
     }
 }
 
-fn start_blocked_image_reload(root: &std::path::Path, master: &mut File) {
+fn start_blocked_image_reload(
+    root: &std::path::Path,
+    package_root: &std::path::Path,
+    master: &mut File,
+) {
     use std::os::unix::fs::PermissionsExt;
 
-    let package = root.join("reload-package.sh");
+    // A user-configured package must be outside the untrusted workspace.
+    let package = package_root.join("reload-package.sh");
     std::fs::write(
         &package,
         r#"#!/bin/sh
@@ -1774,7 +1779,8 @@ fn terminal_image_exit_replay_uses_settings_from_an_interrupted_reload() {
     output_until(&mut master, |text| {
         text.contains(ITERM_IMAGE) && text.contains("Enter to send")
     });
-    start_blocked_image_reload(root.path(), &mut master);
+    let package_root = tempfile::tempdir().unwrap();
+    start_blocked_image_reload(root.path(), package_root.path(), &mut master);
     let home = root.path().join("home");
     output_until(&mut master, |_| home.join("probe-started").exists());
     assert_eq!(
@@ -1812,7 +1818,8 @@ fn terminal_image_interrupt_during_reload_keeps_regular_transcript() {
     let cooked_flags = libc::ICANON | libc::ECHO;
     assert_eq!(terminal_flags() & cooked_flags, 0);
 
-    start_blocked_image_reload(root.path(), &mut master);
+    let package_root = tempfile::tempdir().unwrap();
+    start_blocked_image_reload(root.path(), package_root.path(), &mut master);
     let home = root.path().join("home");
     let erased = std::cell::Cell::new(false);
     let record_erase = |text: &str| {
