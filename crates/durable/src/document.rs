@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 
 pub(crate) mod session_current;
 pub use session_current::{
-    LatestConversationDocument, LatestDocumentFork, SessionDocument, SessionDocumentUpdate,
-    SessionDocumentWatch,
+    CurrentDocumentUpdate, CurrentDocumentWatch, LatestConversationDocument, LatestDocumentFork,
+    SessionDocument, SessionDocumentUpdate, SessionDocumentWatch,
 };
 
 const PREFIX: &[u8] = b"durable/document/";

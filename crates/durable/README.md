@@ -494,6 +494,13 @@ when the transcript is forked at an older entry. `Initial` leaves the child's
 address absent until it is first edited. Migration keeps the fork policy and
 incarnation. Updates replace the current payload, and retirement reclaims the
 payload while preserving definition metadata.
+`watch_latest_document` uses the same current-value watch as session
+documents. It follows the specified conversation and address through retirement
+and recreation without following a fork's independent copy. A delivered
+current value includes a Chord root replacement, and a retirement with no
+replacement returns the last value and no operations. Local commits wake the
+watch immediately. The polling interval also covers writes through other
+SQLite connections.
 
 Nested tool calls are journaled by parent operation and call order. The standalone
 `NestedHost::call_keyed` API also accepts explicit caller-scoped keys and reuses

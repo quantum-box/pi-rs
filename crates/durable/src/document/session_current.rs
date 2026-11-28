@@ -228,6 +228,33 @@ impl Staged {
     }
 }
 
+fn check_history_mode(
+    store: &Store,
+    conversation: Uuid,
+    kind: &str,
+    key: &str,
+) -> Result<[Check; 2], Error> {
+    let address = super::Address {
+        scope: conversation.to_string(),
+        name: kind.into(),
+        key: key.into(),
+    };
+    let revision = store.document_snapshot()?;
+    let document_key = address.storage_key()?;
+    let policy_key = address.policy_key()?;
+    if store
+        .document_last_revision(&document_key, revision)?
+        .is_some()
+        || store.document_at(&policy_key, revision)?.is_some()
+    {
+        return Err(Error::InvalidDocumentDefinition);
+    }
+    Ok([document_key, policy_key].map(|key| Check {
+        key,
+        expected: Expected::DocumentUnchangedSince(revision),
+    }))
+}
+
 pub(crate) struct CurrentDocuments<'a> {
     store: &'a Store,
     owner: Uuid,
@@ -280,26 +307,10 @@ impl<'a> CurrentDocuments<'a> {
         let (binding, _) =
             defined_document_binding(definition.kind, definition.version, definition.initial)?;
         let storage_key = if definition.fork.is_some() {
-            let address = super::Address {
-                scope: self.owner.to_string(),
-                name: definition.kind.into(),
-                key: key.into(),
-            };
-            let revision = self.store.document_snapshot()?;
-            let document_key = address.storage_key()?;
-            let policy_key = address.policy_key()?;
-            if self
-                .store
-                .document_last_revision(&document_key, revision)?
-                .is_some()
-                || self.store.document_at(&policy_key, revision)?.is_some()
+            for Check { key, expected } in
+                check_history_mode(self.store, self.owner, definition.kind, key)?
             {
-                return Err(Error::InvalidDocumentDefinition);
-            }
-            for address_key in [document_key, policy_key] {
-                self.other_history
-                    .entry(address_key)
-                    .or_insert(Expected::DocumentUnchangedSince(revision));
+                self.other_history.entry(key).or_insert(expected);
             }
             conversation_key(self.owner, definition.kind, key)?
         } else {
@@ -461,55 +472,66 @@ impl<'a> CurrentDocuments<'a> {
     }
 }
 
-/// The latest committed session document and whether the previously observed
+/// The latest committed document and whether the previously observed
 /// incarnation retired. A retirement without replacement carries the last value.
-pub struct SessionDocumentUpdate<T> {
+pub struct CurrentDocumentUpdate<T> {
     pub value: Arc<DefinedDocumentValue<T>>,
     pub retired: bool,
+    /// Root replacement for a present value, empty for retirement alone.
+    pub operations: Vec<Value>,
 }
 
-/// Pull watch over the current document at a session address. It coalesces
-/// commits and holds no reference that can keep the session's store open.
-pub struct SessionDocumentWatch<T> {
+/// Pull watch over a current-only document. It coalesces intermediate
+/// commits and holds no reference that can keep the store open.
+pub struct CurrentDocumentWatch<T> {
     owner: Weak<OwnedStore>,
     source_closed: CancellationToken,
     cancelled: CancellationToken,
     conversation: Uuid,
-    scope: [Check; 2],
+    membership: Option<[Check; 2]>,
+    fork: Option<LatestDocumentFork>,
     key: Vec<u8>,
     binding: StoredDocumentDefinition,
     interval: Duration,
+    wake: durable_store::CommitUpdates,
     version: u64,
     value: Arc<DefinedDocumentValue<T>>,
     present: bool,
     end: Option<crate::runtime::ViewWatchEnd>,
 }
 
-impl<T: DeserializeOwned + Serialize> SessionDocumentWatch<T> {
+impl<T: DeserializeOwned + Serialize> CurrentDocumentWatch<T> {
     pub(crate) fn attach(
         owner: &Arc<OwnedStore>,
         source_closed: CancellationToken,
         conversation: Uuid,
-        definition: &SessionDocument<T>,
+        definition: CurrentDefinition<'_, T>,
         key: &str,
         interval: Duration,
         cancelled: CancellationToken,
     ) -> Result<Option<Self>, Error> {
         if interval.is_zero() {
             return Err(Error::InvalidSessionAdmission(
-                "session document watch interval must be nonzero".into(),
+                "document watch interval must be nonzero".into(),
             ));
         }
         let store = owner.store();
+        let wake = store.subscribe_commits()?;
         let (binding, _) =
-            defined_document_binding(&definition.kind, definition.version, &definition.initial)?;
+            defined_document_binding(definition.kind, definition.version, definition.initial)?;
         for _ in 0..128 {
             if cancelled.is_cancelled() || source_closed.is_cancelled() {
                 return Ok(None);
             }
             let before = store.commit_sequence()?;
-            let (session, scope) = crate::session_membership::document_scope(store, conversation)?;
-            let key = storage_key(session, &definition.kind, key)?;
+            let (key, membership) = if definition.fork.is_some() {
+                check_history_mode(store, conversation, definition.kind, key)?;
+                (conversation_key(conversation, definition.kind, key)?, None)
+            } else {
+                let (session, scope) =
+                    crate::session_membership::document_scope(store, conversation)?;
+                (storage_key(session, definition.kind, key)?, Some(scope))
+            };
             let entry = store.get(&key)?;
             if store.commit_sequence()? != before {
                 continue;
@@ -517,7 +539,7 @@ impl<T: DeserializeOwned + Serialize> SessionDocumentWatch<T> {
             let Some(entry) = entry else { return Ok(None) };
             let record: StoredDocument = serde_json::from_slice(&entry.value)?;
             record.validate(&binding)?;
-            if record.fork.is_some() {
+            if record.fork != definition.fork {
                 return Err(Error::InvalidDocumentDefinition);
             }
             let Some(value) = record.typed()? else {
@@ -528,10 +550,12 @@ impl<T: DeserializeOwned + Serialize> SessionDocumentWatch<T> {
                 source_closed,
                 cancelled,
                 conversation,
-                scope,
+                membership,
+                fork: definition.fork,
                 key,
                 binding,
                 interval,
+                wake,
                 version: entry.version,
                 value: Arc::new(value),
                 present: true,
@@ -539,7 +563,7 @@ impl<T: DeserializeOwned + Serialize> SessionDocumentWatch<T> {
             }));
         }
         Err(Error::InvalidSessionAdmission(
-            "could not capture a stable session document snapshot".into(),
+            "could not capture a stable current document snapshot".into(),
         ))
     }
 
@@ -560,11 +584,13 @@ impl<T: DeserializeOwned + Serialize> SessionDocumentWatch<T> {
     fn latest(&self, store: &Store) -> Result<Option<durable_store::Entry>, Error> {
         let before = store.commit_sequence()?;
         let entry = store.get(&self.key)?;
-        let (_, checks) = crate::session_membership::document_scope(store, self.conversation)?;
-        if checks != self.scope {
-            return Err(Error::InvalidSessionAdmission(
-                "session document watch membership changed".into(),
-            ));
+        if let Some(membership) = &self.membership {
+            let (_, checks) = crate::session_membership::document_scope(store, self.conversation)?;
+            if &checks != membership {
+                return Err(Error::InvalidSessionAdmission(
+                    "session document watch membership changed".into(),
+                ));
+            }
         }
         if store.commit_sequence()? != before {
             return Ok(None);
@@ -575,12 +601,15 @@ impl<T: DeserializeOwned + Serialize> SessionDocumentWatch<T> {
     fn update(
         &mut self,
         entry: durable_store::Entry,
-    ) -> Result<Option<SessionDocumentUpdate<T>>, Error> {
+    ) -> Result<Option<CurrentDocumentUpdate<T>>, Error> {
         if entry.version == self.version {
             return Ok(None);
         }
         let record: StoredDocument = serde_json::from_slice(&entry.value)?;
         record.validate(&self.binding)?;
+        if record.fork != self.fork {
+            return Err(Error::InvalidDocumentDefinition);
+        }
         let value: Option<DefinedDocumentValue<T>> = record.typed()?;
         let retired = self.present
             && value
@@ -593,15 +622,19 @@ impl<T: DeserializeOwned + Serialize> SessionDocumentWatch<T> {
         } else if !retired {
             return Ok(None);
         }
-        Ok(Some(SessionDocumentUpdate {
+        let operations = record.value.map_or_else(Vec::new, |value| {
+            crate::chord_ops::replacement(&Value::Object(value))
+        });
+        Ok(Some(CurrentDocumentUpdate {
             value: self.value.clone(),
             retired,
+            operations,
         }))
     }
 
     /// Wait for a new value or retirement. Dropping the pending read leaves
     /// the watch open. Revoking the acquisition membership ends the watch.
-    pub async fn next(&mut self) -> Result<Option<SessionDocumentUpdate<T>>, Error> {
+    pub async fn next(&mut self) -> Result<Option<CurrentDocumentUpdate<T>>, Error> {
         use crate::runtime::ViewWatchEnd;
 
         while self.end.is_none() {
@@ -644,9 +677,16 @@ impl<T: DeserializeOwned + Serialize> SessionDocumentWatch<T> {
             tokio::select! {
                 _ = self.cancelled.cancelled() => {}
                 _ = self.source_closed.cancelled() => {}
+                _ = self.wake.changed() => {}
                 _ = tokio::time::sleep(self.interval) => {}
             }
         }
         Ok(None)
     }
 }
+
+/// A current document watch opened through session membership.
+pub type SessionDocumentWatch<T> = CurrentDocumentWatch<T>;
+
+/// A value or retirement delivered by a session document watch.
+pub type SessionDocumentUpdate<T> = CurrentDocumentUpdate<T>;
