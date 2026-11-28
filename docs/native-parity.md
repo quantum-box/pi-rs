@@ -7361,6 +7361,20 @@ Tool-free summary requests retain tool history as text and pass structured
 images as image blocks. The SDK chooses the endpoint and signs requests or uses the
 bearer token. No AWS resources are created.
 
+Converse sends the catalog-mapped `reasoning_effort` for Kimi K3, Kimi K3.1
+and GLM 5.3. Kimi's disabled level sends `none`. GLM's catalog omits disabled
+and minimal effort, allowing the service's default when no effort is selected.
+The Kimi K3 family skips earlier reasoning blocks on the wire while retaining
+the visible conversation and tool history. A host can override replay support
+with the Bedrock client builder or `compat.supportsReasoningReplay` in
+`models.json`. The workbench resolves effort and replay against the final
+request model, including after a same-route model rewrite. Kimi summaries
+use the catalog's mapped off effort. When replay is disabled, request
+budgeting estimates the serialized history because measured output usage
+can include omitted reasoning.
+[AWS Kimi K3 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k3.html)
+[AWS GLM 5.3 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5-3.html)
+
 Claude and GPT-family models support the Pi reasoning levels and configured
 thinking-level mappings. Claude uses adaptive thinking on the supported newer
 families and budgeted thinking on earlier models; GPT and GPT-OSS use their
