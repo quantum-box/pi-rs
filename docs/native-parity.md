@@ -5196,7 +5196,9 @@ In the TUI, `/model` accepts an exact discovered or scoped model ID such as
 rebuilds its configured catalog and retains discovered IDs whose catalog and
 model routes are unchanged. Explicit provider qualification takes precedence,
 followed by unambiguous literal IDs, including IDs that end in a thinking
-suffix. A literal ID shared by multiple providers requires qualification.
+suffix. Before parsing a thinking suffix, `/model` checks configured IDs even
+with an empty picker cache. A literal ID shared by multiple providers requires
+qualification.
 An unmatched ID with an unknown provider prefix still triggers an error.
 Credential-management commands and the host-granted SDK model file loader retain
 strict file handling.

@@ -975,12 +975,14 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
 
     let mut profiles = serde_json::json!({
         "providers": {
+            "ollama": {"models": [{"id": "company/cold:high"}]},
             "anthropic": {
                 "baseUrl": "http://127.0.0.1:1",
                 "apiKey": "fixture-key",
                 "models": [
                     {"id": "company/literal:high"},
                     {"id": "company/ambiguous:high"},
+                    {"id": "company/cold:high"},
                     {"id": "inactive/stale-model"},
                     {"id": "ollama/qwen2.5:7b"}
                 ]
@@ -988,6 +990,11 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
         }
     });
     std::fs::write(&models, profiles.to_string()).unwrap();
+    master.write_all(b"/model company/cold:high\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains(r#"Model "company/cold:high" is ambiguous"#)
+    });
+
     master.write_all(b"/model qwen2.5:7b\r").unwrap();
     output_until(&mut master, |text| text.contains("Model: qwen2.5:7b"));
     server.join().unwrap();

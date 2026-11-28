@@ -428,8 +428,16 @@ pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
     local_catalogs(args, true)
 }
 
-pub(super) fn configured_catalogs(args: &Cli) -> Vec<Catalog> {
+pub(super) fn configured_model_references(args: &Cli) -> Vec<String> {
     local_catalogs(args, false)
+        .into_iter()
+        .flat_map(|catalog| {
+            catalog
+                .models
+                .into_iter()
+                .map(move |model| format!("{}/{model}", catalog.provider.id()))
+        })
+        .collect()
 }
 
 fn local_catalogs(args: &Cli, include_workspace_models: bool) -> Vec<Catalog> {

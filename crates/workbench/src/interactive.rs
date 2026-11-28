@@ -1585,12 +1585,9 @@ impl View {
         });
         // Configured IDs come from the new profiles. Keep discovery-only IDs
         // on their revalidated routes and include newly configured providers.
-        for catalog in super::model_selection::configured_catalogs(args) {
-            for model in catalog.models {
-                let reference = format!("{}/{model}", catalog.provider.id());
-                if !models.contains(&reference) {
-                    models.push(reference);
-                }
+        for reference in super::model_selection::configured_model_references(args) {
+            if !models.contains(&reference) {
+                models.push(reference);
             }
         }
         self.available_models = models;
@@ -9308,16 +9305,20 @@ fn exact_model_query(
     if query.is_empty() {
         return Ok(None);
     }
-    let scoped;
-    let models = if args.model_scope.is_empty() {
-        catalog
-    } else {
-        scoped = args
+    let local;
+    let models = if !args.model_scope.is_empty() {
+        local = args
             .model_scope
             .iter()
             .map(super::model_selection::ScopedChoice::qualified)
             .collect::<Vec<_>>();
-        &scoped
+        &local
+    } else if catalog.is_empty() && super::model_selection::thinking_suffix(query).is_some() {
+        // A cold picker still knows configured literal IDs before suffix parsing.
+        local = super::model_selection::configured_model_references(args);
+        &local
+    } else {
+        catalog
     };
     let mut matches = models.iter().filter_map(|reference| {
         let (provider, model) =
