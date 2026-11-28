@@ -3,6 +3,7 @@ use crate::journal::CycledModelSelection;
 use crate::runtime::time as platform_time;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::{broadcast, mpsc};
@@ -211,6 +212,22 @@ impl InputAdmission {
             .map_err(|_| Error::Config("input admission closed".into()))
     }
 
+    fn try_acquire(self: &Arc<Self>) -> Result<InputPermit> {
+        let mut state = self.state.lock().expect("input admission");
+        if state.busy {
+            return Err(Error::Session("session input control is in use".into()));
+        }
+        let ticket = state.next;
+        state.next = ticket
+            .checked_add(1)
+            .ok_or_else(|| Error::Config("input admission tickets exhausted".into()))?;
+        state.busy = true;
+        Ok(InputPermit {
+            admission: Some(self.clone()),
+            ticket,
+        })
+    }
+
     fn release(self: &Arc<Self>) {
         loop {
             let next = {
@@ -258,11 +275,404 @@ struct RunConfig {
     limits: Limits,
 }
 
-type PendingStart = Arc<Mutex<Option<(crate::SessionStartReason, Option<PathBuf>)>>>;
+#[derive(Clone)]
+struct PendingStart {
+    reason: crate::SessionStartReason,
+    previous_session_file: Option<PathBuf>,
+    begun: bool,
+    completed_hooks: Arc<AtomicUsize>,
+}
+
+impl PendingStart {
+    fn new(reason: crate::SessionStartReason, previous_session_file: Option<PathBuf>) -> Self {
+        Self {
+            reason,
+            previous_session_file,
+            begun: false,
+            completed_hooks: Arc::default(),
+        }
+    }
+}
+
+// Track SDK installations by instance, independently of renderer snapshots and
+// other host-held Arc clones. Legacy sharing is allowed until a reload claims
+// exclusive lifecycle ownership.
+struct ExtensionClaim {
+    extension: Weak<dyn Extension>,
+    ownership: ExtensionOwnership,
+}
+
+enum ExtensionOwnership {
+    Legacy {
+        installed: LegacyInstallations,
+        pending: Vec<Weak<()>>,
+        live: Vec<Weak<()>>,
+        shutdown: LegacyShutdown,
+    },
+    Exclusive {
+        owner: Weak<()>,
+        retired: bool,
+    },
+}
+
+enum LegacyInstallations {
+    None,
+    One(Weak<()>),
+    Shared,
+}
+
+enum LegacyShutdown {
+    Idle,
+    Waiting { owner: Weak<()>, deferred: bool },
+    Running,
+}
+
+enum ExtensionShutdown {
+    Exclusive,
+    Legacy(Weak<()>),
+}
+
+impl ExtensionShutdown {
+    fn release(registry: &Arc<Registry>, scope: Arc<()>, exclusive: bool) -> Option<Self> {
+        if exclusive {
+            return (Arc::into_inner(scope).is_some() && Arc::strong_count(registry) == 1)
+                .then_some(Self::Exclusive);
+        }
+
+        // Release the last fork and assign its shutdown claims under the same
+        // lock as installation so a later owner always gets a distinct claim.
+        let mut claims = EXTENSION_CLAIMS.lock().expect("SDK extension ownership");
+        let owner = Arc::downgrade(&scope);
+        if Arc::into_inner(scope).is_none() || Arc::strong_count(registry) != 1 {
+            return None;
+        }
+        for extension in &registry.extensions {
+            let claim = extension_claim(&mut claims, extension);
+            if let ExtensionOwnership::Legacy { live, shutdown, .. } = &mut claim.ownership
+                && live.iter().any(|session| session.ptr_eq(&owner))
+                && !live.iter().any(|session| session.strong_count() != 0)
+            {
+                *shutdown = LegacyShutdown::Waiting {
+                    owner: owner.clone(),
+                    deferred: false,
+                };
+            }
+        }
+        Some(Self::Legacy(owner))
+    }
+}
+
+static EXTENSION_CLAIMS: Mutex<Vec<ExtensionClaim>> = Mutex::new(Vec::new());
+static LEGACY_INSTALLATION_FINISHED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+fn extension_claim<'a>(
+    claims: &'a mut Vec<ExtensionClaim>,
+    extension: &Arc<dyn Extension>,
+) -> &'a mut ExtensionClaim {
+    let extension = Arc::downgrade(extension);
+    let index = claims
+        .iter()
+        .position(|claim| claim.extension.ptr_eq(&extension))
+        .unwrap_or_else(|| {
+            claims.push(ExtensionClaim {
+                extension,
+                ownership: ExtensionOwnership::Legacy {
+                    installed: LegacyInstallations::None,
+                    pending: Vec::new(),
+                    live: Vec::new(),
+                    shutdown: LegacyShutdown::Idle,
+                },
+            });
+            claims.len() - 1
+        });
+    &mut claims[index]
+}
+
+fn extension_owned_elsewhere(extension: &dyn Extension) -> Error {
+    Error::Config(format!(
+        "extension instance {} belongs to another SDK session",
+        extension.id()
+    ))
+}
+
+// A builder can call host-owned journal code before installation completes.
+// Reserve its instances while that code runs without holding the claims lock.
+struct LegacyExtensionReservation<'a> {
+    extensions: &'a [Arc<dyn Extension>],
+    owner: Weak<()>,
+    committed: bool,
+}
+
+impl<'a> LegacyExtensionReservation<'a> {
+    fn reserve(extensions: &'a [Arc<dyn Extension>], owner: &Arc<()>) -> Result<Self> {
+        let owner = Arc::downgrade(owner);
+        if !extensions.is_empty() {
+            let mut claims = EXTENSION_CLAIMS.lock().expect("SDK extension ownership");
+            claims.retain(|claim| claim.extension.strong_count() > 0);
+            for extension in extensions {
+                let instance = Arc::downgrade(extension);
+                if let Some(claim) = claims
+                    .iter()
+                    .find(|claim| claim.extension.ptr_eq(&instance))
+                {
+                    match &claim.ownership {
+                        ExtensionOwnership::Exclusive { .. } => {
+                            drop(claims);
+                            return Err(extension_owned_elsewhere(extension.as_ref()));
+                        }
+                        ExtensionOwnership::Legacy {
+                            shutdown: LegacyShutdown::Running,
+                            ..
+                        } => {
+                            drop(claims);
+                            return Err(Error::Config(format!(
+                                "extension instance {} is shutting down; retry after close finishes",
+                                extension.id()
+                            )));
+                        }
+                        ExtensionOwnership::Legacy { .. } => {}
+                    }
+                }
+            }
+            for extension in extensions {
+                let claim = extension_claim(&mut claims, extension);
+                let ExtensionOwnership::Legacy { pending, .. } = &mut claim.ownership else {
+                    unreachable!("checked legacy ownership");
+                };
+                pending.push(owner.clone());
+            }
+        }
+        Ok(Self {
+            extensions,
+            owner,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for LegacyExtensionReservation<'_> {
+    fn drop(&mut self) {
+        if self.extensions.is_empty() {
+            return;
+        }
+        let mut claims = EXTENSION_CLAIMS.lock().expect("SDK extension ownership");
+        for extension in self.extensions {
+            let claim = extension_claim(&mut claims, extension);
+            let ExtensionOwnership::Legacy {
+                installed,
+                pending,
+                live,
+                shutdown,
+            } = &mut claim.ownership
+            else {
+                unreachable!("pending legacy installation prevents exclusive ownership");
+            };
+            pending.retain(|owner| !owner.ptr_eq(&self.owner));
+            if self.committed {
+                live.retain(|owner| owner.strong_count() != 0);
+                if !live.iter().any(|owner| owner.ptr_eq(&self.owner)) {
+                    live.push(self.owner.clone());
+                }
+                *shutdown = LegacyShutdown::Idle;
+                match installed {
+                    LegacyInstallations::None => {
+                        *installed = LegacyInstallations::One(self.owner.clone());
+                    }
+                    LegacyInstallations::One(owner) if !owner.ptr_eq(&self.owner) => {
+                        *installed = LegacyInstallations::Shared;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        drop(claims);
+        LEGACY_INSTALLATION_FINISHED.notify_waiters();
+    }
+}
+
+// Reserve the last legacy connection while its async shutdown runs. Builder
+// reservations can complete or fail without holding the claims lock across
+// journal code; close waits for them only when no live owner can close later.
+struct LegacyShutdownReservation<'a>(&'a Arc<dyn Extension>);
+
+impl<'a> LegacyShutdownReservation<'a> {
+    async fn acquire(
+        extension: &'a Arc<dyn Extension>,
+        owner: &Weak<()>,
+        deferred: bool,
+    ) -> Option<Self> {
+        loop {
+            let changed = LEGACY_INSTALLATION_FINISHED.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut claims = EXTENSION_CLAIMS.lock().expect("SDK extension ownership");
+                let claim = extension_claim(&mut claims, extension);
+                let ExtensionOwnership::Legacy {
+                    pending, shutdown, ..
+                } = &mut claim.ownership
+                else {
+                    return None;
+                };
+                let LegacyShutdown::Waiting {
+                    owner: current,
+                    deferred: current_deferred,
+                } = shutdown
+                else {
+                    return None;
+                };
+                if !current.ptr_eq(owner) || *current_deferred != deferred {
+                    return None;
+                }
+                if pending.is_empty() {
+                    *shutdown = LegacyShutdown::Running;
+                    return Some(Self(extension));
+                }
+            }
+            changed.await;
+        }
+    }
+}
+
+fn defer_legacy_shutdown(
+    extension: &Arc<dyn Extension>,
+    owner: &Weak<()>,
+    timeout: std::time::Duration,
+) -> Option<impl Future<Output = ()> + use<>> {
+    {
+        let mut claims = EXTENSION_CLAIMS.lock().expect("SDK extension ownership");
+        let claim = extension_claim(&mut claims, extension);
+        let ExtensionOwnership::Legacy {
+            shutdown:
+                LegacyShutdown::Waiting {
+                    owner: current,
+                    deferred,
+                },
+            ..
+        } = &mut claim.ownership
+        else {
+            return None;
+        };
+        if !current.ptr_eq(owner) || *deferred {
+            return None;
+        }
+        *deferred = true;
+    }
+
+    // Rollback keeps this claim. A successful installation invalidates it.
+    // This task owns only the connection, so close can release the session and events.
+    let extension = extension.clone();
+    let owner = owner.clone();
+    Some(async move {
+        if let Some(_reservation) =
+            LegacyShutdownReservation::acquire(&extension, &owner, true).await
+        {
+            let _ = platform_time::timeout(timeout, extension.shutdown()).await;
+        }
+    })
+}
+
+impl Drop for LegacyShutdownReservation<'_> {
+    fn drop(&mut self) {
+        let mut claims = EXTENSION_CLAIMS.lock().expect("SDK extension ownership");
+        let claim = extension_claim(&mut claims, self.0);
+        let ExtensionOwnership::Legacy { shutdown, .. } = &mut claim.ownership else {
+            unreachable!("legacy shutdown reserves ownership");
+        };
+        *shutdown = LegacyShutdown::Idle;
+    }
+}
+
+fn claim_exclusive_extensions(
+    current: &[Arc<dyn Extension>],
+    incoming: &[Arc<dyn Extension>],
+    owner: &Arc<()>,
+) -> Result<()> {
+    if current.is_empty() && incoming.is_empty() {
+        return Ok(());
+    }
+    let owner = Arc::downgrade(owner);
+    let mut claims = EXTENSION_CLAIMS.lock().expect("SDK extension ownership");
+    claims.retain(|claim| claim.extension.strong_count() > 0);
+    for extension in current.iter().chain(incoming) {
+        let instance = Arc::downgrade(extension);
+        let Some(claim) = claims
+            .iter()
+            .find(|claim| claim.extension.ptr_eq(&instance))
+        else {
+            continue;
+        };
+        let available = match &claim.ownership {
+            ExtensionOwnership::Legacy {
+                installed,
+                pending,
+                shutdown,
+                ..
+            } => {
+                // A former legacy owner may already have shut down the connection.
+                !matches!(shutdown, LegacyShutdown::Running)
+                    && pending.is_empty()
+                    && match installed {
+                        LegacyInstallations::None => true,
+                        LegacyInstallations::One(installed) => installed.ptr_eq(&owner),
+                        LegacyInstallations::Shared => false,
+                    }
+            }
+            ExtensionOwnership::Exclusive {
+                owner: installed,
+                retired,
+            } => {
+                if installed.ptr_eq(&owner) && *retired {
+                    return Err(Error::Config(
+                        "a retired extension instance cannot be reinstalled".into(),
+                    ));
+                }
+                installed.ptr_eq(&owner)
+            }
+        };
+        if !available {
+            drop(claims);
+            return Err(extension_owned_elsewhere(extension.as_ref()));
+        }
+    }
+    for extension in current.iter().chain(incoming) {
+        extension_claim(&mut claims, extension).ownership = ExtensionOwnership::Exclusive {
+            owner: owner.clone(),
+            retired: false,
+        };
+    }
+    Ok(())
+}
+
+fn retire_extension_claims(extensions: &[Arc<dyn Extension>]) {
+    if extensions.is_empty() {
+        return;
+    }
+    let mut claims = EXTENSION_CLAIMS.lock().expect("SDK extension ownership");
+    for extension in extensions {
+        let claim = extension_claim(&mut claims, extension);
+        let ExtensionOwnership::Exclusive { retired, .. } = &mut claim.ownership else {
+            unreachable!("installed reload extension has an exclusive owner");
+        };
+        *retired = true;
+    }
+}
+
+enum ScopedLifecycle<'a> {
+    Start {
+        cancellation: &'a CancellationToken,
+        progress: &'a AtomicUsize,
+    },
+    ReloadShutdown,
+}
 
 struct SessionOwner {
     id: Uuid,
-    pending_start: PendingStart,
+    pending_start: Mutex<Option<PendingStart>>,
     closed: CancellationToken,
     journal: std::sync::Weak<tokio::sync::Mutex<Session>>,
     input: std::sync::Weak<tokio::sync::Mutex<mpsc::Receiver<crate::AgentInput>>>,
@@ -293,6 +703,7 @@ enum IdleChildAction {
 #[derive(Clone)]
 struct IdleInputScope {
     owner: Arc<SessionOwner>,
+    detached_hooks: Option<Weak<InputHooks>>,
     children: mpsc::UnboundedSender<IdleChildRequest>,
     host: Arc<dyn crate::ToolHost>,
     states: crate::ExtensionStates,
@@ -307,6 +718,10 @@ tokio::task_local! {
 }
 
 impl IdleInputScope {
+    fn is_closed(&self) -> bool {
+        self.detached_hooks.is_none() && self.owner.closed.is_cancelled()
+    }
+
     async fn submit(&self, input: crate::AgentInput) -> Result<()> {
         self.submit_action(IdleChildAction::Input(input)).await
     }
@@ -342,7 +757,7 @@ impl crate::ToolHost for ScopedIdleHost {
     fn supports_custom_entries(&self) -> bool {
         !self.scope.lifetime.is_cancelled()
             && !self.scope.cancellation.is_cancelled()
-            && !self.scope.owner.closed.is_cancelled()
+            && !self.scope.is_closed()
     }
     fn supports_custom_entry_read(&self) -> bool {
         self.supports_custom_entries()
@@ -556,11 +971,15 @@ pub struct SessionControl {
     owner: Arc<SessionOwner>,
     input: mpsc::Sender<crate::AgentInput>,
     active: Arc<Mutex<Option<CancellationToken>>>,
+    // Reload spans two admissions. Keep it cancellable without making cloned
+    // input controls interpret the handoff as a streaming model operation.
+    reload_active: Arc<Mutex<Option<CancellationToken>>>,
     shutdown: CancellationToken,
     auto_compaction: crate::AutoCompactionControl,
     retry: crate::RetryControl,
     input_hooks: Arc<Mutex<InputHooks>>,
     input_order: Arc<InputAdmission>,
+    reload_callbacks: Arc<tokio::sync::RwLock<()>>,
     events: Weak<SessionEvents>,
     tool_timeout: std::time::Duration,
 }
@@ -687,6 +1106,13 @@ impl SessionControl {
         local
     }
 
+    fn callback_input_hooks(&self, scope: Option<&IdleInputScope>) -> InputHooks {
+        scope
+            .and_then(|scope| scope.detached_hooks.as_ref()?.upgrade())
+            .map(|hooks| hooks.as_ref().clone())
+            .unwrap_or_else(|| self.input_hooks.lock().expect("SDK input hooks").clone())
+    }
+
     pub fn set_retry_settings(&self, settings: crate::RetrySettings) -> Result<()> {
         let _guard = self.scoped_guard()?;
         if self.input.is_closed() {
@@ -760,7 +1186,7 @@ impl SessionControl {
             return self.enqueue_child(message, scope).await;
         }
         let order = self.input_order.acquire().await?;
-        if self.input.is_closed() {
+        if self.owner.closed.is_cancelled() || self.input.is_closed() {
             return Err(Error::Config("session is closed".into()));
         }
         let hooks = self.input_hooks.lock().expect("SDK input hooks").clone();
@@ -818,7 +1244,7 @@ impl SessionControl {
         }
         scope.depth += 1;
         let id = message.input.id;
-        let hooks = self.input_hooks.lock().expect("SDK input hooks").clone();
+        let hooks = self.callback_input_hooks(Some(&scope));
         if !hooks.extensions.is_empty() {
             let event = crate::InputEvent {
                 text: std::mem::take(&mut message.input.content),
@@ -873,12 +1299,7 @@ impl SessionControl {
         if closed.is_cancelled() {
             return Err(Error::Config("session is closed".into()));
         }
-        let token = self.shutdown.child_token();
-        *self.active.lock().expect("session control") = Some(token.clone());
-        let active = ActiveRun {
-            token,
-            state: self.active.clone(),
-        };
+        let active = ActiveRun::register(&self.active, self.shutdown.child_token());
         let events = self
             .events
             .upgrade()
@@ -928,22 +1349,8 @@ impl SessionControl {
                 )));
             }
         }
-        let startup = self
-            .owner
-            .pending_start
-            .lock()
-            .expect("session startup")
-            .take();
-        if let Some((reason, previous_session_file)) = startup {
-            self.notify_scoped_start(
-                &mut journal,
-                reason,
-                previous_session_file,
-                &active.token,
-                &mut observe,
-            )
+        self.start_pending(&mut journal, &active.token, &mut observe)
             .await?;
-        }
         let (sender, mut incoming) = mpsc::channel(32);
         let host: Arc<dyn crate::ToolHost> = Arc::new(OwnerBoundHost {
             inner: Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true }),
@@ -959,6 +1366,7 @@ impl SessionControl {
         let states = journal.extension_states();
         let scope = IdleInputScope {
             owner: self.owner.clone(),
+            detached_hooks: None,
             children,
             host: host.clone(),
             states: states.clone(),
@@ -976,7 +1384,6 @@ impl SessionControl {
             &mut observe,
             &mut incoming,
             &mut child_requests,
-            closed,
             &scope,
             future,
         )
@@ -1034,22 +1441,76 @@ impl SessionControl {
         Ok(id)
     }
 
-    async fn notify_scoped_start(
+    async fn start_pending(
         &self,
         journal: &mut Session,
-        reason: crate::SessionStartReason,
-        previous_session_file: Option<PathBuf>,
         cancellation: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
-        let config = self.owner.config.lock().expect("run config").clone();
-        let registry = config
-            .registry
-            .upgrade()
-            .ok_or_else(|| Error::Config("session is closed".into()))?;
+        let startup = self
+            .owner
+            .pending_start
+            .lock()
+            .expect("session startup")
+            .as_mut()
+            .map(|startup| {
+                startup.begun = true;
+                startup.clone()
+            });
+        if let Some(startup) = startup {
+            let registry = self
+                .owner
+                .config
+                .lock()
+                .expect("run config")
+                .registry
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            self.notify_scoped_lifecycle(
+                &registry,
+                journal,
+                crate::LifecycleEvent::SessionStart {
+                    reason: startup.reason,
+                    previous_session_file: startup.previous_session_file,
+                },
+                ScopedLifecycle::Start {
+                    cancellation,
+                    progress: &startup.completed_hooks,
+                },
+                observer,
+            )
+            .await?;
+            self.owner
+                .pending_start
+                .lock()
+                .expect("session startup")
+                .take();
+        }
+        Ok(())
+    }
+
+    async fn notify_scoped_lifecycle(
+        &self,
+        registry: &Registry,
+        journal: &mut Session,
+        event: crate::LifecycleEvent,
+        delivery: ScopedLifecycle<'_>,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
         if !registry.has_session_lifecycle_hooks() {
             return Ok(());
         }
+        let (cancellation, progress, detached_hooks) = match delivery {
+            ScopedLifecycle::Start {
+                cancellation,
+                progress,
+            } => (cancellation.clone(), Some(progress), None),
+            ScopedLifecycle::ReloadShutdown => (
+                CancellationToken::new(),
+                None,
+                Some(Arc::new(InputHooks::new(registry, journal))),
+            ),
+        };
         let states = journal.extension_states();
         let (sender, mut incoming) = mpsc::channel(32);
         let host: Arc<dyn crate::ToolHost> = Arc::new(OwnerBoundHost {
@@ -1059,58 +1520,45 @@ impl SessionControl {
         let (children, mut child_requests) = mpsc::unbounded_channel();
         let scope = IdleInputScope {
             owner: self.owner.clone(),
+            detached_hooks: detached_hooks.as_ref().map(Arc::downgrade),
             children,
             host: host.clone(),
             states: states.clone(),
-            cancellation: cancellation.clone(),
+            cancellation,
             lifetime: CancellationToken::new(),
             gate: Arc::new(Mutex::new(())),
             depth: 0,
         };
-        let mut errors = Vec::new();
-        let mut collect = |event: Notification<'_>| {
-            if let Notification::ExtensionLifecycleError {
-                extension,
-                event,
-                message,
-            } = event
-            {
-                errors.push((extension.to_owned(), event, message.to_owned()));
-            }
+        // Both lanes share the observer so a completed hook's error is
+        // delivered before cancellation can drop the rest of startup.
+        let observer = Mutex::new(observer);
+        let observe = |event: Notification<'_>| {
+            observer.lock().expect("SDK lifecycle observer")(event);
         };
+        let mut lifecycle_observer = observe;
+        let mut journal_observer = observe;
         let future = IDLE_INPUT_SCOPE.scope(scope.clone(), async {
-            crate::lifecycle::notify_with_host(
-                &registry,
-                crate::LifecycleEvent::SessionStart {
-                    reason,
-                    previous_session_file,
-                },
+            crate::lifecycle::notify_with_host_from(
+                registry,
+                event,
                 &states,
-                config.limits.tool_timeout,
-                &mut collect,
+                self.tool_timeout,
+                &mut lifecycle_observer,
                 host,
+                progress,
             )
             .await;
             Ok(())
         });
         pump_idle_callback(
             journal,
-            observer,
+            &mut journal_observer,
             &mut incoming,
             &mut child_requests,
-            &self.owner.closed,
             &scope,
             future,
         )
-        .await?;
-        for (extension, event, message) in &errors {
-            observer(Notification::ExtensionLifecycleError {
-                extension,
-                event,
-                message,
-            });
-        }
-        Ok(())
+        .await
     }
 
     /// Send custom context during an active operation, acknowledged after journaling.
@@ -1151,13 +1599,23 @@ impl SessionControl {
                 "idle input callback nesting limit exceeded".into(),
             ));
         }
+        // The journal acknowledgement can precede the end of this callback.
+        let _callback = if scope.is_none() {
+            Some(tokio::select! {
+                biased;
+                _ = self.owner.closed.cancelled() => return Err(Error::Config("session is closed".into())),
+                guard = self.reload_callbacks.read() => guard,
+            })
+        } else {
+            None
+        };
         let name = crate::sanitize_session_name(&name.into());
         self.queue_control(|reply| crate::AgentInput::SetSessionName {
             name: name.clone(),
             reply,
         })
         .await?;
-        let hooks = self.input_hooks.lock().expect("SDK input hooks").clone();
+        let hooks = self.callback_input_hooks(scope.as_ref());
         if let Some(registry) = hooks.lifecycle {
             let events = self.events.upgrade();
             let mut observe = |notification: Notification<'_>| {
@@ -1204,7 +1662,11 @@ impl SessionControl {
                 .map_err(|_| Error::Config("queue control response was lost".into()))?;
         }
         let token = {
-            let _order = self.input_order.acquire().await?;
+            let _order = tokio::select! {
+                biased;
+                _ = self.owner.closed.cancelled() => return Err(Error::Config("session is closed".into())),
+                order = self.input_order.acquire() => order?,
+            };
             let state = self.active.lock().expect("session control");
             let active = state.as_ref().ok_or_else(|| {
                 Error::Config(
@@ -1230,8 +1692,10 @@ impl SessionControl {
         let Ok(_guard) = self.scoped_guard() else {
             return;
         };
-        if let Some(active) = self.active.lock().expect("session control").as_ref() {
-            active.cancel();
+        for operation in [&self.reload_active, &self.active] {
+            if let Some(active) = operation.lock().expect("session control").as_ref() {
+                active.cancel();
+            }
         }
     }
 
@@ -1399,6 +1863,8 @@ impl SessionBuilder {
         self.system_prompt = prompt.into();
         self
     }
+    /// Supply an extension registry. Sharing instances across SDK sessions is
+    /// supported for ordinary use. Reload requires unshared instances.
     pub fn registry(mut self, registry: Registry) -> Self {
         self.registry = registry;
         self
@@ -1489,6 +1955,7 @@ impl SessionBuilder {
         if self.model_name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
         }
+        let extension_registration_scope = Arc::new(());
         let reservation = self
             .registry
             .reserve_startup_model_bindings(session.session_id())?;
@@ -1595,6 +2062,10 @@ impl SessionBuilder {
         // qualified choice before its first request, while leaving existing
         // historical selections (including unqualified ones) untouched.
         let initial_selection = session.model_identity_at(session.head()).is_none();
+        let extension_registration = LegacyExtensionReservation::reserve(
+            &self.registry.extensions,
+            &extension_registration_scope,
+        )?;
         self.registry.commit_session_model_bindings(
             &reservation,
             bindings,
@@ -1611,6 +2082,7 @@ impl SessionBuilder {
                 Ok(())
             },
         )?;
+        extension_registration.commit();
         drop(reservation);
         if let Some((provider, name, client)) = resolved {
             self.model = client;
@@ -1654,10 +2126,12 @@ impl SessionBuilder {
         let mut registry = self.registry;
         registry.isolate_mcp_runtime();
         let registry = Arc::new(registry);
-        let pending_start = Arc::new(Mutex::new(Some((crate::SessionStartReason::Startup, None))));
         let owner = Arc::new(SessionOwner {
             id: Uuid::new_v4(),
-            pending_start: pending_start.clone(),
+            pending_start: Mutex::new(Some(PendingStart::new(
+                crate::SessionStartReason::Startup,
+                None,
+            ))),
             closed: CancellationToken::new(),
             journal: Arc::downgrade(&session),
             input: Arc::downgrade(&input),
@@ -1676,7 +2150,9 @@ impl SessionBuilder {
             model_identity_resolved,
             system_prompt: self.system_prompt,
             registry,
-            extension_registration_scope: Arc::new(()),
+            extension_registration_scope,
+            exclusive_extensions: false,
+            retired_extensions: Vec::new(),
             limits: self.limits,
             session_id,
             session,
@@ -1688,16 +2164,19 @@ impl SessionBuilder {
                 owner,
                 input: sender,
                 active: Arc::new(Mutex::new(None)),
+                reload_active: Arc::new(Mutex::new(None)),
                 shutdown: CancellationToken::new(),
                 auto_compaction,
                 retry,
                 input_hooks,
                 input_order: Arc::new(InputAdmission::default()),
+                reload_callbacks: Arc::new(tokio::sync::RwLock::new(())),
                 events: weak_events,
                 tool_timeout,
             },
             closed: false,
-            pending_start,
+            close_shutdown: None,
+            reload_shutdown: None,
             session_file: None,
             model_fallback,
             historical_model_resolver: self.historical_model_resolver,
@@ -1706,8 +2185,15 @@ impl SessionBuilder {
     }
 }
 
-/// A session owns its model, registry and journal for its entire lifetime.
-/// Use cloned controls while `prompt` is awaited, and call `close` for asynchronous cleanup.
+struct ReloadShutdown {
+    result: Result<()>,
+    retired: Vec<Arc<dyn Extension>>,
+}
+
+/// A session owns its model, registry and journal. The host can reload the registry while idle.
+/// Use cloned controls while `prompt` is awaited. Await `close` for Quit hooks
+/// and asynchronous cleanup of the current registry. Dropping the session lets
+/// an accepted reload or close finish its cleanup on the running executor.
 pub struct AgentSession {
     model: Arc<dyn Model>,
     model_name: String,
@@ -1716,6 +2202,8 @@ pub struct AgentSession {
     system_prompt: String,
     registry: Arc<Registry>,
     extension_registration_scope: Arc<()>,
+    exclusive_extensions: bool,
+    retired_extensions: Vec<Arc<dyn Extension>>,
     limits: Limits,
     session_id: Uuid,
     session: Arc<tokio::sync::Mutex<Session>>,
@@ -1724,7 +2212,8 @@ pub struct AgentSession {
     events: Option<Arc<SessionEvents>>,
     tool_progress: Option<broadcast::Sender<Arc<ToolProgressUpdate>>>,
     closed: bool,
-    pending_start: PendingStart,
+    close_shutdown: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
+    reload_shutdown: Option<tokio::sync::oneshot::Receiver<ReloadShutdown>>,
     session_file: Option<PathBuf>,
     model_fallback: Option<HistoricalModelFallback>,
     historical_model_resolver: Option<Arc<dyn HistoricalModelResolver>>,
@@ -1955,6 +2444,7 @@ impl AgentSession {
         self.control.clone()
     }
     /// A slow subscriber receives a broadcast lag error instead of blocking execution.
+    /// Once close begins teardown, new subscribers receive a closed channel.
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         match &self.events {
             Some(events) => events.regular.subscribe(),
@@ -2676,6 +3166,263 @@ impl AgentSession {
         self.refresh_run_config();
         Ok(())
     }
+    /// Install a fully prepared extension registry and optional base prompt.
+    ///
+    /// This operation accepts an idle, settled session with no live forks sharing
+    /// its extension connections. The caller retains the candidate on rejection.
+    /// Acceptance gives this session's fork family exclusive lifecycle ownership
+    /// of its current and replacement instances. Instances that have been
+    /// installed in another SDK session cannot participate in an owned reload.
+    /// Preparation and permission decisions belong to the host. An absent prompt
+    /// keeps the current prompt. An absent candidate tool selection keeps the
+    /// current explicit selection for tools still registered.
+    ///
+    /// Started sessions finish notifying the old registry of shutdown before
+    /// starting the replacement. Once accepted, old shutdown runs to completion
+    /// within its hook timeout even if the caller aborts or drops this future.
+    /// The replacement remains installed. The next startup attempt resumes at
+    /// the first unfinished hook.
+    pub async fn reload(&mut self, update: &crate::RegistryUpdate) -> Result<()> {
+        self.ensure_open()?;
+        if Arc::strong_count(&self.extension_registration_scope) != 1 {
+            return Err(Error::Config(
+                "close sessions sharing these extension connections before reloading".into(),
+            ));
+        }
+        let order = self.control.input_order.try_acquire()?;
+        let callbacks = self
+            .control
+            .reload_callbacks
+            .clone()
+            .try_write_owned()
+            .map_err(|_| Error::Session("session extension callback is in use".into()))?;
+        let mut journal = self
+            .session
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| Error::Session("session journal is in use".into()))?;
+        self.finish_reload_shutdown().await?;
+        if self.control.shutdown.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        journal.ensure_reloadable()?;
+        let started = {
+            let startup = self
+                .control
+                .owner
+                .pending_start
+                .lock()
+                .expect("session startup");
+            if startup.as_ref().is_some_and(|startup| {
+                startup.begun || matches!(startup.reason, crate::SessionStartReason::Reload)
+            }) {
+                return Err(Error::Session(
+                    "finish the pending session start before reloading again".into(),
+                ));
+            }
+            startup.is_none()
+        };
+
+        let mut registry = update.registry.clone();
+        registry.prepare_session_reload(&self.registry);
+        claim_exclusive_extensions(
+            &self.registry.extensions,
+            &registry.extensions,
+            &self.extension_registration_scope,
+        )?;
+        self.exclusive_extensions = true;
+        let reload = ActiveRun::register(
+            &self.control.reload_active,
+            self.control.shutdown.child_token(),
+        );
+        let mut retired = std::mem::take(&mut self.retired_extensions);
+        let first_removed = retired.len();
+        retired.extend(
+            self.registry
+                .extensions
+                .iter()
+                .filter(|extension| !registry.contains_extension_instance(extension))
+                .cloned(),
+        );
+        retire_extension_claims(&retired[first_removed..]);
+        let registry = Arc::new(registry);
+        let old_registry = std::mem::replace(&mut self.registry, registry.clone());
+        if let Some(prompt) = &update.system_prompt {
+            self.system_prompt = prompt.clone();
+        }
+        self.refresh_run_config();
+        if started {
+            *self
+                .control
+                .owner
+                .pending_start
+                .lock()
+                .expect("session startup") = Some(PendingStart::new(
+                crate::SessionStartReason::Reload,
+                self.session_file.clone(),
+            ));
+        }
+
+        // Once accepted, finish old shutdown even if the caller stops waiting.
+        // Keep admission and the journal until old hooks and resource cleanup
+        // finish. Scoped child controls continue to use the old input hooks.
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.reload_shutdown = Some(receive);
+        let control = self.control.clone();
+        let events = self.events.as_ref().expect("open session").clone();
+        let target_session_file = self.session_file.clone();
+        let shutdown = async move {
+            let result = if started {
+                control
+                    .notify_scoped_lifecycle(
+                        &old_registry,
+                        &mut journal,
+                        crate::LifecycleEvent::SessionShutdown {
+                            reason: crate::SessionShutdownReason::Reload,
+                            target_session_file,
+                        },
+                        ScopedLifecycle::ReloadShutdown,
+                        &mut |event| {
+                            control.observe(&event);
+                            emit(&events, &event);
+                        },
+                    )
+                    .await
+            } else {
+                Ok(())
+            };
+            {
+                let mut hooks = control.input_hooks.lock().expect("SDK input hooks");
+                if !control.owner.closed.is_cancelled() {
+                    *hooks = InputHooks::new(&registry, &journal);
+                }
+            }
+            drop(old_registry);
+            drop(registry);
+            Self::dispose_retired_extensions(&mut retired, control.tool_timeout, Some(&events))
+                .await;
+            drop(journal);
+            drop(callbacks);
+            drop(order);
+            let _ = send.send(ReloadShutdown { result, retired });
+        };
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        tokio::spawn(shutdown);
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        wasm_bindgen_futures::spawn_local(shutdown);
+
+        self.finish_reload_shutdown().await?;
+        if reload.token.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if started {
+            // A cloned control may deliver the same pending startup first.
+            let (order, mut journal) = tokio::select! {
+                biased;
+                _ = reload.token.cancelled() => return Err(Error::Cancelled),
+                result = async {
+                    let order = self.control.input_order.acquire().await?;
+                    Ok::<_, Error>((order, self.session.lock().await))
+                } => result?,
+            };
+            self.control
+                .start_pending(&mut journal, &reload.token, &mut |event| {
+                    self.control.observe(&event);
+                    emit(self.events.as_ref().expect("open session"), &event);
+                })
+                .await?;
+            drop(journal);
+            drop(order);
+            self.drain_idle_triggers().await?;
+        }
+        if reload.token.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        Ok(())
+    }
+
+    async fn finish_reload_shutdown(&mut self) -> Result<()> {
+        let Some(shutdown) = &mut self.reload_shutdown else {
+            return Ok(());
+        };
+        let result = shutdown.await;
+        self.reload_shutdown = None;
+        let shutdown =
+            result.map_err(|_| Error::Session("extension reload shutdown task failed".into()))?;
+        self.retired_extensions = shutdown.retired;
+        shutdown.result
+    }
+
+    // Shut down eligible connections in reverse registration order. A host
+    // snapshot can keep one connection alive while others are ready to close.
+    async fn dispose_retired_extensions(
+        retired: &mut Vec<Arc<dyn Extension>>,
+        timeout: std::time::Duration,
+        events: Option<&SessionEvents>,
+    ) {
+        for index in (0..retired.len()).rev() {
+            let extension = &retired[index];
+            if Arc::strong_count(extension) != 1 {
+                continue;
+            }
+            let failure =
+                Self::shutdown_extension(extension, timeout, &ExtensionShutdown::Exclusive)
+                    .await
+                    .err();
+            if let Some(message) = failure
+                && let Some(events) = events
+            {
+                emit(
+                    events,
+                    &Notification::ExtensionLifecycleError {
+                        extension: extension.id(),
+                        event: "shutdown",
+                        message: &message,
+                    },
+                );
+            }
+            retired.remove(index);
+        }
+    }
+
+    async fn shutdown_extension(
+        extension: &Arc<dyn Extension>,
+        timeout: std::time::Duration,
+        ownership: &ExtensionShutdown,
+    ) -> crate::ExtensionResult<()> {
+        let mut waiting_for_legacy = match ownership {
+            ExtensionShutdown::Exclusive => None,
+            ExtensionShutdown::Legacy(owner) => Some(owner),
+        };
+        let shutdown = async {
+            let _reservation = if let Some(owner) = waiting_for_legacy {
+                let reservation = LegacyShutdownReservation::acquire(extension, owner, false).await;
+                waiting_for_legacy = None;
+                let Some(reservation) = reservation else {
+                    return Ok(());
+                };
+                Some(reservation)
+            } else {
+                None
+            };
+            extension.shutdown().await
+        };
+        match platform_time::timeout(timeout, shutdown).await {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(owner) = waiting_for_legacy
+                    && let Some(cleanup) = defer_legacy_shutdown(extension, owner, timeout)
+                {
+                    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                    tokio::spawn(cleanup);
+                    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                    wasm_bindgen_futures::spawn_local(cleanup);
+                }
+                Err("extension shutdown timed out".into())
+            }
+        }
+    }
+
     /// Register before forking. Forks share the existing registry and its connections.
     pub fn register_extension(&mut self, extension: Arc<dyn Extension>) -> Result<()> {
         self.ensure_open()?;
@@ -2686,10 +3433,23 @@ impl AgentSession {
                 "register extensions before sharing this session with a fork".into(),
             ));
         }
-        let result = Arc::make_mut(&mut self.registry).register(extension);
+        let journal = self
+            .session
+            .try_lock()
+            .map_err(|_| Error::Session("session journal is in use".into()))?;
+        let mut registry = self.registry.as_ref().clone();
+        registry.register(extension.clone())?;
+        let instances = std::slice::from_ref(&extension);
+        if self.exclusive_extensions {
+            claim_exclusive_extensions(&[], instances, &self.extension_registration_scope)?;
+        } else {
+            LegacyExtensionReservation::reserve(instances, &self.extension_registration_scope)?
+                .commit();
+        }
+        self.registry = Arc::new(registry);
         self.refresh_run_config();
-        result?;
-        self.refresh_input_hooks()?;
+        *self.control.input_hooks.lock().expect("SDK input hooks") =
+            InputHooks::new(&self.registry, &journal);
         Ok(())
     }
     /// Server declarations owned by the loaded extensions.
@@ -3236,6 +3996,7 @@ impl AgentSession {
         bool,
     )> {
         self.ensure_open()?;
+        self.finish_reload_shutdown().await?;
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
@@ -3296,12 +4057,9 @@ impl AgentSession {
                 )));
             }
         }
-        let startup = if defer_startup || resume_preflight {
-            None
+        let startup_result = if defer_startup || resume_preflight {
+            Ok(())
         } else {
-            self.pending_start.lock().expect("session startup").take()
-        };
-        let startup_result = if let Some((reason, previous_session_file)) = startup {
             let active = self.begin_run();
             let events = self.events.as_ref().expect("open session").clone();
             let mut observe = |event: Notification<'_>| {
@@ -3309,16 +4067,8 @@ impl AgentSession {
                 emit(&events, &event);
             };
             self.control
-                .notify_scoped_start(
-                    &mut journal,
-                    reason,
-                    previous_session_file,
-                    &active.token,
-                    &mut observe,
-                )
+                .start_pending(&mut journal, &active.token, &mut observe)
                 .await
-        } else {
-            Ok(())
         };
         drop(journal);
         drop(order);
@@ -3754,6 +4504,7 @@ impl AgentSession {
         fork_registry.isolate_mcp_runtime();
         fork.registry = Arc::new(fork_registry);
         fork.extension_registration_scope = self.extension_registration_scope.clone();
+        fork.exclusive_extensions = self.exclusive_extensions;
         match resolution {
             BranchResolution::Cycled {
                 selection, client, ..
@@ -3831,8 +4582,15 @@ impl AgentSession {
         fork.historical_model_resolver = self.historical_model_resolver.clone();
         fork.cycled_model_resolver = self.cycled_model_resolver.clone();
         fork.refresh_run_config();
-        *fork.pending_start.lock().expect("session startup") =
-            Some((crate::SessionStartReason::Fork, self.session_file.clone()));
+        *fork
+            .control
+            .owner
+            .pending_start
+            .lock()
+            .expect("session startup") = Some(PendingStart::new(
+            crate::SessionStartReason::Fork,
+            self.session_file.clone(),
+        ));
         fork.refresh_input_hooks()?;
         Ok(fork)
     }
@@ -4359,47 +5117,113 @@ impl AgentSession {
         let triggered = self.drain_idle_triggers().await.map(|_| ());
         result.and(triggered)
     }
+    /// Wait for accepted reload shutdown and send Quit to this session's
+    /// started extensions before releasing SDK-owned connections. Once close
+    /// begins teardown, dropping the waiter leaves that work running. Calling
+    /// close again waits for the same teardown.
     pub async fn close(&mut self) -> Result<()> {
-        if self.closed {
+        if !self.closed {
+            let reload_result = self.finish_reload_shutdown().await;
+            self.closed = true;
+            drop(self.tool_progress.take());
+            self.control.owner.closed.cancel();
+            self.control.request_shutdown();
+
+            let registry = std::mem::take(&mut self.registry);
+            let registration_scope = std::mem::take(&mut self.extension_registration_scope);
+            let exclusive_extensions = self.exclusive_extensions;
+            let mut retired = std::mem::take(&mut self.retired_extensions);
+            let control = self.control.clone();
+            let session = self.session.clone();
+            let input = self.input.clone();
+            let events = self.events.take();
+            let timeout = self.limits.tool_timeout;
+            let session_id = self.session_id;
+            let (send, receive) = tokio::sync::oneshot::channel();
+            self.close_shutdown = Some(receive);
+
+            let shutdown = async move {
+                {
+                    let mut input = input.lock().await;
+                    input.close();
+                    while input.try_recv().is_ok() {}
+                }
+                let notification_result = {
+                    // A rename can outlive its journal acknowledgement. Drain
+                    // that callback lane before Quit or connection shutdown.
+                    let _callbacks = control.reload_callbacks.write().await;
+                    *control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
+                    // Let cancelled cloned controls leave the final startup cursor.
+                    let mut journal = session.lock().await;
+                    let completed = control
+                        .owner
+                        .pending_start
+                        .lock()
+                        .expect("session startup")
+                        .as_ref()
+                        .map(|startup| startup.completed_hooks.load(Ordering::Relaxed));
+                    let result = if completed != Some(0) && registry.has_session_lifecycle_hooks() {
+                        crate::lifecycle::notify_idle_session_entries(
+                            &registry,
+                            &mut journal,
+                            crate::LifecycleEvent::SessionShutdown {
+                                reason: crate::SessionShutdownReason::Quit,
+                                target_session_file: None,
+                            },
+                            timeout,
+                            &mut |notification| {
+                                if let Some(events) = &events {
+                                    emit(events, &notification);
+                                }
+                            },
+                            completed,
+                        )
+                        .await
+                    } else {
+                        Ok(())
+                    };
+                    // A new owner can reopen the same UUID as soon as the
+                    // journal writer is released, and install new bindings.
+                    registry.remove_session_branch_models(session_id);
+                    journal.close_store();
+                    result
+                };
+                let mut failure = None;
+                if let Some(shutdown) =
+                    ExtensionShutdown::release(&registry, registration_scope, exclusive_extensions)
+                {
+                    for extension in registry.extensions.iter().rev() {
+                        let result = Self::shutdown_extension(extension, timeout, &shutdown).await;
+                        if let Err(error) = crate::extension::hook(extension.as_ref(), result) {
+                            failure.get_or_insert(error);
+                        }
+                    }
+                }
+                Self::dispose_retired_extensions(&mut retired, timeout, events.as_deref()).await;
+                drop(registry);
+                drop(retired);
+                drop(session);
+                if let Some(events) = events {
+                    let _ = events.regular.send(SessionEvent::Closed);
+                }
+                let _ = send.send(
+                    reload_result
+                        .and(notification_result)
+                        .and(failure.map_or(Ok(()), Err)),
+                );
+            };
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            tokio::spawn(shutdown);
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            wasm_bindgen_futures::spawn_local(shutdown);
+        }
+
+        let Some(shutdown) = &mut self.close_shutdown else {
             return Ok(());
-        }
-        self.closed = true;
-        drop(self.tool_progress.take());
-        self.control.owner.closed.cancel();
-        self.control.abort();
-        {
-            let mut input = self.input.lock().await;
-            input.close();
-            while input.try_recv().is_ok() {}
-        }
-        *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
-        let started = self
-            .pending_start
-            .lock()
-            .expect("session startup")
-            .is_none();
-        let notification_result = if started {
-            self.notify_session_event(crate::LifecycleEvent::SessionShutdown {
-                reason: crate::SessionShutdownReason::Quit,
-                target_session_file: None,
-            })
-            .await
-        } else {
-            Ok(())
         };
-        let registry = std::mem::replace(&mut self.registry, Arc::new(Registry::default()));
-        let registration_scope =
-            std::mem::replace(&mut self.extension_registration_scope, Arc::new(()));
-        let last_session = Arc::into_inner(registration_scope).is_some();
-        let result = if last_session && Arc::strong_count(&registry) == 1 {
-            registry.shutdown().await
-        } else {
-            Ok(())
-        };
-        if let Some(events) = self.events.take() {
-            let _ = events.regular.send(SessionEvent::Closed);
-        }
-        notification_result.and(result)
+        let result = shutdown.await;
+        self.close_shutdown = None;
+        result.map_err(|_| Error::Session("session shutdown task did not complete".into()))?
     }
     fn refresh_run_config(&self) {
         *self.control.owner.config.lock().expect("run config") = RunConfig {
@@ -4431,12 +5255,16 @@ impl AgentSession {
         }
     }
     fn begin_run(&self) -> ActiveRun {
-        let token = self.control.shutdown.child_token();
-        *self.control.active.lock().expect("session control") = Some(token.clone());
-        ActiveRun {
-            token,
-            state: self.control.active.clone(),
-        }
+        // A run triggered by reload inherits cancellation from the handoff.
+        let token = self
+            .control
+            .reload_active
+            .lock()
+            .expect("session control")
+            .as_ref()
+            .unwrap_or(&self.control.shutdown)
+            .child_token();
+        ActiveRun::register(&self.control.active, token)
     }
 }
 impl Drop for AgentSession {
@@ -4490,7 +5318,6 @@ async fn pump_idle_callback<T, F>(
         tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     )>,
     children: &mut mpsc::UnboundedReceiver<IdleChildRequest>,
-    closed: &CancellationToken,
     scope: &IdleInputScope,
     future: F,
 ) -> Result<T>
@@ -4513,7 +5340,7 @@ where
     loop {
         tokio::select! {
             biased;
-            _ = closed.cancelled() => return Err(entry_error.take().unwrap_or_else(|| Error::Config("session is closed".into()))),
+            _ = scope.owner.closed.cancelled(), if scope.detached_hooks.is_none() => return Err(entry_error.take().unwrap_or_else(|| Error::Config("session is closed".into()))),
             _ = scope.cancellation.cancelled() => return Err(entry_error.take().unwrap_or(Error::Cancelled)),
             result = &mut future => return match entry_error { Some(error) => Err(error), None => result },
             work = async {
@@ -4531,13 +5358,16 @@ where
                 };
                 match result {
                     Ok(()) => { let _ = reply.send(Ok(())); }
-                    Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                    Err(error) => {
+                        let _ = reply.send(Err(error.to_string()));
+                        entry_error.get_or_insert(error);
+                    }
                 }
             }
             Work::Child(child) => {
                 if child.reply.is_closed() { continue; }
                 let guard = child.gate.lock().expect("idle scope gate");
-                if child.lifetime.is_cancelled() || scope.cancellation.is_cancelled() || closed.is_cancelled() {
+                if child.lifetime.is_cancelled() || scope.cancellation.is_cancelled() || scope.is_closed() {
                     let _ = child.reply.send(Err(Error::Cancelled));
                     continue;
                 }
@@ -4568,7 +5398,7 @@ where
                         if reply.is_closed() { let _ = child.reply.send(Ok(())); continue; }
                         tokio::select! {
                             biased;
-                            _ = closed.cancelled() => return Err(entry_error.take().unwrap_or_else(|| Error::Config("session is closed".into()))),
+                            _ = scope.owner.closed.cancelled(), if scope.detached_hooks.is_none() => return Err(entry_error.take().unwrap_or_else(|| Error::Config("session is closed".into()))),
                             _ = scope.cancellation.cancelled() => return Err(entry_error.take().unwrap_or(Error::Cancelled)),
                             result = &mut future => return match entry_error { Some(error) => Err(error), None => result },
                             _ = child.lifetime.cancelled() => { let _ = child.reply.send(Err(Error::Cancelled)); },
@@ -4608,6 +5438,7 @@ async fn prepare_idle_input_with_host(
         let (children, mut child_requests) = mpsc::unbounded_channel();
         let scope = IdleInputScope {
             owner: control.owner.clone(),
+            detached_hooks: None,
             children,
             host: host.clone(),
             states: states.clone(),
@@ -4625,7 +5456,6 @@ async fn prepare_idle_input_with_host(
             observer,
             &mut incoming,
             &mut child_requests,
-            &control.owner.closed,
             &scope,
             future,
         )
@@ -4659,6 +5489,14 @@ struct ActiveRun {
     state: Arc<Mutex<Option<CancellationToken>>>,
 }
 impl ActiveRun {
+    fn register(state: &Arc<Mutex<Option<CancellationToken>>>, token: CancellationToken) -> Self {
+        *state.lock().expect("session control") = Some(token.clone());
+        Self {
+            token,
+            state: state.clone(),
+        }
+    }
+
     fn finish_inputs(
         &self,
         session: &mut Session,
@@ -4788,6 +5626,9 @@ fn emit(events: &SessionEvents, notification: &Notification<'_>) {
 }
 
 #[cfg(test)]
+mod reload_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ModelEvent, ModelStream, ToolHost};
@@ -4879,6 +5720,7 @@ mod tests {
         let lifetime = CancellationToken::new();
         let scope = IdleInputScope {
             owner: session.controls().owner.clone(),
+            detached_hooks: None,
             children,
             host: inner.clone(),
             states: Default::default(),
@@ -14981,6 +15823,7 @@ mod tests {
             let (children_sender, mut children) = mpsc::unbounded_channel();
             let scope = IdleInputScope {
                 owner: control.owner.clone(),
+                detached_hooks: None,
                 children: children_sender.clone(),
                 host: Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true }),
                 states: Default::default(),
@@ -15023,7 +15866,6 @@ mod tests {
                 &mut |_| {},
                 &mut incoming,
                 &mut children,
-                &control.owner.closed,
                 &scope,
                 future,
             )

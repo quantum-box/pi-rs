@@ -200,7 +200,10 @@ pub fn configure<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_rs_core::{ModelEvent, ModelRequest, ModelStream};
+    use pi_rs_core::{
+        Extension, Message, ModelEvent, ModelRequest, ModelStream, Outcome, Registry,
+        RegistryUpdate, Tool, ToolContext, ToolSpec,
+    };
     use tauri::Manager;
 
     struct Fixture;
@@ -391,6 +394,152 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tauri::command]
+    async fn reload_host_profile(
+        state: tauri::State<'_, AppState>,
+        profile: tauri::State<'_, RegistryUpdate>,
+    ) -> Result<(), String> {
+        let mut session = state.session.lock().await;
+        if *state.closing.borrow() {
+            return Err("session is closing".into());
+        }
+        session
+            .as_mut()
+            .ok_or_else(|| "session is closed".to_owned())?
+            .reload(profile.inner())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn mock_ipc_reloads_host_profile_in_the_managed_session() {
+        #[derive(Default)]
+        struct CapturingModel(std::sync::Mutex<Vec<ModelRequest>>);
+
+        #[async_trait::async_trait]
+        impl Model for CapturingModel {
+            async fn stream(&self, request: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+                self.0.lock().unwrap().push(request.clone());
+                Fixture.stream(request).await
+            }
+        }
+
+        struct ProfileExtension(&'static str);
+        impl Extension for ProfileExtension {
+            fn id(&self) -> &str {
+                "host-profile"
+            }
+
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                vec![Arc::new(ProfileTool(self.0))]
+            }
+        }
+
+        struct ProfileTool(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for ProfileTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.0.into(),
+                    description: "Host-approved fixture tool".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }
+            }
+
+            async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+                Outcome::Succeeded(self.0.into())
+            }
+        }
+
+        let model = Arc::new(CapturingModel::default());
+        let session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(ProfileExtension("host_before_tool")))
+            .unwrap()
+            .system_prompt("host before prompt")
+            .in_memory()
+            .unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(session_state_from_session(session))
+            .manage(RegistryUpdate {
+                registry: Registry::compose(
+                    vec![Arc::new(ProfileExtension("host_after_tool"))],
+                    &Default::default(),
+                )
+                .unwrap(),
+                system_prompt: Some("host after prompt".into()),
+            })
+            .invoke_handler(tauri::generate_handler![
+                commands::prompt,
+                reload_host_profile,
+                commands::close
+            ])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let invoke = |command, body| {
+            tauri::test::get_ipc_response(&webview, request(command, body)).unwrap()
+        };
+        let checkpoint = || {
+            tauri::async_runtime::block_on(async {
+                let state = app.state::<AppState>();
+                let session = state.session.lock().await;
+                let session = session.as_ref().unwrap();
+                let head = session.journal().unwrap().head();
+                (session.session_id().unwrap(), head)
+            })
+        };
+
+        assert_eq!(
+            invoke("prompt", serde_json::json!({"text":"before reload"}))
+                .deserialize::<String>()
+                .unwrap(),
+            "fixture answer"
+        );
+        let before_reload = checkpoint();
+        // Extra IPC keys cannot override the profile managed by the native host.
+        invoke(
+            "reload_host_profile",
+            serde_json::json!({
+                "extensionPath": "/webview-chosen/extension",
+                "systemPrompt": "webview override",
+            }),
+        );
+        assert_eq!(checkpoint(), before_reload);
+        assert_eq!(
+            invoke("prompt", serde_json::json!({"text":"after reload"}))
+                .deserialize::<String>()
+                .unwrap(),
+            "fixture answer"
+        );
+        invoke("close", serde_json::json!({}));
+
+        let requests = model.0.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (request, prompt, tool) in [
+            (&requests[0], "host before prompt", "host_before_tool"),
+            (&requests[1], "host after prompt", "host_after_tool"),
+        ] {
+            assert!(matches!(
+                request.messages.first(),
+                Some(Message::System { content }) if content == prompt
+            ));
+            assert_eq!(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                [tool]
+            );
+        }
+        assert!(requests[1].messages.iter().any(|message| matches!(
+            message,
+            Message::User { content } if content == "before reload"
+        )));
     }
 
     #[test]
@@ -624,11 +773,67 @@ mod close_cancellation_test {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         task.abort();
-        release.notify_one();
-        let result = tauri::async_runtime::block_on(commands::close(app.state::<AppState>()));
+        assert!(tauri::async_runtime::block_on(task).is_err());
+        let result = tauri::async_runtime::block_on(async {
+            let mut reentered = Box::pin(commands::close(app.state::<AppState>()));
+            assert!(futures_util::poll!(&mut reentered).is_pending());
+            assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+            release.notify_one();
+            reentered.await
+        });
         assert!(result.is_ok());
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
     }
+    #[test]
+    fn tauri_reenters_pending_sdk_close_after_cancelling_the_waiter() {
+        let (sender, entered) = std::sync::mpsc::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut session = SessionBuilder::new(Arc::new(Fixture), "fixture")
+            .extension(Arc::new(BlockingShutdown {
+                entered: std::sync::Mutex::new(Some(sender)),
+                release: release.clone(),
+                completed: completed.clone(),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        tauri::async_runtime::block_on(session.start()).unwrap();
+        let mut events = session.subscribe();
+        let app = tauri::test::mock_builder()
+            .manage(session_state_from_session(session))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let handle = app.handle().clone();
+        let waiter = tauri::async_runtime::spawn(async move {
+            let state = handle.state::<AppState>();
+            let mut session = state.session.lock().await;
+            session.as_mut().unwrap().close().await
+        });
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        waiter.abort();
+        assert!(tauri::async_runtime::block_on(waiter).is_err());
+
+        tauri::async_runtime::block_on(async {
+            let mut reentered = Box::pin(commands::close(app.state::<AppState>()));
+            assert!(futures_util::poll!(&mut reentered).is_pending());
+            assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+            release.notify_one();
+            reentered.await.unwrap();
+        });
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(pi_rs_core::SessionEvent::Closed)
+        ));
+    }
+
     struct PanickingShutdown;
     #[async_trait::async_trait]
     impl Extension for PanickingShutdown {
@@ -675,7 +880,10 @@ mod close_cancellation_test {
             .unwrap();
         let first = tauri::async_runtime::block_on(commands::close(app.state::<AppState>()));
         let second = tauri::async_runtime::block_on(commands::close(app.state::<AppState>()));
-        assert_eq!(first, Err("shutdown task did not complete".to_owned()));
+        assert_eq!(
+            first,
+            Err("session: session shutdown task did not complete".to_owned())
+        );
         assert_eq!(second, first);
         let reopened = SessionBuilder::new(Arc::new(Fixture), "fixture")
             .open(&path)

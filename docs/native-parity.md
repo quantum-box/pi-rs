@@ -7158,8 +7158,74 @@ normalized name, including a cleared name.
 The first model operation, tree navigation, or hook-aware rename
 delivers the start hook. An embedder can call `AgentSession::start`
 explicitly. An owned fork reports the fork reason and the source path
-when the SDK opened the source file. Closing a started
-session delivers its shutdown hook before releasing registry resources.
+when the SDK opened the source file. Awaiting `AgentSession::close` delivers
+Quit to extensions whose startup hooks completed, including the completed
+prefix after interrupted startup. Each fork receives its own Quit for that
+prefix. The last session sharing the registry connections owns their cleanup.
+
+### Owned SDK extension reload
+
+An owned Rust `AgentSession::reload(&RegistryUpdate)` installs a host-prepared
+extension registry and optional base prompt together. A native host can load
+its candidates with `NativeExtensionLoader` and `ResourceFactory`, then
+compose the prompt with `ResourceSnapshot::system_prompt` before calling reload.
+The host keeps the rest of the resource snapshot for its own presentation.
+Core uses the supplied snapshot and performs no settings, package, filesystem,
+or provider discovery.
+
+Reload preserves the journal, branch, controls, limits, UI, and existing
+MCP-disable policy. Named model bindings and the exact clients selected by
+model cycling remain available. The SDK can still read the last assistant
+reply from the active branch. The candidate supplies the extension declarations
+and any request-time registry refresher under its current grants. An explicit candidate tool selection takes precedence.
+Otherwise an existing explicit selection carries forward for names still
+registered. Branch checkpoints still constrain the effective request.
+
+Reload rejects active operations, unfinished journal work, and live forks
+that share the current extension connections. Hosts can retry the same
+candidate after the session is idle, recovery finishes, or the forks close.
+Forks created after reload inherit the installed registry and prompt. Ordinary
+SDK builders and registration still support shared extension instances.
+Each session still receives its own Quit hooks. Connection shutdown waits
+for the last live SDK installation, including forks, and for in-flight
+registrations to settle within the configured tool timeout. An installation
+that races a claimed connection shutdown can retry after close finishes.
+Reload requires both registries to use instances that have never been installed
+in another SDK session, even if that session has closed. The first accepted
+reload claims those instances for the installing session and its forks. The host
+can retain a prepared snapshot for inspection.
+
+For a started session, the old registry finishes shutdown with the reload
+reason before the new registry receives startup. Aborting an accepted reload
+or dropping its future leaves the replacement installed and lets old shutdown
+finish under the lifecycle timeout. Abort remains active while the reload
+waits to reacquire admission for replacement startup. New input waits for
+old shutdown. An instance reused by the same session receives both lifecycle
+notifications and keeps its connection. Existing regular event and tool
+progress subscriptions continue across reload.
+
+Reload and close shut down SDK-owned retired connections in reverse
+registration order on each pass. Renderer snapshots and prepared registry
+copies can keep individual connections alive. Release them before close to
+let the SDK shut down those connections. After an interrupted startup, the
+next owned start or eligible cloned-control input retries the unfinished hook
+and continues with the remaining hooks. Hooks that completed before
+cancellation run once.
+
+Await `close()` to wait for accepted reload shutdown, drain in-flight
+session-name callbacks, and deliver Quit. Close releases the journal writer
+after Quit and bounds each active connection shutdown by the configured tool
+timeout. Tool progress subscriptions close when teardown begins, with buffered
+updates still available to drain. The regular `Closed` event follows connection
+cleanup, including when a connection times out. Once close begins teardown,
+dropping its waiter leaves that work running. A later call joins the outstanding
+teardown and receives its result. Dropping `AgentSession` also lets accepted
+cleanup finish while its executor is running.
+Startup hook errors are published as each hook finishes, so cancellation
+during a later hook preserves earlier diagnostics.
+
+Pi also reloads settings, resets API providers, and discovers resources
+automatically. [Pinned Pi session reload](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L3831).
 
 ### Session transition extension hooks
 

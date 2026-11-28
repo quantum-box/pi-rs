@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pi_rs_core::{
-    AgentSession, ContextContent, CustomMessage, CustomMessageDelivery, Extension, ExtensionState,
-    InputAction, InputEvent, Message, Model, ModelEvent, ModelRequest, ModelStream, Outcome,
-    SessionBuilder, Tool, ToolCall, ToolContext, ToolHost, ToolSpec,
+    AgentSession, ContextContent, CustomMessage, CustomMessageDelivery, Event, Extension,
+    ExtensionState, InputAction, InputEvent, Message, Model, ModelEvent, ModelRequest, ModelStream,
+    Outcome, Registry, RegistryUpdate, SessionBuilder, SessionEvent, Tool, ToolCall, ToolContext,
+    ToolHost, ToolSpec,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
@@ -244,4 +245,95 @@ async fn slow_progress_subscriber() {
         broadcast::error::TryRecvError::Closed
     );
     drop(control);
+}
+
+struct PausedShutdown {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl Extension for PausedShutdown {
+    fn id(&self) -> &str {
+        "progress-shutdown-fixture"
+    }
+
+    async fn shutdown(&self) -> pi_rs_core::ExtensionResult<()> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn progress_survives_reload_and_closes_before_detached_shutdown_finishes() {
+    let mut session = progress_session(None, false);
+    let mut progress = session.subscribe_tool_progress();
+    let mut events = session.subscribe();
+    assert_eq!(session.prompt("before reload").await.unwrap(), "done");
+    assert_eq!(progress.try_recv().unwrap().tool_name, "child");
+    while events.try_recv().is_ok() {}
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let update = RegistryUpdate {
+        registry: Registry::compose(
+            vec![
+                Arc::new(ProgressExtension {
+                    tools: vec![Arc::new(ProgressTool {
+                        name: "child",
+                        release: None,
+                    })],
+                    trigger: false,
+                }),
+                Arc::new(PausedShutdown {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                }),
+            ],
+            &Default::default(),
+        )
+        .unwrap(),
+        system_prompt: Some("after reload".into()),
+    };
+    session.reload(&update).await.unwrap();
+    drop(update);
+    assert_eq!(session.prompt("after reload").await.unwrap(), "done");
+    let mut settled = false;
+    while let Ok(event) = events.try_recv() {
+        if let SessionEvent::Record(record) = event
+            && matches!(&record.event, Event::ToolFinished { outcome: Outcome::Succeeded(text), .. }
+                if text == "settled")
+        {
+            settled = true;
+        }
+    }
+    assert!(settled);
+
+    let mut close = Box::pin(session.close());
+    tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(5), entered.notified()) => result.unwrap(),
+        result = &mut close => panic!("close completed before teardown paused: {result:?}"),
+    }
+    drop(close);
+    assert_eq!(progress.try_recv().unwrap().tool_name, "child");
+    assert_eq!(
+        progress.try_recv().unwrap_err(),
+        broadcast::error::TryRecvError::Closed
+    );
+    assert_eq!(
+        events.try_recv().unwrap_err(),
+        broadcast::error::TryRecvError::Empty
+    );
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), session.close())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(events.try_recv(), Ok(SessionEvent::Closed)));
+    assert_eq!(
+        events.try_recv().unwrap_err(),
+        broadcast::error::TryRecvError::Closed
+    );
 }

@@ -844,6 +844,7 @@ dependencies = [
  "tokio-util",
  "uuid",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "windows-sys 0.61.2",
 ]
 

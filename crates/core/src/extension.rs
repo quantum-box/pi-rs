@@ -2221,6 +2221,29 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub(crate) fn prepare_session_reload(&mut self, current: &Self) {
+        self.branch_models = current.branch_models.clone();
+        self.branch_reservations = current.branch_reservations.clone();
+        self.ui = current.ui.clone();
+        self.omit_default_tool_timeout = current.omit_default_tool_timeout;
+        self.publish_tool_attempts = current.publish_tool_attempts;
+        self.omit_mcp_declarations |= current.omit_mcp_declarations;
+        if self.omit_mcp_declarations {
+            self.mcp_servers = Default::default();
+        } else {
+            self.isolate_mcp_runtime();
+        }
+        if self.active.is_none() {
+            self.active = current.active.as_ref().map(|active| {
+                active
+                    .iter()
+                    .filter(|name| self.tools.contains_key(*name))
+                    .cloned()
+                    .collect()
+            });
+        }
+    }
+
     /// Snapshot resolution order and registered tool ownership for presentation.
     pub fn tool_renderers(&self) -> crate::ToolRendererRegistry {
         crate::ToolRendererRegistry {

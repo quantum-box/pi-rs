@@ -721,6 +721,18 @@ impl SessionStore for BoundaryPreviewStore {
     }
 }
 
+struct ClosedStore;
+
+impl SessionStore for ClosedStore {
+    fn load(&mut self) -> Result<Vec<Record>> {
+        Err(Error::Session("session journal is closed".into()))
+    }
+
+    fn append(&mut self, _: &Record) -> Result<()> {
+        Err(Error::Session("session journal is closed".into()))
+    }
+}
+
 pub struct Session {
     auto_compaction: crate::AutoCompactionControl,
     retry: crate::RetryControl,
@@ -736,6 +748,12 @@ pub struct Session {
 pub(crate) const MAX_USER_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 impl Session {
+    pub(crate) fn close_store(&mut self) {
+        // Keep the committed snapshot available to readers after releasing the
+        // store and its exclusive writer lock.
+        self.store = Box::new(ClosedStore);
+    }
+
     /// Preserve journal IDs and branch selection while validating drafts
     /// independently of the live store.
     pub(crate) fn extension_boundary_snapshot(&self) -> Self {
@@ -2751,6 +2769,56 @@ impl Session {
     /// Check that no tool invocation needs completion or reconciliation.
     pub fn ensure_settled(&self) -> Result<()> {
         ensure_settled(self.operations())
+    }
+
+    pub(crate) fn ensure_reloadable(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Session(
+                "journal write failed; reopen before continuing".into(),
+            ));
+        }
+        self.ensure_settled()?;
+        let interrupted_run = self
+            .branch()
+            .iter()
+            .rev()
+            .find_map(|record| {
+                if let Event::Run { state, .. } = record.event {
+                    return Some((record.id, record.run_id, state));
+                }
+                None
+            })
+            .is_some_and(|(record, run, state)| {
+                run.is_some()
+                    && matches!(
+                        state,
+                        crate::RunState::Running
+                            | crate::RunState::WaitingForOperation
+                            | crate::RunState::WaitingForReconciliation
+                    )
+                    && !self.records[record as usize..].iter().any(|later| {
+                        later.run_id == run
+                            && matches!(
+                                later.event,
+                                Event::Run {
+                                    state: crate::RunState::Completed
+                                        | crate::RunState::Failed
+                                        | crate::RunState::Cancelled,
+                                    ..
+                                }
+                            )
+                    })
+            });
+        if interrupted_run
+            || self.pending_tree_trigger_handoff().is_some()
+            || self.pending_custom_trigger().is_some()
+            || crate::agent::resumable_compaction_run(self).is_some()
+        {
+            return Err(Error::Session(
+                "resume pending session work before reloading extensions".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn append_bash_execution(&mut self, execution: crate::BashExecution) -> Result<()> {
@@ -5978,6 +6046,74 @@ mod record_metadata_tests {
 #[cfg(test)]
 mod session_metadata_tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn sdk_close_preserves_shared_registry_bindings_installed_at_writer_release() {
+        struct ReopenStore {
+            file: Option<FileStore>,
+            reopen: Option<Box<dyn FnOnce() + Send>>,
+        }
+        impl SessionStore for ReopenStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.file.as_mut().unwrap().load()
+            }
+
+            fn append(&mut self, record: &Record) -> Result<()> {
+                self.file.as_mut().unwrap().append(record)
+            }
+        }
+        impl Drop for ReopenStore {
+            fn drop(&mut self) {
+                drop(self.file.take());
+                self.reopen.take().unwrap()();
+            }
+        }
+        struct Model;
+        #[async_trait::async_trait]
+        impl crate::Model for Model {
+            async fn stream(&self, _: crate::ModelRequest) -> Result<crate::ModelStream> {
+                unreachable!("this test only registers model bindings")
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("same-session.jsonl");
+        let registry = crate::Registry::default();
+        let replacement: Arc<dyn crate::Model> = Arc::new(Model);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let reopen = {
+            let path = path.clone();
+            let registry = registry.clone();
+            let replacement = replacement.clone();
+            move || {
+                let reopened = crate::SessionBuilder::new(replacement, "fixture")
+                    .registry(registry)
+                    .open(&path)
+                    .unwrap();
+                assert!(send.send(reopened).is_ok());
+            }
+        };
+        let journal = Session::with_store(ReopenStore {
+            file: Some(FileStore::open(&path).unwrap()),
+            reopen: Some(Box::new(reopen)),
+        })
+        .unwrap();
+        let id = journal.session_id();
+        let mut original = crate::SessionBuilder::new(Arc::new(Model), "fixture")
+            .registry(registry.clone())
+            .build(journal)
+            .unwrap();
+
+        original.close().await.unwrap();
+        let mut reopened = receive.await.unwrap();
+        assert_eq!(reopened.journal().unwrap().session_id(), id);
+        let selected = registry.branch_model(id, "fixture").unwrap();
+        assert!(Arc::ptr_eq(&selected, &replacement));
+        drop(original);
+        assert!(registry.branch_model(id, "fixture").is_some());
+        reopened.close().await.unwrap();
+    }
 
     #[test]
     fn inert_full_history_preserves_branches_and_record_metadata() {
