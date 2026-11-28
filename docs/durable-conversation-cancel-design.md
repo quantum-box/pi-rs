@@ -531,6 +531,17 @@ and reconciliation budget, and a successful restore drill.
 
 ### Migration and restore drill
 
+On Unix, `durable-graph-rehearsal` takes a standard Durable database or a
+v3 experimental database and creates a private output directory. It makes a
+consistent backup, a v4 migration copy, and a copy restored in the input format. It
+reports the original graph protocol (null for a standard database), record
+counts, and elapsed times. The source is opened read-only. The checks compare
+existing commit history, document revisions, fork cuts, and task document
+ownership in addition to the live entries. On older sources with document
+history, the migration check also verifies the first application history
+boundary and the live application entries seeded there. Restoration still
+verifies the original pre-initialization history.
+
 1. Stop the scheduler and let all workers release the database. On Unix, run
    the migration only once the selected binary can acquire the owner lock.
 2. Create a consistent SQLite backup at a new path with the SQLite backup API
@@ -550,5 +561,26 @@ groups, each containing a conversation record, a parent and child task, and a
 document. It creates a consistent backup, migrates to v4, writes new data,
 and checks that the old writer is fenced. The restored v3 copy contains all
 256 original rows and can write again. The fixture models graph shape and
-backup ordering. Production-scale migration and recovery timing still need
-measurements on a representative copy.
+backup ordering.
+
+A separate macOS rehearsal used a standard SDK build with a local model and
+tool to generate 16 parent conversations and 16 historical forks. The backup
+contained 2,128 rows, including 32 conversations and 32 documents, and was
+5,431,296 bytes. The v4 and restored standard builds reproduced the same
+messages, submissions, tool results, 720 history events, and both the current
+and historical document revisions. Both copies accepted 16 new forks from
+historical cuts and returned each original submission on retry. The standard
+build rejected the migrated copy, and the source database hash was unchanged.
+This local run measured 1,047 ms to back up the source, 137 ms to migrate and
+reopen it, and 1,487 ms to restore and verify the backup. Production-scale
+migration and recovery timing still need measurements on a representative
+copy.
+
+
+A synthetic legacy document-heavy database with 4,096 live documents and
+4,096 application logs exercised initialization of the missing application
+history boundary. Migration preserved all 16,384 existing revisions and
+seeded 4,096 application rows at the new boundary. Restoration retained the
+original revision and row count. The source hash was unchanged. For this
+21,217,280-byte backup, the rehearsal reported 41 ms to back up, 34 ms to
+migrate and reopen, and 490 ms to restore and verify.
