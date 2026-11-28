@@ -1,4 +1,5 @@
 //! Terminal presentation over the same journaled CLI used by automation.
+use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use crate::config::NoticeKind;
 use crate::ui::{
     color::ColorMode,
     editor::Editor,
-    images::{self, Cleanup, InlineImage, Renderer},
+    images::{self, Cleanup, InlineAttachment, Renderer},
     keys::Keys,
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
@@ -304,7 +305,7 @@ impl Terminal {
         Ok(true)
     }
 
-    fn switch_mode(&mut self, alternate: bool, view: &mut View) -> Result<()> {
+    fn switch_mode(&mut self, alternate: bool, view: &mut View, args: &Cli) -> Result<()> {
         if self.alternate == alternate {
             return Ok(());
         }
@@ -323,7 +324,12 @@ impl Terminal {
                 DisableMouseCapture,
                 LeaveAlternateScreen
             )?;
-            view.regular.layout = None;
+            let image_layout_changed = view.regular.layout.as_ref().is_some_and(|layout| {
+                layout.output.inline_images != view.inline_image_options(args)
+            });
+            if !image_layout_changed {
+                view.regular.layout = None;
+            }
             view.regular.max_rows = 0;
             view.regular.committed_rows = 0;
         }
@@ -1348,6 +1354,7 @@ struct View {
     async_transitions: bool,
     pending_transition: Option<std::sync::mpsc::Receiver<Result<Cli>>>,
     regular: RegularState,
+    detected_hyperlinks: Cell<Option<bool>>,
     graphics: Renderer,
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
     pending_terminal_title: Option<String>,
@@ -2189,11 +2196,11 @@ impl View {
                 for block in blocks {
                     match block {
                         pi_rs::ContentBlock::Text { text: value, .. } => text.push(value.as_str()),
-                        pi_rs::ContentBlock::Image { data, mime_type } => {
-                            images.push(pi_rs::ImageContent {
+                        pi_rs::ContentBlock::Image { data, mime_type } if !data.is_empty() => {
+                            images.push(InlineAttachment::new(pi_rs::ImageContent {
                                 data: data.clone(),
                                 mime_type: mime_type.clone(),
-                            })
+                            }))
                         }
                         _ => {}
                     }
@@ -2205,10 +2212,8 @@ impl View {
             rendered: None,
             custom_type: message.custom_type.clone(),
             text: text.join("\n"),
+            images,
         });
-        if !images.is_empty() {
-            self.add_images(&images);
-        }
     }
     fn refresh_transcript_extension_renderers(&mut self) -> bool {
         self.custom_render_pending = None;
@@ -2713,7 +2718,13 @@ impl View {
             return true;
         };
         *output = crate::ui::render::strip_shell_ansi(&display_tool_blocks(blocks));
-        *parts = tool_result_parts(&update["content"], self.graphics.enabled());
+        *parts = tool_result_parts(&update["content"]);
+        if name == "codemode"
+            && let Some(text) = codemode_progress_text(&update["details"])
+        {
+            output.clone_from(&text);
+            parts.push(ToolPart::Text(text));
+        }
         records.progress = records.progress.wrapping_add(1);
         self.partial_tool_results.insert(
             id.clone(),
@@ -3401,6 +3412,34 @@ impl View {
             })
             .collect();
         let branch = session.branch();
+        let mut empty_pi_summary_sources = branch
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::SourceEntry { format, entry }
+                    if format == "pi"
+                        && entry["type"] == "branch_summary"
+                        && entry["summary"] == "" =>
+                {
+                    Some(record.id)
+                }
+                _ => None,
+            })
+            .peekable();
+        let hidden_summaries: std::collections::HashSet<_> =
+            if empty_pi_summary_sources.peek().is_some() {
+                let conversions = session.validated_pi_conversion_counts().unwrap_or_default();
+                // Imported summary usage can precede the summary in its conversion.
+                empty_pi_summary_sources
+                    .filter_map(|id| {
+                        conversions
+                            .get(&id)
+                            .filter(|&&count| count > 0)
+                            .map(|count| id + count)
+                    })
+                    .collect()
+            } else {
+                Default::default()
+            };
         let assistant_records: std::collections::HashMap<_, _> = branch
             .iter()
             .filter_map(|&record| match record.event {
@@ -3556,8 +3595,10 @@ impl View {
                 }
                 _ => {}
             }
-            self.add_summary(record, Some(session));
-            self.show_summary_billing(record, records);
+            if !hidden_summaries.contains(&record.id) {
+                self.add_summary(record, Some(session));
+                self.show_summary_billing(record, records);
+            }
             self.observe_cache(record, args);
             self.observe_reasoning_drop(record);
         }
@@ -3584,14 +3625,13 @@ impl View {
         Ok(())
     }
     fn add_images(&mut self, images: &[pi_rs::ImageContent]) {
-        if self.graphics.enabled() {
-            self.lines.extend(
-                images
-                    .iter()
-                    .filter_map(InlineImage::decode)
-                    .map(Entry::Image),
-            );
-        }
+        self.lines.extend(
+            images
+                .iter()
+                .cloned()
+                .map(InlineAttachment::new)
+                .map(Entry::Image),
+        );
     }
     fn add_tool(&mut self, invocation: &pi_rs::Invocation, record: Option<u64>) {
         if invocation.call.name == super::operation_models::TOOL {
@@ -3631,10 +3671,15 @@ impl View {
             }
             return;
         }
+        let nested_progress = self
+            .partial_tool_results
+            .get(operation)
+            .and_then(|partial| partial.details.as_ref())
+            .and_then(codemode_progress_text);
         let mut rendered_parts = match outcome {
             pi_rs::Outcome::Structured { data, .. }
             | pi_rs::Outcome::StructuredWithDetails { data, .. } => {
-                tool_result_parts(&data["content"], self.graphics.enabled())
+                tool_result_parts(&data["content"])
             }
             _ => Vec::new(),
         };
@@ -3673,6 +3718,15 @@ impl View {
             };
             *numbered_diff = diff.is_some();
             *output = diff.map_or_else(|| display_tool_result(outcome), str::to_owned);
+            if name == "codemode"
+                && let Some(text) = nested_progress
+            {
+                if parts.is_empty() {
+                    parts.push(ToolPart::Text(output.clone()));
+                }
+                output.insert_str(0, &format!("{text}\n"));
+                parts.insert(0, ToolPart::Text(text));
+            }
             *failed = !matches!(
                 outcome,
                 pi_rs::Outcome::Succeeded(_)
@@ -3970,15 +4024,12 @@ render_call_id: None,
                     }
                     Some("tool_finished" | "tool_reconciled") => {
                         self.phase = Some("処理を継続中");
-                        if let Some(record) = value["record"]["id"].as_u64() {
-                            self.track_tool_render(event["operation_id"].as_str().unwrap_or_default(), record, false);
-                        }
+                        let operation = event["operation_id"].as_str().unwrap_or_default();
                         if let Ok(outcome) = serde_json::from_value(event["outcome"].clone()) {
-                            self.finish_tool(
-                                event["operation_id"].as_str().unwrap_or_default(),
-                                &outcome,
-                                None,
-                            );
+                            self.finish_tool(operation, &outcome, None);
+                        }
+                        if let Some(record) = value["record"]["id"].as_u64() {
+                            self.track_tool_render(operation, record, false);
                         }
                     }
                     Some("compacted" | "branch_summary") => self.summarizing = false,
@@ -4596,12 +4647,22 @@ render_call_id: None,
     }
 
     fn base_transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'static> {
+        let hyperlinks = if let Some(enabled) = args.settings.terminal_hyperlinks() {
+            self.detected_hyperlinks.set(None);
+            enabled
+        } else if let Some(detected) = self.detected_hyperlinks.get() {
+            detected
+        } else {
+            let detected = crate::ui::render::detect_terminal_hyperlinks();
+            self.detected_hyperlinks.set(Some(detected));
+            detected
+        };
         TranscriptOptions {
             hidden_thinking_label: None,
             code_block_indent: None,
+            hyperlinks,
             notices: args.settings.notices(),
-            image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
-                .then(|| args.settings.terminal_image_width()),
+            inline_images: self.inline_image_options(args),
             padding: args.settings.output_padding(),
             expand_key: self.expand_key,
             mermaid: match (args.settings.mermaid_mode(), streaming) {
@@ -4610,6 +4671,32 @@ render_call_id: None,
                 (_, false) => Mermaid::Final,
             },
         }
+    }
+
+    fn inline_image_options(&self, args: &Cli) -> Option<(images::Protocol, usize)> {
+        self.graphics
+            .protocol()
+            .filter(|_| args.settings.show_terminal_images())
+            .map(|protocol| (protocol, args.settings.terminal_image_width()))
+    }
+
+    fn update_image_protocol(&mut self, args: &Cli, terminal: Option<&Terminal>) -> Result<bool> {
+        let previous = self.graphics.protocol();
+        let protocol = self
+            .graphics
+            .resolve_protocol(args.settings.terminal_image_override());
+        if protocol == previous {
+            return Ok(false);
+        }
+        let fullscreen = terminal.map_or(args.tui_mode != Some(TuiMode::Regular), |terminal| {
+            terminal.alternate
+        });
+        self.graphics
+            .set_protocol(protocol, fullscreen, &mut std::io::stdout().lock())?;
+        if previous.is_none() && protocol.is_some() {
+            images::query_cell_size()?;
+        }
+        Ok(true)
     }
 
     fn debug_log(&self, args: &Cli, theme: &Theme, width: usize, height: usize) -> Result<String> {
@@ -4771,10 +4858,27 @@ render_call_id: None,
             output: base_output,
             code_block_indent: args.settings.code_block_indent().to_owned(),
         };
-        let redraw = self.regular.layout.is_some()
-            && (self.regular.redraw
-                || self.regular.layout.as_ref() != Some(&layout)
-                || self.lines.len() < self.regular.committed);
+        // An image setting can change without affecting any rows in the
+        // restored transcript. Keep scrollback in that case.
+        if let Some(previous) = &mut self.regular.layout
+            && previous.output.inline_images != layout.output.inline_images
+            && self.graphics.regular_image_protocol().is_none()
+            && (layout.output.inline_images.is_none()
+                || !self
+                    .lines
+                    .iter()
+                    .take(self.regular.committed)
+                    .any(|entry| entry.has_inline_images(self.expand_tools)))
+        {
+            previous.output.inline_images = layout.output.inline_images;
+        }
+        let stale_iterm2 = self.graphics.regular_image_protocol() == Some(images::Protocol::Iterm2)
+            && self.graphics.protocol() != Some(images::Protocol::Iterm2);
+        let redraw = stale_iterm2
+            || (self.regular.layout.is_some()
+                && (self.regular.redraw
+                    || self.regular.layout.as_ref() != Some(&layout)
+                    || self.lines.len() < self.regular.committed));
         self.regular.layout = Some(layout);
         self.regular.redraw = false;
         if self.lines.len() < self.regular.committed {
@@ -5010,10 +5114,10 @@ render_call_id: None,
     }
 }
 
-fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
+fn tool_result_parts(content: &Value) -> Vec<ToolPart> {
     content
         .as_array()
-        .filter(|blocks| images && blocks.iter().any(|block| block["type"] == "image"))
+        .filter(|blocks| blocks.iter().any(|block| block["type"] == "image"))
         .into_iter()
         .flatten()
         .filter_map(|value| match value["type"].as_str() {
@@ -5023,7 +5127,7 @@ fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
             Some("image") => {
                 let image = serde_json::from_value::<pi_rs::ImageContent>(value.clone())
                     .ok()
-                    .and_then(|content| InlineImage::decode(&content));
+                    .map(InlineAttachment::new);
                 Some(match image {
                     Some(image) => ToolPart::Image(image),
                     None => ToolPart::Text("[image unavailable]".into()),
@@ -5032,6 +5136,38 @@ fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
             _ => None,
         })
         .collect()
+}
+
+fn codemode_progress_text(details: &Value) -> Option<String> {
+    const VISIBLE_CALLS: usize = 6;
+    let calls = details["calls"].as_array()?;
+    if calls.is_empty() {
+        return None;
+    }
+    let hidden = calls.len().saturating_sub(VISIBLE_CALLS);
+    let mut lines = Vec::new();
+    if hidden > 0 {
+        lines.push(format!("… {hidden} earlier calls"));
+    }
+    for call in &calls[hidden..] {
+        let status = match call["status"].as_str()? {
+            "running" => "…",
+            "ok" => "✓",
+            "error" => "✗",
+            "cancelled" => "⊘",
+            _ => continue,
+        };
+        let name = call["name"].as_str()?;
+        let args = call["args"].as_str().unwrap_or_default();
+        let duration = call["durationMs"]
+            .as_u64()
+            .map_or(String::new(), |ms| format!(" {ms}ms"));
+        lines.push(format!("{status} {name} {args}{duration}"));
+    }
+    if let Some(omitted) = details["omittedCalls"].as_u64().filter(|count| *count > 0) {
+        lines.push(format!("… {omitted} additional calls omitted"));
+    }
+    Some(crate::ui::render::strip_shell_ansi(&lines.join("\n")))
 }
 
 fn display_tool_blocks(blocks: &[Value]) -> String {
@@ -6230,6 +6366,7 @@ pub(super) async fn run(
         async_transitions: true,
         expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
+        graphics: Renderer::new(args.settings.terminal_image_override()),
         ..View::default()
     };
     let changelog_path = super::config::agent_dir().join("pi-rs-changelog.json");
@@ -6378,10 +6515,11 @@ pub(super) async fn run(
                 dirty = true;
             }
         }
+        dirty |= view.update_image_protocol(&args, _terminal.as_ref())?;
         if let Some(terminal) = &mut _terminal {
             let alternate = args.tui_mode != Some(TuiMode::Regular);
             if terminal.alternate != alternate {
-                terminal.switch_mode(alternate, &mut view)?;
+                terminal.switch_mode(alternate, &mut view, &args)?;
                 dirty = true;
             }
         }
@@ -8393,6 +8531,9 @@ pub(super) async fn run(
                             args.settings =
                                 args.settings.reload_latest(&args.workspace, args.trusted)?;
                             args.extension_theme = None;
+                            // Fullscreen exit replay uses the new protocol even
+                            // if reload preparation is interrupted.
+                            dirty |= view.update_image_protocol(&args, _terminal.as_ref())?;
                             for warning in args.settings.diagnostics() {
                                 view.append(warning);
                             }
@@ -12935,14 +13076,27 @@ mod tests {
                 unreachable!()
             };
             assert!(*finished);
-            if enabled {
-                assert!(
-                    matches!(parts.as_slice(), [ToolPart::Text(a), ToolPart::Image(_), ToolPart::Text(b)] if a == "before" && b == "after")
-                );
-            } else {
-                assert!(parts.is_empty());
-                assert!(output.contains("[image · image/png]"));
-            }
+            assert!(
+                matches!(parts.as_slice(), [ToolPart::Text(a), ToolPart::Image(_), ToolPart::Text(b)] if a == "before" && b == "after")
+            );
+            assert!(output.contains("[image · image/png]"));
+            let render = |view: &View| {
+                entry
+                    .render(
+                        &Theme::system(),
+                        96,
+                        true,
+                        true,
+                        view.transcript_options(&args, false),
+                    )
+                    .iter()
+                    .any(|line| line.image.is_some())
+            };
+            assert_eq!(render(&view), enabled);
+            view.graphics
+                .set_protocol(Some(images::Protocol::Kitty), true, &mut Vec::new())
+                .unwrap();
+            assert!(render(&view));
         }
     }
 
@@ -14170,6 +14324,122 @@ exit {exit}
         );
     }
     #[test]
+    fn restore_hides_empty_pi_branch_summaries_without_losing_billing() {
+        use super::{Cli, Entry, NoticeKind, SummaryKind, View};
+        use clap::Parser;
+        use pi_rs::{Event, Session};
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"root"}}),
+            json!({"type":"message","id":"away","parentId":"root","message":{"role":"user","content":"away"}}),
+            json!({"type":"branch_summary","id":"billed","parentId":"root","fromId":"away","summary":"","usage":{"input":2,"output":1,"cost":{"total":0.125}}}),
+            json!({"type":"branch_summary","id":"empty","parentId":"billed","fromId":"away","summary":""}),
+            json!({"type":"branch_summary","id":"sibling","parentId":"root","fromId":"away","summary":" ","usage":{"input":4,"output":2,"cost":{"total":0.25}}}),
+            json!({"type":"message","id":"leaf","parentId":"empty","message":{"role":"user","content":"continuation"}}),
+        ];
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let path = directory.path().join("native.jsonl");
+        imported.export_jsonl(&path).unwrap();
+        let mut session = Session::open(&path).unwrap();
+        let leaf = session.head();
+        let branch = session.branch();
+        let summaries: Vec<_> = branch
+            .into_iter()
+            .filter(|record| matches!(&record.event, Event::BranchSummary { summary, .. } if summary.is_empty()))
+            .collect();
+        assert_eq!(summaries.len(), 2);
+        let billed = summaries[0];
+        let (usage, metadata) = billed.summary_usage(session.records()).unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (2, 1));
+        assert_eq!(
+            metadata
+                .and_then(|details| details.metadata.cost_usd)
+                .and_then(|cost| cost.as_f64()),
+            Some(0.125)
+        );
+        assert_eq!(session.statistics().cost, Some(0.375));
+
+        let native_summary = summaries[1].clone();
+        let args = Cli::parse_from(["pi", "--offline"]);
+        let mut view = View::default();
+        let summary_count = |view: &View| {
+            view.lines
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        Entry::Summary {
+                            kind: SummaryKind::Branch,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        let billing_count = |view: &View| {
+            view.lines
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        Entry::TranscriptNotice {
+                            kind: NoticeKind::CompactionCosts,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        view.restore_session(&args, &session).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (0, 0));
+
+        let sibling = session.records().iter().find(|record| {
+            matches!(&record.event, Event::BranchSummary { summary, .. } if summary == " ")
+        }).unwrap().id;
+        session.checkout(sibling).unwrap();
+        view.restore_session(&args, &session).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (1, 1));
+
+        session.checkout(leaf).unwrap();
+        view.restore_session(&args, &session).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (0, 0));
+        assert_eq!(session.statistics().cost, Some(0.375));
+
+        session.checkout(native_summary.parent.unwrap()).unwrap();
+        let mut records = session.records().to_vec();
+        let metadata = records
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|metadata| (record.id, metadata))
+            })
+            .collect();
+        let native_id = records.len() as u64 + 1;
+        records.push(pi_rs::Record {
+            id: native_id,
+            version: records.last().unwrap().version,
+            ..native_summary
+        });
+        let mixed = Session::from_records_with_metadata(records, metadata).unwrap();
+        view.restore_session(&args, &mixed).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (1, 0));
+    }
+
+    #[test]
     fn imported_branch_checkout_fork_and_switch_restore_selection() {
         use clap::Parser;
         use serde_json::json;
@@ -15370,6 +15640,44 @@ exit {exit}
     }
 
     #[test]
+    fn codemode_displays_live_and_cancelled_calls_alongside_script_output() {
+        let mut view = super::View::default();
+        let operation_id = uuid::Uuid::new_v4();
+        let operation = operation_id.to_string();
+        view.add_tool(
+            &pi_rs::Invocation {
+                operation_id,
+                call: pi_rs::ToolCall {
+                    id: "script".into(),
+                    name: "codemode".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            Some(1),
+        );
+        view.track_tool_render(&operation, 2, true);
+        let update = |status| {
+            json!({
+                "toolCallId":"script","toolName":"codemode",
+                "partialResult":{"content":[],"details":{"calls":[{"name":"echo","args":"{}","status":status}]}}
+            })
+        };
+        assert!(view.render_tool_progress(&update("running")));
+        assert!(matches!(&view.lines[0], Entry::Tool { output, .. } if output.contains("… echo")));
+        assert!(view.render_tool_progress(&update("cancelled")));
+        view.finish_tool(
+            &operation,
+            &pi_rs::Outcome::Failed("retained output".into()),
+            None,
+        );
+        view.track_tool_render(&operation, 3, false);
+        assert!(
+            matches!(&view.lines[0], Entry::Tool { output, finished: true, .. }
+            if output.contains("⊘ echo") && output.contains("retained output"))
+        );
+    }
+
+    #[test]
     fn tool_renderer_projects_partial_results_until_the_matching_tool_finishes() {
         let mut view = super::View::default();
         let operation_id = uuid::Uuid::new_v4();
@@ -15669,6 +15977,10 @@ exit {exit}
                     data: String::new(),
                     mime_type: "image/png".into(),
                 },
+                pi_rs::ContentBlock::Image {
+                    data: "bm90IGEgUE5H".into(),
+                    mime_type: "image/png".into(),
+                },
                 pi_rs::ContentBlock::Text {
                     text: "second".into(),
                     text_signature: None,
@@ -15681,6 +15993,7 @@ exit {exit}
         assert!(
             matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**first**\nsecond")
         );
+        assert!(!view.lines[0].has_inline_images(true));
     }
 
     #[test]

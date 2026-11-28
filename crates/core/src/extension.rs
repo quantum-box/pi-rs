@@ -30,13 +30,21 @@ impl From<&str> for CommandCallbackFailure {
     }
 }
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
-type BranchModels = BTreeMap<
+type NamedBranchModels = BTreeMap<
     (Option<Uuid>, Option<String>, String),
     (Arc<dyn crate::Model>, Option<crate::Limits>),
 >;
 
+type CycledModels = BTreeMap<(Uuid, crate::journal::CycledModelSelection), Arc<dyn crate::Model>>;
+// Registry snapshots and reloads carry both kinds of journal binding together.
+#[derive(Default)]
+struct BranchModels {
+    named: NamedBranchModels,
+    cycled: CycledModels,
+}
+
 type ReservedBranchModel = (Uuid, String, String);
-struct BranchModelReservation {
+pub(crate) struct BranchModelReservation {
     reserved: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
     key: ReservedBranchModel,
 }
@@ -545,6 +553,20 @@ pub trait ToolHost: Send + Sync {
     async fn report_progress(&self, _partial_result: Value) -> ExtensionResult<()> {
         Ok(())
     }
+    /// Publish progress with a fallback to emit if the tool stops before
+    /// reporting settlement. A later update replaces or clears the fallback.
+    #[doc(hidden)]
+    async fn report_progress_with_settlement(
+        &self,
+        partial_result: Value,
+        _settlement: Option<Value>,
+    ) -> ExtensionResult<()> {
+        self.report_progress(partial_result).await
+    }
+    /// Refresh the omission count on a pending progress settlement without
+    /// sending another snapshot. Hosts may ignore this optional metadata.
+    #[doc(hidden)]
+    fn update_progress_omitted_calls(&self, _count: u64) {}
     fn has_ui(&self) -> bool {
         false
     }
@@ -705,6 +727,12 @@ pub trait Tool: Send + Sync {
     /// `invoke_transaction_with_timeout`. The scheduler still bounds settlement
     /// and handles caller cancellation. This applies to direct calls.
     fn settles_host_timeout(&self) -> bool {
+        false
+    }
+    /// Opt in to a cumulative budget for progress hooks and stop those
+    /// hooks when the tool returns. Accepted events still reach the observer.
+    #[doc(hidden)]
+    fn bounds_progress_hooks(&self) -> bool {
         false
     }
     fn execution(&self) -> ToolExecution {
@@ -1186,6 +1214,25 @@ pub struct UserBashResult {
     pub full_output_path: Option<String>,
 }
 
+/// Additional presentation data for the native shell host. The legacy result
+/// type remains usable by extensions that do not supply save failure detail.
+#[doc(hidden)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserBashResultWithOutputError {
+    #[serde(flatten)]
+    pub result: UserBashResult,
+    #[serde(default, deserialize_with = "deserialize_output_save_error")]
+    pub full_output_error: Option<String>,
+}
+
+fn deserialize_output_save_error<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.as_str().map(str::to_owned))
+}
+
 /// The first extension that handles a user command can replace its result or execution.
 pub enum UserBashReplacement {
     Result(UserBashResult),
@@ -1426,6 +1473,22 @@ pub trait Extension: Send + Sync {
         _host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<Option<UserBashResult>> {
         self.user_bash(event, state).await
+    }
+
+    #[doc(hidden)]
+    async fn user_bash_with_output_error(
+        &self,
+        event: &UserBashEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<UserBashResultWithOutputError>> {
+        Ok(self
+            .user_bash_with_host(event, state, host)
+            .await?
+            .map(|result| UserBashResultWithOutputError {
+                result,
+                full_output_error: None,
+            }))
     }
 
     /// Opt in to selecting a custom streaming implementation of user shell execution.
@@ -2345,6 +2408,7 @@ impl Registry {
         self.branch_models
             .write()
             .expect("branch models")
+            .named
             .insert((None, None, name), (model, None));
         Ok(())
     }
@@ -2370,6 +2434,7 @@ impl Registry {
         self.branch_models
             .write()
             .expect("branch models")
+            .named
             .insert((Some(session_id), None, name), (model, None));
         Ok(())
     }
@@ -2424,8 +2489,9 @@ impl Registry {
                 .expect("branch reservations");
             let models = self.branch_models.read().expect("branch models");
             let existing = models
+                .named
                 .get(&(Some(session_id), None, name.to_owned()))
-                .or_else(|| models.get(&(None, None, name.to_owned())));
+                .or_else(|| models.named.get(&(None, None, name.to_owned())));
             if reservations.contains_key(&key)
                 || reservations.contains_key(&(session_id, String::new(), String::new()))
                 || !existing.is_some_and(|(existing, _)| Arc::ptr_eq(existing, &model))
@@ -2470,7 +2536,7 @@ impl Registry {
                 .write()
                 .expect("branch reservations");
             let models = self.branch_models.read().expect("branch models");
-            let existing = models.get(&key);
+            let existing = models.named.get(&key);
             if reservations.contains_key(&reservation_key)
                 || reservations.contains_key(&(session_id, String::new(), String::new()))
                 || existing.is_some_and(|(existing, _)| !Arc::ptr_eq(existing, &model))
@@ -2496,76 +2562,187 @@ impl Registry {
             self.branch_models
                 .write()
                 .expect("branch models")
+                .named
                 .entry(key)
                 .or_insert((model, None));
         }
         Ok((result, revoked))
     }
-    /// Reserve the entire session while startup commits and installs its
-    /// complete staged model set. A concurrent revocation wins as a unit.
-    pub(crate) fn commit_session_model_bindings<T>(
+    pub(crate) fn cycled_model(
         &self,
-        session_id: Uuid,
-        bindings: Vec<(Option<String>, String, Arc<dyn crate::Model>)>,
-        guarded: Option<(&str, &str, &Arc<dyn crate::Model>)>,
+        session: Uuid,
+        selection: &crate::journal::CycledModelSelection,
+    ) -> Option<Arc<dyn crate::Model>> {
+        self.branch_models
+            .read()
+            .expect("branch models")
+            .cycled
+            .get(&(session, selection.clone()))
+            .cloned()
+    }
+
+    pub(crate) fn commit_cycled_model<T>(
+        &self,
+        session: Uuid,
+        selection: &crate::journal::CycledModelSelection,
+        client: Arc<dyn crate::Model>,
+        require_existing: bool,
         commit: impl FnOnce() -> Result<T>,
     ) -> Result<(T, bool)> {
+        let key = (session, selection.clone());
+        self.commit_reserved_session_models(
+            session,
+            || {
+                let models = self.branch_models.read().expect("branch models");
+                let models = &models.cycled;
+                match models.get(&key) {
+                    Some(existing) if Arc::ptr_eq(existing, &client) => Ok(()),
+                    None if !require_existing => Ok(()),
+                    _ => Err(Error::Config(
+                        "cycled model client changed while resolving".into(),
+                    )),
+                }
+            },
+            commit,
+            || {
+                self.branch_models
+                    .write()
+                    .expect("branch models")
+                    .cycled
+                    .entry(key.clone())
+                    .or_insert_with(|| client.clone());
+            },
+        )
+    }
+
+    /// Reserve startup bindings before calling host resolvers. The reservation
+    /// remains active across authorization without holding the registry locks.
+    pub(crate) fn reserve_startup_model_bindings(
+        &self,
+        session: Uuid,
+    ) -> Result<BranchModelReservation> {
+        self.reserve_session_models(session, || Ok(()))
+    }
+
+    /// Publish the staged startup bindings together. A supplied cycle list
+    /// replaces this session's cache, including when empty.
+    pub(crate) fn commit_session_model_bindings<T>(
+        &self,
+        reservation: &BranchModelReservation,
+        bindings: Vec<(Option<String>, String, Arc<dyn crate::Model>)>,
+        guarded: Option<(&str, &str, &Arc<dyn crate::Model>)>,
+        refreshed_cycles: Option<&[(crate::journal::CycledModelSelection, Arc<dyn crate::Model>)]>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         if bindings.iter().any(|(provider, name, _)| {
             name.trim().is_empty() || provider.as_ref().is_some_and(|p| p.trim().is_empty())
         }) {
             return Err(Error::Config("provider or model name is empty".into()));
         }
-        let key = (session_id, String::new(), String::new());
+        let session_id = reservation.key.0;
+        if let Some((provider, name, client)) = guarded
+            && self
+                .branch_models
+                .read()
+                .expect("branch models")
+                .named
+                .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
+                .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, client))
         {
-            let mut reservations = self
-                .branch_reservations
-                .write()
-                .expect("branch reservations");
-            if reservations
-                .keys()
-                .any(|(owner, _, _)| *owner == session_id)
-            {
-                return Err(Error::Config("session models are being resolved".into()));
-            }
-            if let Some((provider, name, client)) = guarded
-                && self
-                    .branch_models
-                    .read()
-                    .expect("branch models")
-                    .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
-                    .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, client))
-            {
-                return Err(Error::Config(format!(
-                    "model client changed while resolving {provider}/{name}"
-                )));
-            }
-            reservations.insert(key.clone(), false);
+            return Err(Error::Config(format!(
+                "model client changed while resolving {provider}/{name}"
+            )));
         }
-        let _reservation = BranchModelReservation {
-            reserved: self.branch_reservations.clone(),
-            key,
-        };
-        let result = commit()?;
-        let reservations = self
+        let revoked_error =
+            || Error::Config("session model bindings were revoked during open".into());
+        if self
             .branch_reservations
             .read()
-            .expect("branch reservations");
-        let revoked = reservations.get(&_reservation.key) == Some(&true);
-        if !revoked {
+            .expect("branch reservations")
+            .get(&reservation.key)
+            == Some(&true)
+        {
+            return Err(revoked_error());
+        }
+        // The store may call back into the registry during append. Release the
+        // read lock before writing, then check revocation again at publication.
+        let (result, revoked) = self.commit_model_reservation(reservation, commit, || {
             let mut models = self.branch_models.write().expect("branch models");
+            if let Some(refreshed) = refreshed_cycles {
+                models.cycled.retain(|(owner, _), _| *owner != session_id);
+                models.cycled.extend(
+                    refreshed.iter().map(|(selection, client)| {
+                        ((session_id, selection.clone()), client.clone())
+                    }),
+                );
+            }
             for (provider, name, client) in bindings {
                 let guarded_binding =
                     guarded.is_some_and(|(p, n, _)| provider.as_deref() == Some(p) && name == n);
                 let key = (Some(session_id), provider, name);
                 if guarded_binding {
-                    models.entry(key).or_insert((client, None));
+                    models.named.entry(key).or_insert((client, None));
                 } else {
-                    models.insert(key, (client, None));
+                    models.named.insert(key, (client, None));
                 }
             }
+        })?;
+        if revoked {
+            return Err(revoked_error());
+        }
+        Ok(result)
+    }
+
+    fn commit_reserved_session_models<T>(
+        &self,
+        session: Uuid,
+        validate: impl FnOnce() -> Result<()>,
+        commit: impl FnOnce() -> Result<T>,
+        install: impl FnOnce(),
+    ) -> Result<(T, bool)> {
+        let reservation = self.reserve_session_models(session, validate)?;
+        self.commit_model_reservation(&reservation, commit, install)
+    }
+
+    fn reserve_session_models(
+        &self,
+        session: Uuid,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<BranchModelReservation> {
+        let key = (session, String::new(), String::new());
+        let mut reservations = self
+            .branch_reservations
+            .write()
+            .expect("branch reservations");
+        if reservations.keys().any(|(owner, _, _)| *owner == session) {
+            return Err(Error::Config("session models are being resolved".into()));
+        }
+        validate()?;
+        reservations.insert(key.clone(), false);
+        Ok(BranchModelReservation {
+            reserved: self.branch_reservations.clone(),
+            key,
+        })
+    }
+
+    fn commit_model_reservation<T>(
+        &self,
+        reservation: &BranchModelReservation,
+        commit: impl FnOnce() -> Result<T>,
+        install: impl FnOnce(),
+    ) -> Result<(T, bool)> {
+        let result = commit()?;
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        let revoked = reservations.get(&reservation.key) == Some(&true);
+        if !revoked {
+            install();
         }
         Ok((result, revoked))
     }
+
     /// Register a session-specific provider client and its effective run limits.
     pub fn register_session_provider_model_with_limits(
         &self,
@@ -2587,10 +2764,14 @@ impl Registry {
         {
             return Err(Error::Config("model client is being resolved".into()));
         }
-        self.branch_models.write().expect("branch models").insert(
-            (Some(session_id), Some(provider.to_owned()), name.to_owned()),
-            (model, limits),
-        );
+        self.branch_models
+            .write()
+            .expect("branch models")
+            .named
+            .insert(
+                (Some(session_id), Some(provider.to_owned()), name.to_owned()),
+                (model, limits),
+            );
         Ok(())
     }
     pub(crate) fn provider_branch_config(
@@ -2602,6 +2783,7 @@ impl Registry {
         self.branch_models
             .read()
             .expect("branch models")
+            .named
             .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
             .cloned()
     }
@@ -2612,8 +2794,9 @@ impl Registry {
     ) -> Option<Arc<dyn crate::Model>> {
         let models = self.branch_models.read().expect("branch models");
         models
+            .named
             .get(&(Some(session_id), None, name.to_owned()))
-            .or_else(|| models.get(&(None, None, name.to_owned())))
+            .or_else(|| models.named.get(&(None, None, name.to_owned())))
             .map(|(model, _)| model.clone())
     }
     pub(crate) fn copy_session_branch_models(&self, source: Uuid, destination: Uuid) {
@@ -2621,16 +2804,17 @@ impl Registry {
             .branch_reservations
             .read()
             .expect("branch reservations");
+        if reservations.contains_key(&(destination, String::new(), String::new())) {
+            return;
+        }
         let mut models = self.branch_models.write().expect("branch models");
-        let copies: Vec<_> = models
+        let named: Vec<_> = models
+            .named
             .iter()
             .filter(|((owner, _, _), _)| *owner == Some(source))
             .map(|((_, provider, name), model)| (provider.clone(), name.clone(), model.clone()))
             .collect();
-        for (provider, name, model) in copies {
-            if reservations.contains_key(&(destination, String::new(), String::new())) {
-                continue;
-            }
+        for (provider, name, model) in named {
             if reservations.contains_key(&(
                 destination,
                 provider.clone().unwrap_or_default(),
@@ -2638,9 +2822,21 @@ impl Registry {
             )) {
                 continue;
             }
-            models.insert((Some(destination), provider, name), model);
+            models
+                .named
+                .insert((Some(destination), provider, name), model);
+        }
+        if reservations.get(&(source, String::new(), String::new())) != Some(&true) {
+            let cycled: Vec<_> = models
+                .cycled
+                .iter()
+                .filter(|((owner, _), _)| *owner == source)
+                .map(|((_, selection), client)| ((destination, selection.clone()), client.clone()))
+                .collect();
+            models.cycled.extend(cycled);
         }
     }
+
     /// Remove recovery clients for a session before rebuilding its host configuration.
     pub fn remove_session_branch_models(&self, session_id: Uuid) {
         let mut reservations = self
@@ -2652,9 +2848,10 @@ impl Registry {
                 *revoked = true;
             }
         }
-        self.branch_models
-            .write()
-            .expect("branch models")
+        let mut models = self.branch_models.write().expect("branch models");
+        models.cycled.retain(|(owner, _), _| *owner != session_id);
+        models
+            .named
             .retain(|(owner, _, _), _| *owner != Some(session_id));
     }
     /// Allow tools that opt out to run without the host's default timeout.
@@ -2929,8 +3126,10 @@ impl Registry {
         states: &ExtensionStates,
         cancel: &CancellationToken,
     ) -> Result<Option<UserBashReplacement>> {
-        self.prepare_user_bash_inner(event, states, cancel, None)
-            .await
+        Ok(self
+            .prepare_user_bash_inner(event, states, cancel, None)
+            .await?
+            .map(|(replacement, _)| replacement))
     }
 
     pub async fn prepare_user_bash_with_host(
@@ -2940,6 +3139,20 @@ impl Registry {
         cancel: &CancellationToken,
         host: Arc<dyn ToolHost>,
     ) -> Result<Option<UserBashReplacement>> {
+        Ok(self
+            .prepare_user_bash_with_output_error(event, states, cancel, host)
+            .await?
+            .map(|(replacement, _)| replacement))
+    }
+
+    #[doc(hidden)]
+    pub async fn prepare_user_bash_with_output_error(
+        &self,
+        event: &UserBashEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        host: Arc<dyn ToolHost>,
+    ) -> Result<Option<(UserBashReplacement, Option<String>)>> {
         self.prepare_user_bash_inner(event, states, cancel, Some(host))
             .await
     }
@@ -2950,17 +3163,27 @@ impl Registry {
         states: &ExtensionStates,
         cancel: &CancellationToken,
         host: Option<Arc<dyn ToolHost>>,
-    ) -> Result<Option<UserBashReplacement>> {
+    ) -> Result<Option<(UserBashReplacement, Option<String>)>> {
         for extension in &self.extensions {
             let state = states.get(extension.id());
             if extension.handles_user_bash() {
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = async { match &host { Some(host) => extension.user_bash_with_host(event, state, host.clone()).await, None => extension.user_bash(event, state).await } } => result,
+                    result = async {
+                        match &host {
+                            Some(host) => extension.user_bash_with_output_error(event, state, host.clone()).await,
+                            None => Ok(extension.user_bash(event, state).await?.map(|result| {
+                                UserBashResultWithOutputError { result, full_output_error: None }
+                            })),
+                        }
+                    } => result,
                 };
                 if let Some(result) = hook(extension.as_ref(), result)? {
-                    return Ok(Some(UserBashReplacement::Result(result)));
+                    return Ok(Some((
+                        UserBashReplacement::Result(result.result),
+                        result.full_output_error,
+                    )));
                 }
             }
             if extension.handles_user_bash_operations() {
@@ -2970,10 +3193,13 @@ impl Registry {
                     result = async { match &host { Some(host) => extension.user_bash_operations_with_host(event, state, host.clone()).await, None => extension.user_bash_operations(event, state).await } } => result,
                 };
                 if hook(extension.as_ref(), result)? {
-                    return Ok(Some(UserBashReplacement::Operations {
-                        extension: extension.clone(),
-                        state: state.cloned(),
-                    }));
+                    return Ok(Some((
+                        UserBashReplacement::Operations {
+                            extension: extension.clone(),
+                            state: state.cloned(),
+                        },
+                        None,
+                    )));
                 }
             }
         }

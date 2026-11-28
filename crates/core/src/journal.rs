@@ -12,6 +12,14 @@ use crate::{
     Usage, UsageReport,
 };
 
+mod assistant_transcript;
+
+pub(crate) use assistant_transcript::RETRY_SCHEDULED;
+pub use assistant_transcript::{
+    AssistantTranscriptEntry, native_assistant_stop_reason, superseded_turn_partial,
+    superseded_turn_partial_with_completion,
+};
+
 pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
 const BRANCH_FALLBACK_JOURNAL_VERSION: u32 = 4;
 pub(crate) const TOOL_DECISION_JOURNAL_VERSION: u32 = 5;
@@ -441,6 +449,15 @@ impl AbandonedBranch {
     }
 }
 
+// A provider/model pair can be selected repeatedly with different clients.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CycledModelSelection {
+    pub id: Uuid,
+    pub provider: String,
+    pub model: String,
+    pub thinking: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -481,6 +498,15 @@ impl Record {
         chrono::DateTime::parse_from_rfc3339(self.timestamp.as_deref()?)
             .ok()
             .map(|timestamp| timestamp.timestamp_millis())
+    }
+
+    /// The recorded thinking level of a valid SDK model binding.
+    #[doc(hidden)]
+    pub fn sdk_model_binding_thinking<'a>(
+        &'a self,
+        metadata: &'a serde_json::Value,
+    ) -> Option<&'a str> {
+        Session::parse_sdk_model_binding(self, metadata).map(|(_, _, _, thinking)| thinking)
     }
 }
 
@@ -1676,16 +1702,14 @@ impl Session {
         let token_index = crate::tokens::SourceTokenIndex::new(self, &branch);
         let entries = conversation_entries_unrepaired(&branch, self.operations());
         let system_invalidations = crate::tokens::non_additive_native_system_checkpoints(&branch);
-        let invalidated_at = branch
-            .iter()
-            .rev()
-            .find_map(|record| {
-                (matches!(
-                    record.event,
-                    Event::ContextEdited { .. } | Event::Compacted { .. }
-                ) || system_invalidations.contains(&record.id))
+        let invalidated_at = branch_with_context_edits(&branch)
+            .filter_map(|(record, context_edit)| {
+                (matches!(record.event, Event::Compacted { .. })
+                    || context_edit
+                    || system_invalidations.contains(&record.id))
                 .then_some(record.id)
             })
+            .last()
             .unwrap_or(0);
         let completions: BTreeMap<_, _> = branch
             .iter()
@@ -1783,14 +1807,11 @@ impl Session {
     pub(crate) fn context_budget_estimate(&self) -> crate::ContextUsageEstimate {
         let branch = self.branch();
         let entries = conversation_entries(&branch, self.operations());
-        let invalidated_at = branch
-            .iter()
-            .rev()
-            .find_map(|record| {
-                matches!(
+        let invalidated_at = branch_with_context_edits(&branch)
+            .filter_map(|(record, context_edit)| {
+                (matches!(
                     record.event,
-                    Event::ContextEdited { .. }
-                        | Event::Compacted { .. }
+                    Event::Compacted { .. }
                         | Event::SystemCheckpoint { .. }
                         | Event::ModelSelected { .. }
                         | Event::BranchModelSelected { .. }
@@ -1798,9 +1819,10 @@ impl Session {
                             fallback_model: Some(_),
                             ..
                         }
-                )
-                .then_some(record.id)
+                ) || context_edit)
+                    .then_some(record.id)
             })
+            .last()
             .unwrap_or(0);
         let completions: BTreeMap<_, _> = branch
             .iter()
@@ -1893,29 +1915,8 @@ impl Session {
     }
 
     pub(crate) fn imported_assistant_message(&self, source: u64) -> Option<&serde_json::Value> {
-        let assistant = self.records.get(source.checked_sub(1)? as usize)?;
-        let Event::Assistant {
-            request_id: Some(request_id),
-            ..
-        } = &assistant.event
-        else {
-            return None;
-        };
-        let completion = self
-            .records
-            .get(assistant.parent?.checked_sub(1)? as usize)?;
-        if !matches!(&completion.event, Event::ModelFinished { request_id: id, .. } if id == request_id)
-        {
-            return None;
-        }
-        let original = self
-            .records
-            .get(completion.parent?.checked_sub(1)? as usize)?;
-        let Event::SourceEntry { format, entry } = &original.event else {
-            return None;
-        };
-        (format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant")
-            .then_some(&entry["message"])
+        let lookup = |id: u64| self.records.get(id.checked_sub(1)? as usize);
+        imported_assistant_source(lookup(source)?, lookup).map(|(entry, _)| &entry["message"])
     }
 
     pub fn operations(&self) -> Vec<(Invocation, OperationState)> {
@@ -1944,17 +1945,122 @@ impl Session {
             .map(|(_, model, thinking)| (model, thinking))
     }
 
+    fn selection_history(&self, target: u64) -> impl Iterator<Item = &Record> {
+        std::iter::successors(
+            target
+                .checked_sub(1)
+                .and_then(|id| self.records.get(id as usize)),
+            |record| self.records.get(record.parent?.checked_sub(1)? as usize),
+        )
+    }
+
+    fn is_model_selection(record: &Record) -> bool {
+        matches!(
+            record.event,
+            Event::ModelSelected { .. }
+                | Event::BranchModelSelected { .. }
+                | Event::BranchSummary {
+                    fallback_model: Some(_),
+                    ..
+                }
+        )
+    }
+
+    pub(crate) fn cycled_model_at(&self, target: u64) -> Result<Option<CycledModelSelection>> {
+        for record in self.selection_history(target) {
+            let metadata = self.record_metadata(record.id).filter(|metadata| {
+                ["sdkCycleBinding", "sdkCycleThinking", "sdkThinkingOnly"]
+                    .iter()
+                    .any(|key| metadata.get(key).is_some())
+            });
+            if let Some(metadata) = metadata {
+                let (id, provider, model, thinking) =
+                    Self::parse_sdk_model_binding(record, metadata).ok_or_else(|| {
+                        Error::Session(format!("invalid SDK cycle binding at record {}", record.id))
+                    })?;
+                return Ok(Some(CycledModelSelection {
+                    id,
+                    provider: provider.to_owned(),
+                    model: model.to_owned(),
+                    thinking: thinking.to_owned(),
+                }));
+            }
+            if Self::is_model_selection(record) {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    fn parse_sdk_model_binding<'a>(
+        record: &'a Record,
+        metadata: &'a serde_json::Value,
+    ) -> Option<(Uuid, &'a str, &'a str, &'a str)> {
+        let id = Uuid::parse_str(metadata.get("sdkCycleBinding")?.as_str()?).ok()?;
+        let thinking = metadata.get("sdkCycleThinking")?.as_str()?;
+        if id.is_nil()
+            || thinking.trim().is_empty()
+            || metadata
+                .get("sdkThinkingOnly")
+                .is_some_and(|flag| flag.as_bool() != Some(true))
+        {
+            return None;
+        }
+        let (provider, model) = match &record.event {
+            Event::ModelSelected {
+                provider: Some(provider),
+                model,
+                thinking: Some(selected),
+            } if selected == thinking => (provider, model),
+            Event::BranchModelSelected {
+                provider, model, ..
+            } => (provider, model),
+            Event::BranchSummary {
+                fallback_model: Some(selection),
+                ..
+            } => (&selection.provider, &selection.model),
+            _ => return None,
+        };
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return None;
+        }
+        Some((id, provider, model, thinking))
+    }
+
+    pub(crate) fn select_cycled_model(&mut self, selection: &CycledModelSelection) -> Result<()> {
+        self.append_cycled_model_transition(
+            Event::ModelSelected {
+                provider: Some(selection.provider.clone()),
+                model: selection.model.clone(),
+                thinking: Some(selection.thinking.clone()),
+            },
+            selection,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn append_cycled_model_transition(
+        &mut self,
+        event: Event,
+        selection: &CycledModelSelection,
+    ) -> Result<&Record> {
+        self.append_inner_with_metadata(
+            event,
+            false,
+            Some(serde_json::json!({"sdkCycleBinding": selection.id, "sdkCycleThinking": selection.thinking})),
+            false,
+        )
+    }
+
     /// The provider belongs to the same selection record as the model. Older
     /// records and request-only histories have no reliable provider identity.
     pub(crate) fn model_identity_at(
         &self,
         target: u64,
     ) -> Option<(Option<String>, String, Option<String>)> {
-        let branch = self.path(target);
-        branch
-            .iter()
-            .rev()
-            .find_map(|record| match &record.event {
+        self.selection_history(target)
+            .find(|record| Self::is_model_selection(record))
+            .and_then(|record| match &record.event {
                 Event::ModelSelected {
                     model,
                     thinking,
@@ -1962,22 +2068,33 @@ impl Session {
                 } => Some((provider.clone(), model.clone(), thinking.clone())),
                 Event::BranchModelSelected {
                     provider, model, ..
-                } => Some((Some(provider.clone()), model.clone(), None)),
+                } => Some((
+                    Some(provider.clone()),
+                    model.clone(),
+                    self.record_metadata(record.id)
+                        .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
+                        .map(str::to_owned),
+                )),
                 Event::BranchSummary {
                     fallback_model: Some(selection),
                     ..
                 } => Some((
                     Some(selection.provider.clone()),
                     selection.model.clone(),
-                    None,
+                    self.record_metadata(record.id)
+                        .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
+                        .map(str::to_owned),
                 )),
                 _ => None,
             })
             .or_else(|| {
-                branch.iter().rev().find_map(|record| match &record.event {
-                    Event::ModelRequested { model, .. } => Some((None, model.clone(), None)),
-                    _ => None,
-                })
+                self.path(target)
+                    .into_iter()
+                    .rev()
+                    .find_map(|record| match &record.event {
+                        Event::ModelRequested { model, .. } => Some((None, model.clone(), None)),
+                        _ => None,
+                    })
             })
     }
 
@@ -2031,7 +2148,7 @@ impl Session {
         Ok(())
     }
 
-    /// Commit a native fallback in one record, even on an imported Pi head.
+    /// Commit a native model selection in one record, even on an imported Pi head.
     /// A distinct timestamp preserves the existing imported-conversion marker
     /// understood by older journal and RPC readers.
     pub(crate) fn select_provider_model_atomic(
@@ -2218,9 +2335,19 @@ impl Session {
             .find_map(|record| match &record.event {
                 Event::SessionInfo {
                     name: Some(name), ..
-                } => Some(name.as_str()),
+                } => Some(Some(name.as_str())),
+                // Pi treats the latest session_info as the whole title update.
+                // Native SessionInfo records can update just the directory.
+                Event::SourceEntry { format, entry }
+                    if format == "pi"
+                        && entry["type"] == "session_info"
+                        && entry["name"].is_null() =>
+                {
+                    Some(None)
+                }
                 _ => None,
             })
+            .flatten()
             .map(|name| name.trim_matches(is_ecmascript_whitespace))
             .filter(|name| !name.is_empty())
     }
@@ -2358,10 +2485,18 @@ impl Session {
 
     /// Find a callback-triggered run that has not started or was interrupted.
     pub fn pending_custom_trigger(&self) -> Option<Uuid> {
-        let branch = self.branch();
+        self.pending_custom_triggers(true).next()
+    }
+
+    fn pending_custom_triggers(&self, include_branch: bool) -> impl Iterator<Item = Uuid> + '_ {
+        let branch = if include_branch {
+            self.branch()
+        } else {
+            Vec::new()
+        };
         let branch_ids: std::collections::HashSet<_> =
             branch.iter().map(|record| record.id).collect();
-        self.records.iter().find_map(|record| {
+        self.records.iter().filter_map(move |record| {
             let (input, global) = match &record.event {
                 Event::CustomMessageQueued { input } if branch_ids.contains(&record.id) => (input, false),
                 Event::TreeMessageQueued { input } => (input, true),
@@ -2384,6 +2519,22 @@ impl Session {
         })
     }
 
+    fn tree_trigger_run_head(&self, run_id: Uuid) -> Option<u64> {
+        self.records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.run_id == Some(run_id) && !matches!(record.event, Event::Checkout { .. })
+            })
+            .map(|record| record.id)
+    }
+
+    /// Branches with recorded work that startup may resume in a tree handoff.
+    pub(crate) fn pending_tree_trigger_heads(&self) -> impl Iterator<Item = u64> + '_ {
+        self.pending_custom_triggers(false)
+            .filter_map(|id| self.tree_trigger_run_head(id))
+    }
+
     /// Restore the branch that owns an interrupted session-wide tree trigger.
     /// The current branch must be settled; the destination may contain the
     /// pending operation that recovery is about to reconcile.
@@ -2396,15 +2547,7 @@ impl Session {
         if !is_tree_trigger || self.pending_custom_trigger() != Some(run_id) {
             return Ok(None);
         }
-        let Some(target) = self
-            .records
-            .iter()
-            .rev()
-            .find(|record| {
-                record.run_id == Some(run_id) && !matches!(record.event, Event::Checkout { .. })
-            })
-            .map(|record| record.id)
-        else {
+        let Some(target) = self.tree_trigger_run_head(run_id) else {
             return Ok(None);
         };
         if self.head == target {
@@ -2444,7 +2587,7 @@ impl Session {
         }
     }
 
-    fn pending_tree_trigger_handoff(&self) -> Option<(u64, u64)> {
+    pub(crate) fn pending_tree_trigger_handoff(&self) -> Option<(u64, u64)> {
         self.records.iter().rev().find_map(|record| {
             let Event::TreeTriggerHandoff { return_to, .. } = record.event else {
                 return None;
@@ -2612,7 +2755,7 @@ impl Session {
 
     pub fn append_bash_execution(&mut self, execution: crate::BashExecution) -> Result<()> {
         self.ensure_settled()?;
-        self.record_bash_result(execution)
+        self.record_bash_result(execution, None)
     }
 
     /// Append extension data without adding a message to the model context.
@@ -2635,12 +2778,21 @@ impl Session {
     /// An interrupted tool can still await reconciliation. Its eventual result
     /// is projected beside its tool call, before this shell output.
     pub fn append_local_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {
+        self.append_local_bash_result_with_output_error(execution, None)
+    }
+
+    #[doc(hidden)]
+    pub fn append_local_bash_result_with_output_error(
+        &mut self,
+        execution: crate::BashExecution,
+        full_output_error: Option<&str>,
+    ) -> Result<()> {
         if self.host_binding().is_some() {
             return Err(Error::Session(
                 "a managed session must record shell output through its host".into(),
             ));
         }
-        self.record_bash_result(execution)
+        self.record_bash_result(execution, full_output_error)
     }
 
     /// Record background cache usage only on the session and branch that sent it.
@@ -2670,29 +2822,29 @@ impl Session {
 
     /// A refresh during a run belongs to the latest unchanged model request.
     pub fn cache_request_current(&self, session_id: Uuid, request_id: Uuid) -> bool {
-        self.session_id() == session_id
-            && self.host_binding().is_none()
-            && self
-                .branch()
-                .into_iter()
-                .rev()
-                .find_map(|record| match record.event {
-                    Event::ModelRequested {
-                        request_id: current,
-                        ..
-                    } => Some(current == Some(request_id)),
-                    Event::Compacted { .. }
-                    | Event::BranchSummary { .. }
-                    | Event::ContextEdited { .. }
-                    | Event::BashExecution { .. }
-                    | Event::CustomMessage { .. }
-                    | Event::CustomMessageDelivered { .. }
-                    | Event::User { .. }
-                    | Event::UserWithImages { .. }
-                    | Event::UserImages { .. } => Some(false),
-                    _ => None,
-                })
-                == Some(true)
+        if self.session_id() != session_id || self.host_binding().is_some() {
+            return false;
+        }
+        let branch = self.branch();
+        branch_with_context_edits(&branch)
+            .filter_map(|(record, context_edit)| match record.event {
+                Event::ModelRequested {
+                    request_id: current,
+                    ..
+                } => Some(current == Some(request_id)),
+                Event::Compacted { .. }
+                | Event::BranchSummary { .. }
+                | Event::BashExecution { .. }
+                | Event::CustomMessage { .. }
+                | Event::CustomMessageDelivered { .. }
+                | Event::User { .. }
+                | Event::UserWithImages { .. }
+                | Event::UserImages { .. } => Some(false),
+                _ if context_edit => Some(false),
+                _ => None,
+            })
+            .last()
+            == Some(true)
     }
 
     pub(crate) fn append_cache_warm(
@@ -2711,12 +2863,19 @@ impl Session {
         })
     }
 
-    fn record_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {
+    fn record_bash_result(
+        &mut self,
+        execution: crate::BashExecution,
+        full_output_error: Option<&str>,
+    ) -> Result<()> {
+        let metadata = execution
+            .output_save_error(full_output_error)
+            .map(|error| serde_json::json!({"fullOutputError":error}));
         let event = Event::BashExecution { execution };
         if serde_json::to_vec(&event)?.len() > 8 * 1024 * 1024 {
             return Err(Error::Config("shell execution exceeds size limit".into()));
         }
-        self.append(event)?;
+        self.append_with_advisory_metadata(event, metadata)?;
         Ok(())
     }
 
@@ -3077,6 +3236,9 @@ impl Session {
                 continue;
             }
             if entry["type"] == "label" {
+                if verified_conversions.get(&record.id) == Some(&0) {
+                    continue;
+                }
                 let paired = branch.get(index + 1).is_some_and(|next| {
                     next.parent == Some(record.id) && next.timestamp == record.timestamp
                         && next.run_id.is_none()
@@ -3247,6 +3409,22 @@ impl Session {
                         }
                     }
                     if entry["type"] == "compaction"
+                        && let Some(source) = source_ids.get(&original_id)
+                        && let Some(count) = verified_conversions
+                            .get(&original_id)
+                            .filter(|&&count| count > 0)
+                        && matches!(
+                            &self.records[(original_id + count - 1) as usize].event,
+                            Event::Compacted {
+                                retain_from: None,
+                                ..
+                            }
+                        )
+                    {
+                        // A verified no-retention compaction is self-contained
+                        // in the fork even when its raw boundary was a sibling.
+                        entry["firstKeptEntryId"] = serde_json::json!(source);
+                    } else if entry["type"] == "compaction"
                         && let Some(old) = entry["firstKeptEntryId"].as_str()
                         && let Some(label_id) = source_labels.get(old)
                     {
@@ -3923,23 +4101,40 @@ pub fn aborted_turn_partial_request(event: &Event) -> Option<Uuid> {
 /// Whether a completion is a marked, display-only cancelled turn partial.
 #[doc(hidden)]
 pub fn is_aborted_turn_partial(records: &[Record], record: &Record) -> bool {
+    turn_partial_failure(records, record) == Some(ModelFailure::Cancelled)
+}
+
+pub(crate) fn turn_partial_marker(failure: ModelFailure) -> &'static str {
+    match failure {
+        ModelFailure::Cancelled => "pi-rs:aborted-turn-partial",
+        ModelFailure::Failed | ModelFailure::Retryable => "pi-rs:failed-turn-partial",
+    }
+}
+
+/// The failure of a marked, display-only turn partial. Summary partials and
+/// older unmarked failures have no display provenance.
+#[doc(hidden)]
+pub fn turn_partial_failure(records: &[Record], record: &Record) -> Option<ModelFailure> {
     let Event::ModelFinished {
         request_id,
-        failure: Some(ModelFailure::Cancelled),
+        failure: Some(failure),
         partial,
         ..
     } = &record.event
     else {
-        return false;
+        return None;
     };
-    let Some(parent) = record
-        .parent
-        .and_then(|id| id.checked_sub(1))
-        .and_then(|index| records.get(index as usize))
-    else {
-        return false;
+    let parent = records.get(record.parent?.checked_sub(1)? as usize)?;
+    let Event::SourceEntry { format, entry } = &parent.event else {
+        return None;
     };
-    aborted_turn_partial_request(&parent.event) == Some(*request_id) && !partial.is_empty()
+    (!partial.is_empty()
+        && format == turn_partial_marker(*failure)
+        && entry["requestId"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            == Some(*request_id))
+    .then_some(*failure)
 }
 
 fn validate_context_edit(
@@ -3951,8 +4146,8 @@ fn validate_context_edit(
         .checked_sub(1)
         .and_then(|index| records.get(index as usize))
         .ok_or_else(|| Error::Session("invalid context edit target".into()))?;
-    let assistant =
-        matches!(record.event, Event::Assistant { .. }) || is_aborted_turn_partial(records, record);
+    let assistant = matches!(record.event, Event::Assistant { .. })
+        || turn_partial_failure(records, record).is_some();
     if !assistant
         && !matches!(
             record.event,
@@ -4804,30 +4999,174 @@ pub(crate) fn conversation_entries(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<(u64, Message)> {
-    let retain_from = path
-        .iter()
+    conversation_entries_since(path, operations, retained_message_floor(path))
+}
+
+fn retained_message_floor(path: &[&Record]) -> u64 {
+    path.iter()
         .rev()
         .find_map(|record| match record.event {
             Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(record.id)),
             _ => None,
         })
-        .unwrap_or(0);
-    conversation_entries_since(path, operations, retain_from)
+        .unwrap_or(0)
 }
 
 pub(crate) fn conversation_entries_unrepaired(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<(u64, Message)> {
-    let retain_from = path
-        .iter()
-        .rev()
-        .find_map(|record| match record.event {
-            Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(record.id)),
+    conversation_entries_since_inner(path, operations, retained_message_floor(path), false)
+}
+
+fn context_edits<'a>(path: &[&'a Record]) -> BTreeMap<u64, &'a Option<crate::ContextContent>> {
+    path.iter()
+        .filter_map(|record| match &record.event {
+            Event::ContextEdited {
+                target,
+                replacement,
+            } => Some((*target, replacement)),
             _ => None,
         })
-        .unwrap_or(0);
-    conversation_entries_since_inner(path, operations, retain_from, false)
+        .collect()
+}
+
+/// Find the nearest completion on the marker's branch without crossing a run boundary.
+fn nearest_model_completion<'a>(
+    marker: &Record,
+    lookup: impl Fn(u64) -> Option<&'a Record>,
+) -> Option<&'a Record> {
+    let mut parent = marker.parent;
+    while let Some(record) = parent.and_then(&lookup) {
+        if record.run_id != marker.run_id {
+            return None;
+        }
+        if matches!(record.event, Event::ModelFinished { .. }) {
+            return Some(record);
+        }
+        parent = record.parent;
+    }
+    None
+}
+
+fn imported_assistant_source<'a>(
+    assistant: &Record,
+    lookup: impl Fn(u64) -> Option<&'a Record>,
+) -> Option<(&'a serde_json::Value, &'a Record)> {
+    let Event::Assistant {
+        request_id: Some(request),
+        ..
+    } = &assistant.event
+    else {
+        return None;
+    };
+    let completion = lookup(assistant.parent?)?;
+    let Event::ModelFinished { request_id, .. } = &completion.event else {
+        return None;
+    };
+    if request_id != request {
+        return None;
+    }
+    let Event::SourceEntry { format, entry } = &lookup(completion.parent?)?.event else {
+        return None;
+    };
+    (format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant")
+        .then_some((entry, completion))
+}
+
+/// Carry the nearest preceding completion from the record's actual parent.
+/// `parent_completion` is the nearest completion strictly before `parent`.
+#[doc(hidden)]
+pub fn nearest_completion_before(
+    record: &Record,
+    parent: Option<&Record>,
+    parent_completion: Option<u64>,
+) -> Option<u64> {
+    let parent = parent
+        .filter(|parent| record.parent == Some(parent.id) && record.run_id == parent.run_id)?;
+    if matches!(parent.event, Event::ModelFinished { .. }) {
+        Some(parent.id)
+    } else {
+        parent_completion
+    }
+}
+
+fn branch_with_nearest_completion<'a, 'b>(
+    branch: &'b [&'a Record],
+) -> impl Iterator<Item = (&'a Record, Option<u64>)> + 'b {
+    let mut parent = None;
+    let mut completion = None;
+    branch.iter().copied().map(move |record| {
+        completion = nearest_completion_before(record, parent, completion);
+        parent = Some(record);
+        (record, completion)
+    })
+}
+
+fn branch_with_context_edits<'a, 'b>(
+    branch: &'b [&'a Record],
+) -> impl Iterator<Item = (&'a Record, bool)> + 'b {
+    let lookup = |id| {
+        branch
+            .binary_search_by_key(&id, |record| record.id)
+            .ok()
+            .map(|index| branch[index])
+    };
+    branch_with_nearest_completion(branch).map(move |(record, completion)| {
+        (record, is_model_context_edit(record, completion, lookup))
+    })
+}
+
+fn is_model_context_edit<'a>(
+    record: &Record,
+    nearest_completion: Option<u64>,
+    lookup: impl Fn(u64) -> Option<&'a Record>,
+) -> bool {
+    let Event::ContextEdited {
+        target,
+        replacement,
+    } = &record.event
+    else {
+        return false;
+    };
+    let Some(target) = lookup(*target) else {
+        return true;
+    };
+    if matches!(target.event, Event::ModelFinished { .. }) {
+        return false;
+    }
+    if replacement.is_some() {
+        return true;
+    }
+    let Some(source) = record.parent.and_then(&lookup) else {
+        return true;
+    };
+    let Event::SourceEntry { format, entry } = &source.event else {
+        return true;
+    };
+    // The flag is advisory. The original failed reply must correspond to the
+    // nearest completion, as it would for a native retry or overflow marker.
+    !(record.run_id.is_none()
+        && source.id + 1 == record.id
+        && source.timestamp == record.timestamp
+        && format == "pi"
+        && entry["type"] == "context_edit"
+        && entry
+            .get("replacement")
+            .is_some_and(serde_json::Value::is_null)
+        && entry[crate::pi_import::SUPERSEDED_PARTIAL_FIELD] == true
+        && imported_assistant_source(target, lookup).is_some_and(|(message, completion)| {
+            matches!(
+                completion.event,
+                Event::ModelFinished {
+                    failure: Some(ModelFailure::Failed),
+                    ..
+                }
+            ) && entry["targetId"]
+                .as_str()
+                .is_some_and(|id| message["id"] == id)
+                && nearest_completion == Some(completion.id)
+        }))
 }
 
 fn conversation_entries_since(
@@ -4902,16 +5241,16 @@ fn conversation_entries_since_inner(
             _ => None,
         })
         .collect();
-    let edits: BTreeMap<_, _> = path
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::ContextEdited {
-                target,
-                replacement,
-            } => Some((*target, replacement)),
-            _ => None,
-        })
-        .collect();
+    let mut edits = context_edits(path);
+    if !edits.is_empty() {
+        // Previous versions wrote retry omissions as edits to display-only
+        // completions. Explicit edits to those partials also stay in display.
+        for record in path {
+            if matches!(record.event, Event::ModelFinished { .. }) {
+                edits.remove(&record.id);
+            }
+        }
+    }
     // Replacement blocks may introduce calls with no corresponding result.
     // Compare those calls with the actual repaired model projection, while
     // keeping an otherwise empty assistant for its thinking and usage.
@@ -5141,7 +5480,7 @@ fn conversation_entries_since_inner(
             (source, message)
         })
         .collect();
-    if repair && !edits.is_empty() {
+    if repair && !edits.is_empty() && branch_with_context_edits(path).any(|(_, edit)| edit) {
         let thinking_sources: BTreeSet<_> = messages
             .iter()
             .filter_map(|(source, message)| {
@@ -5521,6 +5860,60 @@ mod record_metadata_tests {
         drop(share);
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.record_metadata(id), Some(&metadata));
+    }
+
+    #[test]
+    fn user_shell_save_error_is_advisory_for_legacy_stores() {
+        struct LegacyStore(MemoryStore);
+
+        impl SessionStore for LegacyStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.0.load()
+            }
+
+            fn append(&mut self, record: &Record) -> Result<()> {
+                self.0.append(record)
+            }
+        }
+
+        let execution = crate::BashExecution {
+            command: "fixture".into(),
+            output: "bounded tail".into(),
+            exit_code: Some(19),
+            cancelled: false,
+            truncated: true,
+            full_output_path: None,
+            exclude_from_context: false,
+        };
+        let mut legacy = Session::with_store(LegacyStore(MemoryStore::default())).unwrap();
+        legacy
+            .append_local_bash_result_with_output_error(execution.clone(), Some("disk full"))
+            .unwrap();
+        let record = legacy.records().last().unwrap();
+        assert!(matches!(&record.event, Event::BashExecution { execution }
+            if execution.exit_code == Some(19) && execution.output == "bounded tail"));
+        assert!(legacy.record_metadata(record.id).is_none());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append_local_bash_result_with_output_error(execution, Some("disk full"))
+            .unwrap();
+        let id = session.head();
+        drop(session);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(
+            reopened.record_metadata(id),
+            Some(&serde_json::json!({"fullOutputError":"disk full"}))
+        );
+        assert_eq!(
+            {
+                let fork = reopened.fork_session(id).unwrap();
+                fork.record_metadata(fork.head()).cloned()
+            },
+            reopened.record_metadata(id).cloned()
+        );
     }
 
     #[test]

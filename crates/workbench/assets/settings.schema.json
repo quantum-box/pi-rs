@@ -112,7 +112,13 @@
       "type": "object",
       "properties": {
         "clearOnShrink": { "type": "boolean" },
+        "hyperlinks": { "description": "Use true or false to override hyperlink detection. Use \"auto\" for automatic detection. Other legacy values are preserved and treated as automatic." },
+        "trueColor": { "description": "Use true or false to override true color detection. Use \"auto\" for automatic detection. Other legacy values are preserved and treated as automatic." },
         "showTerminalProgress": { "type": "boolean" },
+        "images": {
+          "description": "Use kitty or iterm2, or false to disable inline image protocols. Other values use detection.",
+          "default": "auto"
+        },
         "showImages": { "type": "boolean" },
         "imageWidthCells": { "type": "integer", "minimum": 1 }
       }

@@ -255,7 +255,7 @@ pub enum ToolPart {
     Text(String),
     Warning(String),
     TruncationNotice(String),
-    Image(std::sync::Arc<super::images::InlineImage>),
+    Image(std::sync::Arc<super::images::InlineAttachment>),
 }
 
 #[derive(Clone)]
@@ -341,6 +341,7 @@ pub enum Entry {
         id: u64,
         custom_type: String,
         text: String,
+        images: Vec<std::sync::Arc<super::images::InlineAttachment>>,
         rendered: Option<pi_rs::RenderedCustomMessage>,
     },
     CustomRecord {
@@ -355,7 +356,7 @@ pub enum Entry {
         text: String,
         expanded: Option<bool>,
     },
-    Image(std::sync::Arc<super::images::InlineImage>),
+    Image(std::sync::Arc<super::images::InlineAttachment>),
     Tool {
         id: String,
         call_id: Option<String>,
@@ -374,15 +375,36 @@ pub enum Entry {
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranscriptOptions<'a> {
     pub notices: crate::config::NoticeSettings,
-    pub image_width: Option<usize>,
+    pub inline_images: Option<(super::images::Protocol, usize)>,
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
     pub code_block_indent: Option<&'a str>,
+    pub hyperlinks: bool,
     pub hidden_thinking_label: Option<&'a str>,
     pub expand_key: Option<crossterm::event::KeyEvent>,
 }
 
 impl Entry {
+    pub fn has_inline_images(&self, expand_tools: bool) -> bool {
+        match self {
+            Self::Image(image) => image.is_renderable(),
+            Self::CustomMessage { images, .. } => images.iter().any(|image| image.is_renderable()),
+            Self::Tool {
+                parts,
+                numbered_diff,
+                rendered,
+                ..
+            } if rendered.as_ref().is_some_and(|tool| tool.result.is_some())
+                || (expand_tools && !numbered_diff) =>
+            {
+                parts
+                    .iter()
+                    .any(|part| matches!(part, ToolPart::Image(image) if image.is_renderable()))
+            }
+            _ => false,
+        }
+    }
+
     pub fn user(text: String) -> Self {
         Self::user_markdown(text.into())
     }
@@ -472,7 +494,7 @@ impl Entry {
                             inner,
                             0,
                             options.mermaid,
-                            *HYPERLINKS,
+                            options.hyperlinks,
                             false,
                         ));
                         lines.push(Line::default());
@@ -564,11 +586,7 @@ impl Entry {
                 lines
             }
             Self::CustomRecord { rendered: None, .. } => return Vec::new(),
-            Self::CustomMessage {
-                rendered: Some(rendered),
-                ..
-            }
-            | Self::CustomRecord {
+            Self::CustomRecord {
                 rendered: Some(rendered),
                 ..
             } => {
@@ -577,22 +595,41 @@ impl Entry {
                 return lines;
             }
             Self::CustomMessage {
-                custom_type, text, ..
+                custom_type,
+                text,
+                images,
+                rendered,
+                ..
             } => {
-                let mut label =
-                    Span::themed(format!("[{custom_type}]"), theme, "customMessageLabel");
-                label.bold = true;
                 let mut lines = vec![Line::default()];
-                lines.extend(wrap(&[label], inner));
-                lines.push(Line::default());
-                let mut body = transcript_markdown(text, theme, inner, options, false);
-                custom_message_base_style(&mut body, theme);
-                lines.extend(body);
-                lines.push(Line::default());
-                for line in &mut lines {
-                    line.background = Some(theme.color("customMessageBg"));
+                if let Some(rendered) = rendered {
+                    lines.extend(extension_rows(rendered, theme, width));
+                } else {
+                    let mut label =
+                        Span::themed(format!("[{custom_type}]"), theme, "customMessageLabel");
+                    label.bold = true;
+                    lines.extend(wrap(&[label], inner));
+                    lines.push(Line::default());
+                    let mut body = transcript_markdown(text, theme, inner, options, false);
+                    custom_message_base_style(&mut body, theme);
+                    lines.extend(body);
+                    lines.push(Line::default());
+                    for line in &mut lines {
+                        line.background = Some(theme.color("customMessageBg"));
+                    }
+                    lines.push(Line::default());
                 }
-                lines.push(Line::default());
+                if let Some((protocol, limit)) = options.inline_images {
+                    lines.extend(
+                        images
+                            .iter()
+                            .filter_map(|image| image.lines(width, limit, padding, protocol))
+                            .flatten(),
+                    );
+                }
+                if rendered.is_some() {
+                    return lines;
+                }
                 lines
             }
             Self::Summary {
@@ -653,8 +690,9 @@ impl Entry {
             }
             Self::Image(image) => {
                 return options
-                    .image_width
-                    .map_or_else(Vec::new, |limit| image.lines(width, limit, padding));
+                    .inline_images
+                    .and_then(|(protocol, limit)| image.lines(width, limit, padding, protocol))
+                    .unwrap_or_default();
             }
             Self::Thinking { text, expanded } => {
                 if text
@@ -772,10 +810,12 @@ impl Entry {
                     .and_then(|rendered| rendered.result.as_ref())
                 {
                     lines.extend(extension_rows(result, theme, inner));
-                    if let Some(limit) = options.image_width {
+                    if let Some((protocol, limit)) = options.inline_images {
                         for part in parts {
-                            if let ToolPart::Image(image) = part {
-                                lines.extend(image.lines(width, limit, padding));
+                            if let ToolPart::Image(image) = part
+                                && let Some(rows) = image.lines(width, limit, padding, protocol)
+                            {
+                                lines.extend(rows);
                             }
                         }
                     }
@@ -810,14 +850,19 @@ impl Entry {
                         && parts
                             .iter()
                             .any(|part| matches!(part, ToolPart::Text(_) | ToolPart::Image(_)))
-                        && let Some(limit) = options.image_width
+                        && let Some((protocol, limit)) = options.inline_images
                     {
                         for part in parts {
                             match part {
                                 ToolPart::Text(text) => render_text(text, &mut lines),
                                 ToolPart::Warning(_) | ToolPart::TruncationNotice(_) => {}
                                 ToolPart::Image(image) => {
-                                    lines.extend(image.lines(width, limit, padding))
+                                    if let Some(rows) = image.lines(width, limit, padding, protocol)
+                                    {
+                                        lines.extend(rows);
+                                    } else {
+                                        render_text("[image unavailable]", &mut lines);
+                                    }
                                 }
                             }
                         }
@@ -1369,8 +1414,9 @@ fn tmux_hyperlinks() -> bool {
     }
 }
 
-static HYPERLINKS: LazyLock<bool> =
-    LazyLock::new(|| detect_hyperlinks(|name| std::env::var(name).ok(), tmux_hyperlinks));
+pub(crate) fn detect_terminal_hyperlinks() -> bool {
+    detect_hyperlinks(|name| std::env::var(name).ok(), tmux_hyperlinks)
+}
 
 #[derive(Default)]
 struct Table {
@@ -1563,6 +1609,20 @@ fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
 
 fn safe_hyperlink(url: &str) -> bool {
     !url.is_empty() && !url.chars().any(char::is_control)
+}
+
+fn osc8_destination(enabled: bool, url: &str) -> Option<String> {
+    // Wrapping opens the destination again on each line. Use Pi's UTF-16
+    // length limit before attaching it to any span that could be wrapped.
+    const MAX_HYPERLINK_URL_LENGTH: usize = 8192;
+    (enabled
+        && url
+            .encode_utf16()
+            .take(MAX_HYPERLINK_URL_LENGTH + 1)
+            .count()
+            <= MAX_HYPERLINK_URL_LENGTH
+        && safe_hyperlink(url))
+    .then(|| url.to_owned())
 }
 
 // Parser formatting can split a local part across text events. Do not link a
@@ -2006,7 +2066,7 @@ fn transcript_markdown(
         0,
         MarkdownOptions {
             mermaid: options.mermaid,
-            hyperlinks: *HYPERLINKS,
+            hyperlinks: options.hyperlinks,
             preserve_source,
             code_block_indent: options
                 .code_block_indent
@@ -3069,9 +3129,9 @@ fn markdown_plain_at_depth(
                     );
                     span.bold = bold > 0 || heading > 0;
                     span.underline = heading == 1 || !links.is_empty();
-                    span.hyperlink = links.last().and_then(|(url, _, _)| {
-                        (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
-                    });
+                    span.hyperlink = links
+                        .last()
+                        .and_then(|(url, _, _)| osc8_destination(hyperlinks, url));
                     span.italic = italic > 0;
                     span.thinking_link = heading == 0 && !links.is_empty();
                     span.strikethrough = strikethrough > 0;
@@ -3117,8 +3177,7 @@ fn markdown_plain_at_depth(
                             link.thinking_link = heading == 0;
                             link.dim = theme.is_dim("mdLink");
                             link.underline = true;
-                            link.hyperlink =
-                                (hyperlinks && safe_hyperlink(&url)).then(|| url.clone());
+                            link.hyperlink = osc8_destination(hyperlinks, &url);
                             spans.push(link);
                             if (!hyperlinks || !safe_hyperlink(&url))
                                 && label != url
@@ -3158,9 +3217,9 @@ fn markdown_plain_at_depth(
                 );
                 span.bold = bold > 0 || heading > 0;
                 span.underline = heading == 1 || !links.is_empty();
-                span.hyperlink = links.last().and_then(|(url, _, _)| {
-                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
-                });
+                span.hyperlink = links
+                    .last()
+                    .and_then(|(url, _, _)| osc8_destination(hyperlinks, url));
                 span.italic = italic > 0;
                 span.thinking_link = heading == 0 && !links.is_empty();
                 span.strikethrough = strikethrough > 0;
@@ -3228,9 +3287,9 @@ fn markdown_plain_at_depth(
                 }
                 let mut span = Span::themed(text, theme, "mdCode");
                 span.underline = heading == 1 || !links.is_empty();
-                span.hyperlink = links.last().and_then(|(url, _, _)| {
-                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
-                });
+                span.hyperlink = links
+                    .last()
+                    .and_then(|(url, _, _)| osc8_destination(hyperlinks, url));
                 span.bold = bold > 0 || heading > 0;
                 span.italic = italic > 0;
                 span.strikethrough = strikethrough > 0;
@@ -3266,9 +3325,9 @@ fn markdown_plain_at_depth(
                         label.push_str(&continuation);
                     }
                     let mut span = Span::themed(continuation, theme, "text");
-                    span.hyperlink = links.last().and_then(|(url, _, _)| {
-                        (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
-                    });
+                    span.hyperlink = links
+                        .last()
+                        .and_then(|(url, _, _)| osc8_destination(hyperlinks, url));
                     spans.push(span);
                 }
             }
@@ -5323,6 +5382,7 @@ mod tests {
             id: 1,
             custom_type: "card".into(),
             text: "fallback".into(),
+            images: vec![],
             rendered: Some(pi_rs::RenderedCustomMessage {
                 lines: vec![vec![pi_rs::UiComponentSpan {
                     text: "status\u{7}".into(),
@@ -5352,6 +5412,7 @@ mod tests {
             rendered: None,
             custom_type: "fixture\x1b]bad".into(),
             text: "**bold**\n\nplain \x1b]0;bad\x07text".into(),
+            images: vec![],
         };
         for width in [12, 80] {
             let lines = entry.render(
@@ -5408,6 +5469,7 @@ mod tests {
             rendered: None,
             custom_type: "x".into(),
             text: "plain `code`".into(),
+            images: vec![],
         };
         let lines = entry.render(&theme, 80, false, false, TranscriptOptions::default());
         let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
@@ -5739,11 +5801,10 @@ mod tests {
         image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
-        let image = super::super::images::InlineImage::decode(&pi_rs::ImageContent {
+        let image = super::super::images::InlineAttachment::new(pi_rs::ImageContent {
             data: base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()),
             mime_type: "image/png".into(),
-        })
-        .unwrap();
+        });
         let entry = Entry::Tool {
             id: "test".into(),
             call_id: None,
@@ -5768,7 +5829,7 @@ mod tests {
             true,
             true,
             TranscriptOptions {
-                image_width: Some(60),
+                inline_images: Some((super::super::images::Protocol::Kitty, 60)),
                 padding: 1,
                 ..Default::default()
             },
@@ -5791,7 +5852,7 @@ mod tests {
                     false,
                     true,
                     TranscriptOptions {
-                        image_width: Some(60),
+                        inline_images: Some((super::super::images::Protocol::Kitty, 60)),
                         padding: 1,
                         ..Default::default()
                     }
@@ -6514,6 +6575,48 @@ mod tests {
             assert!(!output.contains(" (https://example.com)"));
         }
         assert!(!safe_hyperlink("https://example.com/\x1b]0;bad"));
+    }
+
+    #[test]
+    fn osc8_skips_oversized_destinations_and_keeps_link_text() {
+        let theme = Theme::system();
+        let long_url = format!("https://example.com/{}", "x".repeat(20_000));
+        for (source, visible) in [
+            (long_url.clone(), long_url.as_str()),
+            (format!("[**documentation**]({long_url})"), "documentation"),
+        ] {
+            let lines = markdown_at_depth(
+                &source,
+                &theme,
+                80,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            let mut bytes = Vec::new();
+            for line in &lines {
+                line.draw(&mut bytes, 80, ColorMode::TrueColor).unwrap();
+            }
+            assert!(!String::from_utf8(bytes).unwrap().contains("\x1b]8;"));
+            assert_eq!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .map(|span| span.text.as_str())
+                    .collect::<String>(),
+                visible
+            );
+        }
+
+        let prefix = "https://example.com/";
+        let at_limit = format!("{prefix}{}", "🌐".repeat((8192 - prefix.len()) / 2));
+        assert_eq!(at_limit.encode_utf16().count(), 8192);
+        assert_eq!(
+            osc8_destination(true, &at_limit).as_deref(),
+            Some(at_limit.as_str())
+        );
+        assert!(osc8_destination(true, &format!("{at_limit}x")).is_none());
     }
 
     #[test]

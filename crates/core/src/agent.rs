@@ -5,7 +5,7 @@ mod turn_scheduler;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -450,10 +450,48 @@ pub(crate) struct TreeModelResolution {
     pub fallback: bool,
     pub require_existing: bool,
     pub legacy: bool,
+    pub cycle: Option<crate::journal::CycledModelSelection>,
     pub revoked: Arc<std::sync::atomic::AtomicBool>,
 }
 
+type TreeHandoffModel = (Arc<dyn Model>, Option<Limits>);
+
 impl Agent<'_> {
+    fn tree_handoff_model(
+        &self,
+        session: &Session,
+        name: Option<&str>,
+        previous_provider: Option<&str>,
+        previous_cycle: Option<&crate::journal::CycledModelSelection>,
+    ) -> Result<Option<TreeHandoffModel>> {
+        let cycle = session.cycled_model_at(session.head())?;
+        let provider = session.model_provider();
+        let Some(name) = name.filter(|name| {
+            *name != self.model_name
+                || provider != previous_provider
+                || cycle.as_ref() != previous_cycle
+        }) else {
+            return Ok(None);
+        };
+        let model = if let Some(selection) = cycle {
+            self.registry
+                .cycled_model(session.session_id(), &selection)
+                .map(|model| (model, None))
+        } else if let Some(provider) = provider {
+            self.registry
+                .provider_branch_config(session.session_id(), provider, name)
+        } else {
+            self.registry
+                .branch_model(session.session_id(), name)
+                .map(|model| (model, None))
+        };
+        model.map(Some).ok_or_else(|| {
+            Error::Config(format!(
+                "tree trigger recovery requires registered model {name}"
+            ))
+        })
+    }
+
     pub(crate) async fn settle_recovery_before_hooks(
         &self,
         session: &Session,
@@ -715,6 +753,7 @@ impl Agent<'_> {
             return Err(Error::Cancelled);
         }
         let selected_provider = session.model_provider().map(str::to_owned);
+        let selected_cycle = session.cycled_model_at(session.head())?;
         let handoff = if input.is_none() {
             match session.begin_tree_trigger_handoff(run_id) {
                 Ok(handoff) => handoff,
@@ -762,55 +801,32 @@ impl Agent<'_> {
         let branch_model = handoff
             .as_ref()
             .and_then(|_| session.model_selection().map(|selection| selection.0));
-        let provider_changed =
-            handoff.is_some() && session.model_provider() != selected_provider.as_deref();
-        let model = match branch_model
-            .as_deref()
-            .filter(|name| *name != self.model_name || provider_changed)
-        {
-            Some(name) => match session
-                .model_provider()
-                .and_then(|provider| {
-                    self.registry
-                        .provider_branch_config(session.session_id(), provider, name)
-                })
-                .or_else(|| {
-                    session
-                        .model_provider()
-                        .is_none()
-                        .then(|| {
-                            self.registry
-                                .branch_model(session.session_id(), name)
-                                .map(|model| (model, None))
-                        })
-                        .flatten()
-                }) {
-                Some(model) => Some(model),
-                None => {
-                    let error = if let Some((return_to, _)) = handoff {
-                        finish_tree_handoff(session, return_to, observer)
-                            .err()
-                            .unwrap_or_else(|| {
-                                Error::Config(format!(
-                                    "tree trigger recovery requires registered model {name}"
-                                ))
-                            })
-                    } else {
-                        Error::Config(format!(
-                            "tree trigger recovery requires registered model {name}"
-                        ))
-                    };
-                    observer(Notification::RunStarted { run_id });
-                    let message = error.to_string();
-                    observer(Notification::RunEnded {
-                        run_id,
-                        succeeded: false,
-                        error: Some(&message),
-                    });
-                    return Err(error);
-                }
-            },
-            None => None,
+        let model = match handoff.as_ref().map_or(Ok(None), |_| {
+            self.tree_handoff_model(
+                session,
+                branch_model.as_deref(),
+                selected_provider.as_deref(),
+                selected_cycle.as_ref(),
+            )
+        }) {
+            Ok(model) => model,
+            Err(error) => {
+                let error = if let Some((return_to, _)) = handoff {
+                    finish_tree_handoff(session, return_to, observer)
+                        .err()
+                        .unwrap_or(error)
+                } else {
+                    error
+                };
+                observer(Notification::RunStarted { run_id });
+                let message = error.to_string();
+                observer(Notification::RunEnded {
+                    run_id,
+                    succeeded: false,
+                    error: Some(&message),
+                });
+                return Err(error);
+            }
         };
         session.set_run_id(Some(run_id));
         observer(Notification::RunStarted { run_id });
@@ -850,6 +866,7 @@ impl Agent<'_> {
                 break;
             };
             let selected_provider = session.model_provider().map(str::to_owned);
+            let selected_cycle = session.cycled_model_at(session.head())?;
             let handoff = match session.begin_tree_trigger_handoff(trigger_id) {
                 Ok(Some((return_to, records))) => {
                     for record in &records {
@@ -875,51 +892,32 @@ impl Agent<'_> {
             observer(Notification::RunStarted { run_id: trigger_id });
             let branch_model =
                 handoff.and_then(|_| session.model_selection().map(|selection| selection.0));
-            let provider_changed =
-                handoff.is_some() && session.model_provider() != selected_provider.as_deref();
-            let model = match branch_model
-                .as_deref()
-                .filter(|name| *name != self.model_name || provider_changed)
-            {
-                Some(name) => match session
-                    .model_provider()
-                    .and_then(|provider| {
-                        self.registry
-                            .provider_branch_config(session.session_id(), provider, name)
-                    })
-                    .or_else(|| {
-                        session
-                            .model_provider()
-                            .is_none()
-                            .then(|| {
-                                self.registry
-                                    .branch_model(session.session_id(), name)
-                                    .map(|model| (model, None))
-                            })
-                            .flatten()
-                    }) {
-                    Some(model) => Some(model),
-                    None => {
-                        session.set_run_id(None);
-                        let message =
-                            format!("tree trigger recovery requires registered model {name}");
-                        let error = if let Some(return_to) = handoff {
-                            finish_tree_handoff(session, return_to, observer)
-                                .err()
-                                .map(|error| error.to_string())
-                                .unwrap_or(message)
-                        } else {
-                            message
-                        };
-                        observer(Notification::RunEnded {
-                            run_id: trigger_id,
-                            succeeded: false,
-                            error: Some(&error),
-                        });
-                        break;
-                    }
-                },
-                None => None,
+            let model = match handoff.map_or(Ok(None), |_| {
+                self.tree_handoff_model(
+                    session,
+                    branch_model.as_deref(),
+                    selected_provider.as_deref(),
+                    selected_cycle.as_ref(),
+                )
+            }) {
+                Ok(model) => model,
+                Err(error) => {
+                    session.set_run_id(None);
+                    let error = if let Some(return_to) = handoff {
+                        finish_tree_handoff(session, return_to, observer)
+                            .err()
+                            .unwrap_or(error)
+                    } else {
+                        error
+                    };
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id: trigger_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    break;
+                }
             };
             let branch_agent = Agent {
                 model: model
@@ -2507,10 +2505,12 @@ impl Agent<'_> {
                         )
                         .await?;
                 }
-                let attempt = active
+                let ReplyAttempt {
+                    outcome: result,
+                    partial_request,
+                } = active
                     .reply(session, attempt, true, cancel, observer, Some(followups))
                     .await?;
-                let result = attempt.outcome;
                 if let Err(Error::Model(message) | Error::RetryableModel(message)) = &result
                     && crate::retry::context_overflow_error(message)
                     && session.auto_compaction_control().enabled()
@@ -2532,6 +2532,18 @@ impl Agent<'_> {
                     && retry_attempt < settings.max_retries
                     && request_index + 1 < active.limits.model_requests
                 {
+                    // Persist the omission before notifying the caller or entering
+                    // cancellable backoff. The failed completion remains in history.
+                    if let Some(request_id) = partial_request {
+                        commit(
+                            session,
+                            Event::SourceEntry {
+                                format: crate::journal::RETRY_SCHEDULED.into(),
+                                entry: serde_json::json!({"requestId": request_id}),
+                            },
+                            observer,
+                        )?;
+                    }
                     retry_attempt += 1;
                     let delay_ms = settings.delay_ms(retry_attempt);
                     let retry_wait = control.begin_wait();
@@ -3957,11 +3969,12 @@ impl Agent<'_> {
         };
         // Only turn replies are displayable. Summary requests can contain
         // private prompt material and must never enter the RPC transcript.
-        if retain_reply && matches!(result, Err(Error::Cancelled)) && !content.is_empty() {
+        let partial_failure = failure.filter(|_| retain_reply && !content.is_empty());
+        if let Some(failure) = partial_failure {
             commit(
                 session,
                 Event::SourceEntry {
-                    format: "pi-rs:aborted-turn-partial".into(),
+                    format: crate::journal::turn_partial_marker(failure).into(),
                     entry: serde_json::json!({"requestId": request_id}),
                 },
                 observer,
@@ -4028,7 +4041,10 @@ impl Agent<'_> {
             observer(Notification::Committed(record));
         });
         self.settle_usage(request_id, &usage, &metadata).await?;
-        Ok(ReplyAttempt { outcome: result })
+        Ok(ReplyAttempt {
+            outcome: result,
+            partial_request: partial_failure.map(|_| request_id),
+        })
     }
 
     async fn settle_usage(
@@ -5177,8 +5193,21 @@ impl Agent<'_> {
         }
         if let Some(resolved) = resolution {
             let session_id = session.session_id();
-            let commit = || session.append(transition).cloned();
-            let (record, revoked) = if resolved.legacy {
+            let commit = || match &resolved.cycle {
+                Some(selection) if resolved.fallback => session
+                    .append_cycled_model_transition(transition, selection)
+                    .cloned(),
+                _ => session.append(transition).cloned(),
+            };
+            let (record, revoked) = if let Some(selection) = &resolved.cycle {
+                self.registry.commit_cycled_model(
+                    session_id,
+                    selection,
+                    resolved.client,
+                    resolved.require_existing,
+                    commit,
+                )?
+            } else if resolved.legacy {
                 self.registry.commit_existing_legacy_model(
                     session_id,
                     &resolved.model,
@@ -7138,7 +7167,103 @@ struct ProgressReporter {
     tool_name: String,
     args: serde_json::Value,
     parent_tool_call_id: Option<String>,
+    settlement: Arc<Mutex<ProgressSettlement>>,
 }
+
+#[derive(Default)]
+struct ProgressSettlement {
+    closed: bool,
+    pending: Option<TurnProgress>,
+    omitted_calls: u64,
+}
+
+impl ProgressReporter {
+    fn close(&self) -> Option<TurnProgress> {
+        let mut settlement = self.settlement.lock().expect("tool progress settlement");
+        settlement.closed = true;
+        let mut pending = settlement.pending.take()?;
+        if let TurnProgress::Event(event) = &mut pending
+            && let crate::LifecycleEvent::ToolExecutionUpdate { partial_result, .. } =
+                event.as_mut()
+            && let Some(count) = partial_result.pointer_mut("/details/omittedCalls")
+            && count
+                .as_u64()
+                .is_some_and(|reported| reported < settlement.omitted_calls)
+        {
+            *count = settlement.omitted_calls.into();
+        }
+        Some(pending)
+    }
+
+    fn event(&self, partial_result: serde_json::Value) -> crate::ExtensionResult<TurnProgress> {
+        // Leave room for the settlement counter to grow to any u64 value.
+        let counter_bytes = partial_result
+            .pointer("/details/omittedCalls")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |count| {
+                20 - (count.checked_ilog10().unwrap_or(0) as usize + 1)
+            });
+        let event = crate::LifecycleEvent::ToolExecutionUpdate {
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+            args: self.args.clone(),
+            partial_result,
+            parent_tool_call_id: self.parent_tool_call_id.clone(),
+        };
+        // Count the entire event, including escaped arguments and identifiers,
+        // without allocating a second copy of its serialized representation.
+        serde_json::to_writer(ProgressSizeLimit(1024 * 1024 - counter_bytes), &event)
+            .map_err(|_| "tool progress event exceeds size limit".to_owned())?;
+        Ok(TurnProgress::Event(Box::new(event)))
+    }
+
+    fn report(
+        &self,
+        partial_result: serde_json::Value,
+        settlement: Option<serde_json::Value>,
+        retain_if_full: bool,
+        cancellation: &CancellationToken,
+    ) -> crate::ExtensionResult<()> {
+        let live = self.event(partial_result)?;
+        let settlement = settlement.map(|value| self.event(value)).transpose()?;
+        let mut pending = self.settlement.lock().expect("tool progress settlement");
+        if pending.closed || cancellation.is_cancelled() {
+            return Err("tool progress cancelled".into());
+        }
+        match &self.sender {
+            ProgressSink::Turn(sender) => match sender.try_reserve() {
+                Ok(permit) => {
+                    permit.send(live);
+                    pending.pending = settlement;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if retain_if_full {
+                        pending.pending = settlement.or(Some(live));
+                    }
+                    return Err("tool progress queue is full".into());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err("tool has finished".into()),
+            },
+        }
+        Ok(())
+    }
+}
+
+struct ProgressSizeLimit(usize);
+impl std::io::Write for ProgressSizeLimit {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or(std::io::ErrorKind::WriteZero)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 enum ProgressSink {
     Turn(mpsc::Sender<TurnProgress>),
@@ -7163,35 +7288,32 @@ impl ToolHost for NestedHost {
         &self,
         partial_result: serde_json::Value,
     ) -> crate::ExtensionResult<()> {
-        let Some(progress) = &self.progress else {
-            return Ok(());
-        };
-        if serde_json::to_vec(&partial_result)
-            .map_err(|error| error.to_string())?
-            .len()
-            > 1024 * 1024
-        {
-            return Err("tool progress exceeds size limit".into());
-        }
-        let event = crate::LifecycleEvent::ToolExecutionUpdate {
-            tool_call_id: progress.tool_call_id.clone(),
-            tool_name: progress.tool_name.clone(),
-            args: progress.args.clone(),
-            partial_result,
-            parent_tool_call_id: progress.parent_tool_call_id.clone(),
-        };
-        if self.cancellation.is_cancelled() {
-            return Err("tool progress cancelled".into());
-        }
-        match &progress.sender {
-            ProgressSink::Turn(sender) => sender
-                .try_send(TurnProgress::Event(Box::new(event)))
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => "tool progress queue is full".into(),
-                    mpsc::error::TrySendError::Closed(_) => "tool has finished".into(),
-                }),
+        self.progress.as_ref().map_or(Ok(()), |progress| {
+            progress.report(partial_result, None, false, &self.cancellation)
+        })
+    }
+    async fn report_progress_with_settlement(
+        &self,
+        partial_result: serde_json::Value,
+        settlement: Option<serde_json::Value>,
+    ) -> crate::ExtensionResult<()> {
+        self.progress.as_ref().map_or(Ok(()), |progress| {
+            progress.report(partial_result, settlement, true, &self.cancellation)
+        })
+    }
+
+    fn update_progress_omitted_calls(&self, count: u64) {
+        if let Some(progress) = &self.progress {
+            let mut settlement = progress
+                .settlement
+                .lock()
+                .expect("tool progress settlement");
+            if !settlement.closed {
+                settlement.omitted_calls = count;
+            }
         }
     }
+
     fn has_ui(&self) -> bool {
         self.ui.is_some()
     }
@@ -7355,6 +7477,7 @@ impl PreparedAttempt<'_> {
 
 struct ReplyAttempt {
     outcome: Result<Reply>,
+    partial_request: Option<Uuid>,
 }
 
 struct Reply {
@@ -9745,7 +9868,15 @@ mod tree_tests {
         async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
             assert!(request.max_output_tokens >= self.minimum_output_tokens);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 || self.always_fail {
+            if call == 0 {
+                return Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("overflow partial".into())),
+                    Err(Error::Model(
+                        "prompt is too long: private-fixture-secret".into(),
+                    )),
+                ])));
+            }
+            if self.always_fail {
                 return Err(Error::Model(
                     "prompt is too long: private-fixture-secret".into(),
                 ));
@@ -9827,6 +9958,27 @@ mod tree_tests {
                     &mut |_| {},
                 )
                 .await;
+            let failed = session
+                .records()
+                .iter()
+                .find(|record| {
+                    matches!(&record.event,
+                Event::ModelFinished { partial, .. } if partial == "overflow partial")
+                })
+                .unwrap();
+            assert!(
+                session
+                    .records()
+                    .iter()
+                    .any(
+                        |record| crate::superseded_turn_partial(session.records(), record)
+                            == Some(failed.id)
+                    )
+            );
+            assert_ne!(
+                session.last_assistant_text().as_deref(),
+                Some("overflow partial")
+            );
             if !provide && run_budget == 16 {
                 assert!(matches!(result, Err(Error::Budget)));
                 assert_eq!(model.calls.load(Ordering::SeqCst), 1);
@@ -9842,10 +9994,12 @@ mod tree_tests {
                 model.calls.load(Ordering::SeqCst),
                 if provide { 2 } else { 3 }
             );
-            let events = seen.lock().unwrap();
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0]["reason"], "overflow");
-            assert_eq!(events[0]["willRetry"], true);
+            {
+                let events = seen.lock().unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0]["reason"], "overflow");
+                assert_eq!(events[0]["willRetry"], true);
+            }
             if !provide {
                 assert!(!session.records().iter().any(|record| matches!(&record.event,
                     Event::ModelFinished { partial, failure: None, reply: None, .. } if partial == "model summary")),
@@ -9862,6 +10016,54 @@ mod tree_tests {
                     .unwrap()
                     .contains("private-fixture-secret")
             );
+            if always_fail {
+                // Reopen exactly after the durable failure, before recovery
+                // could persist its marker. The next attempt has no text.
+                let run_id = failed.run_id.unwrap();
+                let prefix =
+                    Session::from_records(session.records()[..failed.id as usize].to_vec())
+                        .unwrap();
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory
+                    .path()
+                    .join("interrupted-before-overflow-marker.jsonl");
+                prefix.export_jsonl(&path).unwrap();
+                let mut reopened = Session::open(&path).unwrap();
+                assert_eq!(
+                    reopened.last_assistant_text().as_deref(),
+                    Some("overflow partial")
+                );
+                assert!(
+                    agent
+                        .run_correlated(
+                            &mut reopened,
+                            run_id,
+                            None,
+                            &mut inputs,
+                            &CancellationToken::new(),
+                            &mut |_| {}
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    reopened.branch().iter().any(|record| matches!(record.event,
+                    Event::Compacted { retain_from: Some(boundary), .. } if boundary <= failed.id))
+                );
+                assert!(
+                    reopened
+                        .branch()
+                        .iter()
+                        .any(
+                            |record| crate::superseded_turn_partial(reopened.records(), record)
+                                == Some(failed.id)
+                        )
+                );
+                assert_ne!(
+                    reopened.last_assistant_text().as_deref(),
+                    Some("overflow partial")
+                );
+            }
         }
     }
 
@@ -9902,6 +10104,10 @@ mod tree_tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("prompt is too long"), "{error}");
+        assert_eq!(
+            session.last_assistant_text().as_deref(),
+            Some("overflow partial")
+        );
         assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert!(
             !session

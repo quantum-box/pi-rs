@@ -379,7 +379,8 @@ pub(super) use pi_rs_workbench::session_html::render as html;
 pub(super) use pi_rs_workbench::session_html::unattributed_outcome;
 
 pub fn copy_last(session: &Session) -> Result<()> {
-    let text = super::rpc_messages::last_assistant_text(session)
+    let text = session
+        .last_assistant_text()
         .ok_or_else(|| Error::Config("No agent messages to copy yet.".into()))?;
     copy_text(&text)
 }

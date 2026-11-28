@@ -186,7 +186,7 @@ or custom models through the native fallback.
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts with per-server resource pagination; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
-| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted prompt, context, skill, template and theme resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Package and extension loading, model/auth factories and remaining Pi SDK equivalents |
+| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted prompt, context, skill, template, theme and package resource snapshots, explicit native extension composition, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Automatic SDK package discovery, install and reload, remaining model/auth factory and other Pi SDK equivalents |
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
@@ -556,7 +556,9 @@ available to Codemode. Live Vercel authentication and inference were unverified.
 ### Mistral checkpoint
 
 Mistral exposes the 34 Pi 1.6.0 chat models using `MISTRAL_API_KEY` and the
-`mistral-conversations` transport. DeepSeek V4.1 Flash 1017 supports images
+`mistral-conversations` transport. The bundled default is
+`mistral-medium-latest`, matching the pinned Pi startup preference. An
+explicit or saved model still takes precedence. DeepSeek V4.1 Flash 1017 supports images
 with the catalog's resize limits. Ministral 3 3B has a 131,072-token output
 limit. Mistral Large (latest) uses the updated pricing and a 1,048,576-token
 context window with low, medium, and high reasoning effort. The transport
@@ -934,6 +936,14 @@ changes rerender the active presentation with the host theme. Live tool
 calls render progressively parsed arguments and execution updates render
 partial content before the committed result.
 
+Rust SDK hosts can opt in to live `tool_execution_update` payloads with
+`AgentSession::subscribe_tool_progress()`. Direct and control-triggered runs
+forward the scheduler's partial results, including parent call IDs for nested
+tools. The bounded stream reports lag and closes with the session. Final tool
+results stay on the existing record stream. The JavaScript browser wrapper
+continues to return completed prompt and resume results.
+[Pinned Pi event dispatch](https://github.com/earendil-works/pi/blob/bf3f6a2228710cf457604f74b0aceb7bcc8a6b9e/packages/coding-agent/src/core/agent-session.ts#L1209-L1213)
+
 ### Executable cross-tool renderers
 
 Executable extensions advertise ordered exact and prefix matches for tool
@@ -1114,6 +1124,10 @@ nonempty `ALACRITTY_WINDOW_ID` when it uses `TERM=xterm-256color`, matching Pi
 v1.6.0 even when `TERM_PROGRAM` is unset.
 Empty terminal-identification environment variables do not advertise OSC 8
 support or indicate a tmux session.
+On hyperlink-capable terminals, destinations beyond Pi's 8,192 UTF-16 unit
+limit retain their visible link text without OSC 8. Wrapping therefore cannot
+repeat a very long destination on every line.
+[Pinned Pi hyperlink limit](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/tui/src/terminal-image.ts#L795-L815)
 Bare HTTP, HTTPS and FTP URLs, `www.` links and email addresses receive link
 styling and the same terminal-dependent behavior. Bare URLs stop before CJK
 punctuation while explicit links retain it in their destination. Markdown
@@ -1673,6 +1687,14 @@ off the UI thread. Unresolved variable or command references and OAuth entries
 leave the route unconfigured. The SDK host controls ambient environment access,
 OAuth, and any credential writes.
 
+For SDK reloads, the host loads one immutable credential snapshot and builds a
+complete replacement with `ModelClientFactory::catalog` before publishing it.
+This preserves the last valid catalog on a read or build failure, following
+Pi's snapshot retention on auth reload errors. A replacement changes future
+lookups. Retained clients keep their original credentials and exact routes.
+The SDK rebuild is explicit and performs no provider discovery or OAuth
+refresh. See [the embedding guide](sdk-embedding.md#reload-saved-keys-and-model-routes).
+
 ### Native SDK model file catalogs
 
 Embedded hosts can build an immutable catalog with
@@ -1777,12 +1799,13 @@ returns an exact client, a different provider/model client, or unavailable.
 For a fallback the SDK commits the chosen identity, clears the thinking level,
 and exposes both identities through `AgentSession::model_fallback`. The SDK
 rejects a fallback before committing if that provider/model already has a
-different client; an existing matching client must be the same `Arc`. A host
-revocation during the write prevents the entire staged client set from being
-installed, and conflicting in-flight registrations are rejected before the
-journal write.
-The durable selection can then exist without a client and requires a new
-authorized registration before dispatch. The SDK cannot verify an opaque
+different client. An existing matching client must be the same `Arc`. A
+revocation during startup resolution aborts construction before the journal
+records a replacement selection. A revocation during the write fails
+construction and blocks publication of the entire staged client set. A
+selection already written to disk requires a new authorized registration
+before dispatch. Conflicting in-flight registrations are rejected before the
+journal write. The SDK cannot verify an opaque
 client's endpoint; the host must enforce endpoint-bound
 credentials. Unqualified legacy selections never invoke the resolver, and
 existing exact registrations take precedence. The resolver runs on session
@@ -2108,6 +2131,31 @@ lookups and explicit resolution. Unfiltered and offline lists use the matching
 cached catalog when the current account can be identified without running a
 credential command.
 
+Codemode also accepts explicitly configured `pi-decision` classifiers with a
+provider or model `baseUrl`. This API posts the model and classifier context to
+`<baseUrl>/decision` and preserves typed answers, usage, and an optional response
+ID. Terminal HTTP errors include bounded diagnostics from the decision error
+envelope with echoed request credentials redacted. With cookies, non-Bearer
+authorization, or sensitive custom headers, diagnostics retain the HTTP status
+and recognized error codes. When a server requests a retry delay above the
+60-second cap, the terminal error includes the delay rejection and the same
+sanitized HTTP diagnostic.
+Cancellation covers credential loading and the HTTP operation.
+Provider-level `api: "pi-decision"` and profiles
+that only declare operations with a model-level `pi-decision` keep their defaults
+off bundled chat and the remaining bundled operations. A mixed profile with a
+provider-level `pi-decision` requires each chat model to declare a supported chat
+API and its own `baseUrl`. Without a provider discovery endpoint, the catalog
+lists model-scoped chat routes, including Azure, and omits bundled models with
+no route.
+Azure environment defaults apply to chat. The decision profile's
+credentials and headers stay on its operation routes.
+The legacy `pi-classifier` API and automatic Radius discovery keep their
+`/classify` route. Pi Decision uses the existing endpoint-bound credentials
+and headers, HTTP limits, and classifier retry policy. A built-in provider name
+supplies neither an implicit decision URL nor ambient credentials for it.
+[Pinned Pi Decision protocol](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/src/api/pi-decision.ts#L16-L46)
+
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
 and the Decisions-specific 504 retry exclusion. Native image validation and
@@ -2169,6 +2217,27 @@ cancellation still takes priority. Other tools and programmatic calls retain
 their existing scheduler deadlines.
 [Pinned Codemode worker deadline](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/codemode/src/runtime/execution.ts)
 [Pinned coding-agent result formatting](https://github.com/earendil-works/pi/blob/b882d08f34f8/packages/coding-agent/src/extensions/codemode/execute.ts)
+
+Native Codemode publishes an empty parent progress snapshot at startup, then
+reports nested tool calls in dispatch order with stable script-local IDs,
+bounded argument and error previews, and durations on completion. Parallel
+calls update their original positions. The first 64 calls are tracked, and
+further calls are counted without changing dispatch. Script return, timeout,
+and caller abort mark still-running calls cancelled in the settlement snapshot.
+The terminal shows recent call states. RPC and JSON attach the snapshot as
+`codemodeProgress` on the parent's `tool_execution_end` event. The snapshot
+is transient and leaves tool-result messages, journal records, model output,
+and the store transaction intact. The scheduler bounds complete progress
+events and omits large parent arguments. Codemode gives extension observers a
+single 250 ms maximum budget and stops those callbacks when the tool returns.
+Ordinary tools still drain accepted updates. Queued Codemode events reach
+presentation consumers, and caller abort preserves the latest omission count
+even if the script cannot publish its final snapshot. The snapshot covers
+`tools.*` and `models.generateImages`. Image rows show the provider and model
+ID and the mapped success, error, or cancellation status. Completed calls
+include their elapsed time. Classifier and catalogue calls still use their
+existing reporting.
+[Pinned Codemode nested tool lifecycle](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/extensions/codemode/execute.ts#L514-L550)
 
 `PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
@@ -2296,10 +2365,21 @@ A source entry with a missing parent is recovered as a separate native branch;
 its original parent ID remains in the retained source entry, while RPC presents
 it as a root. Missing ancestors may contain unrecoverable state or tool calls;
 orphan tool results and compactions involving orphaned branches are still rejected.
-Forward parent references and compaction boundaries on a different branch are
-also rejected. Pi instead drops a retained boundary that is not on the current
-path; native import rejects it rather than silently retaining unrelated history.
+Forward parent references and missing or forward compaction boundary IDs are
+also rejected. Pi v1 keeps its positional boundary migration, and RPC exposes
+the verified boundary as a projected entry ID. When a compaction names an
+earlier boundary on a complete sibling branch, Pi restores its system
+checkpoint, summary and descendants with no pre-compaction messages. Native
+import does the same and retains the original
+boundary and usage in a full export. A fork or Pi RPC projection uses the
+compaction's own ID as the boundary, so the result is independent of the
+sibling branch.
 
+Pi labels and context edits whose target IDs are absent from the whole source
+remain inert. The original source nodes are preserved in the native journal,
+and the RPC projection keeps their target IDs unbound. Branch forks retain
+these context edits and rebuild labels only for retained targets. Forward
+references and context edits that target another branch are rejected.
 Context edits are projected onto future model context while the imported raw
 entries remain available. Imported system messages appear as `[system]` in the
 default session tree, where their text can be searched and copied.
@@ -2528,6 +2608,19 @@ Empty terminal-identification environment variables do not enable image
 protocols or imply an active tmux session, matching Pi's detection behavior.
 `PI_IMAGE_PROTOCOL` is case-insensitive, and `TERM=xterm-kitty` alone does not
 override another terminal's image protocol.
+
+`terminal.images` forces `"kitty"` or `"iterm2"`, or disables both protocols
+with `false`. Other values use `PI_IMAGE_PROTOCOL` and terminal detection.
+Both terminal modes read the setting at startup and on `/reload`. When the
+protocol changes, pi-rs releases its Kitty uploads or erases the old iTerm2
+image cells before redrawing. Regular-mode scrollback is purged for iTerm2
+cleanup only when the regular screen has displayed iTerm2 images. The purge
+and transcript redraw share one frame, so an exit during reload preparation
+preserves the existing regular transcript. The selected protocol also controls
+Kitty's optimized image dimensions.
+`terminal.showImages` independently controls visibility. Changes made in
+fullscreen apply to the regular transcript when returning to it, and retained
+attachments can be shown again after a settings change or resize.
 
 A PTY fixture verifies both protocols, user and tool images, cached redraw,
 cleanup and terminal restoration. Protocol bytes were checked without a GUI
@@ -3071,9 +3164,16 @@ index, which uses Cargo metadata for Cargo builds and the manifest version for
 other packages. A package needs at least one enabled executable in the
 terminal worker's registry. Standalone executables and packages that only
 supply skills, prompts or themes do not produce these notices.
-pi-rs preserves the upstream `enableInstallTelemetry` key in shared settings
-files. Native pi-rs sends no install or update reports to `pi.dev` and never
-adds upstream Pi attribution headers as a side effect of that setting.
+Upstream Pi removed installation telemetry, the `enableInstallTelemetry`
+setting, and its `PI_TELEMETRY` override in [484da3a86][pi-remove-telemetry].
+Native pi-rs preserves the legacy key when editing shared settings and keeps
+its changelog state local. The key and environment variable have no effect in
+pi-rs. Upstream Pi now applies its client attribution to supported provider
+requests independently of telemetry. Native pi-rs uses provider-specific
+and host-configured headers independently of the legacy field. It does not
+inject upstream Pi attribution by default.
+
+[pi-remove-telemetry]: https://github.com/earendil-works/pi/commit/484da3a8696b4726ddfe9677d3ba98bbd64b076c
 The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the
@@ -3959,9 +4059,21 @@ stream close event and reports errors from that event. Rust's standard file
 drop has no error result. A path in a live progress snapshot refers to a spill
 that is still being written.
 
-User-initiated shell execution also retains its bounded output and exit status.
-Its journal and RPC result do not yet expose the separate save error.
+User-initiated shell execution keeps its bounded output and exit status and exposes
+`fullOutputError` in the RPC completion and shell history when truncated
+output could not be saved. Native execution, extension streaming operations,
+and extension-supplied results use the same projection. Successful spills
+provide the file path. Small output has no save error, including when raw
+terminal control bytes triggered an unsuccessful spill attempt.
+
+Native journal metadata stores up to 4 KiB of save failure detail. Older
+stores without metadata support still record the original shell execution,
+and imported Pi history can read the detail from its source entry. The Rust
+`BashExecution` and `UserBashResult` fields retain their existing shape.
 [Pi shell output accumulator](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/tools/output-accumulator.ts)
+[Pi user shell executor](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/bash-executor.ts)
+[Pi session recording](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts)
+[Pi RPC shell completion](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/rpc/rpc-mode.ts)
 
 ### Grep context and line-limit checkpoint
 
@@ -4150,10 +4262,27 @@ measured response is available. Unknown cost is returned as null; preservation o
 below. Live statistics are covered below. Complete message-variant counting and
 provider pricing remain open.
 
+Interactive restore skips the transcript card and cost notice for an imported
+Pi `branch_summary` with an empty string. The original entry, its branch
+position and billed usage remain in the journal. This also applies after a
+native export and reopen.
+[Pinned Pi summary projection](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/session-manager.ts#L458-L460)
+[Pinned Pi transcript restore](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L4371-L4383)
+
 Tests cover an imported multi-branch session with assistant, tool-result,
 standalone and summary usage. A loopback RPC test covers message and tool counts,
 cache accounting, summary usage deduplication and unknown post-compaction context.
 The complete workspace tests and all-target Clippy pass.
+
+### Rust SDK session statistics
+
+`AgentSession::session_stats()` follows Pi's `getSessionStats()` by combining
+the external session ID, SDK-managed file path, durable totals across the
+session, and context usage for the current branch. The SDK uses the host's
+configured context window and reads the journal once without contacting a
+provider. Its totals retain the native UUID and journal accounting. Workbench
+RPC uses projected Pi message counts and adds usage from native model
+operations. [Pinned Pi implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4363-L4415)
 
 
 ### Imported extension entries
@@ -4168,6 +4297,11 @@ Legacy `custom` and `hookMessage` message records likewise retain their display
 metadata and enter model context without being rendered as user prompts.
 Imported message-form branch summaries use Pi's summary context framing while
 retaining their original RPC representation and branch reference.
+When checkout or a branch summary inherits a valid SDK-cycled selection,
+Workbench restores its recorded thinking level and emits it as a
+`thinking_level_change` entry in RPC history and Pi-format JSONL exports.
+Missing or malformed bindings use the branch default on restore and emit
+`off` in RPC history and Pi-format exports.
 Message-form compaction summaries are displayed as summaries and framed for
 model context without performing another compaction or removing earlier entries.
 
@@ -4195,8 +4329,27 @@ catalogs, automatic native pricing and detailed cost provenance remain open.
 
 Session and owned SDK name reads trim ECMAScript whitespace from the latest
 stored name, as Pi does, including names imported from external JSONL. A
-whitespace-only name clears the title without falling back to an older name;
-reading preserves internal line breaks and does not rewrite the journal.
+whitespace-only name clears the title. The latest imported Pi `session_info`
+also clears the title when it omits `name`, even after checkout to an earlier
+branch. Native working-directory updates leave the title in place. Name reads
+preserve internal line breaks and leave the journal intact.
+[Pinned Pi session name lookup](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/session-manager.ts#L1339-L1350)
+
+### SDK model-facing tool selection
+
+An owned Rust session exposes `active_tool_names` and `set_active_tools` for
+the configured model-facing tool selection. Native branch checkpoints preserve
+their recorded loadout. The runtime intersects that loadout with the selected
+registry tools and uses current schemas. A selected tool can therefore be absent
+from a request on a restored branch. Request-time registry hooks can also
+change the advertised list.
+
+The setter requires mutable ownership and an available journal, so hosts apply
+it to future runs. Pi can apply a selection on the next turn of an active run.
+Native registry validation rejects unknown names without replacing the previous
+selection. Native nested orchestration can call registered tools regardless of
+selection. In Pi, inactive callable tools must have `codemode` or `deferred`
+exposure.
 
 ### SDK queued input inspection
 
@@ -4673,10 +4826,10 @@ Its global `selfUpdateCommand` setting and `PI_SELF_UPDATE_COMMAND`
 environment variable customize the JavaScript installation step.
 Install or update the pi-rs binary through its original installation method.
 
-Pi's `enableInstallTelemetry`, `enableAnalytics`, and `trackingId` settings
-are specific to upstream Pi. pi-rs keeps changelog state local. Explicit
-model diagnostics, OAuth, and package downloads follow their own
-configuration.
+Shared settings can contain Pi's legacy `enableInstallTelemetry` and the
+analytics metadata keys `enableAnalytics` and `trackingId`. pi-rs preserves
+these fields and keeps changelog state local. Explicit model diagnostics,
+OAuth, and package downloads follow their own configuration.
 
 `--offline` and `PI_OFFLINE=1` suppress automatic Cargo registry and Git package downloads,
 including refreshes of temporary packages, and reuse the installed resources.
@@ -5973,7 +6126,13 @@ Non-data URLs and structurally incomplete data URLs are ignored. Unlike Pi,
 pi-rs validates generated image MIME types and base64 before exposing them and
 retains its response-size limit. Provider-level operation headers are bound to
 the provider endpoint, including for classifiers; model headers apply to their
-own endpoint. No live OpenRouter account was used.
+own endpoint. Codemode sends image generation once, including when OpenRouter
+returns HTTP 429 with retry headers. A script deadline or caller cancellation
+closes the in-flight response. Loopback checks cover those paths, the 7 MiB
+provider response cap, and a zero-token text preview that retains the image and
+spills the generated text to a file. No live OpenRouter account was used.
+[Pinned OpenRouter image request](https://github.com/earendil-works/pi/blob/8d9408574325a12e2e34898bb8fa22784120e479/packages/ai/src/api/openrouter-images.ts#L68-L85)
+[Pinned Codemode image calls](https://github.com/earendil-works/pi/blob/8d9408574325a12e2e34898bb8fa22784120e479/packages/coding-agent/src/extensions/codemode/execute.ts#L792-L810)
 
 ### Chat model connection and compatibility
 
@@ -6237,6 +6396,16 @@ continuations and session restarts. Text and summary fragments are combined
 into their logical blocks, and encrypted blocks stay separate. Replay is
 bound to the original endpoint and model. A loopback RPC check exercised
 restart, encrypted-only thinking and a switch to a different model endpoint.
+
+### Terminal hyperlink capability
+
+An explicit boolean in `terminal.hyperlinks` takes precedence over
+`PI_HYPERLINKS` and automatic terminal detection. Use `"auto"` for automatic
+detection. Existing non-boolean values in `terminal.hyperlinks` and
+`terminal.trueColor` are preserved and use automatic detection too.
+Both transcript modes redraw Markdown links after `/reload`. Returning from
+a boolean hyperlink override to automatic mode refreshes detection, including
+the tmux client capability probe. Subsequent draws reuse the detected result.
 
 ### Terminal color capability
 
@@ -7387,6 +7556,32 @@ The file getter reports paths managed by the SDK. Hosts that supply their own
 journal store retain responsibility for its location. ID and name reads return
 an error while the journal is locked.
 
+`AgentSession::get_last_assistant_text()` and native RPC
+`get_last_assistant_text` select from the active branch after compaction and
+context edits. They concatenate text and trim ECMAScript whitespace. An empty
+normal reply ends the search, while an omitted reply or a non-normal reply
+without text lets it continue. RPC `get_messages` keeps an edited reply's
+original stop reason, even if the edit removes all its text or calls. For
+native completions without a recognized length limit or recorded failure, the
+original presence of tool calls distinguishes `toolUse` from `stop`. Pi
+imports keep their original stop reasons. Marked failed and cancelled turn
+partials can provide display text without entering model context. A durable
+retry or overflow marker omits the superseded partial on its branch, including
+after cancelling backoff or resuming overflow recovery from a saved failure.
+The raw attempt and its usage remain in the journal. Earlier native journals
+that recorded the omission as a context edit still hide that partial. Edits
+to display-only completions leave measured usage and model projection intact.
+Pi-compatible export includes an advisory flag on generated omission edits.
+On import, the flag keeps the edit display-only when its target matches the
+nearest failed completion on that branch. Other edits retain their ordinary
+semantics.
+Older readers can open journals containing the retry marker and may display
+the superseded partial.
+Older unmarked failures and summary partials remain excluded. RPC keeps
+unmodified imported blocks, including signed thinking, when restoring an empty
+normal reply after tool-call repair.
+[Pinned Pi assistant text selection](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4522-L4549)
+
 ### SDK skill commands
 
 `SkillResources::expand_command` renders Pi-style `/skill:name` invocations
@@ -7546,8 +7741,9 @@ include symlink targets and authorize discovery before the loader applies
 disabled IDs. Hosts can omit a path to skip executing its discovery hook.
 A replaceable inline extension yields when an enabled, non-replaceable
 extension claims a tool, command or flag of the same kind and name. The SDK
-host controls settings, load order, and package discovery. Pi's default
-resource loader also discovers project and package extensions automatically.
+host controls settings, load order, and which executable candidates to pass
+to the loader. Pi's default resource loader discovers project and package
+extensions automatically.
 
 ### Combined native SDK resource snapshots
 
@@ -7567,7 +7763,54 @@ file grants.
 format for the addendum, project context, skills, and working directory. The
 host supplies the default preamble with any tool and documentation sections,
 chooses the skill reader based on its tool loadout, and handles template
-invocation and theme selection. This factory uses explicit grants. Pi's default
-loader also discovers settings and packages, loads extensions, and rebuilds
-the structured prompt during a session. Native hosts can explicitly apply a
-fresh prompt to an idle session with `AgentSession::set_system_prompt`.
+invocation and theme selection. Pi's default loader also discovers settings
+and packages, loads extensions, and rebuilds the structured prompt during a
+session. Native hosts can explicitly apply a fresh prompt to an idle session
+with `AgentSession::set_system_prompt`.
+
+### Native SDK package resources
+
+`ResourceFactory::load_with_packages` adds skill metadata, prompt templates and
+themes from host-granted local package directories to the combined snapshot.
+`PackageResourcePaths::discover` also exposes the selected paths for hosts that
+load individual resource kinds. Discovery shares the native CLI's manifest
+precedence of `pi-package.json`, Cargo metadata and Pi `package.json`. Explicit
+Pi `package.json` resource lists contribute themes only, as in the native CLI.
+Without an explicit resource list, discovery uses the conventional resource
+directories. The SDK supports package-relative paths and globs. `!` exclusions
+can match a basename or a literal directory subtree. The SDK shares the
+native CLI's path, basename, glob and supported extglob matcher. Skill
+patterns can match the directory containing `SKILL.md`, including exact
+`+` and `-` overrides. Wildcards match the file or its containing directory.
+A literal directory path can select its subtree.
+Qualified prompt sources use the native path glob syntax, so a source such as
+`prompts/@(one).md` names that file literally. Prompt basename lookups, prompt
+exclusions, and theme filters still use the shared matcher. Exact `+` and `-`
+overrides compare literal paths.
+Native skill discovery looks for `SKILL.md` and can include nested skill
+directories.
+For extensions, discovery starts with executable files directly inside
+`extensions/` and adds executable files named by plain exact manifest paths.
+Extension filters also match the executable stem, so `!helper` excludes
+`helper.exe`. Windows discovery uses the native CLI's `.exe` suffix check.
+Override-only extension lists filter the conventional candidates. For skills,
+prompts and themes, override-only lists retain package-wide discovery, and a
+force-include can add an exact file outside the plain sources.
+
+Packages are evaluated in grant order, with paths sorted within each resource
+kind. Recursive scans have entry and depth limits and skip hidden entries,
+linked directories, `target` and `node_modules`. Exact manifest paths can
+include hidden entries and follow symlinks, as can granted package roots.
+Scans can also discover file symlinks, so grants allow reading those targets
+even outside the directory. SDK scans use manifest patterns without Pi's
+local ignore rules. The SDK uses the native CLI's executable convention in
+place of Pi's JavaScript and TypeScript extension entrypoints.
+
+Package discovery reads manifests and file metadata. Extensions appear as
+candidate paths, and the host authorizes each executable separately with
+`NativeExtensionSource::Executable` to run its discovery hook. Installation,
+Cargo builds, package acquisition, settings discovery and reload scheduling
+remain host responsibilities. Pi's default SDK loader resolves these sources
+through its package manager and loads extensions during reload.
+[Pi SDK](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/sdk.ts)
+· [Pi resource loader](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/resource-loader.ts)
