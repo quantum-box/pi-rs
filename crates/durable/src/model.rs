@@ -107,6 +107,12 @@ impl DurableToolRequest {
 /// restrictions. Preparation must not send a request. Errors fail closed.
 #[async_trait::async_trait]
 pub trait ProviderAdapter: Send + Sync {
+    /// Check an image admission against the currently known request context.
+    /// This runs before the input is committed, with no hooks or network I/O.
+    fn validate_image_admission(&self, _request: &ProviderResultRequest) -> Result<()> {
+        Ok(())
+    }
+
     /// Opt in only if durable block requests are implemented without truncation.
     fn supports_durable_blocks(&self) -> bool {
         false

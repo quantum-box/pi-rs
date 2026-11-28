@@ -116,6 +116,63 @@ fn config(model: &str) -> Config {
         max_output_tokens: 100,
     }
 }
+
+#[cfg(all(feature = "builtin-images", feature = "openai-responses"))]
+#[tokio::test]
+async fn responses_rejects_aggregate_image_overflow_before_admission() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use pi_rs_durable::{images::BuiltinImageProcessor, openai_responses::OpenAiResponsesAdapter};
+
+    let mut seed = 1u32;
+    let mut image_block = |size| {
+        let pixels = image::RgbImage::from_fn(size, size, |_, _| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            image::Rgb([seed as u8, (seed >> 8) as u8, (seed >> 16) as u8])
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        json!({"type":"image","mimeType":"image/png","data":STANDARD.encode(bytes.into_inner())})
+    };
+    let big = image_block(800);
+    let small = image_block(2);
+    let fit = UserImageAdmission::new(Arc::new(BuiltinImageProcessor));
+    let adapter = Arc::new(
+        OpenAiResponsesAdapter::new("http://127.0.0.1:1/v1/responses", "fixture".into()).unwrap(),
+    );
+    let cancel = CancellationToken::new();
+    for queued in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        h.install_provider_adapter(adapter.clone()).unwrap();
+        let id = h.create_conversation(config("gpt-4.1")).unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        if queued {
+            h.submit(id, None, "keep this turn active".into()).unwrap();
+        }
+        h.submit_fitted_user_blocks(id, None, vec![big.clone()], &fit, &cancel)
+            .await
+            .unwrap();
+        let before = h.conversation(id).unwrap();
+        let error = h
+            .submit_fitted_user_blocks(id, Some("retry".into()), vec![big.clone()], &fit, &cancel)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Responses request size limit"),
+            "{error}"
+        );
+        let after = h.conversation(id).unwrap();
+        assert_eq!(after.submissions.len(), before.submissions.len());
+        assert_eq!(after.messages, before.messages);
+        h.submit_fitted_user_blocks(id, Some("retry".into()), vec![small.clone()], &fit, &cancel)
+            .await
+            .unwrap();
+    }
+}
 struct Switch;
 impl pi_rs_durable::task::scheduler::Handler for Switch {
     fn run(
