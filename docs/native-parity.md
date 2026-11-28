@@ -3761,6 +3761,8 @@ Kitty committed-history and active-region placements use separate placement
 IDs, and active redraws delete only the active placements. Visible-row counts
 stop at image boundaries so cropped images do not cover following widgets.
 The implementation follows the [Kitty placement deletion protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol.html).
+Image IDs stay in the positive signed 32-bit range so Konsole can parse
+uploads, placements, and deletions.
 
 PTY fixtures verified blocked model turns with user and tool images for Kitty
 and iTerm2, transition into committed history, draft edits, resize reuse and

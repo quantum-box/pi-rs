@@ -73,11 +73,21 @@ fn detect(get: impl Fn(&str) -> Option<String>) -> Option<Protocol> {
     }
     (program == "iterm.app" || present("ITERM_SESSION_ID")).then_some(Protocol::Iterm2)
 }
+// Konsole parses Kitty graphics IDs as signed 32-bit integers.
+const MAX_IMAGE_ID: u32 = i32::MAX as u32;
 static NEXT_ID: LazyLock<AtomicU32> = LazyLock::new(|| {
-    AtomicU32::new(
-        u32::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..4].try_into().unwrap()).max(1),
-    )
+    let bytes = uuid::Uuid::new_v4();
+    let seed = u32::from_le_bytes(bytes.as_bytes()[..4].try_into().unwrap());
+    AtomicU32::new(seed % MAX_IMAGE_ID + 1)
 });
+
+fn next_image_id(next: &AtomicU32) -> u32 {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+        Some(if id == MAX_IMAGE_ID { 1 } else { id + 1 })
+    })
+    .expect("image IDs always advance")
+}
+
 /// Keep the encoded attachment available while inline images are disabled.
 /// Prepare it once when it first becomes visible and release the source then.
 pub struct InlineAttachment {
@@ -137,12 +147,7 @@ impl InlineImage {
         let format = image::guess_format(&bytes).ok()?;
         let reader = image::ImageReader::with_format(Cursor::new(bytes), format);
         let prepared = pi_rs_workbench::coding::normalize_image(reader).ok()?;
-        let id = loop {
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            if id != 0 {
-                break id;
-            }
-        };
+        let id = next_image_id(&NEXT_ID);
         Some(Arc::new(Self {
             id,
             data: base64::engine::general_purpose::STANDARD.encode(&prepared.png),
@@ -676,6 +681,15 @@ mod tests {
             cleanup: Cleanup::default(),
             crops: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn image_ids_wrap_in_the_nonzero_signed_32_bit_range() {
+        let next = AtomicU32::new(MAX_IMAGE_ID - 1);
+        assert_eq!(next_image_id(&next), MAX_IMAGE_ID - 1);
+        assert_eq!(next_image_id(&next), MAX_IMAGE_ID);
+        assert_eq!(next_image_id(&next), 1);
+        assert_eq!(next_image_id(&next), 2);
     }
 
     #[test]
