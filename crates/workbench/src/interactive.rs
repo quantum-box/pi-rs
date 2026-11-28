@@ -2060,12 +2060,28 @@ impl View {
 
     fn draft_key_action<'a>(
         keys: &'a Keys,
-        editor: Option<&'a crate::ui::editor::ExtensionEditor>,
+        editor: Option<&crate::ui::editor::ExtensionEditor>,
         empty: bool,
         key: KeyEvent,
     ) -> &'a str {
         let default = keys.action(key, empty).unwrap_or("");
         editor.map_or(default, |editor| editor.action(key, default))
+    }
+
+    fn draft_receives_interrupt(&self, keys: &Keys, key: KeyEvent, fullscreen: bool) -> bool {
+        if fullscreen
+            && (self.search.is_some()
+                || keys.matches("tui.altScreen.search", key)
+                || keys.viewport_action(key).is_some())
+        {
+            return false;
+        }
+        Self::draft_key_action(
+            keys,
+            self.extension_chrome.editor.as_ref(),
+            self.editor.text.is_empty() && self.draft_images.is_empty(),
+            key,
+        ) == "app.interrupt"
     }
 
     fn border_status(
@@ -2088,14 +2104,7 @@ impl View {
             fullscreen,
             now,
             remaining,
-            keys.interrupt_binding(|key| {
-                Self::draft_key_action(
-                    keys,
-                    self.extension_chrome.editor.as_ref(),
-                    self.editor.text.is_empty() && self.draft_images.is_empty(),
-                    key,
-                ) == "app.interrupt"
-            }),
+            keys.interrupt_binding(|key| self.draft_receives_interrupt(keys, key, fullscreen)),
         );
         format!("{working}{other}")
     }
@@ -15638,6 +15647,18 @@ exit {exit}
             .unwrap();
         assert!(view.clear_extension_chrome());
         assert_eq!(output(&view).matches("Thinking...").count(), 1);
+    }
+
+    #[test]
+    fn fullscreen_search_hides_the_draft_interrupt_hint() {
+        let view = View {
+            search: Some(Search::default()),
+            ..Default::default()
+        };
+        let keys = Keys::default();
+        let key = keys.first_binding("app.interrupt").unwrap();
+        assert!(view.draft_receives_interrupt(&keys, key, false));
+        assert!(!view.draft_receives_interrupt(&keys, key, true));
     }
 
     #[test]
