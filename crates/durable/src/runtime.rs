@@ -4004,6 +4004,19 @@ pub enum ForkBoundary {
     Display { entry_id: Uuid },
 }
 
+enum ResetForkCut {
+    Replay {
+        state: Box<Conversation>,
+        position: crate::transcript::Cursor,
+        revision: u64,
+        checks: Vec<Check>,
+    },
+    Anchored {
+        reset: Uuid,
+        checks: Vec<Check>,
+    },
+}
+
 /// An immutable link to the conversation that exposed the selected history.
 /// The source may be an earlier ancestor for inherited entries.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -9585,7 +9598,7 @@ impl Harness {
         boundary: ForkBoundary,
         prefix: Option<(usize, usize)>,
         application_cut: Option<(u64, Vec<crate::application_entry::ApplicationEntry>)>,
-        reset_cut: Option<(Conversation, crate::transcript::Cursor, u64, Vec<Check>)>,
+        reset_cut: Option<ResetForkCut>,
         display_cut: Option<usize>,
         evidence: &[Check],
         membership: &crate::session_membership::ForkMembershipProof,
@@ -9607,9 +9620,9 @@ impl Harness {
             .get(key.as_bytes())?
             .ok_or(crate::fork::Error::InvalidCursor)?;
         let revision = match (&application_cut, &reset_cut) {
-            (_, Some((_, _, revision, _))) => *revision,
-            (Some((revision, _)), None) => *revision,
-            (None, None) => self
+            (_, Some(ResetForkCut::Replay { revision, .. })) => *revision,
+            (Some((revision, _)), _) => *revision,
+            (None, _) => self
                 .owner
                 .store()
                 .document_cut(key.as_bytes())?
@@ -9636,7 +9649,20 @@ impl Harness {
             }
             writes.truncate(len);
         }
-        if let Some((cut, position, _, _)) = &reset_cut {
+        if let Some(ResetForkCut::Anchored { reset, .. }) = &reset_cut {
+            let writes = value
+                .pointer_mut("/documents/pi-rs~1runtime~1application-writes")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let after_reset = serde_json::to_value(reset)?;
+            writes.retain(|write| write.get("after_reset") != Some(&after_reset));
+        }
+        if let Some(ResetForkCut::Replay {
+            state: cut,
+            position,
+            ..
+        }) = &reset_cut
+        {
             value["_transcript"] = serde_json::to_value(position)?;
             value["config"] = serde_json::to_value(&cut.config)?;
             value["submissions"] = serde_json::to_value(&cut.submissions)?;
@@ -9976,9 +10002,13 @@ impl Harness {
             membership
                 .append_to(state.id, &mut batch)
                 .map_err(|error| Error::Invalid(format!("fork session membership: {error}")))?;
-            if let Some((_, _, _, checks)) = &reset_cut {
-                batch.checks.extend(checks.clone());
-            } else {
+            if let Some(
+                ResetForkCut::Replay { checks, .. } | ResetForkCut::Anchored { checks, .. },
+            ) = &reset_cut
+            {
+                batch.checks.extend_from_slice(checks);
+            }
+            if !matches!(reset_cut, Some(ResetForkCut::Replay { .. })) {
                 self.record_display_fork_origin(&state, id, cursor, &mut batch)?;
             }
             if let Some((_, entries)) = &application_cut {
@@ -10600,6 +10630,7 @@ impl Harness {
             | TranscriptChange::AppendV4 { stable_prefix, .. } => Some(*stable_prefix),
             _ => None,
         };
+        let replacement = matches!(change, TranscriptChange::ReplaceV2 { .. });
         let (messages, _, metadata) = change.parts()?;
         let (commit, origin) = metadata
             .as_ref()
@@ -10654,7 +10685,12 @@ impl Harness {
                 ForkBoundary::Message { entry_id },
                 prefix,
                 None,
-                Some((cut, position.cursor, revision, checks)),
+                Some(ResetForkCut::Replay {
+                    state: Box::new(cut),
+                    position: position.cursor,
+                    revision,
+                    checks,
+                }),
                 None,
                 &[],
                 membership,
@@ -10709,8 +10745,15 @@ impl Harness {
             .and_then(|(ids, _, _)| ids.get(count - 1).copied())
             .or_else(|| compacted_metadata.as_ref().map(|(_, _, _, id, _)| *id))
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let mut reset_cut = None;
         let prefix = if count == messages.len() {
             None
+        } else if replacement {
+            let (reset, checks) = self
+                .anchored_block_reset(id, commit, &position.cursor)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            reset_cut = Some(ResetForkCut::Anchored { reset, checks });
+            Some((count, messages.len()))
         } else {
             let prefix = stable_prefix.ok_or(crate::fork::Error::InvalidSnapshot)?;
             let total = prefix
@@ -10727,11 +10770,107 @@ impl Harness {
             ForkBoundary::Message { entry_id },
             prefix,
             None,
-            None,
+            reset_cut,
             None,
             &[],
             membership,
         )
+    }
+
+    fn anchored_block_reset(
+        &self,
+        conversation: Uuid,
+        observation: u64,
+        position: &crate::transcript::Cursor,
+    ) -> Result<Option<(Uuid, Vec<Check>)>, Error> {
+        use crate::fork::Error::InvalidSnapshot;
+        let transcript = crate::transcript::Transcript::new(self.owner.store(), conversation);
+        let page = transcript.read_with_blocks(position, std::num::NonZeroUsize::MIN)?;
+        let entry = page.records.first().ok_or(InvalidSnapshot)?;
+        let Some(blocks) = entry
+            .content_blocks
+            .as_ref()
+            .filter(|blocks| !blocks.is_empty())
+        else {
+            return Ok(None);
+        };
+        let TranscriptChange::ReplaceV2 {
+            messages,
+            ids,
+            origin,
+            commit,
+        } = serde_json::from_value(entry.value.clone())?
+        else {
+            return Ok(None);
+        };
+        let previous = observation
+            .checked_sub(1)
+            .filter(|id| *id != 0)
+            .ok_or(InvalidSnapshot)?;
+        if origin != conversation
+            || commit != observation
+            || self
+                .session_observation_transcript(conversation, observation)?
+                .as_ref()
+                != Some(position)
+        {
+            return Err(InvalidSnapshot.into());
+        }
+        let previous_checks = self.fork_anchor_checks(conversation, previous)?;
+        let current_checks = self.fork_anchor_checks(conversation, observation)?;
+        let snapshot = |check: &Check, index| -> Result<serde_json::Value, Error> {
+            let entry = self.owner.store().get(&check.key)?.ok_or(InvalidSnapshot)?;
+            if check.expected != Expected::Version(entry.version) {
+                return Err(InvalidSnapshot.into());
+            }
+            let snapshot: serde_json::Value = serde_json::from_slice(&entry.value)?;
+            let record = self.session_observation(conversation, index)?;
+            if snapshot.get("_transcript") != record.value.get("_transcript")
+                || snapshot.pointer("/documents/pi-rs~1runtime~1resets")
+                    != record.value.get("resets")
+            {
+                return Err(InvalidSnapshot.into());
+            }
+            Ok(record.value)
+        };
+        let before = snapshot(&previous_checks[1], previous)?;
+        let after = snapshot(&current_checks[1], observation)?;
+        let prior = serde_json::from_value(before["_transcript"].clone())?;
+        let before: Vec<crate::reset::Reset> = serde_json::from_value(before["resets"].clone())?;
+        let after: Vec<crate::reset::Reset> = serde_json::from_value(after["resets"].clone())?;
+        let [reset] = after
+            .strip_prefix(before.as_slice())
+            .ok_or(InvalidSnapshot)?
+        else {
+            return Err(InvalidSnapshot.into());
+        };
+        let handoff = reset.message();
+        let offset = usize::from(handoff.is_some());
+        if messages.len() != offset + blocks.len()
+            || ids.len() != messages.len()
+            || handoff
+                .as_ref()
+                .is_some_and(|message| messages.first() != Some(message))
+            || messages[offset..]
+                .iter()
+                .zip(&ids[offset..])
+                .zip(blocks)
+                .any(|((message, id), binding)| {
+                    !matches!(message, Message::User { content } if content.is_empty())
+                        || *id != binding.message_id
+                })
+        {
+            return Err(InvalidSnapshot.into());
+        }
+        let anchor = format!("runtime/fork/{conversation}/{observation:020}");
+        let mut checks = previous_checks.to_vec();
+        checks.extend(current_checks);
+        checks.extend(transcript.atomic_append_checks(
+            anchor.as_bytes(),
+            &prior,
+            std::slice::from_ref(position),
+        )?);
+        Ok(Some((reset.id, checks)))
     }
 
     fn original_occurrence_position(
@@ -11749,6 +11888,11 @@ impl Harness {
                 .map(|write| write.id)
                 .collect();
             writes.retain(|entry| retained.contains(&entry.id()));
+        } else if !message.history.commit_boundary
+            && let Some((reset, _)) =
+                self.anchored_block_reset(source, record.cursor.0, &position.cursor)?
+        {
+            writes.retain(|entry| !matches!(entry, SessionEntry::Custom { entry, .. } if entry.after_reset == Some(reset)));
         }
         Ok(())
     }
@@ -12905,11 +13049,19 @@ impl Harness {
                     } => {
                         let mut original = serde_json::to_value(&predecessor.next)?;
                         original["transcript"] = serde_json::to_value(origin)?;
-                        self.verify_failure_reset_cut(
-                            origin,
-                            &serde_json::from_value(original)?,
-                            commit,
-                        )?;
+                        let original = serde_json::from_value(original)?;
+                        if self
+                            .session_observation_transcript(origin, commit)?
+                            .as_ref()
+                            == Some(&original)
+                        {
+                            let (_, checks) = self
+                                .anchored_block_reset(origin, commit, &original)?
+                                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                            self.owner.store().commit(&checks, &[])?;
+                        } else {
+                            self.verify_failure_reset_cut(origin, &original, commit)?;
+                        }
                         (0, commit, origin, messages.len())
                     }
                     _ => return Err(crate::fork::Error::InvalidSnapshot.into()),
