@@ -1149,6 +1149,11 @@ async fn granted_model_file_composes_saved_auth_with_exact_api_and_base_routes()
     assert_eq!(catalog.identities().len(), 2);
     std::fs::remove_file(models_path).unwrap();
     assert_eq!(grants.load(&factory).unwrap().identities().len(), 0);
+    std::fs::write(&grants.file, "{").unwrap();
+    assert!(matches!(
+        grants.load(&factory),
+        Err(pi_rs::Error::Config(message)) if message == "invalid models file JSON"
+    ));
 }
 
 #[test]

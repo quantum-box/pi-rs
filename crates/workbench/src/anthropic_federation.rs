@@ -35,6 +35,12 @@ pub(super) struct Federation {
     refreshing: tokio::sync::Mutex<()>,
 }
 
+impl PartialEq for Federation {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+    }
+}
+
 #[derive(Default)]
 struct Cache {
     token: Option<AccessToken>,

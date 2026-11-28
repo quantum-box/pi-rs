@@ -5594,7 +5594,11 @@ fn slash(
                 .filter(|worker| worker.busy);
             if active.is_none() {
                 args.reload_model_profiles()?;
+                if let Some(warning) = args.model_profiles.warning() {
+                    view.append(warning);
+                }
             }
+            args.model_profiles.ensure_model_reference_available(rest)?;
             if super::model_selection::qualified_model(rest, &args.model_profiles).is_some()
                 || super::model_selection::thinking_suffix(rest).is_some()
             {
@@ -5607,6 +5611,9 @@ fn slash(
         }
         "/scoped-models" => {
             args.reload_model_profiles()?;
+            if let Some(warning) = args.model_profiles.warning() {
+                view.append(warning);
+            }
             start_model_picker(args, view, ModelListIntent::Scope);
         }
         "/login" if rest.eq_ignore_ascii_case("anthropic") => show_anthropic_methods(view),
@@ -8751,6 +8758,9 @@ pub(super) async fn run(
                                 Some(AuthReload::start(args.model_keys.revision().to_owned()));
                             view.append("Reloading provider credentials (Esc to cancel)");
                             args.reload_model_profiles()?;
+                            if let Some(warning) = args.model_profiles.warning() {
+                                view.append(warning);
+                            }
                             {
                                 let preparation = super::packages::prepare(&args);
                                 tokio::pin!(preparation);

@@ -121,7 +121,7 @@ pub(super) async fn automatic_startup_model(args: &Cli) -> Option<ScopedChoice> 
         .providers()
         .filter(|provider| *provider != Provider::Ollama)
     {
-        let radius = if provider == Provider::Radius {
+        let radius = if provider == Provider::Radius && profiles.warning().is_none() {
             match args.connect_provider(&provider, None) {
                 // A model fallback must not fetch catalogs or refresh OAuth.
                 // Pi Messages can read its local Radius catalog without probing.
@@ -202,10 +202,40 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    pub(super) fn static_models(args: &Cli, provider: Provider, models: Vec<String>) -> Self {
+        let aliases = aliases(&args.model_profiles, &provider, &models);
+        Self {
+            provider,
+            client: None,
+            models,
+            aliases,
+            probe_details: false,
+            complete: false,
+        }
+    }
+
     pub(super) async fn discovered_radius_catalog(
         &self,
     ) -> Option<std::sync::Arc<super::radius_catalog::Catalog>> {
         self.client.as_ref()?.discovered_radius_catalog().await
+    }
+
+    pub(super) fn needs_scope_discovery(&self, patterns: &[String]) -> bool {
+        let catalog = std::slice::from_ref(self);
+        let exact = |reference| !exact_scope_matches(reference, Some(self), catalog).is_empty();
+        patterns
+            .iter()
+            .map(|pattern| pattern.trim())
+            .filter(|pattern| !pattern.is_empty())
+            .any(|pattern| {
+                let base = thinking_suffix(pattern).map(|(model, _)| model);
+                // Scope resolution checks literal IDs before expanding a glob.
+                if pattern.contains(['*', '?', '[']) {
+                    !exact(base.unwrap_or(pattern))
+                } else {
+                    !exact(pattern) && !base.is_some_and(exact)
+                }
+            })
     }
 
     pub fn display_name<'a>(&'a self, model: &'a str) -> &'a str {
@@ -259,7 +289,43 @@ fn catalog_client(
     args.connect_provider(provider, None).map(Some)
 }
 
+pub(super) async fn anonymous_local_models(provider: &Provider, endpoint: &str) -> Vec<String> {
+    if provider.adapter() == super::providers::Adapter::ChatCompletions
+        && reqwest::Url::parse(endpoint)
+            .is_ok_and(|url| matches!(url.host_str(), Some("127.0.0.1" | "[::1]")))
+        && let Ok(client) = pi_rs::ollama::Ollama::new(endpoint, None)
+    {
+        return client.models().await.unwrap_or_default();
+    }
+    Vec::new()
+}
+
 pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
+    if args.model_profiles.warning().is_some() {
+        if args.explicit_endpoint_for(&provider).is_some() {
+            if probe {
+                return connected_catalog(args, provider, true).await;
+            }
+            args.connect_provider(&provider, None)?;
+        }
+        let mut models = args.model_profiles.model_ids(&provider);
+        if probe {
+            for model in anonymous_local_models(&provider, args.endpoint_for(&provider)).await {
+                if !models.contains(&model) {
+                    models.push(model);
+                }
+            }
+        }
+        return Ok(Catalog::static_models(args, provider, models));
+    }
+    connected_catalog(args, provider, probe).await
+}
+
+pub(super) async fn connected_catalog(
+    args: &Cli,
+    provider: Provider,
+    probe: bool,
+) -> Result<Catalog> {
     let mut models = args.model_profiles.model_ids(&provider);
     let client = catalog_client(args, &provider, &mut models)?.map(|client| {
         if provider == Provider::Radius {
@@ -288,7 +354,7 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
                 complete = true;
                 let mut seen: std::collections::BTreeSet<_> = models.iter().cloned().collect();
                 models.extend(discovered.into_iter().filter(|id| seen.insert(id.clone())));
-                probe_details = true;
+                probe_details = args.model_profiles.warning().is_none();
             }
             Err(error) if models.is_empty() => return Err(error),
             Err(_) => {}
@@ -893,6 +959,17 @@ fn canonical(model: String, ids: &[String], aliases: &[(String, String)]) -> Str
 }
 
 pub fn next_model(args: &Cli, available: &[ScopedChoice], reverse: bool) -> Option<ScopedChoice> {
+    let eligible;
+    let available = if args.model_profiles.warning().is_some() {
+        eligible = available
+            .iter()
+            .filter(|choice| args.saved_model_route_available(&choice.provider, &choice.model))
+            .cloned()
+            .collect::<Vec<_>>();
+        eligible.as_slice()
+    } else {
+        available
+    };
     let count = available.len();
     if count <= 1 {
         return None;
@@ -908,7 +985,7 @@ pub fn next_model(args: &Cli, available: &[ScopedChoice], reverse: bool) -> Opti
     };
     Some(available[next].clone())
 }
-fn unqualified<'a>(value: &'a str, provider: &str) -> &'a str {
+pub(super) fn unqualified<'a>(value: &'a str, provider: &str) -> &'a str {
     let value = value.trim();
     value
         .split_once('/')
@@ -1020,9 +1097,20 @@ pub fn split(value: &str, available: &[String], provider: &str) -> Result<Choice
     if let Some((choice, _)) = catalog_choice(value, available, false, provider) {
         return Ok(choice);
     }
-    let (model, thinking) = thinking_suffix(named).map_or((named, None), |(model, level)| {
-        (model, Some(level.to_owned()))
-    });
+    literal_choice(named, true)
+}
+
+pub(super) fn literal_choice(value: &str, parse_thinking: bool) -> Result<Choice> {
+    let named = value.trim();
+    if named.is_empty() {
+        return Err(Error::Config("model ID is required".into()));
+    }
+    let (model, thinking) = parse_thinking
+        .then(|| thinking_suffix(named))
+        .flatten()
+        .map_or((named, None), |(model, level)| {
+            (model, Some(level.to_owned()))
+        });
     Ok(Choice {
         model: model.into(),
         thinking,

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 type Environment = Map<String, Value>;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) struct Adc {
     pub endpoint: String,
     credentials_path: Option<PathBuf>,

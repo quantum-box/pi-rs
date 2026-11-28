@@ -105,6 +105,8 @@ struct Cli {
     #[arg(skip)]
     complete_catalogs: Vec<(String, String)>,
     #[arg(skip)]
+    verified_local_catalog: Option<VerifiedLocalCatalog>,
+    #[arg(skip)]
     session_transition: Option<pi_rs::SessionStartReason>,
     #[arg(skip)]
     settings: config::Settings,
@@ -353,6 +355,13 @@ struct InitialSelection {
     model: String,
 }
 
+#[derive(Clone)]
+struct VerifiedLocalCatalog {
+    provider: Provider,
+    endpoint: String,
+    models: Vec<String>,
+}
+
 impl Cli {
     fn theme_setting(&self) -> Option<&str> {
         self.extension_theme
@@ -413,7 +422,9 @@ impl Cli {
     }
 
     fn allow_model_probes(&self) -> bool {
-        self.allow_endpoint_probes(self.model_endpoint_for(&self.provider, Some(&self.model)))
+        self.model_profiles.warning().is_none()
+            && self
+                .allow_endpoint_probes(self.model_endpoint_for(&self.provider, Some(&self.model)))
     }
 
     fn allow_endpoint_probes(&self, endpoint: &str) -> bool {
@@ -485,14 +496,23 @@ impl Cli {
         provider: &Provider,
         endpoint: &str,
     ) -> Option<model_auth::Credential> {
+        self.configured_model_credential_for_profiles(&self.model_profiles, provider, endpoint)
+    }
+
+    fn configured_model_credential_for_profiles(
+        &self,
+        profiles: &model_profiles::Profiles,
+        provider: &Provider,
+        endpoint: &str,
+    ) -> Option<model_auth::Credential> {
         self.model_keys
             .credential(provider, endpoint)
             .or_else(|| {
                 self.model_keys
-                    .custom_credential(provider, endpoint, &self.model_profiles)
+                    .custom_credential(provider, endpoint, profiles)
             })
             .cloned()
-            .or_else(|| self.model_profiles.credential(provider, endpoint))
+            .or_else(|| profiles.credential(provider, endpoint))
             .or_else(|| {
                 if provider == &Provider::Radius {
                     let gateway = radius_auth::Gateway::configured_origin().ok()?;
@@ -510,11 +530,9 @@ impl Cli {
                         .filter(|key| !key.trim().is_empty())
                         .map(model_auth::Credential::Literal)
                         .or_else(|| {
-                            vertex_auth::Adc::configured(self.model_keys.environment(
-                                provider,
-                                endpoint,
-                                &self.model_profiles,
-                            ))
+                            vertex_auth::Adc::configured(
+                                self.model_keys.environment(provider, endpoint, profiles),
+                            )
                             .map(model_auth::Credential::VertexAdc)
                         });
                 }
@@ -532,15 +550,11 @@ impl Cli {
                     let eligible = match provider.id() {
                         "azure" => {
                             !endpoint.is_empty()
-                                && self
-                                    .model_profiles
-                                    .has_provider_endpoint(provider, endpoint)
+                                && profiles.has_provider_endpoint(provider, endpoint)
                         }
                         "cloudflare-workers-ai" => {
                             model_profiles::cloudflare_workers_chat_account(endpoint).is_some()
-                                && self
-                                    .model_profiles
-                                    .has_provider_endpoint(provider, endpoint)
+                                && profiles.has_provider_endpoint(provider, endpoint)
                         }
                         _ => builtin.is_official_endpoint(endpoint),
                     };
@@ -576,6 +590,30 @@ impl Cli {
             })
     }
 
+    fn model_request_authorization(
+        &self,
+        profiles: &model_profiles::Profiles,
+        provider: &Provider,
+        endpoint: &str,
+        model: Option<&str>,
+    ) -> (
+        Option<model_auth::Credential>,
+        model_profiles::RequestHeaders,
+    ) {
+        let inline = self.model_override_token(provider, endpoint);
+        let env = inline
+            .is_none()
+            .then(|| self.model_keys.environment(provider, endpoint, profiles))
+            .flatten();
+        let headers = profiles
+            .header_settings(provider, endpoint, model)
+            .with_environment(env);
+        let credential = inline.map(model_auth::Credential::Literal).or_else(|| {
+            self.configured_model_credential_for_profiles(profiles, provider, endpoint)
+        });
+        (credential, headers)
+    }
+
     fn connect_provider(
         &self,
         provider: &Provider,
@@ -586,19 +624,8 @@ impl Cli {
             || provider.adapter(),
             |model| self.model_profiles.model_adapter(provider, model),
         );
-        let credential = self.model_credential_for(provider, endpoint);
-        let settings = self
-            .model_profiles
-            .header_settings(provider, endpoint, model)
-            .with_environment(
-                self.model_override_token(provider, endpoint)
-                    .is_none()
-                    .then(|| {
-                        self.model_keys
-                            .environment(provider, endpoint, &self.model_profiles)
-                    })
-                    .flatten(),
-            );
+        let (credential, settings) =
+            self.model_request_authorization(&self.model_profiles, provider, endpoint, model);
         if model.is_some_and(str::is_empty)
             || settings.has_command()
             || credential
@@ -654,6 +681,131 @@ impl Cli {
             .unwrap_or_else(|| self.endpoint_for(provider))
     }
 
+    fn verified_local_models(&self, provider: &Provider) -> Option<&[String]> {
+        let catalog = self.verified_local_catalog.as_ref()?;
+        (&catalog.provider == provider && catalog.endpoint == self.endpoint_for(provider))
+            .then_some(catalog.models.as_slice())
+    }
+
+    fn saved_model_route_available(&self, provider: &Provider, model: &str) -> bool {
+        self.model_profiles.warning().is_none()
+            || self.explicit_endpoint_for(provider).is_some()
+            || (!self.model_profiles.has_model_definition(provider, model)
+                && self.verified_local_models(provider).is_some_and(|models| {
+                    models.iter().any(|id| id == model)
+                        && self.model_endpoint_for(provider, Some(model))
+                            == self.endpoint_for(provider)
+                }))
+    }
+
+    async fn confirm_local_catalog(&mut self, provider: &Provider) {
+        if self.verified_local_models(provider).is_some() {
+            return;
+        }
+        let endpoint = self.endpoint_for(provider).to_owned();
+        let models = model_selection::anonymous_local_models(provider, &endpoint).await;
+        self.verified_local_catalog = Some(VerifiedLocalCatalog {
+            provider: provider.clone(),
+            endpoint,
+            models,
+        });
+    }
+
+    async fn verify_saved_model_route(&mut self) -> Result<()> {
+        let provider = self.provider.clone();
+        if !self.saved_model_route_available(&provider, &self.model)
+            && !self
+                .model_profiles
+                .has_model_definition(&provider, &self.model)
+        {
+            self.confirm_local_catalog(&provider).await;
+        }
+        if self.saved_model_route_available(&provider, &self.model) {
+            return Ok(());
+        }
+        Err(Error::Config(
+            "models.json error: saved model is unavailable on the selected route; select a built-in model with --model or confirm the custom route with --endpoint".into(),
+        ))
+    }
+
+    fn verify_default_provider_route(&self) -> Result<()> {
+        if self.model_profiles.warning().is_some()
+            && self.explicit_endpoint_for(&self.provider).is_none()
+            && self.saved_provider_is(&self.provider)
+        {
+            return Err(Error::Config(
+                "models.json error: the saved provider route is unavailable; pass --model or --endpoint".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn saved_provider_is(&self, provider: &Provider) -> bool {
+        self.settings
+            .string("defaultProvider")
+            .and_then(|name| self.model_profiles.provider(name))
+            .as_ref()
+            == Some(provider)
+    }
+
+    fn fallback_scope_catalog(
+        &self,
+        provider: &Provider,
+        confirmed_model: Option<&str>,
+    ) -> model_selection::Catalog {
+        // A saved scope can include a bundled ID whose route came from the discarded file.
+        let mut models = if self.explicit_endpoint_for(provider).is_some() {
+            self.model_profiles.model_ids(provider)
+        } else {
+            Vec::new()
+        };
+        for model in self
+            .verified_local_models(provider)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|model| self.saved_model_route_available(provider, model))
+            .chain(confirmed_model)
+        {
+            if !models.iter().any(|id| id == model) {
+                models.push(model.to_owned());
+            }
+        }
+        model_selection::Catalog::static_models(self, provider.clone(), models)
+    }
+
+    async fn discover_fallback_scope(
+        &mut self,
+        provider: &Provider,
+        confirmed_model: Option<&str>,
+        patterns: &[String],
+    ) -> model_selection::Catalog {
+        let mut catalog = self.fallback_scope_catalog(provider, confirmed_model);
+        if !catalog.needs_scope_discovery(patterns) {
+            return catalog;
+        }
+        if let Some(endpoint) = self.explicit_endpoint_for(provider) {
+            if self.allow_endpoint_probes(endpoint)
+                && let Ok(discovered) =
+                    model_selection::connected_catalog(self, provider.clone(), true).await
+            {
+                for model in discovered.models {
+                    if !catalog.models.contains(&model) {
+                        catalog.models.push(model);
+                    }
+                }
+                return model_selection::Catalog::static_models(
+                    self,
+                    provider.clone(),
+                    catalog.models,
+                );
+            }
+            return catalog;
+        }
+        self.confirm_local_catalog(provider).await;
+        self.fallback_scope_catalog(provider, confirmed_model)
+    }
+
     fn endpoint_for(&self, provider: &Provider) -> &str {
         if provider == &self.provider {
             return &self.endpoint;
@@ -666,31 +818,84 @@ impl Cli {
         self.model_keys = keys;
         if self.model_profiles.cloudflare_gateway_route()
             != self.model_keys.cloudflare_gateway_route().as_ref()
+            || self.model_profiles.cloudflare_saved_account()
+                != self.model_keys.cloudflare_chat_account()
         {
-            self.reload_model_profiles()?;
-            return Ok(());
-        }
-        if self.model_profiles.cloudflare_saved_account()
-            != self.model_keys.cloudflare_chat_account()
-        {
-            self.reload_model_profiles()?;
+            self.apply_model_profiles(model_profiles::Profiles::load(&self.model_keys)?)?;
         }
         Ok(())
     }
 
     fn reload_model_profiles(&mut self) -> Result<()> {
-        let profiles = model_profiles::Profiles::load(&self.model_keys)?;
+        self.apply_model_profiles(model_profiles::Profiles::load_for_cli(&self.model_keys)?)
+    }
+
+    fn apply_model_profiles(&mut self, profiles: model_profiles::Profiles) -> Result<()> {
         let provider = profiles.provider(self.provider.id()).ok_or_else(|| {
-            Error::Config(format!(
+            let message = format!(
                 "model provider {} is no longer configured",
                 self.provider.id()
-            ))
+            );
+            Error::Config(if profiles.warning().is_some() {
+                format!("models.json error: {message}")
+            } else {
+                message
+            })
         })?;
         let explicit_current_endpoint = self.endpoint_explicit
             && self
                 .initial_connection
                 .as_ref()
                 .is_some_and(|(initial, _)| initial.id() == provider.id());
+        if profiles.warning().is_some() {
+            let active_and_scoped = std::iter::once((&self.provider, self.model.as_str())).chain(
+                self.model_scope
+                    .iter()
+                    .map(|choice| (&choice.provider, choice.model.as_str())),
+            );
+            let routes = active_and_scoped
+                .map(|(provider, model)| (provider, model, self.endpoint_for(provider)))
+                .chain(
+                    self.initial_selection
+                        .iter()
+                        .chain(&self.cli_selection)
+                        .map(|selection| {
+                            (
+                                &selection.provider,
+                                selection.model.as_str(),
+                                selection.endpoint.as_str(),
+                            )
+                        }),
+                );
+            for (provider, model, previous_base) in routes {
+                let explicit_endpoint = self.explicit_endpoint_for(provider);
+                let previous_endpoint = explicit_endpoint
+                    .or_else(|| self.model_profiles.model_endpoint(provider, model))
+                    .unwrap_or(previous_base);
+                let endpoint = explicit_endpoint.unwrap_or_else(|| {
+                    profiles
+                        .model_endpoint(provider, model)
+                        .unwrap_or_else(|| profiles.endpoint(provider))
+                });
+                if profiles.provider(provider.id()).as_ref() != Some(provider)
+                    || endpoint != previous_endpoint
+                    || profiles.model_adapter(provider, model)
+                        != self.model_profiles.model_adapter(provider, model)
+                    || self.model_request_authorization(&profiles, provider, endpoint, Some(model))
+                        != self.model_request_authorization(
+                            &self.model_profiles,
+                            provider,
+                            previous_endpoint,
+                            Some(model),
+                        )
+                {
+                    return Err(Error::Config(format!(
+                        "models.json error: cannot replace model route {}/{model}",
+                        provider.id()
+                    )));
+                }
+            }
+        }
         if !explicit_current_endpoint {
             self.endpoint = profiles.endpoint(&provider).to_owned();
         }
@@ -923,6 +1128,9 @@ impl Cli {
             .model_profiles
             .provider(provider.unwrap_or("ollama"))
             .map(|provider| {
+                if !self.model_explicit && !self.saved_model_route_available(&provider, &model) {
+                    return (false, true);
+                }
                 let endpoint = self.endpoint_for(&provider);
                 let known = self
                     .model_profiles
@@ -988,6 +1196,25 @@ impl Cli {
         // Extension-registered Pi virtual models are absent from this catalog.
         // Pi treats absent catalog entries as nonvirtual.
         let selection = session_import::branch_selection(session, |_, _| None);
+        if self.model_profiles.warning().is_some()
+            && !self.connection_explicit
+            && !self.model_explicit
+        {
+            let provider = match &selection {
+                session_import::BranchSelection::Native => session.model_provider(),
+                session_import::BranchSelection::Selected { provider, .. } => {
+                    Some(provider.as_str())
+                }
+                session_import::BranchSelection::Unresolved { .. } => None,
+            };
+            if let Some(provider) = provider
+                && self.model_profiles.provider(provider).is_none()
+            {
+                return Err(Error::Config(format!(
+                    "unknown model provider {provider:?}"
+                )));
+            }
+        }
         let branch_thinking = match &selection {
             session_import::BranchSelection::Native => {
                 session.model_selection().and_then(|(_, thinking)| thinking)
@@ -1054,12 +1281,21 @@ impl Cli {
             .as_deref()
             .map(|value| value.split(',').map(str::to_owned).collect())
             .unwrap_or_else(|| self.settings.strings("enabledModels"));
-        let mut catalogs = model_selection::cached_catalogs(self);
-        if self.selection_discovery_pending
-            || self
-                .selection_workspace
-                .as_ref()
-                .is_some_and(|cwd| cwd != &self.workspace)
+        let degraded = self.model_profiles.warning().is_some();
+        let explicit_scope = degraded
+            && self.models.is_some()
+            && patterns.iter().any(|pattern| !pattern.trim().is_empty());
+        let mut catalogs = if degraded {
+            Vec::new()
+        } else {
+            model_selection::cached_catalogs(self)
+        };
+        if !degraded
+            && (self.selection_discovery_pending
+                || self
+                    .selection_workspace
+                    .as_ref()
+                    .is_some_and(|cwd| cwd != &self.workspace))
         {
             // A previous runtime's negative catalog is not authoritative for
             // this workspace, especially when rediscovery is unavailable.
@@ -1140,19 +1376,6 @@ impl Cli {
                 }
             }
         }
-        self.selection_workspace = Some(self.workspace.clone());
-        self.discovered_models = catalogs
-            .iter()
-            .flat_map(|catalog| {
-                catalog
-                    .models
-                    .iter()
-                    .map(|model| (catalog.provider.id().to_owned(), model.clone()))
-            })
-            .collect();
-        self.model_scope =
-            model_selection::scoped_choices(patterns.iter().map(String::as_str), &catalogs).0;
-
         let fallback = self
             .initial_selection
             .clone()
@@ -1208,16 +1431,86 @@ impl Cli {
                 id
             }
         });
-        let missing_retired_default = configured_model.is_some_and(|model| {
-            model_selection::is_unconfigured_retired_ant_ling_model(
-                &self.model_profiles,
-                &provider,
-                model,
-            ) && !self
-                .discovered_models
-                .iter()
-                .any(|(id, discovered)| id == provider.id() && model == discovered)
-        });
+        let saved_provider_matches = configured_provider
+            .is_none_or(|name| self.model_profiles.provider(name).as_ref() == Some(&provider));
+        if degraded {
+            let confirmed = self
+                .cli_selection
+                .as_ref()
+                .filter(|selection| {
+                    selection.provider == provider
+                        && selection.endpoint == self.endpoint_for(&provider)
+                })
+                .map(|selection| selection.model.as_str())
+                .or_else(|| {
+                    configured_model.filter(|model| {
+                        (saved_provider_matches || self.explicit_endpoint_for(&provider).is_some())
+                            && self.saved_model_route_available(&provider, model)
+                    })
+                });
+            let needs_saved_confirmation = !explicit_scope
+                && saved_provider_matches
+                && configured_model.is_some_and(|model| {
+                    !self.saved_model_route_available(&provider, model)
+                        && !self.model_profiles.has_model_definition(&provider, model)
+                });
+            let mut args = self.clone();
+            let selected = provider.clone();
+            let literal = confirmed.map(str::to_owned);
+            let scope = patterns.clone();
+            let discovery = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?
+                    .block_on(async {
+                        tokio::time::timeout(timeout, async {
+                            if needs_saved_confirmation {
+                                args.confirm_local_catalog(&selected).await;
+                            }
+                            let catalog = args
+                                .discover_fallback_scope(&selected, literal.as_deref(), &scope)
+                                .await;
+                            (catalog, args.verified_local_catalog)
+                        })
+                        .await
+                        .ok()
+                    })
+            })
+            .join()
+            .ok()
+            .flatten();
+            if let Some((catalog, verified)) = discovery {
+                self.verified_local_catalog = verified;
+                catalogs.push(catalog);
+            } else {
+                catalogs.push(self.fallback_scope_catalog(&provider, confirmed));
+            }
+        }
+        self.selection_workspace = Some(self.workspace.clone());
+        self.discovered_models = catalogs
+            .iter()
+            .flat_map(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .map(|model| (catalog.provider.id().to_owned(), model.clone()))
+            })
+            .collect();
+        self.model_scope =
+            model_selection::scoped_choices(patterns.iter().map(String::as_str), &catalogs).0;
+
+        let missing_retired_default = !degraded
+            && configured_model.is_some_and(|model| {
+                model_selection::is_unconfigured_retired_ant_ling_model(
+                    &self.model_profiles,
+                    &provider,
+                    model,
+                ) && !self
+                    .discovered_models
+                    .iter()
+                    .any(|(id, discovered)| id == provider.id() && model == discovered)
+            });
         let provider = if missing_retired_default && !self.connection_explicit {
             fallback.provider.clone()
         } else {
@@ -1230,32 +1523,54 @@ impl Cli {
                     &provider,
                     &fallback.model,
                 ));
-        let model = configured_model
-            .filter(|_| !missing_retired_default)
-            .map(str::to_owned)
-            .or_else(|| keep_fallback.then(|| fallback.model.clone()))
-            .or_else(|| {
-                catalogs
-                    .iter()
-                    .find(|catalog| catalog.provider == provider)
-                    .and_then(|catalog| {
-                        model_selection::default_for_provider(&provider, &catalog.models)
-                    })
-                    .cloned()
-            });
+        let verified_model = configured_model.filter(|model| {
+            !missing_retired_default
+                && (!degraded
+                    || saved_provider_matches
+                    || self.explicit_endpoint_for(&provider).is_some())
+                && self.saved_model_route_available(&provider, model)
+        });
+        let unverified_default = degraded && configured_model.is_some() && verified_model.is_none();
+        let model = if unverified_default {
+            None
+        } else {
+            verified_model
+                .map(str::to_owned)
+                .or_else(|| keep_fallback.then(|| fallback.model.clone()))
+                .or_else(|| {
+                    catalogs
+                        .iter()
+                        .find(|catalog| catalog.provider == provider)
+                        .and_then(|catalog| {
+                            model_selection::default_for_provider(&provider, &catalog.models)
+                        })
+                        .cloned()
+                })
+        };
         let (provider, model) = model.map_or_else(
             || (fallback.provider.clone(), fallback.model.clone()),
             |model| (provider, model),
         );
-        let chosen = self
-            .model_scope
-            .iter()
-            .find(|choice| choice.provider == provider && choice.model == model)
-            .or_else(|| {
-                self.model_scope
-                    .iter()
-                    .find(|choice| !self.connection_explicit || choice.provider == provider)
-            });
+        let chosen = if explicit_scope {
+            self.model_scope
+                .iter()
+                .find(|choice| !self.connection_explicit || choice.provider == provider)
+        } else if unverified_default
+            || (degraded
+                && verified_model.is_some()
+                && self.explicit_endpoint_for(&provider).is_some())
+        {
+            None
+        } else {
+            self.model_scope
+                .iter()
+                .find(|choice| choice.provider == provider && choice.model == model)
+                .or_else(|| {
+                    self.model_scope
+                        .iter()
+                        .find(|choice| !self.connection_explicit || choice.provider == provider)
+                })
+        };
         let (provider, model) = chosen.map_or((provider, model), |choice| {
             (choice.provider.clone(), choice.model.clone())
         });
@@ -1733,41 +2048,98 @@ async fn run_cli() -> i32 {
             result = model_auth::Keys::load_async() => result?,
             _ = &mut signal_rx => return Err(Error::Cancelled),
         };
-        args.model_profiles = model_profiles::Profiles::load(&args.model_keys)?;
-        let configured_model = args.settings.string("defaultModel");
+        args.model_profiles = if matches!(
+            args.command,
+            Some(Command::Login { .. } | Command::Logout { .. })
+        ) {
+            model_profiles::Profiles::load(&args.model_keys)?
+        } else {
+            model_profiles::Profiles::load_for_cli(&args.model_keys)?
+        };
+        if args.worker_settings_stdin
+            && std::env::var_os(process::MODEL_PROFILE_REVISION_ENV)
+                .is_some_and(|expected| expected != std::ffi::OsStr::new(args.model_profiles.revision()))
+        {
+            return Err(Error::Config(
+                "models.json error: worker model configuration differs from its parent".into(),
+            ));
+        }
+        if !args.worker_settings_stdin
+            && let Some(warning) = args.model_profiles.warning()
+        {
+            eprintln!("{warning}");
+        }
+        let catalog_fallback = args.model_profiles.warning().is_some();
+        let explicit_endpoint =
+            matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
+        let unscoped_listing = args.list_models.is_some()
+            && args.provider_argument.is_none()
+            && !args.model_explicit
+            && !explicit_endpoint;
+        let (saved_provider, configured_model) = if catalog_fallback && unscoped_listing {
+            (None, None)
+        } else {
+            (
+                args.settings.string("defaultProvider"),
+                args.settings.string("defaultModel"),
+            )
+        };
         let provider_prefix = |model: &str| {
             model
                 .split_once('/')
                 .and_then(|(prefix, _)| args.model_profiles.provider(prefix))
         };
-        let explicit_default_provider = args
-            .settings
-            .string("defaultProvider")
-            .and_then(|name| args.model_profiles.provider(name));
+        let explicit_default_provider =
+            saved_provider.and_then(|name| args.model_profiles.provider(name));
         let configured_provider = explicit_default_provider
             .clone()
             .or_else(|| configured_model.and_then(provider_prefix))
             .unwrap_or_default();
-        let explicit_endpoint =
-            matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
+        let inline = args.api_key.is_some() || std::env::var_os("PI_RS_MODEL_TOKEN").is_some();
+        let managed_worker = matches!(args.command, Some(Command::Serve));
+        if catalog_fallback && !managed_worker {
+            if !explicit_endpoint && inline {
+                return Err(Error::Config(
+                    "models.json error: an inline model key requires an explicit endpoint".into(),
+                ));
+            }
+            if args.model_explicit && args.provider_argument.is_none() && !explicit_endpoint {
+                args.model_profiles.ensure_model_reference_available(&args.model)?;
+            }
+        }
         let resolved = if args.model_explicit
             && args.provider_argument.is_none()
             && !explicit_endpoint
-            && !matches!(args.command, Some(Command::Serve))
+            && !managed_worker
         {
-            let inline = args.api_key.is_some() || std::env::var_os("PI_RS_MODEL_TOKEN").is_some();
             model_selection::cli_catalog_model(&args, &args.model, inline)?
         } else {
             None
         };
+        let explicit_model_provider = if args.model_explicit {
+            provider_prefix(&args.model)
+        } else {
+            None
+        };
+        if catalog_fallback
+            && !managed_worker
+            && !explicit_endpoint
+            && args.provider_argument.is_none()
+            && resolved.is_none()
+            && explicit_model_provider.is_none()
+            && explicit_default_provider.is_none()
+            && let Some(name) = saved_provider
+        {
+            return Err(Error::Config(format!("unknown model provider {name:?}")));
+        }
         args.provider = if let Some(name) = args.provider_argument.as_deref() {
             args.model_profiles
                 .provider(name)
                 .ok_or_else(|| Error::Config(format!("unknown model provider {name:?}")))?
         } else if let Some(model) = &resolved {
             model.provider.clone()
-        } else if args.model_explicit {
-            provider_prefix(&args.model).unwrap_or_else(|| configured_provider.clone())
+        } else if let Some(provider) = explicit_model_provider {
+            provider
         } else {
             configured_provider.clone()
         };
@@ -1777,7 +2149,45 @@ async fn run_cli() -> i32 {
             args.endpoint = args.model_profiles.endpoint(&args.provider).into();
         }
         args.initial_connection = Some((args.provider.clone(), args.endpoint.clone()));
-        if let Some(model) = resolved {
+        let require_builtin =
+            catalog_fallback && args.model_explicit && !explicit_endpoint && !managed_worker;
+        let explicit_custom_endpoint = explicit_endpoint
+            && args.endpoint != args.provider.default_endpoint()
+            && !builtin_chat::find(args.provider.id())
+                .is_some_and(|builtin| builtin.is_official_endpoint(&args.endpoint));
+        let selected = match resolved {
+            Some(model) => Some(model_selection::Choice {
+                model: model.model,
+                thinking: model.thinking,
+            }),
+            None if require_builtin => Some(model_selection::split_with_profiles(
+                &args.model,
+                &[],
+                &args.provider,
+                &args.model_profiles,
+            )?),
+            None if catalog_fallback
+                && args.model_explicit
+                && explicit_endpoint
+                && (args.provider_argument.is_some() || explicit_custom_endpoint)
+                && !managed_worker => {
+                    let model = if args.provider_argument.is_some() {
+                        &args.model
+                    } else {
+                        model_selection::unqualified(&args.model, args.provider.id())
+                    };
+                    Some(model_selection::literal_choice(model, !args.thinking_explicit)?)
+                }
+            None => None,
+        };
+        if let Some(model) = selected {
+            if require_builtin
+                && !args.model_profiles.has_model_definition(&args.provider, &model.model)
+            {
+                return Err(Error::Config(
+                    "models.json error: explicit model is unavailable in the built-in catalog; pass --endpoint to use a custom model".into(),
+                ));
+            }
             args.model = model.model;
             args.model_is_literal = true;
             if !args.thinking_explicit && model.thinking.is_some() {
@@ -1786,9 +2196,24 @@ async fn run_cli() -> i32 {
             }
         } else if !args.model_explicit {
             if let Some(model) = configured_model.filter(|_| args.provider == configured_provider) {
-                args.model = model.into();
-                args.model_is_literal = explicit_default_provider.is_some();
-            } else if args.provider != Provider::Ollama {
+                if catalog_fallback && explicit_default_provider.is_none() && !managed_worker {
+                    let saved = model_selection::literal_choice(
+                        model_selection::unqualified(model, args.provider.id()),
+                        true,
+                    )?;
+                    args.model = saved.model;
+                    args.model_is_literal = true;
+                    if !args.thinking_explicit && saved.thinking.is_some() {
+                        args.thinking = saved.thinking;
+                        args.thinking_explicit = true;
+                    }
+                } else {
+                    args.model = model.into();
+                    args.model_is_literal = explicit_default_provider.is_some();
+                }
+            } else if args.provider != Provider::Ollama
+                || (catalog_fallback && !explicit_endpoint && args.saved_provider_is(&args.provider) && !managed_worker)
+            {
                 args.model.clear();
             }
         }
@@ -1965,27 +2390,6 @@ async fn execute(
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     let pi_style_invocation = args.command.is_none();
-    let patterns: Vec<_> = if let Some(patterns) = &args.models {
-        patterns.split(',').collect()
-    } else if matches!(
-        args.command,
-        None | Some(
-            Command::Run { .. }
-                | Command::Resume
-                | Command::Interactive
-                | Command::Compact { .. }
-                | Command::Review { .. }
-        )
-    ) {
-        args.settings.value()["enabledModels"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect()
-    } else {
-        Vec::new()
-    };
     if let Some(search) = &args.list_models {
         return model_listing::list(&args, search).await;
     }
@@ -1999,6 +2403,8 @@ async fn execute(
                 | Command::Review { .. }
         )
     );
+    let needs_default_model = starts_model_session && args.model.is_empty();
+    let degraded = args.model_profiles.warning().is_some();
     let can_select_automatically = starts_model_session
         && !args.connection_explicit
         && args.api_key.is_none()
@@ -2011,13 +2417,15 @@ async fn execute(
         model_selection::qualified_model(&args.model, &args.model_profiles)
             .filter(|(provider, _)| *provider == args.provider)
             .map_or(args.model.as_str(), |(_, id)| id)
-    };
+    }
+    .to_owned();
     let retired_default = starts_model_session
+        && !degraded
         && !args.model_explicit
         && model_selection::is_unconfigured_retired_ant_ling_model(
             &args.model_profiles,
             &args.provider,
-            saved_model,
+            &saved_model,
         )
         && (saved_model == args.model
             || args
@@ -2025,8 +2433,38 @@ async fn execute(
                 .model(&args.provider, &args.model)
                 .is_none());
     let mut retired_catalog_error = None;
+    let patterns: Vec<String> = if let Some(patterns) = &args.models {
+        patterns.split(',').map(str::to_owned).collect()
+    } else if starts_model_session {
+        args.settings.strings("enabledModels")
+    } else {
+        Vec::new()
+    };
     let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
-    let catalogs = if has_patterns {
+    let explicit_scope = degraded && args.models.is_some() && has_patterns;
+    if starts_model_session
+        && !explicit_scope
+        && !args.model_explicit
+        && args.model_is_literal
+        && !args.model.is_empty()
+    {
+        args.verify_saved_model_route().await?;
+    }
+    let confirmed_saved = degraded
+        && !args.model_explicit
+        && args.model_is_literal
+        && args.explicit_endpoint_for(&args.provider).is_some();
+    let catalogs = if degraded && has_patterns {
+        let provider = args.provider.clone();
+        let confirmed = (args.model_is_literal
+            && !args.model.is_empty()
+            && (args.model_explicit || args.saved_model_route_available(&provider, &args.model)))
+        .then(|| args.model.clone());
+        vec![
+            args.discover_fallback_scope(&provider, confirmed.as_deref(), &patterns)
+                .await,
+        ]
+    } else if has_patterns {
         if matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }))
         {
             tokio::select! {
@@ -2036,10 +2474,14 @@ async fn execute(
         } else {
             model_selection::catalogs(&args, true).await?
         }
-    } else if (starts_model_session && args.model.is_empty()) || retired_default {
-        match model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes())
-            .await
-        {
+    } else if needs_default_model || retired_default {
+        args.verify_default_provider_route()?;
+        let probe = if degraded {
+            args.allow_endpoint_probes(args.endpoint_for(&args.provider))
+        } else {
+            args.allow_model_probes()
+        };
+        match model_selection::catalog(&args, args.provider.clone(), probe).await {
             Ok(catalog) => vec![catalog],
             Err(error) if retired_default && can_select_automatically => {
                 retired_catalog_error = Some(error);
@@ -2057,7 +2499,7 @@ async fn execute(
     let missing_retired_default = retired_default
         && !available
             .iter()
-            .any(|id| id == saved_model || id == &args.model);
+            .any(|id| id == &saved_model || id == &args.model);
     if missing_retired_default {
         args.model.clear();
     }
@@ -2097,22 +2539,39 @@ async fn execute(
             args.thinking_explicit = true;
         }
     }
-    let (scope, warnings) = model_selection::scoped_choices(patterns, &catalogs);
+    let (scope, warnings) =
+        model_selection::scoped_choices(patterns.iter().map(String::as_str), &catalogs);
     for warning in warnings {
         eprintln!("Warning: {warning}");
     }
+    if has_patterns && scope.is_empty() && degraded {
+        let explicit_selection = args.model_explicit
+            && (args.endpoint_explicit
+                || args
+                    .model_profiles
+                    .has_model_definition(&args.provider, &args.model));
+        if args.models.is_some() || !(explicit_selection || confirmed_saved) {
+            return Err(Error::Config(
+                "models.json error: the requested model scope is unavailable on a confirmed route; pass --model or --endpoint".into(),
+            ));
+        }
+    }
     args.model_scope = scope;
     if !args.model_explicit {
-        let selected = args
-            .model_scope
-            .iter()
-            .find(|choice| choice.provider == args.provider && choice.model == args.model)
-            .or_else(|| {
-                args.model_scope
-                    .iter()
-                    .find(|choice| !args.connection_explicit || choice.provider == args.provider)
-            })
-            .cloned();
+        let first_in_scope = || {
+            args.model_scope
+                .iter()
+                .find(|choice| !args.connection_explicit || choice.provider == args.provider)
+        };
+        let selected = if explicit_scope {
+            first_in_scope()
+        } else {
+            args.model_scope
+                .iter()
+                .find(|choice| choice.provider == args.provider && choice.model == args.model)
+                .or_else(|| first_in_scope().filter(|_| !confirmed_saved))
+        }
+        .cloned();
         let selected = if selected.is_none()
             && can_select_automatically
             && (missing_retired_default
@@ -2139,6 +2598,7 @@ async fn execute(
         if let Some(error) = retired_catalog_error {
             return Err(error);
         }
+        args.verify_default_provider_route()?;
         args.model = model_selection::default_for_provider(&args.provider, available)
             .cloned()
             .ok_or_else(|| {
@@ -2628,8 +3088,12 @@ async fn execute(
                 &mut |event| observe(event, args.trace),
             )?;
             if !trigger { return Ok(()); }
+            if !args.model_explicit && args.model_is_literal && !args.model.is_empty() {
+                args.verify_saved_model_route().await?;
+            }
             if args.model.is_empty() {
-                let catalog = model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes()).await?;
+                args.verify_default_provider_route()?;
+                let catalog = model_selection::catalog(&args, args.provider.clone(), args.allow_endpoint_probes(args.endpoint_for(&args.provider))).await?;
                 args.model = model_selection::default_for_provider(&args.provider, &catalog.models).cloned().ok_or_else(|| Error::Config("no model is available for the selected provider; pass --model".into()))?;
                 args.bind_initial_model_endpoint();
                 if !args.thinking_explicit { args.apply_model_thinking_defaults(); }

@@ -1218,7 +1218,7 @@ pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
     read_object_with_format(
         path,
         settings,
-        settings || name.is_some_and(|name| name == "mcp.json"),
+        settings || name.is_some_and(|name| name == "mcp.json" || name == "models.json"),
     )
 }
 
@@ -1243,11 +1243,18 @@ fn read_json_object(
             if bytes.is_empty() && empty_is_object {
                 return Ok(Value::Object(Map::new()));
             }
-            // Pi accepts a UTF-8 BOM in settings and MCP configuration when loading and editing them.
+            // Pi accepts a UTF-8 BOM in these configuration files.
             let input = if allow_bom {
                 bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes)
             } else {
                 &bytes
+            };
+            let normalized;
+            let input = if path.file_name().is_some_and(|name| name == "models.json") {
+                normalized = normalize_models_json(input);
+                normalized.as_slice()
+            } else {
+                input
             };
             let value: Value = serde_json::from_slice(input).map_err(|error| {
                 let reason = if path.file_name().is_some_and(|name| name == "settings.json")
@@ -1267,6 +1274,53 @@ fn read_json_object(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
         Err(error) => Err(JsonObjectError::Read(error)),
     }
+}
+
+// Pi allows line comments and trailing commas in models.json. Replace them
+// with whitespace so malformed input retains its original line and column.
+fn normalize_models_json(input: &[u8]) -> Vec<u8> {
+    let mut output = input.to_vec();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_comment = false;
+    let mut comma = None;
+    for (index, &byte) in input.iter().enumerate() {
+        if in_comment {
+            if byte == b'\n' {
+                in_comment = false;
+            } else {
+                output[index] = b' ';
+            }
+        } else if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else {
+            match byte {
+                b'/' if input.get(index + 1) == Some(&b'/') => {
+                    in_comment = true;
+                    output[index] = b' ';
+                }
+                b',' => comma = Some(index),
+                b'}' | b']' => {
+                    if let Some(comma) = comma.take() {
+                        output[comma] = b' ';
+                    }
+                }
+                b'"' => {
+                    in_string = true;
+                    comma = None;
+                }
+                b' ' | b'\t' | b'\n' | b'\r' => {}
+                _ => comma = None,
+            }
+        }
+    }
+    output
 }
 
 #[cfg(test)]
@@ -1937,16 +1991,18 @@ mod tests {
         }
     }
     #[test]
-    fn bom_handling_is_limited_to_settings_and_mcp_configuration() {
+    fn bom_handling_is_limited_to_supported_configuration_files() {
         let directory = tempfile::tempdir().unwrap();
         let mcp = directory.path().join("mcp.json");
         let settings = directory.path().join("settings.json");
         let other = directory.path().join("other.json");
-        for path in [&mcp, &settings, &other] {
+        let models = directory.path().join("models.json");
+        for path in [&mcp, &settings, &models, &other] {
             std::fs::write(path, "\u{feff}{\"keep\":true}").unwrap();
         }
         assert_eq!(super::read_object(&mcp).unwrap()["keep"], true);
         assert_eq!(super::read_object(&settings).unwrap()["keep"], true);
+        assert_eq!(super::read_object(&models).unwrap()["keep"], true);
         assert!(super::read_object(&other).is_err());
     }
 

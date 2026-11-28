@@ -43,7 +43,7 @@ pub(super) async fn await_admitted_oauth_refresh<T: Send + 'static>(
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) enum Credential {
     Literal(String),
     Bearer(String),

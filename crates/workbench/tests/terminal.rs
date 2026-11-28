@@ -876,6 +876,92 @@ fn reload_applies_saved_theme_changes_without_overriding_cli_selection() {
 }
 
 #[test]
+fn malformed_models_json_warns_at_terminal_startup_and_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let models = home.join("models.json");
+    std::fs::write(&models, "{").unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 180,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-session",
+                "--tui-mode",
+                "regular",
+                "--provider",
+                "ollama",
+                "--model",
+                "qwen2.5:7b",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| {
+        text.contains("models.json error:") && text.contains("Enter to send")
+    });
+
+    std::fs::write(&models, r#"{"providers":[]}"#).unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("invalid model configuration") && text.contains("Reloaded settings")
+    });
+
+    std::fs::remove_file(&models).unwrap();
+    std::fs::create_dir(&models).unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("could not read the file") && text.contains("Reloaded settings")
+    });
+
+    std::fs::remove_dir(&models).unwrap();
+    std::fs::write(&models, "{}").unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| text.contains("Reloaded settings"));
+    master.write_all(b"prompt-still-usable").unwrap();
+    output_until(&mut master, |text| text.contains("prompt-still-usable"));
+}
+
+#[test]
 fn terminal_color_and_hyperlink_capabilities_apply_at_startup_and_reload_in_both_modes() {
     const RGB: &str = "\x1b[38;2;255;0;0m";
     const INDEXED: &str = "\x1b[38;5;196m";
@@ -956,15 +1042,23 @@ fn terminal_color_and_hyperlink_capabilities_apply_at_startup_and_reload_in_both
             master.write_all(b"/reload\r").unwrap();
             output_until(&mut master, |text| {
                 let background = if configured { INDEXED_BG } else { RGB_BG };
-                let ready = text.contains("Reloaded settings")
-                    && text.contains(TRANSCRIPT)
-                    && text.contains(after)
-                    && text.contains(background)
-                    && text.contains(URL);
-                if ready {
-                    assert_eq!(text.contains(&osc_link), !configured, "{mode}");
-                }
-                ready
+                // Typing /reload can redraw the transcript using the old settings.
+                // Match the transcript and its link in the completed reload frame.
+                text.split("\x1b[?2026h")
+                    .skip(1)
+                    .filter_map(|frame| frame.split_once("\x1b[?2026l"))
+                    .map(|(frame, _)| frame)
+                    .any(|frame| {
+                        let ready = frame.contains("Reloaded settings")
+                            && frame.contains(TRANSCRIPT)
+                            && frame.contains(after)
+                            && frame.contains(background)
+                            && frame.contains(URL);
+                        if ready {
+                            assert_eq!(frame.contains(&osc_link), !configured, "{mode}");
+                        }
+                        ready
+                    })
             });
         }
     }

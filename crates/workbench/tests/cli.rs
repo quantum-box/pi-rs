@@ -1754,6 +1754,990 @@ fn switching_rpc_sessions_keeps_last_good_skill_settings() {
 }
 
 #[test]
+fn list_models_accepts_pi_models_json_comments_and_trailing_commas() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("models.json");
+    let source = concat!(
+        "\u{feff}",
+        r#"{
+  // Keep a comment outside a quoted URL and model name.
+  "providers": {
+    "fixture-relay": {
+      "baseUrl": "http://127.0.0.1:1/v1",
+      "api": "openai-completions",
+      "models": [{"id":"fixture-jsonc", "name":"quoted \"// value\"",},], // end of line
+    },
+  },
+}"#
+    );
+    std::fs::write(&path, source).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--offline",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--provider",
+            "fixture-relay",
+            "--list-models=fixture-jsonc",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture-jsonc"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("models.json error"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+}
+
+#[test]
+fn malformed_models_json_warns_and_keeps_the_builtin_listing() {
+    let root = tempfile::tempdir().unwrap();
+    let models = root.path().join("models.json");
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("ANTHROPIC_API_KEY", "fixture-builtin-key")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("ANTHROPIC_OAUTH_TOKEN")
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args(["--offline", "--no-trust", "--no-mcp", "--no-extensions"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let list = ["--provider", "anthropic", "--list-models=claude-opus"];
+    let baseline = run(&list);
+    assert!(baseline.status.success(), "{baseline:?}");
+    assert!(String::from_utf8_lossy(&baseline.stdout).contains("claude-opus"));
+    assert!(!String::from_utf8_lossy(&baseline.stderr).contains("models.json error"));
+
+    for malformed in [
+        "{",
+        "[]",
+        r#"{"providers":{"anthropic":{"baseUrl":"http://unapproved.example.test","apiKey":"fixture-secret"}}}"#,
+    ] {
+        std::fs::write(&models, malformed).unwrap();
+        let output = run(&list);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, baseline.stdout);
+        let warning = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(warning.matches("Warning: models.json error:").count(), 1);
+        assert!(warning.contains(models.to_str().unwrap()), "{warning}");
+        assert!(!warning.contains("fixture-secret"), "{warning}");
+        assert_eq!(std::fs::read_to_string(&models).unwrap(), malformed);
+    }
+
+    for (selection, error) in [
+        (
+            &["--provider", "fixture-relay"][..],
+            "unknown model provider",
+        ),
+        (
+            &["--model", "fixture-relay/fixture-model"][..],
+            "unknown model provider",
+        ),
+        (
+            &[
+                "--provider",
+                "anthropic",
+                "--api-key",
+                "fixture-inline-secret",
+            ][..],
+            "requires an explicit endpoint",
+        ),
+    ] {
+        let mut arguments = selection.to_vec();
+        arguments.push("--list-models");
+        let output = run(&arguments);
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(error), "{stderr}");
+        assert!(!stderr.contains("fixture-inline-secret"), "{stderr}");
+    }
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"defaultProvider":"fixture-relay","defaultModel":"fixture-model"}).to_string(),
+    )
+    .unwrap();
+    let recovered = run(&[
+        "--model",
+        "anthropic/claude-opus-4-6",
+        "--list-models=claude-opus-4-6",
+    ]);
+    assert!(recovered.status.success(), "{recovered:?}");
+    assert!(String::from_utf8_lossy(&recovered.stdout).contains("claude-opus-4-6"));
+    for settings in [
+        json!({"defaultProvider":"fixture-relay","defaultModel":"fixture-model"}),
+        json!({"defaultModel":"fixture-relay/fixture-model"}),
+    ] {
+        std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+        let unscoped = run(&["--list-models"]);
+        assert!(unscoped.status.success(), "{unscoped:?}");
+        assert!(String::from_utf8_lossy(&unscoped.stdout).contains("claude-opus-4-6"));
+
+        let explicitly_scoped = run(&["--provider", "fixture-relay", "--list-models"]);
+        assert!(!explicitly_scoped.status.success(), "{explicitly_scoped:?}");
+        assert!(
+            String::from_utf8_lossy(&explicitly_scoped.stderr).contains("unknown model provider")
+        );
+    }
+    let invalid_route = run(&[
+        "--provider",
+        "ollama",
+        "--endpoint",
+        "invalid-endpoint",
+        "--list-models",
+    ]);
+    assert!(!invalid_route.status.success(), "{invalid_route:?}");
+    assert!(String::from_utf8_lossy(&invalid_route.stderr).contains("invalid model endpoint"));
+
+    let auth = run(&[
+        "--provider",
+        "anthropic",
+        "auth",
+        "check",
+        "--json",
+        "--no-refresh",
+    ]);
+    assert_eq!(auth.status.code(), Some(2), "{auth:?}");
+    let status: Value = serde_json::from_slice(&auth.stdout).unwrap();
+    assert_eq!(status["reason"], "invalid_state");
+}
+
+#[test]
+fn malformed_models_json_respects_an_explicit_builtin_despite_a_stale_saved_scope() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("models.json"), "{").unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({
+            "defaultProvider":"fixture-relay",
+            "defaultModel":"private-model",
+            "enabledModels":["fixture-relay/private-model"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let start = |extra: &[&str]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("ANTHROPIC_API_KEY", "fixture-key")
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args([
+                "--mode",
+                "rpc",
+                "--no-session",
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+            ])
+            .args(extra)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n")
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let model = "anthropic/claude-opus-4-6";
+    let recovered = start(&["--model", model]);
+    assert!(recovered.status.success(), "{recovered:?}");
+    let state = String::from_utf8(recovered.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["id"] == "state")
+        .unwrap();
+    assert_eq!(state["data"]["model"]["provider"], "anthropic");
+    assert_eq!(state["data"]["model"]["id"], "claude-opus-4-6");
+    for (selection, expected) in [
+        (
+            vec!["--model", "anthropic/unknown-fixture"],
+            "explicit model is unavailable in the built-in catalog",
+        ),
+        (
+            vec!["--model", model, "--models", "fixture-relay/private-model"],
+            "requested model scope is unavailable",
+        ),
+    ] {
+        let rejected = start(&selection);
+        assert!(!rejected.status.success(), "{rejected:?}");
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(expected));
+    }
+    let local = start(&[
+        "--provider",
+        "ollama",
+        "--model",
+        "private-model",
+        "--endpoint",
+        "http://127.0.0.1:1/v1/chat/completions",
+    ]);
+    assert!(local.status.success(), "{local:?}");
+    assert!(String::from_utf8_lossy(&local.stdout).contains("\"id\":\"private-model\""));
+
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"defaultProvider":"anthropic"}).to_string(),
+    )
+    .unwrap();
+    // Test with no saved or explicit scope against both fallback cases.
+    for unreadable in [false, true] {
+        let models = root.path().join("models.json");
+        if unreadable {
+            std::fs::remove_file(&models).unwrap();
+            std::fs::create_dir(&models).unwrap();
+        }
+        for selection in [
+            &["--model", "unknown-fixture"][..],
+            &["--model", "anthropic/unknown-fixture"][..],
+            &["--provider", "anthropic", "--model", "unknown-fixture"][..],
+            &["--model", "anthropic/unknown-fixture", "--list-models"][..],
+        ] {
+            let rejected = start(selection);
+            assert!(!rejected.status.success(), "{rejected:?}");
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr)
+                    .contains("explicit model is unavailable in the built-in catalog")
+            );
+        }
+        let selected = start(&["--provider", "anthropic", "--model", "claude-opus-4-6"]);
+        assert!(selected.status.success(), "{selected:?}");
+        assert!(String::from_utf8_lossy(&selected.stdout).contains("claude-opus-4-6"));
+    }
+
+    for settings in [
+        json!({"defaultProvider":"anthropic","defaultModel":"claude-opus"}),
+        json!({"defaultModel":"anthropic/claude-opus"}),
+    ] {
+        std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+        let rejected = start(&[]);
+        assert!(!rejected.status.success(), "{rejected:?}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("saved model is unavailable on the selected route")
+        );
+        let recovered = start(&["--model", model]);
+        assert!(recovered.status.success(), "{recovered:?}");
+    }
+}
+
+#[test]
+fn custom_model_with_an_explicit_endpoint_survives_malformed_models_json() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("models.json");
+    let (endpoint, server) = model_fixture();
+    for fallback in [true, false] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        if fallback {
+            std::fs::write(&path, "{").unwrap();
+            command.args(["--endpoint", &endpoint]);
+        } else {
+            // A valid profile can route a model ID outside the bundled catalog.
+            std::fs::write(
+                &path,
+                json!({"providers":{"ollama":{"baseUrl":endpoint}}}).to_string(),
+            )
+            .unwrap();
+        }
+        let output = command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-tools",
+                "--no-session",
+                "--provider",
+                "ollama",
+                "--model",
+                "private-model",
+                "--print",
+                "same input",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"fixture answer\n");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).contains("models.json error"),
+            fallback
+        );
+    }
+    server.join().unwrap();
+}
+
+fn catalog_fallback_command(root: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root)
+        .env_clear()
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("PI_RS_HOME", root);
+    // Winsock needs SystemRoot to load its TCP provider in the isolated child.
+    #[cfg(windows)]
+    command.env(
+        "SystemRoot",
+        std::env::var_os("SystemRoot").expect("Windows fixture requires SystemRoot"),
+    );
+    command
+}
+
+fn catalog_fallback_rpc(root: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let mut child = catalog_fallback_command(root)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--offline",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+        ])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n")
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn catalog_fallback_requires_confirmation_for_a_shadowed_saved_model() {
+    let root = tempfile::tempdir().unwrap();
+    let models = root.path().join("models.json");
+    let model = "gpt-4.1";
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"defaultProvider":"openai", "defaultModel":model, "enabledModels":[model]})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        &models,
+        json!({"providers":{"openai":{
+            "baseUrl":"http://127.0.0.1:1/v1",
+            "models":[{"id":model, "api":"openai-completions"}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let configured = catalog_fallback_rpc(root.path(), &[]);
+    assert!(configured.status.success(), "{configured:?}");
+    assert!(String::from_utf8_lossy(&configured.stdout).contains("openai-completions"));
+
+    std::fs::write(&models, "{").unwrap();
+    let rejected = catalog_fallback_rpc(root.path(), &[]);
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("confirm the custom route"));
+    assert!(rejected.stdout.is_empty(), "{rejected:?}");
+
+    for flags in [
+        &["--provider", "openai", "--model", model][..],
+        &["--model", "openai/gpt-4.1", "--models", "openai/gpt-4.1"][..],
+    ] {
+        let confirmed = catalog_fallback_rpc(root.path(), flags);
+        assert!(confirmed.status.success(), "{flags:?}: {confirmed:?}");
+        assert!(String::from_utf8_lossy(&confirmed.stdout).contains("openai-responses"));
+    }
+
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"defaultProvider":"openai","enabledModels":["openai/gpt-4.1"]}).to_string(),
+    )
+    .unwrap();
+    let rejected_scope = catalog_fallback_rpc(root.path(), &[]);
+    assert!(!rejected_scope.status.success(), "{rejected_scope:?}");
+    assert!(
+        String::from_utf8_lossy(&rejected_scope.stderr)
+            .contains("scope is unavailable on a confirmed route")
+    );
+    assert!(rejected_scope.stdout.is_empty(), "{rejected_scope:?}");
+
+    for (provider, flags) in [
+        ("ollama", &[][..]),
+        ("ollama", &["--provider", "ollama"][..]),
+        ("openai", &["--provider", "openai"][..]),
+    ] {
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"defaultProvider":provider}).to_string(),
+        )
+        .unwrap();
+        let rejected = catalog_fallback_rpc(root.path(), flags);
+        assert!(
+            !rejected.status.success(),
+            "{provider} {flags:?}: {rejected:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("saved provider route is unavailable")
+        );
+        assert!(rejected.stdout.is_empty(), "{rejected:?}");
+    }
+
+    std::fs::remove_file(root.path().join("settings.json")).unwrap();
+    let unsaved = catalog_fallback_rpc(root.path(), &[]);
+    assert!(unsaved.status.success(), "{unsaved:?}");
+    let state: Value = serde_json::from_slice(&unsaved.stdout).unwrap();
+    assert_eq!(state["data"]["model"]["provider"], "ollama");
+    assert_eq!(state["data"]["model"]["id"], "qwen2.5:7b");
+}
+
+#[test]
+fn catalog_fallback_requires_confirmation_for_a_retired_ant_ling_default() {
+    let root = tempfile::tempdir().unwrap();
+    let model = "Ring-2.6-1T";
+    std::fs::write(root.path().join("models.json"), "{").unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"defaultProvider":"ant-ling", "defaultModel":model}).to_string(),
+    )
+    .unwrap();
+
+    let unconfirmed = catalog_fallback_rpc(root.path(), &[]);
+    assert!(!unconfirmed.status.success(), "{unconfirmed:?}");
+    assert!(
+        String::from_utf8_lossy(&unconfirmed.stderr).contains("confirm the custom route"),
+        "{unconfirmed:?}"
+    );
+
+    let confirmed = catalog_fallback_rpc(
+        root.path(),
+        &[
+            "--endpoint",
+            "http://127.0.0.1:1/v1",
+            "--api-key",
+            "fixture-key",
+        ],
+    );
+    assert!(confirmed.status.success(), "{confirmed:?}");
+    let state: Value = serde_json::from_slice(&confirmed.stdout).unwrap();
+    assert_eq!(state["data"]["model"]["provider"], "ant-ling");
+    assert_eq!(state["data"]["model"]["id"], model);
+}
+
+#[test]
+fn catalog_fallback_listing_uses_only_credentials_bound_to_the_explicit_endpoint() {
+    const TOKEN: &str = "synthetic-listing-token";
+    for (host, credential_matches) in [("localhost", true), ("127.0.0.1", false)] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = format!("http://{host}:{port}/v1/chat/completions");
+        let saved_endpoint = if credential_matches {
+            endpoint.as_str()
+        } else {
+            "http://127.0.0.1:1/v1/chat/completions"
+        };
+        std::fs::write(root.path().join("models.json"), "{").unwrap();
+        std::fs::write(
+            root.path().join("auth.json"),
+            json!({"ollama":{"type":"api_key","key":TOKEN,"endpoint":saved_endpoint}}).to_string(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, request) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            assert_eq!(request.trim_end(), "GET /v1/models HTTP/1.1");
+            let mut authorization = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("authorization")
+                {
+                    authorization = Some(value.trim().to_owned());
+                }
+            }
+            assert_eq!(
+                authorization,
+                credential_matches.then(|| format!("Bearer {TOKEN}"))
+            );
+            let body = r#"{"data":[{"id":"fixture-listed-model"}]}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            listener
+        });
+        let output = catalog_fallback_command(root.path())
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--provider",
+                "ollama",
+                "--endpoint",
+                &endpoint,
+                "--list-models=fixture-listed-model",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{host}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("fixture-listed-model"),
+            "{host}: {output:?}"
+        );
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
+fn catalog_fallback_uses_confirmed_scope_and_endpoint_credentials() {
+    const SAVED: &str = "fixture/saved[1m]:7b";
+    const OTHER: &str = "fixture/other:7b";
+    const TOKEN: &str = "synthetic-test-sentinel";
+    const CHAT: &str = "POST /v1/chat/completions HTTP/1.1";
+    const MODELS: &str = "GET /v1/models HTTP/1.1";
+
+    let other_first = format!("{OTHER},{SAVED}");
+    let qualified_saved = format!("ollama/{SAVED}:off");
+    for (host, scope, profile_valid, expected_model, expected_requests) in [
+        ("127.0.0.1", SAVED, false, SAVED, &[CHAT][..]),
+        (
+            "127.0.0.1",
+            qualified_saved.as_str(),
+            false,
+            SAVED,
+            &[CHAT][..],
+        ),
+        ("127.0.0.1", OTHER, false, OTHER, &[MODELS, CHAT][..]),
+        (
+            "127.0.0.1",
+            other_first.as_str(),
+            false,
+            OTHER,
+            &[MODELS, CHAT][..],
+        ),
+        ("localhost", OTHER, false, OTHER, &[MODELS, CHAT][..]),
+        ("localhost", OTHER, true, OTHER, &[MODELS, CHAT][..]),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{host}:{}/v1/chat/completions",
+            listener.local_addr().unwrap().port()
+        );
+        std::fs::write(
+            root.path().join("models.json"),
+            if profile_valid { "{}" } else { "{" },
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"defaultProvider":"ollama", "defaultModel":SAVED}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("auth.json"),
+            json!({"ollama":{"type":"api_key","key":TOKEN,"endpoint":endpoint}}).to_string(),
+        )
+        .unwrap();
+
+        let (stop, finished) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if finished.recv_timeout(Duration::from_millis(5)).is_ok() {
+                            return requests;
+                        }
+                        continue;
+                    }
+                    Err(error) => panic!("model fixture accept failed: {error}"),
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(&socket);
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let request = request.trim_end().to_owned();
+                let mut authorization = None;
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("authorization") {
+                            authorization = Some(value.trim().to_owned());
+                        } else if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                assert_eq!(
+                    authorization.as_deref(),
+                    Some("Bearer synthetic-test-sentinel"),
+                    "{request}"
+                );
+                let (body, content_type) = match request.as_str() {
+                    MODELS => (
+                        json!({"data":[{"id":SAVED},{"id":OTHER}]}).to_string(),
+                        "application/json",
+                    ),
+                    CHAT => {
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(body["model"], expected_model);
+                        (
+                            concat!(
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+                                "data: [DONE]\n\n"
+                            ).into(),
+                            "text/event-stream",
+                        )
+                    }
+                    _ if profile_valid && request.starts_with("GET /api/") => {
+                        write!(&socket, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        continue;
+                    }
+                    _ => panic!("unexpected fixture request {request}"),
+                };
+                requests.push(request);
+                write!(
+                    &socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let output = catalog_fallback_command(root.path())
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-tools",
+                "--no-session",
+                "--endpoint",
+                &endpoint,
+                "--models",
+                scope,
+                "--thinking",
+                "off",
+                "--print",
+                "fixture prompt",
+            ])
+            .output()
+            .unwrap();
+        stop.send(()).ok();
+        let requests = server.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{host} {scope} {profile_valid}: {output:?}"
+        );
+        assert_eq!(output.stdout, b"fixture answer\n");
+        assert_eq!(
+            requests, expected_requests,
+            "{host} {scope} {profile_valid}"
+        );
+    }
+}
+
+#[test]
+fn catalog_fallback_preserves_the_literal_model_on_a_verified_route() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let endpoint = format!("{base}/v1/messages");
+    let model = "claude-opus";
+    let settings = json!({"defaultProvider":"anthropic","defaultModel":model});
+    std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+    let path = root.path().join("models.json");
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for expected_model in [
+            model,
+            model,
+            "claude-opus:high",
+            "anthropic/fixture-model",
+            model,
+        ] {
+            let (socket, request, body) = loop {
+                let socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "missing request for {expected_model}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("model fixture accept failed: {error}"),
+                };
+                let (request, body) = read_rpc_model_fixture_request(&socket, |_| Ok(())).unwrap();
+                if request.starts_with("GET /v1/models/") {
+                    write!(
+                        &socket,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                break (socket, request, body);
+            };
+            assert!(request.starts_with("POST /v1/messages "), "{request}");
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["model"], expected_model);
+            let response = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"fixture\",\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"fixture answer\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            write!(
+                &socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        }
+    });
+
+    std::fs::write(&path, "{").unwrap();
+    let run = |extra: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-tools",
+                "--no-session",
+                "--provider",
+                "anthropic",
+                "--thinking",
+                "off",
+            ])
+            .args(extra)
+            .args(["--print", "fixture prompt"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"fixture answer\n");
+    };
+    run(&[
+        "--endpoint",
+        &endpoint,
+        "--api-key",
+        "fixture-key",
+        "--model",
+        model,
+    ]);
+    run(&["--endpoint", &endpoint, "--api-key", "fixture-key"]);
+    run(&[
+        "--endpoint",
+        &endpoint,
+        "--api-key",
+        "fixture-key",
+        "--model",
+        "claude-opus:high",
+    ]);
+    run(&[
+        "--endpoint",
+        &endpoint,
+        "--api-key",
+        "fixture-key",
+        "--model",
+        "anthropic/fixture-model",
+    ]);
+    std::fs::write(
+        &path,
+        json!({"providers":{"anthropic":{
+            "baseUrl":base, "apiKey":"fixture-key", "models":[{"id":model}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    run(&[]);
+    server.join().unwrap();
+}
+
+#[test]
+fn unreadable_models_json_warns_for_the_catalog_and_keeps_legacy_auth_strict() {
+    let root = tempfile::tempdir().unwrap();
+    let models = root.path().join("models.json");
+    std::fs::create_dir(&models).unwrap();
+    let auth = root.path().join("auth.json");
+    let saved = json!({"anthropic":{"type":"api_key","key":"fixture-key"}}).to_string();
+    std::fs::write(&auth, &saved).unwrap();
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args(["--offline", "--no-trust", "--no-mcp", "--no-extensions"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let listed = run(&["--provider", "anthropic", "--list-models=claude-opus-4-6"]);
+    assert!(listed.status.success(), "{listed:?}");
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("claude-opus-4-6"));
+    let warning = String::from_utf8_lossy(&listed.stderr);
+    assert!(warning.contains("models.json error:") && warning.contains("could not read the file"));
+    assert!(!warning.contains("fixture-key"));
+
+    std::fs::remove_dir(&models).unwrap();
+    std::fs::write(&models, "{").unwrap();
+    for command in [
+        &["login", "openai-chatgpt", "--list-accounts"][..],
+        &["logout", "anthropic"][..],
+    ] {
+        let rejected = run(command);
+        assert!(!rejected.status.success(), "{rejected:?}");
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains("models.json") && !stderr.contains("Ignoring the file"),
+            "{stderr}"
+        );
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), saved);
+    }
+}
+
+fn model_profile_worker(root: &std::path::Path, revision: &str) -> std::process::Output {
+    let snapshot = json!({
+        "value":{},
+        "diagnostics":[],
+        "resource_layers":[[root, {}]]
+    })
+    .to_string();
+    let mut worker = catalog_fallback_command(root)
+        .env("PI_RS_WORKER_MODEL_PROFILE_REVISION", revision)
+        .arg("--session")
+        .arg(root.join("worker.jsonl"))
+        .args([
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/chat/completions",
+            "--offline",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--stdin-control",
+            "--worker-settings-stdin",
+            "serve",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = worker.stdin.take().unwrap();
+    input
+        .write_all(&(snapshot.len() as u64).to_be_bytes())
+        .unwrap();
+    input.write_all(snapshot.as_bytes()).unwrap();
+    drop(input);
+    worker.wait_with_output().unwrap()
+}
+
+#[test]
+fn worker_rejects_a_changed_models_json_revision_even_when_the_file_is_missing() {
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    let models = root.path().join("models.json");
+    let original = json!({"providers":{"ollama":{"baseUrl":"http://127.0.0.1:1"}}});
+    let expected = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&original).unwrap())
+    );
+    for changed in [None, Some("{}"), Some("{")] {
+        if let Some(changed) = changed {
+            std::fs::write(&models, changed).unwrap();
+        }
+        let rejected = model_profile_worker(root.path(), &expected);
+        assert!(!rejected.status.success(), "{changed:?}: {rejected:?}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("worker model configuration differs from its parent"),
+            "{changed:?}: {rejected:?}"
+        );
+    }
+}
+
+#[test]
+fn worker_rejects_leaving_models_json_fallback_with_an_equivalent_catalog() {
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    let models = root.path().join("models.json");
+    let empty_revision = format!("{:x}", Sha256::digest(b"{}"));
+    let fallback_revision = format!("{empty_revision}:fallback");
+
+    for changed in [None, Some("{}")] {
+        std::fs::write(&models, "{").unwrap();
+        let fallback = model_profile_worker(root.path(), &fallback_revision);
+        assert!(fallback.status.success(), "{fallback:?}");
+
+        if let Some(contents) = changed {
+            std::fs::write(&models, contents).unwrap();
+        } else {
+            std::fs::remove_file(&models).unwrap();
+        }
+        let rejected = model_profile_worker(root.path(), &fallback_revision);
+        assert!(!rejected.status.success(), "{changed:?}: {rejected:?}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("worker model configuration differs from its parent"),
+            "{changed:?}: {rejected:?}"
+        );
+
+        let equivalent = model_profile_worker(root.path(), &empty_revision);
+        assert!(equivalent.status.success(), "{changed:?}: {equivalent:?}");
+    }
+}
+
+#[test]
 fn model_listing_searches_ids_with_pi_token_swaps() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
