@@ -25,7 +25,7 @@ use pi_rs_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::Path,
     sync::{
         Arc,
@@ -1445,6 +1445,9 @@ pub struct Conversation {
     round_added_tools: Vec<Vec<String>>,
     #[serde(default)]
     input_modes: HashMap<Uuid, InputMode>,
+    // Inputs accepted while idle. A real run releases them at its boundaries.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    held_inputs: BTreeSet<Uuid>,
     #[serde(default)]
     answer_ids: HashMap<Uuid, Uuid>,
     #[serde(default)]
@@ -2473,7 +2476,9 @@ impl Conversation {
             || !matches!(self.phase, Phase::Idle | Phase::FailedIdle)
             || self.submissions.iter().any(|s| {
                 matches!(s.status, Status::Running)
-                    || (s.status == Status::Queued && !matches!(self.phase, Phase::FailedIdle))
+                    || (s.status == Status::Queued
+                        && !self.held_inputs.contains(&s.id)
+                        && !matches!(self.phase, Phase::FailedIdle))
             })
     }
     // A reset retained by an aborted, parked conversation is future work,
@@ -2518,6 +2523,26 @@ impl Conversation {
                 self.phase,
                 Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
             )
+    }
+
+    /// Whether a paused host should resume input work when it opens the conversation.
+    pub fn has_runnable_input(&self) -> bool {
+        self.input_run_active()
+            || (!matches!(self.phase, Phase::FailedIdle) && self.has_unheld_queued_input())
+    }
+
+    fn has_unheld_queued_input(&self) -> bool {
+        self.submissions
+            .iter()
+            .any(|s| s.status == Status::Queued && !self.held_inputs.contains(&s.id))
+    }
+
+    /// The primary input for the current run, including while recovering it.
+    pub fn running_submission(&self) -> Option<&Submission> {
+        let active = self.active?;
+        self.submissions
+            .iter()
+            .find(|submission| submission.id == active && submission.status == Status::Running)
     }
 
     /// Current model request identity for a submission placed in this run.
@@ -4594,7 +4619,7 @@ impl crate::session_transaction::SessionTransaction<'_> {
                 .iter()
                 .any(|w| !w.placed && !w.withdrawn)
             && c.pending_resets.is_empty()
-            && !c.submissions.iter().any(|s| s.status == Status::Queued);
+            && !c.has_unheld_queued_input();
         c.submissions.push(Submission {
             kind: SubmissionKind::Input,
             id,
@@ -4622,6 +4647,9 @@ impl crate::session_transaction::SessionTransaction<'_> {
             c.retry_state = RetryState::default();
             c.overflow_compaction_attempted = false;
             c.phase = Phase::ModelReady { turns: 0 };
+            if !c.held_inputs.is_empty() {
+                place_queued(c, false);
+            }
         } else if matches!(c.phase, Phase::FailedIdle) {
             c.phase = Phase::Idle;
         }
@@ -7204,9 +7232,18 @@ impl Harness {
                             if let Some(mode) = latest.input_modes.get(&submission.id) {
                                 state.input_modes.insert(submission.id, *mode);
                             }
+                            if latest.held_inputs.contains(&submission.id) {
+                                state.held_inputs.insert(submission.id);
+                            }
                             state.submissions.push(submission);
                         }
                     }
+                    state.held_inputs.retain(|id| {
+                        state
+                            .submissions
+                            .iter()
+                            .any(|s| s.id == *id && s.status == Status::Queued)
+                    });
                     if base.abort_requested
                         && !state.abort_requested
                         && matches!(state.phase, Phase::Idle | Phase::FailedIdle)
@@ -8856,6 +8893,7 @@ impl Harness {
             round_handoffs: Vec::new(),
             round_added_tools: Vec::new(),
             input_modes: HashMap::new(),
+            held_inputs: BTreeSet::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
             retry_state: RetryState::default(),
@@ -9421,6 +9459,7 @@ impl Harness {
             round_handoffs: Vec::new(),
             round_added_tools: Vec::new(),
             input_modes: HashMap::new(),
+            held_inputs: BTreeSet::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
             retry_state: RetryState::default(),
@@ -15205,7 +15244,7 @@ impl Harness {
         cancel: &CancellationToken,
     ) -> Result<crate::images::ImageAdmissionResult, Error> {
         self.submit_fitted_user_blocks_inner(
-            id, request_id, blocks, admission, options, None, cancel,
+            id, request_id, blocks, admission, options, None, false, cancel,
         )
         .await
     }
@@ -15228,6 +15267,7 @@ impl Harness {
             admission,
             options,
             Some(notify),
+            false,
             cancel,
         )
         .await
@@ -15241,6 +15281,7 @@ impl Harness {
         admission: &crate::images::UserImageAdmission,
         options: AdmissionOptions,
         notify: Option<SubmissionNotify>,
+        hold_if_idle: bool,
         cancel: &CancellationToken,
     ) -> Result<crate::images::ImageAdmissionResult, Error> {
         if request_id
@@ -15286,7 +15327,7 @@ impl Harness {
                 return Err(Error::Invalid("empty submission notification key".into()));
             }
             let busy = state.input_run_active();
-            if busy && options.reject_when_busy {
+            if busy && (options.reject_when_busy || hold_if_idle) {
                 return Err(AdmissionError::Busy.into());
             }
             if !busy && options.reject_when_idle {
@@ -15295,7 +15336,8 @@ impl Harness {
             if state.abort_requested {
                 return Err(Error::Invalid("abort in progress".into()));
             }
-            let place_now = matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+            let place_now = !hold_if_idle
+                && matches!(state.phase, Phase::Idle | Phase::FailedIdle)
                 && state.active.is_none()
                 && state.pending_independent_summary.is_none()
                 && !state
@@ -15303,7 +15345,7 @@ impl Harness {
                     .iter()
                     .any(|w| !w.placed && !w.withdrawn)
                 && state.pending_resets.is_empty()
-                && !state.submissions.iter().any(|s| s.status == Status::Queued);
+                && !state.has_unheld_queued_input();
             let adapter = self
                 .provider_adapter
                 .as_ref()
@@ -15419,7 +15461,9 @@ impl Harness {
                 state.submission_notifications.insert(sid, notify.clone());
             }
             state.input_modes.insert(sid, options.mode);
-            if place_now {
+            if hold_if_idle {
+                state.held_inputs.insert(sid);
+            } else if place_now {
                 state.run_failure = None;
                 state.failure_continuation_inputs.clear();
                 state.active = Some(sid);
@@ -15439,6 +15483,9 @@ impl Harness {
                 state.retry_state = RetryState::default();
                 state.overflow_compaction_attempted = false;
                 state.phase = Phase::ModelReady { turns: 0 };
+                if !state.held_inputs.is_empty() {
+                    place_queued(&mut state, false);
+                }
             } else if matches!(state.phase, Phase::FailedIdle) {
                 state.phase = Phase::Idle;
             }
@@ -15726,6 +15773,7 @@ impl Harness {
             request_id,
             content,
             options,
+            false,
             &mut |_| Ok(()),
             None,
             None,
@@ -15753,6 +15801,7 @@ impl Harness {
             request_id,
             content,
             options,
+            false,
             &mut |_| Ok(()),
             None,
             Some(notify),
@@ -15779,7 +15828,16 @@ impl Harness {
                 "reserved subagent reporter request ID".into(),
             ));
         }
-        self.submit_internal_with_options(id, request_id, content, options, &mut change, None, None)
+        self.submit_internal_with_options(
+            id,
+            request_id,
+            content,
+            options,
+            false,
+            &mut change,
+            None,
+            None,
+        )
     }
     pub(crate) fn submit_reporter_input(
         &mut self,
@@ -15798,6 +15856,7 @@ impl Harness {
                 mode,
                 ..Default::default()
             },
+            false,
             &mut |_| Ok(()),
             Some((parent, generation)),
             None,
@@ -15828,6 +15887,7 @@ impl Harness {
             request_id,
             content,
             options,
+            false,
             &mut change,
             None,
             Some(notify),
@@ -15840,6 +15900,7 @@ impl Harness {
         request_id: Option<String>,
         content: String,
         options: AdmissionOptions,
+        hold_if_idle: bool,
         change: &mut impl FnMut(
             &mut crate::document::AdmissionDocuments<'_>,
         ) -> Result<(), crate::document::Error>,
@@ -15902,14 +15963,18 @@ impl Harness {
                     c.phase,
                     Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
                 );
-            if busy && options.reject_when_busy {
+            if busy && (options.reject_when_busy || hold_if_idle) {
                 return Err(AdmissionError::Busy.into());
             }
             if !busy && options.reject_when_idle {
                 return Err(AdmissionError::Idle.into());
             }
+            if hold_if_idle && c.abort_requested {
+                return Err(Error::Invalid("abort in progress".into()));
+            }
             let sid = Uuid::new_v4();
-            let place_now = matches!(c.phase, Phase::Idle | Phase::FailedIdle)
+            let place_now = !hold_if_idle
+                && matches!(c.phase, Phase::Idle | Phase::FailedIdle)
                 && !c.abort_requested
                 && c.active.is_none()
                 && c.pending_independent_summary.is_none()
@@ -15918,10 +15983,7 @@ impl Harness {
                     .iter()
                     .any(|w| !w.placed && !w.withdrawn)
                 && c.pending_resets.is_empty()
-                && !c
-                    .submissions
-                    .iter()
-                    .any(|item| item.status == Status::Queued);
+                && !c.has_unheld_queued_input();
             c.submissions.push(Submission {
                 kind: SubmissionKind::Input,
                 id: sid,
@@ -15940,7 +16002,9 @@ impl Harness {
                 c.submission_notifications.insert(sid, notify.clone());
             }
             c.input_modes.insert(sid, options.mode);
-            if place_now {
+            if hold_if_idle {
+                c.held_inputs.insert(sid);
+            } else if place_now {
                 c.run_failure = None;
                 c.failure_continuation_inputs.clear();
                 c.active = Some(sid);
@@ -15951,6 +16015,9 @@ impl Harness {
                 c.retry_state = RetryState::default();
                 c.overflow_compaction_attempted = false;
                 c.phase = Phase::ModelReady { turns: 0 };
+                if !c.held_inputs.is_empty() {
+                    place_queued(&mut c, false);
+                }
             } else if matches!(c.phase, Phase::FailedIdle) {
                 c.phase = Phase::Idle;
             }
@@ -16193,6 +16260,7 @@ impl Harness {
                         mode,
                         submission: input.clone(),
                     });
+                    state.held_inputs.remove(&input.id);
                     input.status = Status::Unanswered {
                         reason: "aborted".into(),
                     };
@@ -24816,6 +24884,56 @@ impl Scheduler {
         self.schedule(id);
         Ok(submission)
     }
+    /// Persist a text input in the idle queue without starting a model run.
+    pub fn stage_input(
+        &mut self,
+        id: Uuid,
+        content: String,
+        mode: InputMode,
+    ) -> Result<Uuid, Error> {
+        self.harness.submit_internal_with_options(
+            id,
+            None,
+            content,
+            AdmissionOptions {
+                mode,
+                on_abort: OnAbort::Keep,
+                ..Default::default()
+            },
+            true,
+            &mut |_| Ok(()),
+            None,
+            None,
+        )
+    }
+
+    /// Fit and persist an idle queue input without starting a model run.
+    pub async fn stage_fitted_user_blocks(
+        &mut self,
+        id: Uuid,
+        blocks: Vec<serde_json::Value>,
+        admission: &crate::images::UserImageAdmission,
+        mode: InputMode,
+        cancel: &CancellationToken,
+    ) -> Result<crate::images::ImageAdmissionResult, Error> {
+        self.harness
+            .submit_fitted_user_blocks_inner(
+                id,
+                None,
+                blocks,
+                admission,
+                AdmissionOptions {
+                    mode,
+                    on_abort: OnAbort::Keep,
+                    ..Default::default()
+                },
+                None,
+                true,
+                cancel,
+            )
+            .await
+    }
+
     /// Admit with policies and schedule only after a successful admission.
     pub fn submit_with_options(
         &mut self,
@@ -27396,6 +27514,22 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         }
         _ => false,
     };
+    old.as_object_mut().and_then(|v| v.remove("held_inputs"));
+    new.as_object_mut().and_then(|v| v.remove("held_inputs"));
+    let held_admissions_only = latest.held_inputs.difference(&base.held_inputs).all(|id| {
+        latest
+            .submissions
+            .iter()
+            .skip(base.submissions.len())
+            .any(|input| {
+                input.id == *id && input.status == Status::Queued && input.on_abort == OnAbort::Keep
+            })
+    }) && base.held_inputs.difference(&latest.held_inputs).all(|id| {
+        latest.submissions.iter().any(|input| {
+            input.id == *id
+                && matches!(&input.status, Status::Unanswered { reason } if reason == "aborted")
+        })
+    });
     let old_modes = old.as_object_mut().and_then(|v| v.remove("input_modes"));
     let new_modes = new.as_object_mut().and_then(|v| v.remove("input_modes"));
     let modes_unchanged = match (old_modes, new_modes) {
@@ -27413,6 +27547,7 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         && notifications_unchanged
         && pending_ok
         && modes_unchanged
+        && held_admissions_only
         && resets_unchanged
         && reset_blocks_unchanged
         && fitted_receipts_unchanged
@@ -27748,40 +27883,57 @@ fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
     let mut follow = false;
     let mut placed = false;
     let mut continued_failure = false;
-    for submission in &mut c.submissions {
-        if submission.status != Status::Queued {
-            continue;
+    // Start a run from runnable input first. Once it has an owner, include
+    // held steering in that first model request under the same queue limit.
+    let passes: &[bool] = if starting_run && !c.held_inputs.is_empty() {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &held_steering in passes {
+        if held_steering && !placed {
+            break;
         }
-        let mode = c
-            .input_modes
-            .get(&submission.id)
-            .copied()
-            .unwrap_or(InputMode::FollowUp);
-        let (seen, setting) = match mode {
-            InputMode::Steer => (&mut steer, c.queue_modes.steering_mode),
-            InputMode::FollowUp if final_boundary => (&mut follow, c.queue_modes.follow_up_mode),
-            InputMode::FollowUp => continue,
-        };
-        if *seen && setting == QueueMode::OneAtATime {
-            continue;
-        }
-        *seen = true;
-        placed = true;
-        continued_failure |= c.failure_continuation_inputs.contains(&submission.id);
-        submission.status = Status::Running;
-        c.active.get_or_insert(submission.id);
-        let message = Message::User {
-            content: submission.content.clone(),
-        };
-        let index = c.messages.len();
-        c.messages.push(message.clone());
-        if let Some(binding) = &submission.input_blocks {
-            c.content_blocks.insert(index, binding.clone());
-        }
-        if let Some(proof) = &mut c.block_reset_proof {
-            proof.messages.push(message);
+        for submission in &mut c.submissions {
+            if submission.status != Status::Queued
+                || (starting_run && c.held_inputs.contains(&submission.id) != held_steering)
+            {
+                continue;
+            }
+            let mode = c
+                .input_modes
+                .get(&submission.id)
+                .copied()
+                .unwrap_or(InputMode::FollowUp);
+            let (seen, setting) = match mode {
+                InputMode::Steer => (&mut steer, c.queue_modes.steering_mode),
+                InputMode::FollowUp if final_boundary && !held_steering => {
+                    (&mut follow, c.queue_modes.follow_up_mode)
+                }
+                InputMode::FollowUp => continue,
+            };
+            if *seen && setting == QueueMode::OneAtATime {
+                continue;
+            }
+            *seen = true;
+            placed = true;
+            continued_failure |= c.failure_continuation_inputs.contains(&submission.id);
+            submission.status = Status::Running;
+            c.held_inputs.remove(&submission.id);
+            c.active.get_or_insert(submission.id);
+            let message = Message::User {
+                content: submission.content.clone(),
+            };
+            let index = c.messages.len();
+            c.messages.push(message.clone());
             if let Some(binding) = &submission.input_blocks {
-                proof.blocks.insert(index, binding.clone());
+                c.content_blocks.insert(index, binding.clone());
+            }
+            if let Some(proof) = &mut c.block_reset_proof {
+                proof.messages.push(message);
+                if let Some(binding) = &submission.input_blocks {
+                    proof.blocks.insert(index, binding.clone());
+                }
             }
         }
     }
@@ -27795,6 +27947,7 @@ fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
 }
 
 fn finish_answer(c: &mut Conversation, answer: String) {
+    c.held_inputs.clear();
     let answer_id = Uuid::new_v4();
     c.active = None;
     for s in &mut c.submissions {
@@ -27835,12 +27988,13 @@ fn apply_failed_run_policy(c: &mut Conversation) {
             c.failure_continuation_inputs = c
                 .submissions
                 .iter()
-                .filter(|s| s.status == Status::Queued)
+                .filter(|s| s.status == Status::Queued && !c.held_inputs.contains(&s.id))
                 .map(|s| s.id)
                 .collect();
             c.phase = Phase::Idle;
         }
         AfterFailedRun::Withdraw => {
+            c.held_inputs.clear();
             for s in &mut c.submissions {
                 if s.status == Status::Queued {
                     s.status = Status::Unanswered {
@@ -27852,9 +28006,11 @@ fn apply_failed_run_policy(c: &mut Conversation) {
     }
 }
 fn has_post_abort_input(c: &Conversation, retained: &[Uuid]) -> bool {
-    c.submissions
-        .iter()
-        .any(|submission| submission.status == Status::Queued && !retained.contains(&submission.id))
+    c.submissions.iter().any(|submission| {
+        submission.status == Status::Queued
+            && !c.held_inputs.contains(&submission.id)
+            && !retained.contains(&submission.id)
+    })
 }
 
 fn finish_abort(c: &mut Conversation) {
@@ -35075,6 +35231,7 @@ mod scheduler_tests {
             round_handoffs: Vec::new(),
             round_added_tools: Vec::new(),
             input_modes: HashMap::new(),
+            held_inputs: BTreeSet::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
             retry_state: RetryState::default(),
