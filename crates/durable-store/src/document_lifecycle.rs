@@ -20,7 +20,47 @@ fn definition(bytes: &[u8]) -> Option<Value> {
         .filter(|value| !value.is_null())
 }
 
-/// Validate the final explicit writes while the SQLite writer lock is held.
+/// Prepare the retirement of the definition selected by the settling commit.
+/// Older untyped policies require no metadata update.
+pub(crate) fn retirement_policy(
+    tx: &Transaction<'_>,
+    policy_key: Vec<u8>,
+    staged: Option<&Mutation>,
+) -> Result<Option<Mutation>, Error> {
+    let stored;
+    let value = match staged {
+        Some(Mutation::Put { value, .. }) => Some(value.as_slice()),
+        Some(Mutation::Delete { .. }) => None,
+        None => {
+            stored = tx
+                .query_row(
+                    "SELECT value FROM durable_store_entries WHERE key=?1",
+                    [&policy_key],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            stored.as_deref()
+        }
+    };
+    let Some(mut policy) = value.and_then(|value| serde_json::from_slice::<Value>(value).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(incarnation) = policy
+        .pointer_mut("/definition/incarnation")
+        .filter(|incarnation| !incarnation.is_null())
+    else {
+        return Ok(None);
+    };
+    *incarnation = Value::Null;
+    let value = serde_json::to_vec(&policy).map_err(|_| Error::InvalidDocumentLifecycle)?;
+    Ok(Some(Mutation::Put {
+        key: policy_key,
+        value,
+    }))
+}
+
+/// Validate the final writes while the SQLite writer lock is held.
 pub(crate) fn validate(tx: &Transaction<'_>, mutations: &[Mutation]) -> Result<(), Error> {
     let mut touched = HashMap::<&[u8], Writes<'_>>::new();
     for mutation in mutations {

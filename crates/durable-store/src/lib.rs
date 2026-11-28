@@ -3128,6 +3128,7 @@ impl Store {
             }
         }
         let mut effective = Vec::with_capacity(mutations.len());
+        let mut owned_policy_writes = std::collections::HashMap::new();
         for mutation in mutations {
             let key = match mutation {
                 Mutation::Put { key, .. } | Mutation::Delete { key } => key,
@@ -3144,11 +3145,15 @@ impl Store {
                 if states[owner] && !settling.contains(owner) {
                     return Err(Error::Conflict { key: key.clone() });
                 }
+                if policy_document.is_some() {
+                    owned_policy_writes.insert(key.as_slice(), effective.len());
+                }
                 // Keep the mutation in order; a retirement appended below
                 // makes the final document state absent in this transaction.
             }
             effective.push(mutation.clone());
         }
+        let mut auto_retired = false;
         for (doc, owner) in &owners {
             if task_candidates.contains_key(owner) && states.get(owner) == Some(&true) {
                 let exists: bool = tx.query_row(
@@ -3162,8 +3167,31 @@ impl Store {
                         .any(|mutation| matches!(mutation, Mutation::Put { key, .. } if key == doc))
                 {
                     effective.push(Mutation::Delete { key: doc.clone() });
+                    auto_retired = true;
+                }
+                let policy_key = [
+                    b"durable/document-policy/".as_slice(),
+                    doc.strip_prefix(b"durable/document/")
+                        .ok_or(Error::InvalidSnapshot)?,
+                ]
+                .concat();
+                let staged = owned_policy_writes.get(policy_key.as_slice()).copied();
+                if let Some(retired) = document_lifecycle::retirement_policy(
+                    &tx,
+                    policy_key,
+                    staged.map(|index| &effective[index]),
+                )? {
+                    if let Some(index) = staged {
+                        effective[index] = retired;
+                    } else {
+                        effective.push(retired);
+                    }
+                    auto_retired = true;
                 }
             }
+        }
+        if auto_retired {
+            document_lifecycle::validate(&tx, &effective)?;
         }
         #[cfg(feature = "experimental-graph-revision")]
         {
