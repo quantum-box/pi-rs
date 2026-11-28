@@ -260,20 +260,39 @@ mod tests {
     }
 
     #[test]
-    fn ant_ling_sends_only_explicit_reasoning_effort() {
-        let compat: ChatCompatibility =
-            serde_json::from_value(json!({"thinkingFormat":"ant-ling"})).unwrap();
-        let mut body = json!({});
-        compat.reasoning_options(&mut body, Some(true), true, Some("high"), false, None);
-        assert_eq!(body, json!({"reasoning":{"effort":"high"}}));
-        for (supported, enabled, effort) in [
-            (Some(true), true, None),
-            (Some(true), false, Some("high")),
-            (Some(false), true, Some("high")),
-        ] {
-            let mut body = json!({});
-            compat.reasoning_options(&mut body, supported, enabled, effort, false, None);
-            assert_eq!(body, json!({}));
+    fn ant_ling_legacy_profile_and_catalog_send_only_the_thinking_toggle() {
+        for format in ["ant-ling", "deepseek"] {
+            let compat: ChatCompatibility = serde_json::from_value(json!({
+                "thinkingFormat":format, "supportsReasoningEffort":false
+            }))
+            .unwrap();
+            for (supported, enabled, allow_off, expected) in [
+                (
+                    Some(true),
+                    true,
+                    true,
+                    json!({"thinking":{"type":"enabled"}}),
+                ),
+                (
+                    Some(true),
+                    false,
+                    true,
+                    json!({"thinking":{"type":"disabled"}}),
+                ),
+                (Some(true), false, false, json!({})),
+                (Some(false), true, true, json!({})),
+            ] {
+                let mut body = json!({});
+                compat.reasoning_options(
+                    &mut body,
+                    supported,
+                    enabled,
+                    Some("high"),
+                    allow_off,
+                    None,
+                );
+                assert_eq!(body, expected, "{format}");
+            }
         }
     }
 
@@ -662,8 +681,10 @@ impl ChatCompatibility {
         let effective = effort.unwrap_or(if enabled { "medium" } else { "none" });
         match self.thinking_format {
             Some(ThinkingFormat::AntLing) => {
-                if enabled && let Some(level) = effort {
-                    body["reasoning"] = json!({"effort":level});
+                // Legacy model profiles used this name. Current Ling models
+                // accept only the binary thinking toggle.
+                if enabled || allow_off {
+                    body["thinking"] = json!({"type":if enabled { "enabled" } else { "disabled" }});
                 }
                 return;
             }
