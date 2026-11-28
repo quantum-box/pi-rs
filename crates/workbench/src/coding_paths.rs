@@ -68,6 +68,11 @@ fn plain_input_with_policy(value: &str, home: Option<&Path>, remote: bool) -> Re
                     value[2..].trim_start_matches(|ch| ch == '/' || (cfg!(windows) && ch == '\\')),
                 )
             };
+            if matches!(tail.components().next(), Some(Component::Prefix(_))) {
+                return Err(Error::Config(
+                    "home-relative path cannot include a drive prefix".into(),
+                ));
+            }
             home.join(tail)
         });
     }
@@ -201,6 +206,12 @@ mod tests {
         }
         assert!(validate_file_url_path("/tmp/a%20b/%E6%97%A5", false).is_ok());
         assert!(validate_file_url_path("/tmp/a%252Fb", false).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_path_rejects_drive_prefix_after_repeated_separators() {
+        assert!(plain_input("~//D:/profile", Some(Path::new("C:/home"))).is_err());
     }
 
     #[cfg(windows)]

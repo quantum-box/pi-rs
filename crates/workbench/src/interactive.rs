@@ -8927,15 +8927,17 @@ pub(super) async fn run(
     {
         view.replay_transcript(&args, &theme)?;
     }
-    if !args.no_session && args.session.is_file() {
+    if !args.no_session
+        && args.session.is_file()
+        && let Ok(profile) = &args.resume_agent_dir
+    {
         let path = args.session.to_string_lossy();
         let path = if cfg!(windows) {
             format!("'{}'", path.replace('\'', "''"))
         } else {
             shell_words::quote(&path).into_owned()
         };
-        let profile = args
-            .resume_agent_dir
+        let profile = profile
             .as_ref()
             .map(|directory| {
                 let directory = directory.to_string_lossy();

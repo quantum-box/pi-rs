@@ -621,7 +621,7 @@ fn report_body(executable: &Path, args: &Cli, confirm_project: bool) -> Option<S
         "--workspace".into(),
         workspace.to_str()?.into(),
     ];
-    if let Some(directory) = &args.resume_agent_dir {
+    if let Some(directory) = args.resume_agent_dir.as_ref().ok()?.as_ref() {
         argv.push("--agent-dir".into());
         argv.push(directory.to_str()?.into());
     }
@@ -801,7 +801,7 @@ mod tests {
         );
         assert!(report_body(Path::new("relative"), &args, false).is_none());
         assert!(report_body(&root.join("separator\u{1b}"), &args, false).is_none());
-        args.resume_agent_dir = Some(root.join("agent profile"));
+        args.resume_agent_dir = Ok(Some(root.join("agent profile")));
         let body = report_body(&executable, &args, false).unwrap();
         assert!(body.contains(&format!(
             ",{},{}",

@@ -93,8 +93,8 @@ struct Cli {
     /// Config directory for settings, authentication, and resources.
     #[arg(long, value_name = "DIR")]
     agent_dir: Option<PathBuf>,
-    #[arg(skip)]
-    resume_agent_dir: Option<PathBuf>,
+    #[arg(skip = Ok(None))]
+    resume_agent_dir: std::result::Result<Option<PathBuf>, std::io::ErrorKind>,
     #[arg(skip)]
     initial_selection: Option<InitialSelection>,
     #[arg(skip)]
@@ -1607,12 +1607,17 @@ fn main() {
             std::env::set_var("PI_CODING_AGENT_DIR", path);
         }
     }
-    let resume_agent_dir = agent_dir.or_else(|| {
-        (std::env::var_os("PI_RS_HOME").is_some()
-            || std::env::var_os("PI_CODING_AGENT_DIR").is_some())
-        .then(|| agent_dir_arg::resolve_existing_profile(&pi_rs_workbench::agent_dir()).ok())
-        .flatten()
-    });
+    let resume_agent_dir = match agent_dir {
+        Some(path) => Ok(Some(path)),
+        None if std::env::var_os("PI_RS_HOME").is_some()
+            || std::env::var_os("PI_CODING_AGENT_DIR").is_some() =>
+        {
+            agent_dir_arg::resolve_existing_profile(&pi_rs_workbench::agent_dir())
+                .map(Some)
+                .map_err(|error| error.kind())
+        }
+        None => Ok(None),
+    };
     if let Some(code) = run_durable_cli(&argv) {
         std::process::exit(code);
     }
@@ -1645,7 +1650,7 @@ const RPC_FILE_ARGUMENT_ERROR: &str = "Error: @file arguments are not supported 
 async fn run_cli(
     resume_token: Option<String>,
     mut argv: Vec<std::ffi::OsString>,
-    resume_agent_dir: Option<PathBuf>,
+    resume_agent_dir: std::result::Result<Option<PathBuf>, std::io::ErrorKind>,
 ) -> i32 {
     // Terminal-owned workers receive the same foreground-group SIGINT as the
     // frontend and editor. Their parent handles terminal interrupts and sends

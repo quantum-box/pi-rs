@@ -65,9 +65,21 @@ pub(super) fn resolve_existing_profile(path: &Path) -> std::io::Result<PathBuf> 
         .components()
         .any(|part| part == Component::ParentDir)
     {
-        absolute.canonicalize()
+        canonical_profile_with_missing_suffix(&absolute)
     } else {
         Ok(absolute)
+    }
+}
+
+fn canonical_profile_with_missing_suffix(path: &Path) -> std::io::Result<PathBuf> {
+    match path.canonicalize() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some((parent, name)) = path.parent().zip(path.file_name()) else {
+                return Err(error);
+            };
+            Ok(canonical_profile_with_missing_suffix(parent)?.join(name))
+        }
+        result => result,
     }
 }
 
@@ -85,6 +97,8 @@ mod tests {
         std::fs::create_dir(&profile).unwrap();
         let link = root.path().join("link");
         std::os::unix::fs::symlink(child, &link).unwrap();
+        let missing = resolve_existing_profile(&link.join("../profile/missing")).unwrap();
+        assert_eq!(missing, profile.canonicalize().unwrap().join("missing"));
         let reported = resolve_existing_profile(&link.join("../profile")).unwrap();
         assert_eq!(reported, profile.canonicalize().unwrap());
         assert_eq!(resolve(&reported).unwrap(), reported);
