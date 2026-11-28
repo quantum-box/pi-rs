@@ -3345,6 +3345,11 @@ journal at settlement, after the assistant and tool records. `abort` and
 terminal, Escape interrupts the model first when both are active. Native and
 imported Pi shell records keep context-exclusion flags.
 
+The working status shows a configured interrupt key when it can reach the
+draft. Fullscreen selection copy takes precedence when its binding applies
+and there is text to copy. Search, pickers, and dialogs can also take focus
+before the draft.
+
 RPC and both terminal modes passed fixtures covering streamed UTF-8 output,
 nonzero exits, included/excluded model context, cancellation, process cleanup
 and durable restoration. A held model response verified concurrent execution,

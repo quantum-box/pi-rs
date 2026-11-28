@@ -16,7 +16,7 @@ pub struct Keys {
 }
 impl Keys {
     #[cfg(test)]
-    pub(super) fn set_test_binding(&mut self, action: &str, key: &str) {
+    pub(crate) fn set_test_binding(&mut self, action: &str, key: &str) {
         self.bindings
             .insert(action.into(), vec![parse(key).unwrap()]);
     }

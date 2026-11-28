@@ -2068,12 +2068,19 @@ impl View {
         editor.map_or(default, |editor| editor.action(key, default))
     }
 
-    fn draft_receives_interrupt(&self, keys: &Keys, key: KeyEvent, fullscreen: bool) -> bool {
-        if fullscreen
+    fn draft_receives_interrupt(&self, args: &Cli, keys: &Keys, key: KeyEvent) -> bool {
+        // Both picker types and dialogs handle input before draft dispatch.
+        if self.picker.is_some() || self.dialog().is_some() {
+            return false;
+        }
+        if args.tui_mode != Some(TuiMode::Regular)
             && (self.search.is_some()
                 || keys.matches("tui.altScreen.search", key)
                 || keys.viewport_action(key).is_some())
         {
+            return false;
+        }
+        if self.keyboard_selection_text(args, keys, key).is_some() {
             return false;
         }
         Self::draft_key_action(
@@ -2086,12 +2093,13 @@ impl View {
 
     fn border_status(
         &self,
+        args: &Cli,
         busy: bool,
-        fullscreen: bool,
         now: Instant,
         width: usize,
         keys: &Keys,
     ) -> String {
+        let fullscreen = args.tui_mode != Some(TuiMode::Regular);
         let mut other = self.draft_status();
         other.push_str(&self.extension_status());
         if fullscreen && let Some((message, _)) = &self.flash {
@@ -2104,7 +2112,7 @@ impl View {
             fullscreen,
             now,
             remaining,
-            keys.interrupt_binding(|key| self.draft_receives_interrupt(keys, key, fullscreen)),
+            keys.interrupt_binding(|key| self.draft_receives_interrupt(args, keys, key)),
         );
         format!("{working}{other}")
     }
@@ -4238,25 +4246,26 @@ render_call_id: None,
         self.request_started = None;
         self.phase = None;
     }
-    fn copy_selection(&mut self) -> bool {
-        let Some(text) = self.mouse.text() else {
-            return false;
-        };
-        let message = match sessions::copy_text(&text) {
+    fn copy_selected_text(&mut self, text: &str) {
+        let message = match sessions::copy_text(text) {
             Ok(()) => "Copied!".to_owned(),
             Err(error) => format!("Copy failed: {error}"),
         };
         self.flash = Some((message, Instant::now()));
-        true
     }
 
-    fn keyboard_copies_selection(
-        &self,
-        editor_copy: bool,
-        message_copy: bool,
-        copy_on_select: bool,
-    ) -> bool {
-        (editor_copy || (message_copy && !copy_on_select)) && self.mouse.text().is_some()
+    fn keyboard_selection_text(&self, args: &Cli, keys: &Keys, key: KeyEvent) -> Option<String> {
+        if args.tui_mode != Some(TuiMode::Regular)
+            && (keys.matches("tui.input.copy", key)
+                || (keys.matches("app.message.copy", key)
+                    && args.settings.boolean("fullscreenCopyOnSelect") == Some(false)))
+        {
+            // A highlighted range can trim to empty. A real copy attempt,
+            // including one that reports an error, consumes the shortcut.
+            self.mouse.text()
+        } else {
+            None
+        }
     }
 
     fn fullscreen_mouse(&mut self, event: MouseEvent, args: &Cli) -> bool {
@@ -4362,8 +4371,9 @@ render_call_id: None,
                     self.mouse.clear();
                 } else if self.mouse.release(event.column, event.row)
                     && args.settings.boolean("fullscreenCopyOnSelect") != Some(false)
+                    && let Some(text) = self.mouse.text()
                 {
-                    self.copy_selection();
+                    self.copy_selected_text(&text);
                 }
             }
             _ => return false,
@@ -4674,7 +4684,7 @@ render_call_id: None,
             !cfg!(windows),
             synchronized_updates_supported(),
         )?;
-        let status = self.border_status(busy, true, Instant::now(), width, keys);
+        let status = self.border_status(args, busy, Instant::now(), width, keys);
         queue!(out, Hide)?;
         self.graphics.clear_fullscreen_frame(&mut out)?;
         for (row, line) in header.iter().enumerate() {
@@ -5251,7 +5261,7 @@ render_call_id: None,
             )?;
             queue!(out, Print("\r\n"))?;
         }
-        let status = self.border_status(busy, false, Instant::now(), width, keys);
+        let status = self.border_status(args, busy, Instant::now(), width, keys);
         Line::themed(
             &format!(
                 "{}{}",
@@ -8465,13 +8475,9 @@ pub(super) async fn run(
                     }
                 }
                 if !submit_completion
-                    && view.keyboard_copies_selection(
-                        keys.matches("tui.input.copy", key),
-                        keys.matches("app.message.copy", key),
-                        args.settings.boolean("fullscreenCopyOnSelect") != Some(false),
-                    )
-                    && view.copy_selection()
+                    && let Some(text) = view.keyboard_selection_text(&args, &keys, key)
                 {
+                    view.copy_selected_text(&text);
                     continue;
                 }
                 view.mouse.clear();
@@ -15438,19 +15444,60 @@ exit {exit}
 
     #[test]
     fn copy_shortcut_prefers_selected_text_when_auto_copy_is_disabled() {
-        let mut view = super::View::default();
-        assert!(!view.keyboard_copies_selection(false, true, false));
-        let lines = [super::Line::plain(
-            "selected text",
-            crossterm::style::Color::Reset,
-        )];
-        view.mouse.update(&lines, 0, 0..1);
-        view.mouse.press(0, 0, std::time::Instant::now());
+        use clap::Parser;
+        use crossterm::style::Color;
+
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.json");
+        let mut args = Cli::parse_from(["pi"]);
+        args.tui_mode = Some(TuiMode::Fullscreen);
+        std::fs::write(&settings, r#"{"fullscreenCopyOnSelect":false}"#).unwrap();
+        args.settings =
+            crate::config::Settings::load_from_paths(directory.path(), false, &settings).unwrap();
+        let mut keys = Keys::default();
+        let message_copy = keys.first_binding("app.message.copy").unwrap();
+        let editor_copy = keys.first_binding("tui.input.copy").unwrap();
+        // Rebind interrupt to also check the rendered result for message copy.
+        keys.set_test_binding("app.interrupt", "ctrl+x");
+        let mut view = View {
+            shell_running: true,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        assert!(
+            view.keyboard_selection_text(&args, &keys, message_copy)
+                .is_none()
+        );
+        view.mouse
+            .update(&[Line::plain("selected text", Color::Reset)], 0, 0..1);
+        view.mouse.press(0, 0, now);
         assert!(view.mouse.release(7, 0));
-        assert_eq!(view.mouse.text().as_deref(), Some("selected"));
-        assert!(view.keyboard_copies_selection(false, true, false));
-        assert!(!view.keyboard_copies_selection(false, true, true));
-        assert!(view.keyboard_copies_selection(true, false, true));
+        assert_eq!(
+            view.keyboard_selection_text(&args, &keys, message_copy)
+                .as_deref(),
+            Some("selected")
+        );
+        assert!(
+            !view
+                .border_status(&args, true, now, 80, &keys)
+                .contains("取消")
+        );
+
+        std::fs::write(&settings, r#"{"fullscreenCopyOnSelect":true}"#).unwrap();
+        args.settings =
+            crate::config::Settings::load_from_paths(directory.path(), false, &settings).unwrap();
+        assert!(
+            view.keyboard_selection_text(&args, &keys, message_copy)
+                .is_none()
+        );
+        assert!(
+            view.border_status(&args, true, now, 80, &keys)
+                .contains("Ctrl+Xで取消")
+        );
+        assert!(
+            view.keyboard_selection_text(&args, &keys, editor_copy)
+                .is_some()
+        );
     }
 
     #[test]
@@ -15651,14 +15698,89 @@ exit {exit}
 
     #[test]
     fn fullscreen_search_hides_the_draft_interrupt_hint() {
+        use clap::Parser;
+
+        let mut args = Cli::parse_from(["pi"]);
         let view = View {
             search: Some(Search::default()),
             ..Default::default()
         };
         let keys = Keys::default();
         let key = keys.first_binding("app.interrupt").unwrap();
-        assert!(view.draft_receives_interrupt(&keys, key, false));
-        assert!(!view.draft_receives_interrupt(&keys, key, true));
+        args.tui_mode = Some(TuiMode::Regular);
+        assert!(view.draft_receives_interrupt(&args, &keys, key));
+        args.tui_mode = Some(TuiMode::Fullscreen);
+        assert!(!view.draft_receives_interrupt(&args, &keys, key));
+    }
+
+    #[test]
+    fn fullscreen_selection_hides_ctrl_c_hint_only_when_copy_consumes_it() {
+        use clap::Parser;
+        use crossterm::style::Color;
+
+        let mut args = Cli::parse_from(["pi"]);
+        args.tui_mode = Some(TuiMode::Fullscreen);
+        let mut keys = Keys::default();
+        keys.set_test_binding("app.clear", "f7");
+        keys.set_test_binding("app.interrupt", "ctrl+c");
+        let key = keys.first_binding("app.interrupt").unwrap();
+        assert_eq!(keys.action(key, true), Some("app.interrupt"));
+        let now = Instant::now();
+        let mut view = View {
+            shell_running: true,
+            ..Default::default()
+        };
+        let status = |view: &View, args: &Cli| view.border_status(args, true, now, 80, &keys);
+        assert!(status(&view, &args).contains("Ctrl+Cで取消"));
+
+        view.mouse
+            .update(&[Line::plain("selected text", Color::Reset)], 0, 0..1);
+        view.mouse.press(0, 0, now);
+        assert!(view.mouse.release(7, 0));
+        let fullscreen_status = status(&view, &args);
+        assert!(fullscreen_status.contains("コマンド実行中"));
+        assert!(!fullscreen_status.contains("取消"));
+        args.tui_mode = Some(TuiMode::Regular);
+        assert!(status(&view, &args).contains("Ctrl+Cで取消"));
+
+        args.tui_mode = Some(TuiMode::Fullscreen);
+        view.mouse
+            .update(&[Line::plain("        ", Color::Reset)], 0, 0..1);
+        view.mouse.press(0, 0, now);
+        assert!(view.mouse.release(7, 0));
+        assert!(view.mouse.text().is_none());
+        assert!(status(&view, &args).contains("Ctrl+Cで取消"));
+    }
+
+    #[test]
+    fn picker_and_dialog_hide_the_draft_interrupt_hint() {
+        use clap::Parser;
+
+        let mut args = Cli::parse_from(["pi"]);
+        let mut view = View {
+            shell_running: true,
+            ..Default::default()
+        };
+        let keys = Keys::default();
+        let now = Instant::now();
+        for mode in [TuiMode::Regular, TuiMode::Fullscreen] {
+            args.tui_mode = Some(mode);
+            let status = |view: &View| view.border_status(&args, true, now, 80, &keys);
+            assert!(status(&view).contains("Escで取消"));
+            for picker in [
+                Picker::new("Select model", Vec::new()),
+                Picker::completion(vec![("/clear".into(), None)], 0..0, 6),
+            ] {
+                view.picker = Some(picker);
+                assert!(!status(&view).contains("取消"));
+            }
+            view.picker = None;
+            view.dialogs
+                .push_back(crate::ui::dialog::Dialog::secret("Code".into()));
+            assert!(!status(&view).contains("取消"));
+            view.dialogs.clear();
+            assert!(status(&view).contains("Escで取消"));
+        }
     }
 
     #[test]
@@ -15682,6 +15804,9 @@ exit {exit}
 
     #[test]
     fn extension_working_indicator_animates_hides_and_restores_in_both_modes() {
+        use clap::Parser;
+
+        let mut args = Cli::parse_from(["pi"]);
         let keys = Keys::default();
         let interrupt = keys.first_binding("app.interrupt");
         let id = uuid::Uuid::new_v4();
@@ -15760,8 +15885,9 @@ exit {exit}
             .unwrap();
         view.ui_status
             .insert("fixture".into(), "independent status".into());
-        for fullscreen in [false, true] {
-            let status = view.border_status(true, fullscreen, later, 48, &keys);
+        for mode in [TuiMode::Regular, TuiMode::Fullscreen] {
+            args.tui_mode = Some(mode);
+            let status = view.border_status(&args, true, later, 48, &keys);
             assert!(status.contains("Escで取消"));
             assert!(status.contains("independent status"));
             assert!(UnicodeWidthStr::width(status.as_str()) <= 48);
