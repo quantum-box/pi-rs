@@ -1151,6 +1151,112 @@ async fn granted_model_file_composes_saved_auth_with_exact_api_and_base_routes()
     assert_eq!(grants.load(&factory).unwrap().identities().len(), 0);
 }
 
+fn load_file_thinking_catalog(declaration: serde_json::Value) -> pi_rs::ModelCatalog {
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use serde_json::json;
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("models.json");
+    let base_url = "http://127.0.0.1:1/v1";
+    let endpoint = format!("{base_url}/chat/completions");
+    let mut provider = json!({"api":"openai-completions","baseUrl":base_url});
+    provider
+        .as_object_mut()
+        .unwrap()
+        .extend(declaration.as_object().unwrap().clone());
+    std::fs::write(
+        &file,
+        json!({"providers":{"relay":provider,"ungranted":{"models":true}}}).to_string(),
+    )
+    .unwrap();
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "relay",
+        &endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    ModelFileReadGrants {
+        file,
+        routes: vec![ModelFileRoute {
+            provider: "relay".into(),
+            api: NativeModelApi::OpenAiChat,
+            base_url: base_url.into(),
+            endpoint,
+        }],
+    }
+    .load(&ModelClientFactory::new(auth.build()))
+    .unwrap()
+}
+
+#[test]
+fn file_thinking_levels() {
+    let catalog = load_file_thinking_catalog(serde_json::json!({"models":[
+        {"id":"mapped","reasoning":true,
+         "thinkingLevelMap":{"off":null,"medium":null,"xhigh":"strong","max":null}},
+        {"id":"legacy","reasoning":true},
+        {"id":"legacy-nonreasoning","reasoning":false},
+        {"id":"empty-map","reasoning":true,"thinkingLevelMap":{}},
+        {"id":"nonreasoning","reasoning":false,"thinkingLevelMap":{"off":null,"max":"very-strong"}},
+        {"id":"all-disabled","reasoning":true,
+         "thinkingLevelMap":{"off":null,"minimal":null,"low":null,"medium":null,"high":null}}
+    ]}));
+    assert_eq!(
+        catalog.thinking_levels("relay", "mapped").unwrap(),
+        ["minimal", "low", "high", "xhigh"]
+    );
+    assert_eq!(catalog.thinking_levels("relay", "legacy"), None);
+    assert_eq!(
+        catalog.thinking_levels("relay", "legacy-nonreasoning"),
+        None
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "empty-map").unwrap(),
+        ["off", "minimal", "low", "medium", "high"]
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "nonreasoning").unwrap(),
+        ["off"]
+    );
+    assert!(
+        catalog
+            .thinking_levels("relay", "all-disabled")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn file_thinking_overrides() {
+    let catalog = load_file_thinking_catalog(serde_json::json!({
+        "models":[
+            {"id":"mapped","reasoning":true,
+             "thinkingLevelMap":{"off":null,"medium":null,"xhigh":"strong","max":null}},
+            {"id":"override-only","reasoning":false},
+            {"id":"outside","baseUrl":"http://127.0.0.1:2/v1","thinkingLevelMap":true},
+            {"id":"classifier","type":"classifier","thinkingLevelMap":true}
+        ],
+        "modelOverrides":{
+            "mapped":{"thinkingLevelMap":{"medium":"normal","high":null,"xhigh":null,"max":"ultra"}},
+            "override-only":{"reasoning":true,"thinkingLevelMap":{"low":null}},
+            "outside":{"thinkingLevelMap":true},
+            "classifier":{"thinkingLevelMap":true}
+        }
+    }));
+    assert_eq!(
+        catalog.identities().collect::<Vec<_>>(),
+        [("relay", "mapped"), ("relay", "override-only")]
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "mapped").unwrap(),
+        ["minimal", "low", "medium", "max"]
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "override-only").unwrap(),
+        ["off", "minimal", "medium", "high"]
+    );
+}
+
 #[test]
 fn configured_model_key_grants_reject_codex_oauth_routes() {
     use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
