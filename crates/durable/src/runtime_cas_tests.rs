@@ -4606,7 +4606,8 @@ fn inherited_reset_boundary_forks_from_its_origin_snapshot() {
     h.save(&state, Expected::Version(version)).unwrap();
     drop(h);
     let mut h = Harness::open_paused(&path, options()).unwrap();
-    assert!(h.fork_by_entry_id(child, old).is_err());
+    let earlier = h.fork_by_entry_id(child, old).unwrap();
+    assert!(h.conversation(earlier).unwrap().resets.is_empty());
     let fork = h.fork_by_entry_id(child, entry).unwrap();
     let result = h.conversation(fork).unwrap();
     assert_eq!(result.config.model, "at-reset");
@@ -4693,15 +4694,23 @@ fn inherited_entry_forks_use_visible_origin_commit_and_documents() {
         assert_eq!(h.document(&copied).unwrap().unwrap().value["n"], 1);
     }
     h.reset(grandchild, Some("replacement".into())).unwrap();
-    assert!(h.fork_by_entry_id(grandchild, first).is_err());
-    assert!(h.fork_by_entry_id(grandchild, second).is_err());
     drop(h);
     let mut h = Harness::open_paused(&path, options()).unwrap();
-    assert!(h.fork_by_entry_id(grandchild, first).is_err());
+    for (id, expected_len) in [(first, 1), (second, 2)] {
+        let fork = h.fork_by_entry_id(grandchild, id).unwrap();
+        let result = h.conversation(fork).unwrap();
+        assert_eq!(result.messages.len(), expected_len);
+        assert_eq!(result.config.model, "origin");
+        let copied = Address {
+            scope: fork.to_string(),
+            ..address.clone()
+        };
+        assert_eq!(h.document(&copied).unwrap().unwrap().value["n"], 1);
+    }
 }
 
 #[test]
-fn inherited_entry_rejects_materialized_interior_fork() {
+fn inherited_entry_respects_materialized_interior_cut() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
     let parent = h
@@ -4724,7 +4733,12 @@ fn inherited_entry_rejects_materialized_interior_fork() {
     let child = h
         .fork_at_position(parent, entries[1].position.clone())
         .unwrap();
-    assert!(h.fork_by_entry_id(child, original_id).is_err());
+    let earlier = h.fork_by_entry_id(child, original_id).unwrap();
+    assert_eq!(h.conversation(earlier).unwrap().messages.len(), 1);
+    assert!(
+        h.fork_by_entry_id(child, entries[0].history.as_ref().unwrap().id)
+            .is_err()
+    );
 }
 
 #[test]
@@ -4905,7 +4919,8 @@ fn entry_id_fork_checks_inherited_chain_before_selecting_local_match() {
     let mut h = Harness::open_paused(&path, options()).unwrap();
     let fork = h.fork_by_entry_id(child, local).unwrap();
     assert_eq!(h.conversation(fork).unwrap().messages.len(), 2);
-    assert!(h.fork_by_entry_id(child, inherited).is_err());
+    let fork = h.fork_by_entry_id(child, inherited).unwrap();
+    assert_eq!(h.conversation(fork).unwrap().messages.len(), 1);
 }
 
 #[tokio::test]

@@ -361,6 +361,109 @@ async fn compaction_provenance_survives_concurrent_input_admission() {
 }
 
 #[tokio::test]
+async fn session_message_history_survives_compaction_and_exact_fork_cuts() {
+    use pi_rs_durable::runtime::SessionMessageCursor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let root = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit_and_run(root, None, "old".into(), &cancel)
+        .await
+        .unwrap();
+    h.submit_and_run(root, None, "latest".into(), &cancel)
+        .await
+        .unwrap();
+    let messages = h
+        .view_positioned(root, NonZeroUsize::new(32).unwrap())
+        .unwrap();
+    let old = messages
+        .entries
+        .into_iter()
+        .find(|entry| matches!(&entry.message, Message::User { content } if content == "old"))
+        .unwrap()
+        .history
+        .unwrap();
+    assert!(h.request_compaction(root, 0).unwrap());
+    h.resume(&cancel).await.unwrap();
+    let child = h.fork(root).unwrap();
+    assert!(
+        !h.conversation(child)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::User { content } if content == "old"))
+    );
+    h.submit_and_run(child, None, "child".into(), &cancel)
+        .await
+        .unwrap();
+    let captured = h.session_messages_start(child).unwrap();
+    h.submit_and_run(child, None, "outside capture".into(), &cancel)
+        .await
+        .unwrap();
+    h.submit_and_run(root, None, "outside ancestry".into(), &cancel)
+        .await
+        .unwrap();
+    drop(h);
+
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let mut cursor = Some(captured);
+    let mut entries = Vec::new();
+    while let Some(position) = cursor {
+        let json = serde_json::to_string(&position).unwrap();
+        let position: SessionMessageCursor = serde_json::from_str(&json).unwrap();
+        let page = h.session_messages(&position, NonZeroUsize::MIN).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        entries.extend(page.entries);
+        cursor = page.older;
+    }
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.history.id == old.id)
+            .count(),
+        1
+    );
+    let users: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| match &entry.message {
+            Message::User { content } => Some((entry.history.origin, content.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users[0], (child, "child"));
+    assert!(
+        users
+            .iter()
+            .any(|(source, text)| *source == root && text.contains("summary of prior work"))
+    );
+    assert_eq!(users[users.len() - 2..], [(root, "latest"), (root, "old")]);
+    assert!(!users.iter().any(|(_, text)| text.starts_with("outside")));
+
+    // The raw entry is inherited even though compaction removed it from the
+    // child's model context. The new branch still cuts exactly at that entry.
+    let historical = h.fork_by_entry_id(child, old.id).unwrap();
+    let captured = h.session_messages_start(historical).unwrap();
+    let entries = h
+        .session_messages(&captured, NonZeroUsize::new(32).unwrap())
+        .unwrap()
+        .entries;
+    assert_eq!(entries.first().unwrap().history, old);
+    assert!(
+        !entries.iter().any(
+            |entry| matches!(&entry.message, Message::User { content } if content == "latest")
+        )
+    );
+}
+
+#[tokio::test]
 async fn compaction_retains_occurrence_provenance_across_reopen_and_fork() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
