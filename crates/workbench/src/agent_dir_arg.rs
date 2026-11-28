@@ -20,7 +20,7 @@ pub(super) fn take(argv: Vec<OsString>) -> Result<(Vec<OsString>, Option<PathBuf
                 .next()
                 .filter(|value| !value.is_empty())
                 .ok_or("--agent-dir requires a directory")?;
-            selected = Some(resolve(Path::new(&value)).map_err(|_| "cannot resolve --agent-dir")?);
+            selected = Some(value);
         } else if arg
             .to_str()
             .is_some_and(|value| value.starts_with("--agent-dir="))
@@ -30,6 +30,10 @@ pub(super) fn take(argv: Vec<OsString>) -> Result<(Vec<OsString>, Option<PathBuf
             rest.push(arg);
         }
     }
+    let selected = selected
+        .map(|value| resolve(Path::new(&value)))
+        .transpose()
+        .map_err(|_| "cannot resolve --agent-dir")?;
     Ok((rest, selected))
 }
 
@@ -68,7 +72,7 @@ mod tests {
         let args = [
             "pi",
             "--agent-dir",
-            "first",
+            "file://invalid-host/profile",
             "auth",
             "--agent-dir",
             "a/../last",
