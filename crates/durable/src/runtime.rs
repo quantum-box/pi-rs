@@ -2218,11 +2218,10 @@ fn stop_at_unsafe_park_boundary(stage: &str, state: &Conversation) {
     let Some(root) = std::env::var_os("PI_UNSAFE_BOUNDARY_DIR") else {
         return;
     };
-    std::fs::write(
+    crate::publish_ready_marker(
         std::path::PathBuf::from(root).join("boundary"),
         serde_json::to_vec(&state.tool_attempt()).unwrap(),
-    )
-    .unwrap();
+    );
     loop {
         std::thread::park();
     }
@@ -2509,6 +2508,16 @@ impl Conversation {
     /// predate answer IDs and return None.
     pub fn answer_id(&self, submission: Uuid) -> Option<Uuid> {
         self.answer_ids.get(&submission).copied()
+    }
+
+    /// Whether ordinary input would be queued behind an active run.
+    pub fn input_run_active(&self) -> bool {
+        self.active.is_some()
+            || pending_failure_continuation(self)
+            || matches!(
+                self.phase,
+                Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
+            )
     }
 
     /// Current model request identity for a submission placed in this run.
@@ -16203,6 +16212,47 @@ impl Harness {
             }
         }
     }
+    /// Withdraw all queued inputs in one commit and return them in admission order.
+    /// Inputs that have already entered a run remain part of that run.
+    pub fn clear_input_queue(&mut self, id: Uuid) -> Result<Vec<WithdrawnInput>, Error> {
+        self.load(id)?;
+        let gate = self.owner.conversation_controls().get(id).callback_start;
+        let _start_lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
+        loop {
+            let (mut state, version) = self.load(id)?;
+            let mut withdrawn = Vec::new();
+            for input in &mut state.submissions {
+                if input.status == Status::Queued {
+                    let mode = state
+                        .input_modes
+                        .get(&input.id)
+                        .copied()
+                        .unwrap_or(InputMode::FollowUp);
+                    withdrawn.push(WithdrawnInput {
+                        conversation_id: id,
+                        mode,
+                        submission: input.clone(),
+                    });
+                    input.status = Status::Unanswered {
+                        reason: "aborted".into(),
+                    };
+                }
+            }
+            if withdrawn.is_empty() {
+                return Ok(withdrawn);
+            }
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&state, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
+                Ok(()) => return Ok(withdrawn),
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Persist the abort mark and withdraw the inputs queued at this commit.
     /// The caller must stop any executing worker before driving the mark.
     pub fn request_abort(&mut self, id: Uuid) -> Result<(), Error> {
@@ -24911,6 +24961,11 @@ impl Scheduler {
     ) -> Result<WithdrawResult, Error> {
         self.harness.withdraw_submission(id, submission)
     }
+    /// Withdraw all queued inputs, keeping the currently running input.
+    pub fn clear_input_queue(&mut self, id: Uuid) -> Result<Vec<WithdrawnInput>, Error> {
+        self.harness.clear_input_queue(id)
+    }
+
     pub fn blocked(&self, id: Uuid) -> Result<Option<(Uuid, String)>, Error> {
         self.harness.blocked(id)
     }
@@ -37940,6 +37995,57 @@ mod scheduler_tests {
         );
         scheduler.shutdown().await.unwrap();
     }
+    #[tokio::test]
+    async fn clears_both_input_queues_without_aborting_the_active_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let active = scheduler.submit(id, None, "first".into()).unwrap();
+        model.started.acquire().await.unwrap().forget();
+        let follow_up = scheduler.submit(id, None, "follow-up".into()).unwrap();
+        let steer = scheduler
+            .submit_with_mode(id, None, "steer".into(), InputMode::Steer)
+            .unwrap();
+        let cleared = scheduler.clear_input_queue(id).unwrap();
+        assert_eq!(
+            cleared
+                .iter()
+                .map(|entry| (entry.submission.id, entry.mode))
+                .collect::<Vec<_>>(),
+            [(follow_up, InputMode::FollowUp), (steer, InputMode::Steer)]
+        );
+        assert!(scheduler.clear_input_queue(id).unwrap().is_empty());
+        model.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        let state = scheduler.conversation(id).unwrap();
+        assert!(matches!(state.submissions[0].status, Status::Done { .. }));
+        assert_eq!(state.submissions[0].id, active);
+        assert!(state.submissions[1..].iter().all(|input| {
+            matches!(&input.status, Status::Unanswered { reason } if reason == "aborted")
+        }));
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
+        scheduler.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn restart_processes_abort_mark_before_recovery_can_redispatch() {
         let dir = tempfile::tempdir().unwrap();
