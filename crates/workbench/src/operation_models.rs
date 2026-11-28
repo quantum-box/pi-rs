@@ -1193,8 +1193,9 @@ impl Operations {
         })
     }
 
-    async fn radius_classifiers(
+    async fn radius_operations(
         &self,
+        kind: Kind,
         cancel: &pi_rs::CancellationToken,
         available_only: bool,
     ) -> Result<Vec<Entry>> {
@@ -1208,7 +1209,7 @@ impl Operations {
             let Ok(Some(catalog)) = radius.catalog().await else {
                 return Vec::new();
             };
-            radius_entries(&catalog)
+            radius_entries(&catalog, kind)
         };
         tokio::select! {
             biased;
@@ -1217,17 +1218,18 @@ impl Operations {
         }
     }
 
-    async fn radius_classifier(
+    async fn radius_operation(
         &self,
+        kind: Kind,
         model_id: Option<&str>,
     ) -> Result<Option<(Entry, String, HeaderMap)>> {
         let Some(radius) = self.radius_client(false).await? else {
             return Ok(None);
         };
-        let Some((catalog, token)) = radius.classifier_catalog_with_token().await? else {
+        let Some((catalog, token)) = radius.operation_catalog_with_token().await? else {
             return Ok(None);
         };
-        Ok(radius_entries(&catalog)
+        Ok(radius_entries(&catalog, kind)
             .into_iter()
             .find(|entry| Some(entry.model.id.as_str()) == model_id)
             .map(|entry| (entry, token, radius.context_headers())))
@@ -1287,36 +1289,73 @@ impl Operations {
     }
 }
 
-fn radius_entries(catalog: &radius_catalog::Catalog) -> Vec<Entry> {
+fn radius_entries(catalog: &radius_catalog::Catalog, kind: Kind) -> Vec<Entry> {
+    let api = match kind {
+        Kind::Classifier => Api::PiDecision,
+        Kind::Image => Api::PiImage,
+        Kind::Chat => return Vec::new(),
+    };
     let base = &catalog.base;
-    let endpoint = Url::parse(&format!("{}/decision", base.as_str().trim_end_matches('/')))
-        .expect("validated Radius base URL");
-    catalog
-        .classifiers
-        .iter()
-        .map(|model| Entry {
+    let mut endpoint = base.clone();
+    endpoint.set_path(&format!(
+        "{}/{}",
+        base.path().trim_end_matches('/'),
+        api.route()
+    ));
+    let entry =
+        |id: &str, name: &str, input: &[String], output, context_window, cost: &Cost| Entry {
             provider: "radius".into(),
             model: Configured {
-                id: model.id.clone(),
-                name: Some(model.name.clone()),
-                api: Some(Api::PiDecision),
+                id: id.into(),
+                name: Some(name.into()),
+                api: Some(api),
                 base_url: None,
-                input: Some(model.input.clone()),
-                output: None,
+                input: Some(input.to_vec()),
+                output,
                 input_limits: None,
-                context_window: Some(model.context_window),
-                cost: model.cost.clone(),
+                context_window,
+                cost: cost.clone(),
                 headers: BTreeMap::new(),
                 compat: Compat::default(),
             },
-            api: Api::PiDecision,
+            api,
             base: base.clone(),
             endpoint: endpoint.clone(),
             api_key: None,
             cloudflare_default: false,
             llama_root: None,
-        })
-        .collect()
+        };
+    match kind {
+        Kind::Classifier => catalog
+            .classifiers
+            .iter()
+            .map(|model| {
+                entry(
+                    &model.id,
+                    &model.name,
+                    &model.input,
+                    None,
+                    Some(model.context_window),
+                    &model.cost,
+                )
+            })
+            .collect(),
+        Kind::Image => catalog
+            .images
+            .iter()
+            .map(|model| {
+                entry(
+                    &model.id,
+                    &model.name,
+                    &model.input,
+                    Some(model.output.clone()),
+                    None,
+                    &model.cost,
+                )
+            })
+            .collect(),
+        Kind::Chat => Vec::new(),
+    }
 }
 
 impl Extension for Operations {
@@ -1366,8 +1405,14 @@ impl Tool for Operations {
                     && Some(model.provider.as_str()) == provider
                     && Some(model.model.id.as_str()) == args["id"].as_str()
             });
-            let found = if !found && kind == Some(Kind::Classifier) && provider == Some("radius") {
-                match self.radius_classifiers(&context.cancellation, true).await {
+            let found = if !found
+                && provider == Some("radius")
+                && let Some(kind @ (Kind::Classifier | Kind::Image)) = kind
+            {
+                match self
+                    .radius_operations(kind, &context.cancellation, true)
+                    .await
+                {
                     Ok(entries) => entries
                         .iter()
                         .any(|entry| Some(entry.model.id.as_str()) == args["id"].as_str()),
@@ -1454,10 +1499,9 @@ impl Tool for Operations {
                     }
                     entries = catalogue.list(kind, provider, id, args["available"] == true, &keys) => entries,
                 };
-                if kind == Kind::Classifier && provider.is_none_or(|provider| provider == "radius")
-                {
+                if provider.is_none_or(|provider| provider == "radius") {
                     let discovered = match self
-                        .radius_classifiers(&context.cancellation, args["available"] == true)
+                        .radius_operations(kind, &context.cancellation, args["available"] == true)
                         .await
                     {
                         Ok(entries) => entries,
@@ -1467,7 +1511,7 @@ impl Tool for Operations {
                         id.is_none_or(|id| entry.model.id == id)
                             && !catalogue.0.iter().any(|model| {
                                 model.provider == "radius"
-                                    && model.api.kind() == Kind::Classifier
+                                    && model.api.kind() == kind
                                     && model.model.id == entry.model.id
                             })
                     }) {
@@ -1502,20 +1546,19 @@ impl Tool for Operations {
                 return Outcome::Failed(error.to_string());
             }
         };
-        let radius =
-            if configured.is_none() && kind == Kind::Classifier && provider == Some("radius") {
-                let binding = tokio::select! {
-                    biased;
-                    _ = context.cancellation.cancelled() => Err(Error::Cancelled),
-                    result = self.radius_classifier(args["id"].as_str()) => result,
-                };
-                match binding {
-                    Ok(binding) => binding,
-                    Err(error) => return Outcome::Failed(error.to_string()),
-                }
-            } else {
-                None
+        let radius = if configured.is_none() && provider == Some("radius") {
+            let binding = tokio::select! {
+                biased;
+                _ = context.cancellation.cancelled() => Err(Error::Cancelled),
+                result = self.radius_operation(kind, args["id"].as_str()) => result,
             };
+            match binding {
+                Ok(binding) => binding,
+                Err(error) => return Outcome::Failed(error.to_string()),
+            }
+        } else {
+            None
+        };
         let Some(model) = configured.or(radius.as_ref().map(|(model, _, _)| model)) else {
             return Outcome::Failed("unknown model for this operation".into());
         };
@@ -2085,7 +2128,17 @@ mod tests {
                     "q":{"type":"bool","instructions":"match?","criteria":{"true":"yes","false":"no"}}
                 }}
             });
+            let image_list = json!({"action":"list","type":"image","provider":"radius"});
+            let image_id = if args.offline {
+                "rotated-paint"
+            } else {
+                "radius-paint"
+            };
             if mode == "wrong-account" {
+                assert!(matches!(
+                    operation.invoke(image_list, context()).await,
+                    Outcome::Structured { data, .. } if data == json!([])
+                ));
                 assert!(matches!(
                     operation.invoke(available, context()).await,
                     Outcome::Structured { data, .. } if data == json!([])
@@ -2128,6 +2181,15 @@ mod tests {
             assert_eq!(data.as_array().unwrap().len(), 1, "{data}");
             assert_eq!(data[0]["api"], "pi-decision");
             assert_eq!(data[0]["contextWindow"], 8192);
+            let Outcome::Structured { data: images, .. } =
+                operation.invoke(image_list, context()).await
+            else {
+                panic!("Radius image catalogue should be available from the account cache");
+            };
+            assert_eq!(images.as_array().unwrap().len(), 1, "{images}");
+            assert_eq!(images[0]["id"], image_id);
+            assert_eq!(images[0]["api"], "pi-image");
+            assert_eq!(images[0]["output"], json!(["text", "image"]));
             if !args.offline {
                 assert_eq!(data[0]["id"], "radius-judge");
                 let operation = Operations::new(&args).unwrap();
@@ -2150,6 +2212,27 @@ mod tests {
                 assert_eq!(data["api"], "pi-decision");
                 assert_eq!(data["responseId"], "fixture-decision");
                 assert_eq!(data["usage"]["totalTokens"], 4.0);
+                let image_request = json!({"action":"generateImages","provider":"radius","id":image_id,
+                    "context":{"input":[{"type":"text","text":"draw"}]},"options":{"size":"1K"}});
+                let mut unsupported = image_request.clone();
+                unsupported["context"]["input"][0] =
+                    json!({"type":"image","data":"YQ==","mimeType":"image/png"});
+                assert!(matches!(operation.invoke(unsupported, context()).await,
+                    Outcome::Structured { data, .. } if data["stopReason"] == "error" &&
+                        data["errorMessage"].as_str().unwrap().contains("does not support image input")));
+                let Outcome::Structured { data, .. } =
+                    operation.invoke(image_request, context()).await
+                else {
+                    panic!("Radius image invocation failed");
+                };
+                assert_eq!(data["stopReason"], "stop", "{data}");
+                assert_eq!(data["responseId"], "fixture-image");
+                assert_eq!(
+                    data["output"],
+                    json!([{"type":"text","text":"caption"},
+                    {"type":"image","mimeType":"image/png","data":"YQ=="}])
+                );
+                assert_eq!(data["usage"]["cost"]["total"], 0.25);
                 for status in [503, 404, 307] {
                     let Outcome::Structured { data, .. } =
                         operation.invoke(classify.clone(), context()).await
@@ -2191,7 +2274,7 @@ mod tests {
                 let legacy = Operations::new(&legacy_args).unwrap();
                 assert!(
                     legacy
-                        .radius_classifiers(&context().cancellation, false)
+                        .radius_operations(Kind::Classifier, &context().cancellation, false)
                         .await
                         .unwrap()
                         .iter()
@@ -2255,6 +2338,7 @@ mod tests {
             const CONFIG: &str = "GET /v1/config HTTP/1.1";
             const DECIDE: &str = "POST /relay/v1/decision HTTP/1.1";
             const CLASSIFY: &str = "POST /legacy/v1/classify HTTP/1.1";
+            const IMAGE: &str = "POST /relay/v1/image HTTP/1.1";
             const KEY: &str = "radius-fixture-key";
             for (method, key, status, config_base) in [
                 (CONFIG, KEY, 200, &foreign_base),
@@ -2264,6 +2348,7 @@ mod tests {
                 (CONFIG, KEY, 503, &base),
                 (CONFIG, KEY, 200, &base),
                 (DECIDE, KEY, 200, &base),
+                (IMAGE, KEY, 200, &base),
                 (DECIDE, KEY, 503, &base),
                 (DECIDE, KEY, 404, &base),
                 (DECIDE, KEY, 307, &base),
@@ -2301,6 +2386,10 @@ mod tests {
                         {"id":if key == "rotated-fixture-key" {"rotated-judge"} else {"radius-judge"},
                         "name":"Judge","contextWindow":8192,"input":["text"],"cost":{"input":1.2}},
                         {"id":"bad","name":"Bad","contextWindow":0,"input":["text"],"cost":{"input":1.2}},
+                    ],"images":[
+                        {"id":if key == "rotated-fixture-key" {"rotated-paint"} else {"radius-paint"},
+                         "name":"Paint","input":["text"],"output":["text","image"],"cost":{"imageOutput":2}},
+                        {"id":"bad","name":"Bad","input":["text"],"output":["audio"],"cost":{}}
                     ]});
                     let body = if status == 200 {
                         result.to_string()
@@ -2309,6 +2398,25 @@ mod tests {
                     };
                     request.get_mut().write_all(format!(
                         "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+                    ).as_bytes()).await.unwrap();
+                } else if method == IMAGE {
+                    assert!(tenant);
+                    let mut body = vec![0; length];
+                    request.read_exact(&mut body).await.unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&body).unwrap(),
+                        json!({
+                            "model":"radius-paint","context":{"input":[{"type":"text","text":"draw"}]},
+                            "options":{"size":"1K"}
+                        })
+                    );
+                    let body = json!({"responseId":"fixture-image",
+                        "usage":{"cost":{"total":0.25,"totalFromProvider":true}},
+                        "output":[{"type":"text","text":"caption"},
+                            {"type":"image","mimeType":"image/png","data":"YQ=="}]})
+                    .to_string();
+                    request.get_mut().write_all(format!(
+                        "HTTP/1.1 200 Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
                     ).as_bytes()).await.unwrap();
                 } else {
                     assert_eq!(tenant, method == DECIDE);
@@ -2403,6 +2511,7 @@ mod tests {
                 endpoint: base.clone(),
                 base,
                 models: vec![],
+                images: vec![],
                 classifiers: vec![radius_catalog::Classifier {
                     id: "judge".into(),
                     name: "Judge".into(),
@@ -2411,7 +2520,7 @@ mod tests {
                     cost: Cost::default(),
                 }],
             };
-            let entries = radius_entries(&catalog);
+            let entries = radius_entries(&catalog, Kind::Classifier);
             assert_eq!(entries[0].descriptor()["api"], "pi-decision");
             assert_eq!(entries[0].endpoint.path(), path);
             assert_eq!(entries[0].endpoint.origin(), catalog.base.origin());
