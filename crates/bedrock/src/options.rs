@@ -261,6 +261,32 @@ pub(crate) fn uses_flat_mapped_effort(model: &str, name: Option<&str>) -> bool {
     !has_any(&candidates(model, name), &["claude", "gpt-"])
 }
 
+pub(crate) fn validate_explicit_reasoning(
+    model: &str,
+    name: Option<&str>,
+    level: ReasoningLevel,
+    effort: Option<&str>,
+) -> Result<()> {
+    let items = candidates(model, name);
+    let claude = has_any(&items, &["claude"]);
+    let gpt = has_any(&items, &["gpt-"]);
+    let unsupported = if claude {
+        if level == ReasoningLevel::Off {
+            effort.is_some() || requires_thinking(model, name)
+        } else {
+            effort.is_some() && !has_any(&items, ADAPTIVE)
+        }
+    } else {
+        !gpt && level != ReasoningLevel::Off && effort.is_none()
+    };
+    if unsupported {
+        return Err(Error::Config(
+            "model cannot represent this Bedrock effort".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn reasoning_fields(
     model: &str,
     name: Option<&str>,

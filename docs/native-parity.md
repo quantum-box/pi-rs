@@ -877,6 +877,10 @@ independently of its extension and can replace a previous export. The
 destination is written atomically, and the active session file is protected
 from being replaced by its own export. The export uses the native renderer.
 
+Native SDK HTML export requires a host-selected destination and atomically
+creates a new file. Both the owned SDK session and shared journal exporters
+return `AlreadyExists` if the destination exists at publication.
+
 Cancelled model turns with streamed text remain visible in RPC `get_messages`
 after settlement and session reopen. Marked partials have stable entries in
 `get_entries` and `get_tree`; `edit_context` can replace or omit their displayed
@@ -1760,14 +1764,35 @@ factory supplies its exact credential. The import applies descriptive
 per-key `thinkingLevelMap` overrides. An explicit map exposes Pi's ordered
 selectable levels through `ModelCatalog::thinking_levels`. Null entries
 disable levels, extended levels require a mapping, and a non-reasoning model
-with a map exposes only `off`. Declarations without a map retain `None`.
-The factory still constructs a default client per granted route. Provider
-effort strings, configuration headers, provider compatibility and
-command-based keys stay under host control. Codex Responses declarations use
-the Codex transport.
+with a map exposes only `off`; binding rejects an explicit off string that cannot be sent. Declarations without a map retain `None`.
+The ordinary loader still constructs a default client per granted route.
+Hosts can opt into per-model wire settings through
+`ModelFileReadGrants::snapshot` and `ModelFileSnapshot::bind_thinking`.
+The snapshot retains exact routes and the resolved host or explicitly
+granted file credentials. Each binding clones the authorized adapter and
+uses only the selected model's effort map and the thinking-related
+compatibility fields. Headers and other transport options stay under host
+control. Codex Responses declarations use the Codex transport.
 The SDK defaults to SSE and uses a host-supplied OAuth access token on the
 exact `openai-codex` route. The typed client lets hosts select another Codex
 transport. ChatGPT plan clients use the separate `openai-responses` API.
+
+| Snapshot route | Effort handling |
+| --- | --- |
+| OpenAI-compatible Chat Completions | Sends the exact string through the native format. Standard chat omits unmapped `off`. OpenRouter and string-thinking default to `none`. Provider toggles and templates can only send custom labels when their format has an effort field or a template variable. Unknown formats and incompatible mappings return `UnsupportedMapping`. |
+| OpenAI Responses, Codex Responses, ChatGPT plan | Sends nested `reasoning.effort`. For `off`, the explicit string is literal and the default is `none`, without a reasoning summary. The GitHub Copilot off path omits the field and rejects an explicit off mapping. ChatGPT plan keeps its existing endpoint restriction. |
+| Anthropic Messages | Adaptive models declared with `compat.forceAdaptiveThinking` send `output_config.effort`. Budgeted thinking uses token budgets and rejects explicit active effort strings. An available unmapped `off` selects the native disable control; explicit off mappings are rejected. |
+| Google Gemini | Resolves case-insensitive known Google effort names through the adapter's discrete-level or budget control. An available unmapped `off` uses the native disable control; explicit off mappings are rejected. Active selections require a supported model family and an effort that the family supports. An active level cannot map to `off`. |
+| Bedrock Converse | Uses adaptive Claude `output_config.effort`, nested GPT `reasoning.effort`, or the explicit flat `reasoning_effort` field for GPT-OSS and other models that use a declared effort map. Budgeted Claude thinking rejects explicit effort labels. Models declared non-reasoning omit the reasoning fields. Bedrock file snapshots require a supported regional Runtime endpoint. |
+| Pi Messages | Upstream and native wire send the canonical Pi level in `options.reasoning` and omit it for `off`. A distinct active provider label and any explicit off mapping are rejected. Supporting such a label would require a negotiated Pi Messages wire field. |
+
+For other provider-specific formats, the next step is to add the missing
+adapter setting and test its payload before allowing a file binding to use it.
+For example, budget-only Anthropic models would need a typed budget policy
+rather than a string effort, and new Gemini discrete levels need matching
+model-family and wire-enum support. The file snapshot does not probe for
+capabilities or validate the provider's acceptance of opaque effort labels.
+[Pinned Pi API adapters](https://github.com/earendil-works/pi/tree/c863bdf19c4b18af6491935248972e763e10ef33/packages/ai/src/api)
 
 The native SDK supports `NativeModelApi::PiMessages` and `api: "pi-messages"`
 model declarations, including a host-authorized `radius` route. The SDK grant
@@ -4854,6 +4879,15 @@ IDs, respect slash boundaries, and retain all matches in catalog order.
 Model cycling leaves the current selection intact for lists with fewer than
 two choices. If the current model is outside the list, forward and backward
 cycling start from the first slot, as in Pi.
+
+The Rust SDK also supports standalone thinking changes on the active
+provider-qualified model. Hosts supply the ordered capabilities, clamp policy,
+and an explicitly identified client. An effective change journals the exact
+binding and emits only the thinking selection hook. Native journals preserve a
+binding ID so hosts can restore distinct clients for repeated selections at the
+same level. The SDK leaves global defaults to the host. Native RPC retains its
+host-managed capability and provider resolution.
+[Pinned Pi thinking-level implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2782-L2857)
 
 Scope diagnostics warn about unmatched patterns and invalid thinking suffixes.
 The resolver keeps valid candidates and falls back to normal model selection
