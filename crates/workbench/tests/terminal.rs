@@ -900,7 +900,7 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
                 break;
             }
         }
-        let body = r#"{"data":[{"id":"qwen2.5:7b"},{"id":"company/private-model"}]}"#;
+        let body = r#"{"data":[{"id":"qwen2.5:7b"},{"id":"company/private-model"},{"id":"company/private-model:high"}]}"#;
         write!(
             socket,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -940,6 +940,7 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
             .current_dir(root.path())
             .env("PI_RS_HOME", &home)
             .env("TERM", "xterm-256color")
+            .env("ANTHROPIC_API_KEY", "fixture-builtin-key")
             .env_remove("PI_RS_MODEL_TOKEN")
             .args([
                 "--offline",
@@ -966,12 +967,60 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
         text.contains("models.json error:") && text.contains("Enter to send")
     });
 
+    std::fs::write(
+        &models,
+        serde_json::json!({
+            "providers": {
+                "anthropic": {
+                    "baseUrl": "http://127.0.0.1:1",
+                    "apiKey": "fixture-key",
+                    "models": [
+                        {"id": "company/literal:high"},
+                        {"id": "inactive/stale-model"},
+                        {"id": "ollama/qwen2.5:7b"}
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
     master.write_all(b"/model qwen2.5:7b\r").unwrap();
     output_until(&mut master, |text| text.contains("Model: qwen2.5:7b"));
     server.join().unwrap();
+
+    master.write_all(b"/model inactive/stale-model\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Model: inactive/stale-model")
+    });
+    // The exact literal belongs to Anthropic even when Ollama is active.
+    master.write_all(b"/model ollama/qwen2.5:7b\r").unwrap();
+    output_until(&mut master, |text| text.contains("Model: qwen2.5:7b"));
+    master.write_all(b"/model COMPANY/LITERAL:HIGH\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Model: company/literal:high")
+    });
+    master.write_all(b"/model ollama/qwen2.5:7b\r").unwrap();
+    output_until(&mut master, |text| text.contains("Model: qwen2.5:7b"));
+
+    std::fs::write(&models, "{,}").unwrap();
+    master.write_all(b"/model inactive/stale-model\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains(r#"unknown model provider "inactive""#)
+    });
     master.write_all(b"/model company/private-model\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("Model: company/private-model")
+    });
+    master
+        .write_all(b"/model anthropic/claude-opus-4-6\r")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("Model: claude-opus-4-6"));
+    master
+        .write_all(b"/model company/private-model:high\r")
+        .unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Model: company/private-model:high")
     });
     master.write_all(b"/model company/private\r").unwrap();
     output_until(&mut master, |text| {
