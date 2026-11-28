@@ -441,6 +441,15 @@ impl AbandonedBranch {
     }
 }
 
+// A provider/model pair can be selected repeatedly with different clients.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CycledModelSelection {
+    pub id: Uuid,
+    pub provider: String,
+    pub model: String,
+    pub thinking: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -481,6 +490,15 @@ impl Record {
         chrono::DateTime::parse_from_rfc3339(self.timestamp.as_deref()?)
             .ok()
             .map(|timestamp| timestamp.timestamp_millis())
+    }
+
+    /// The recorded thinking level of a valid SDK model binding.
+    #[doc(hidden)]
+    pub fn sdk_model_binding_thinking<'a>(
+        &'a self,
+        metadata: &'a serde_json::Value,
+    ) -> Option<&'a str> {
+        Session::parse_sdk_model_binding(self, metadata).map(|(_, _, _, thinking)| thinking)
     }
 }
 
@@ -1944,17 +1962,122 @@ impl Session {
             .map(|(_, model, thinking)| (model, thinking))
     }
 
+    fn selection_history(&self, target: u64) -> impl Iterator<Item = &Record> {
+        std::iter::successors(
+            target
+                .checked_sub(1)
+                .and_then(|id| self.records.get(id as usize)),
+            |record| self.records.get(record.parent?.checked_sub(1)? as usize),
+        )
+    }
+
+    fn is_model_selection(record: &Record) -> bool {
+        matches!(
+            record.event,
+            Event::ModelSelected { .. }
+                | Event::BranchModelSelected { .. }
+                | Event::BranchSummary {
+                    fallback_model: Some(_),
+                    ..
+                }
+        )
+    }
+
+    pub(crate) fn cycled_model_at(&self, target: u64) -> Result<Option<CycledModelSelection>> {
+        for record in self.selection_history(target) {
+            let metadata = self.record_metadata(record.id).filter(|metadata| {
+                ["sdkCycleBinding", "sdkCycleThinking", "sdkThinkingOnly"]
+                    .iter()
+                    .any(|key| metadata.get(key).is_some())
+            });
+            if let Some(metadata) = metadata {
+                let (id, provider, model, thinking) =
+                    Self::parse_sdk_model_binding(record, metadata).ok_or_else(|| {
+                        Error::Session(format!("invalid SDK cycle binding at record {}", record.id))
+                    })?;
+                return Ok(Some(CycledModelSelection {
+                    id,
+                    provider: provider.to_owned(),
+                    model: model.to_owned(),
+                    thinking: thinking.to_owned(),
+                }));
+            }
+            if Self::is_model_selection(record) {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    fn parse_sdk_model_binding<'a>(
+        record: &'a Record,
+        metadata: &'a serde_json::Value,
+    ) -> Option<(Uuid, &'a str, &'a str, &'a str)> {
+        let id = Uuid::parse_str(metadata.get("sdkCycleBinding")?.as_str()?).ok()?;
+        let thinking = metadata.get("sdkCycleThinking")?.as_str()?;
+        if id.is_nil()
+            || thinking.trim().is_empty()
+            || metadata
+                .get("sdkThinkingOnly")
+                .is_some_and(|flag| flag.as_bool() != Some(true))
+        {
+            return None;
+        }
+        let (provider, model) = match &record.event {
+            Event::ModelSelected {
+                provider: Some(provider),
+                model,
+                thinking: Some(selected),
+            } if selected == thinking => (provider, model),
+            Event::BranchModelSelected {
+                provider, model, ..
+            } => (provider, model),
+            Event::BranchSummary {
+                fallback_model: Some(selection),
+                ..
+            } => (&selection.provider, &selection.model),
+            _ => return None,
+        };
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return None;
+        }
+        Some((id, provider, model, thinking))
+    }
+
+    pub(crate) fn select_cycled_model(&mut self, selection: &CycledModelSelection) -> Result<()> {
+        self.append_cycled_model_transition(
+            Event::ModelSelected {
+                provider: Some(selection.provider.clone()),
+                model: selection.model.clone(),
+                thinking: Some(selection.thinking.clone()),
+            },
+            selection,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn append_cycled_model_transition(
+        &mut self,
+        event: Event,
+        selection: &CycledModelSelection,
+    ) -> Result<&Record> {
+        self.append_inner_with_metadata(
+            event,
+            false,
+            Some(serde_json::json!({"sdkCycleBinding": selection.id, "sdkCycleThinking": selection.thinking})),
+            false,
+        )
+    }
+
     /// The provider belongs to the same selection record as the model. Older
     /// records and request-only histories have no reliable provider identity.
     pub(crate) fn model_identity_at(
         &self,
         target: u64,
     ) -> Option<(Option<String>, String, Option<String>)> {
-        let branch = self.path(target);
-        branch
-            .iter()
-            .rev()
-            .find_map(|record| match &record.event {
+        self.selection_history(target)
+            .find(|record| Self::is_model_selection(record))
+            .and_then(|record| match &record.event {
                 Event::ModelSelected {
                     model,
                     thinking,
@@ -1962,22 +2085,33 @@ impl Session {
                 } => Some((provider.clone(), model.clone(), thinking.clone())),
                 Event::BranchModelSelected {
                     provider, model, ..
-                } => Some((Some(provider.clone()), model.clone(), None)),
+                } => Some((
+                    Some(provider.clone()),
+                    model.clone(),
+                    self.record_metadata(record.id)
+                        .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
+                        .map(str::to_owned),
+                )),
                 Event::BranchSummary {
                     fallback_model: Some(selection),
                     ..
                 } => Some((
                     Some(selection.provider.clone()),
                     selection.model.clone(),
-                    None,
+                    self.record_metadata(record.id)
+                        .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
+                        .map(str::to_owned),
                 )),
                 _ => None,
             })
             .or_else(|| {
-                branch.iter().rev().find_map(|record| match &record.event {
-                    Event::ModelRequested { model, .. } => Some((None, model.clone(), None)),
-                    _ => None,
-                })
+                self.path(target)
+                    .into_iter()
+                    .rev()
+                    .find_map(|record| match &record.event {
+                        Event::ModelRequested { model, .. } => Some((None, model.clone(), None)),
+                        _ => None,
+                    })
             })
     }
 
@@ -2031,7 +2165,7 @@ impl Session {
         Ok(())
     }
 
-    /// Commit a native fallback in one record, even on an imported Pi head.
+    /// Commit a native model selection in one record, even on an imported Pi head.
     /// A distinct timestamp preserves the existing imported-conversion marker
     /// understood by older journal and RPC readers.
     pub(crate) fn select_provider_model_atomic(
@@ -2358,10 +2492,18 @@ impl Session {
 
     /// Find a callback-triggered run that has not started or was interrupted.
     pub fn pending_custom_trigger(&self) -> Option<Uuid> {
-        let branch = self.branch();
+        self.pending_custom_triggers(true).next()
+    }
+
+    fn pending_custom_triggers(&self, include_branch: bool) -> impl Iterator<Item = Uuid> + '_ {
+        let branch = if include_branch {
+            self.branch()
+        } else {
+            Vec::new()
+        };
         let branch_ids: std::collections::HashSet<_> =
             branch.iter().map(|record| record.id).collect();
-        self.records.iter().find_map(|record| {
+        self.records.iter().filter_map(move |record| {
             let (input, global) = match &record.event {
                 Event::CustomMessageQueued { input } if branch_ids.contains(&record.id) => (input, false),
                 Event::TreeMessageQueued { input } => (input, true),
@@ -2384,6 +2526,22 @@ impl Session {
         })
     }
 
+    fn tree_trigger_run_head(&self, run_id: Uuid) -> Option<u64> {
+        self.records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.run_id == Some(run_id) && !matches!(record.event, Event::Checkout { .. })
+            })
+            .map(|record| record.id)
+    }
+
+    /// Branches with recorded work that startup may resume in a tree handoff.
+    pub(crate) fn pending_tree_trigger_heads(&self) -> impl Iterator<Item = u64> + '_ {
+        self.pending_custom_triggers(false)
+            .filter_map(|id| self.tree_trigger_run_head(id))
+    }
+
     /// Restore the branch that owns an interrupted session-wide tree trigger.
     /// The current branch must be settled; the destination may contain the
     /// pending operation that recovery is about to reconcile.
@@ -2396,15 +2554,7 @@ impl Session {
         if !is_tree_trigger || self.pending_custom_trigger() != Some(run_id) {
             return Ok(None);
         }
-        let Some(target) = self
-            .records
-            .iter()
-            .rev()
-            .find(|record| {
-                record.run_id == Some(run_id) && !matches!(record.event, Event::Checkout { .. })
-            })
-            .map(|record| record.id)
-        else {
+        let Some(target) = self.tree_trigger_run_head(run_id) else {
             return Ok(None);
         };
         if self.head == target {
@@ -2444,7 +2594,7 @@ impl Session {
         }
     }
 
-    fn pending_tree_trigger_handoff(&self) -> Option<(u64, u64)> {
+    pub(crate) fn pending_tree_trigger_handoff(&self) -> Option<(u64, u64)> {
         self.records.iter().rev().find_map(|record| {
             let Event::TreeTriggerHandoff { return_to, .. } = record.event else {
                 return None;

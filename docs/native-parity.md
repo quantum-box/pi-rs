@@ -1795,12 +1795,13 @@ returns an exact client, a different provider/model client, or unavailable.
 For a fallback the SDK commits the chosen identity, clears the thinking level,
 and exposes both identities through `AgentSession::model_fallback`. The SDK
 rejects a fallback before committing if that provider/model already has a
-different client; an existing matching client must be the same `Arc`. A host
-revocation during the write prevents the entire staged client set from being
-installed, and conflicting in-flight registrations are rejected before the
-journal write.
-The durable selection can then exist without a client and requires a new
-authorized registration before dispatch. The SDK cannot verify an opaque
+different client. An existing matching client must be the same `Arc`. A
+revocation during startup resolution aborts construction before the journal
+records a replacement selection. A revocation during the write fails
+construction and blocks publication of the entire staged client set. A
+selection already written to disk requires a new authorized registration
+before dispatch. Conflicting in-flight registrations are rejected before the
+journal write. The SDK cannot verify an opaque
 client's endpoint; the host must enforce endpoint-bound
 credentials. Unqualified legacy selections never invoke the resolver, and
 existing exact registrations take precedence. The resolver runs on session
@@ -4260,6 +4261,11 @@ Legacy `custom` and `hookMessage` message records likewise retain their display
 metadata and enter model context without being rendered as user prompts.
 Imported message-form branch summaries use Pi's summary context framing while
 retaining their original RPC representation and branch reference.
+When checkout or a branch summary inherits a valid SDK-cycled selection,
+Workbench restores its recorded thinking level and emits it as a
+`thinking_level_change` entry in RPC history and Pi-format JSONL exports.
+Missing or malformed bindings use the branch default on restore and emit
+`off` in RPC history and Pi-format exports.
 Message-form compaction summaries are displayed as summaries and framed for
 model context without performing another compaction or removing earlier entries.
 

@@ -75,7 +75,12 @@ pub(super) fn branch_selection(
             | Event::BranchSummary {
                 fallback_model: Some(_),
                 ..
-            } => Some(None),
+            } => Some(
+                session
+                    .record_metadata(record.id)
+                    .and_then(|metadata| record.sdk_model_binding_thinking(metadata))
+                    .map(str::to_owned),
+            ),
             Event::SourceEntry { format, entry }
                 if format == "pi" && entry["type"] == "thinking_level_change" =>
             {
@@ -1213,10 +1218,15 @@ mod tests {
         assert!(changes.iter().any(|entry| entry["type"] == "model_change"));
         let mut cursor = super::super::rpc_entries::Cursor::default();
         cursor.set_verified_counts(&session.validated_pi_conversion_counts().unwrap());
-        cursor.advance(&session.records()[..(native - 1) as usize]);
+        cursor.advance(
+            &session.records()[..(native - 1) as usize],
+            Some(super::super::rpc_messages::MetadataSource::Session(
+                &session,
+            )),
+        );
         let live = cursor.appended(
             session.records(),
-            session.records().len() - 1,
+            native as usize - 1,
             None,
             &Default::default(),
         );
