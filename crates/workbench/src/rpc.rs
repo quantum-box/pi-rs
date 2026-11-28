@@ -1763,7 +1763,7 @@ fn command_cancellable(
                     let details = catalog
                         .details(std::slice::from_ref(&candidate), &current.model_profiles)
                         .await;
-                    let radius = catalog.client.discovered_radius_catalog().await;
+                    let radius = catalog.discovered_radius_catalog().await;
                     let metadata = radius
                         .as_ref()
                         .and_then(|radius| radius.metadata(&candidate));
@@ -2364,7 +2364,7 @@ fn available_models_at(
                 Default::default()
             };
             let radius = if include_details {
-                catalog.client.discovered_radius_catalog().await
+                catalog.discovered_radius_catalog().await
             } else {
                 None
             };

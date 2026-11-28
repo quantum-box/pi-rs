@@ -2127,6 +2127,31 @@ lookups and explicit resolution. Unfiltered and offline lists use the matching
 cached catalog when the current account can be identified without running a
 credential command.
 
+Codemode also accepts explicitly configured `pi-decision` classifiers with a
+provider or model `baseUrl`. This API posts the model and classifier context to
+`<baseUrl>/decision` and preserves typed answers, usage, and an optional response
+ID. Terminal HTTP errors include bounded diagnostics from the decision error
+envelope with echoed request credentials redacted. With cookies, non-Bearer
+authorization, or sensitive custom headers, diagnostics retain the HTTP status
+and recognized error codes. When a server requests a retry delay above the
+60-second cap, the terminal error includes the delay rejection and the same
+sanitized HTTP diagnostic.
+Cancellation covers credential loading and the HTTP operation.
+Provider-level `api: "pi-decision"` and profiles
+that only declare operations with a model-level `pi-decision` keep their defaults
+off bundled chat and the remaining bundled operations. A mixed profile with a
+provider-level `pi-decision` requires each chat model to declare a supported chat
+API and its own `baseUrl`. Without a provider discovery endpoint, the catalog
+lists model-scoped chat routes, including Azure, and omits bundled models with
+no route.
+Azure environment defaults apply to chat. The decision profile's
+credentials and headers stay on its operation routes.
+The legacy `pi-classifier` API and automatic Radius discovery keep their
+`/classify` route. Pi Decision uses the existing endpoint-bound credentials
+and headers, HTTP limits, and classifier retry policy. A built-in provider name
+supplies neither an implicit decision URL nor ambient credentials for it.
+[Pinned Pi Decision protocol](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/ai/src/api/pi-decision.ts#L16-L46)
+
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
 and the Decisions-specific 504 retry exclusion. Native image validation and
