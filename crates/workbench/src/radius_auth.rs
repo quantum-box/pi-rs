@@ -1643,7 +1643,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotating_refresh_holds_shared_store_lock_until_persisted() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1653,8 +1653,8 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut data = [0; 4096];
-            assert!(stream.read(&mut data).await.unwrap() > 0);
+            let form = read_refresh_form(&mut stream).await;
+            assert!(form.contains("refresh_token=old-refresh"));
             started_tx.send(()).unwrap();
             reply_rx.await.unwrap();
             let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;

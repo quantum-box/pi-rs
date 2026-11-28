@@ -3093,6 +3093,9 @@ impl Session {
                 continue;
             }
             if entry["type"] == "label" {
+                if verified_conversions.get(&record.id) == Some(&0) {
+                    continue;
+                }
                 let paired = branch.get(index + 1).is_some_and(|next| {
                     next.parent == Some(record.id) && next.timestamp == record.timestamp
                         && next.run_id.is_none()
@@ -3263,6 +3266,22 @@ impl Session {
                         }
                     }
                     if entry["type"] == "compaction"
+                        && let Some(source) = source_ids.get(&original_id)
+                        && let Some(count) = verified_conversions
+                            .get(&original_id)
+                            .filter(|&&count| count > 0)
+                        && matches!(
+                            &self.records[(original_id + count - 1) as usize].event,
+                            Event::Compacted {
+                                retain_from: None,
+                                ..
+                            }
+                        )
+                    {
+                        // A verified no-retention compaction is self-contained
+                        // in the fork even when its raw boundary was a sibling.
+                        entry["firstKeptEntryId"] = serde_json::json!(source);
+                    } else if entry["type"] == "compaction"
                         && let Some(old) = entry["firstKeptEntryId"].as_str()
                         && let Some(label_id) = source_labels.get(old)
                     {
