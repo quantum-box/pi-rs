@@ -2058,17 +2058,14 @@ impl View {
         format!("{label} {suffix}")
     }
 
-    fn draft_key_action<'a>(&'a self, keys: &'a Keys, key: KeyEvent) -> &'a str {
-        let default = keys
-            .action(
-                key,
-                self.editor.text.is_empty() && self.draft_images.is_empty(),
-            )
-            .unwrap_or("");
-        self.extension_chrome
-            .editor
-            .as_ref()
-            .map_or(default, |editor| editor.action(key, default))
+    fn draft_key_action<'a>(
+        keys: &'a Keys,
+        editor: Option<&'a crate::ui::editor::ExtensionEditor>,
+        empty: bool,
+        key: KeyEvent,
+    ) -> &'a str {
+        let default = keys.action(key, empty).unwrap_or("");
+        editor.map_or(default, |editor| editor.action(key, default))
     }
 
     fn border_status(
@@ -2091,7 +2088,14 @@ impl View {
             fullscreen,
             now,
             remaining,
-            keys.interrupt_binding(|key| self.draft_key_action(keys, key) == "app.interrupt"),
+            keys.interrupt_binding(|key| {
+                Self::draft_key_action(
+                    keys,
+                    self.extension_chrome.editor.as_ref(),
+                    self.editor.text.is_empty() && self.draft_images.is_empty(),
+                    key,
+                ) == "app.interrupt"
+            }),
         );
         format!("{working}{other}")
     }
@@ -8465,7 +8469,12 @@ pub(super) async fn run(
                 let action = if submit_completion {
                     "tui.input.submit"
                 } else {
-                    view.draft_key_action(&keys, key)
+                    View::draft_key_action(
+                        &keys,
+                        view.extension_chrome.editor.as_ref(),
+                        view.editor.text.is_empty() && view.draft_images.is_empty(),
+                        key,
+                    )
                 };
                 if action != "app.interrupt" || is_busy(&worker) {
                     last_idle_interrupt = None;
