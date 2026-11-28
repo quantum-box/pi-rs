@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 
 use pi_rs::{Error, Result, SessionBuilder};
 
+use crate::package_resources::PackageResourcePaths;
 use crate::prompt_resources::{
     ContextReadGrants, ContextResources, ExplicitPromptResourceFactory, PromptReadGrants,
     PromptResources,
@@ -41,6 +42,13 @@ pub struct ResourceSnapshot {
     pub themes: ThemeSnapshot,
 }
 
+/// A combined snapshot with executable paths for the host to review.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageResourceSnapshot {
+    pub resources: ResourceSnapshot,
+    pub extension_candidates: Vec<PathBuf>,
+}
+
 impl ResourceFactory {
     /// Read resources using the supplied grants. Run this off the UI thread.
     /// A read or validation error returns no snapshot. Skill diagnostics are
@@ -56,34 +64,39 @@ impl ResourceFactory {
         grants: &ResourceReadGrants,
         theme_directories: &[PathBuf],
     ) -> Result<ResourceSnapshot> {
-        if grants.context.directories.len() > 128 || grants.prompt_files.len() > 128 {
-            return Err(Error::Config(
-                "too many context directories or prompt files".into(),
-            ));
-        }
-        // The focused loaders have their own path contracts. Validate all paths
-        // here before any loader can enumerate a directory or open a file.
-        for path in grants
-            .prompts
-            .project
-            .iter()
-            .chain(grants.prompts.global.iter())
-            .chain(&grants.prompt_files)
-            .chain(&grants.context.directories)
-            .chain(&grants.skills.files)
-            .chain(&grants.skill_directories)
-            .chain(&grants.templates.files)
-            .chain(&grants.template_directories)
-            .chain(&grants.themes.files)
-            .chain(theme_directories)
-        {
-            if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
-                return Err(Error::Config(format!(
-                    "resource grant must be absolute without parent components: {}",
-                    path.display()
-                )));
-            }
-        }
+        validate_grants(grants, theme_directories)?;
+        self.load_paths(grants, theme_directories)
+    }
+
+    /// Add skill, template and theme files from explicitly granted local
+    /// package directories. Direct file grants are read first, followed by
+    /// package files and separately granted resource directories.
+    /// Package grants authorize reads and executable discovery by filename and
+    /// metadata. The host must separately authorize execution through the
+    /// native extension loader. See [`PackageResourcePaths::discover`].
+    pub fn load_with_packages(
+        &self,
+        grants: &ResourceReadGrants,
+        theme_directories: &[PathBuf],
+        package_directories: &[PathBuf],
+    ) -> Result<PackageResourceSnapshot> {
+        validate_grants(grants, theme_directories)?;
+        let package = PackageResourcePaths::discover(package_directories)?;
+        let mut grants = grants.clone();
+        append_package_paths(&mut grants.skills.files, package.skills);
+        append_package_paths(&mut grants.templates.files, package.prompts);
+        append_package_paths(&mut grants.themes.files, package.themes);
+        Ok(PackageResourceSnapshot {
+            resources: self.load_paths(&grants, theme_directories)?,
+            extension_candidates: package.extension_candidates,
+        })
+    }
+
+    fn load_paths(
+        &self,
+        grants: &ResourceReadGrants,
+        theme_directories: &[PathBuf],
+    ) -> Result<ResourceSnapshot> {
         Ok(ResourceSnapshot {
             prompts: self.prompts.load(&grants.prompts, &grants.prompt_files)?,
             context: grants.context.load()?,
@@ -95,6 +108,46 @@ impl ResourceFactory {
                 .load_with_directories(&grants.template_directories)?,
             themes: grants.themes.load_with_directories(theme_directories)?,
         })
+    }
+}
+
+fn validate_grants(grants: &ResourceReadGrants, theme_directories: &[PathBuf]) -> Result<()> {
+    if grants.context.directories.len() > 128 || grants.prompt_files.len() > 128 {
+        return Err(Error::Config(
+            "too many context directories or prompt files".into(),
+        ));
+    }
+    // The focused loaders have their own path contracts. Validate all paths
+    // here before any loader can enumerate a directory or open a file.
+    for path in grants
+        .prompts
+        .project
+        .iter()
+        .chain(grants.prompts.global.iter())
+        .chain(&grants.prompt_files)
+        .chain(&grants.context.directories)
+        .chain(&grants.skills.files)
+        .chain(&grants.skill_directories)
+        .chain(&grants.templates.files)
+        .chain(&grants.template_directories)
+        .chain(&grants.themes.files)
+        .chain(theme_directories)
+    {
+        if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+            return Err(Error::Config(format!(
+                "resource grant must be absolute without parent components: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn append_package_paths(grants: &mut Vec<PathBuf>, paths: Vec<PathBuf>) {
+    for path in paths {
+        if !grants.contains(&path) {
+            grants.push(path);
+        }
     }
 }
 

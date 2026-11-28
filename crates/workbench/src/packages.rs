@@ -1,4 +1,18 @@
 //! Native Rust package installation and resource discovery.
+use pi_rs_workbench::package_manifest::parse_manifest_object;
+use pi_rs_workbench::package_manifest::read_optional_manifest;
+#[cfg(all(test, unix))]
+use pi_rs_workbench::package_manifest::read_optional_manifest_after_probe;
+pub(crate) use pi_rs_workbench::package_manifest::validate_patterns;
+#[cfg(test)]
+use pi_rs_workbench::package_manifest::{
+    MAX_PACKAGE_MANIFEST_BYTES, read_optional_pi_package_json,
+};
+use pi_rs_workbench::package_manifest::{
+    extension_stem_matches, has_resource_fields, is_native_executable, local_startup_manifest,
+    manifest_pi, resource_patterns, select_resource_with, validate_resource_patterns,
+};
+use pi_rs_workbench::package_pattern::{ResourceMatcher, has_path_glob};
 use pi_rs_workbench::process_cleanup::{Children, owns_kill_target};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -635,7 +649,7 @@ fn collect_package_themes(root: &Path, pi: &Value) -> Result<Vec<PathBuf>> {
     // rules for directory scans must not hide a named manifest entry.
     for pattern in &patterns {
         let candidate = pattern.strip_prefix('+').unwrap_or(pattern);
-        if pattern.starts_with(['!', '-']) || candidate.contains(['*', '?', '[', '{']) {
+        if pattern.starts_with(['!', '-']) || has_path_glob(candidate) {
             continue;
         }
         let path = root.join(candidate.replace('\\', "/"));
@@ -668,189 +682,6 @@ fn collect_package_themes(root: &Path, pi: &Value) -> Result<Vec<PathBuf>> {
     let mut seen = std::collections::HashSet::new();
     themes.retain(|path| seen.insert(dunce::simplified(path).to_path_buf()));
     Ok(themes)
-}
-
-const MAX_PACKAGE_MANIFEST_BYTES: u64 = 1024 * 1024;
-
-// Open nonblocking before checking the opened descriptor, so a FIFO or device
-// substituted between path inspection and open cannot hang the startup UI.
-fn read_optional_manifest(root: &Path, name: &str) -> Result<Option<Vec<u8>>> {
-    read_optional_manifest_after_probe(root, name, || {})
-}
-
-fn read_optional_manifest_after_probe(
-    root: &Path,
-    name: &str,
-    after_probe: impl FnOnce(),
-) -> Result<Option<Vec<u8>>> {
-    let path = root.join(name);
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Error::Config(format!("{}: {error}", path.display()))),
-    }
-    after_probe();
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(&path)
-        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
-    if !metadata.is_file() {
-        return Err(Error::Config(format!(
-            "{} must be a regular file",
-            path.display()
-        )));
-    }
-    if metadata.len() > MAX_PACKAGE_MANIFEST_BYTES {
-        return Err(Error::Config(format!(
-            "{} exceeds the package manifest size limit",
-            path.display()
-        )));
-    }
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(
-        &mut std::io::Read::take(file, MAX_PACKAGE_MANIFEST_BYTES + 1),
-        &mut bytes,
-    )
-    .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
-    if bytes.len() as u64 > MAX_PACKAGE_MANIFEST_BYTES {
-        return Err(Error::Config(format!(
-            "{} exceeds the package manifest size limit",
-            path.display()
-        )));
-    }
-    Ok(Some(bytes))
-}
-
-// Mirror installation precedence without running Cargo or loading executables.
-fn local_startup_manifest(root: &Path) -> Result<(Value, bool)> {
-    let pi_bytes = read_optional_manifest(root, "pi-package.json")?;
-    let cargo_bytes = read_optional_manifest(root, "Cargo.toml")?;
-    let cargo_manifest = if let Some(bytes) = cargo_bytes {
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
-        let manifest: toml::Value = toml::from_str(text)
-            .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
-        let metadata = manifest
-            .get("package")
-            .and_then(|v| v.get("metadata"))
-            .and_then(|v| v.get("pi"));
-        if let Some(metadata) = metadata {
-            validate_pi(&serde_json::to_value(metadata)?)?;
-        }
-        Some(manifest)
-    } else {
-        None
-    };
-    // Validate a competing Pi package manifest even when a higher-priority
-    // native or Cargo manifest supplies the selected resources.
-    let package_manifest = read_optional_pi_package_json(root)?;
-    if let Some(bytes) = pi_bytes {
-        let manifest = parse_manifest_object(&root.join("pi-package.json"), &bytes, false)?;
-        manifest_pi(&manifest)?;
-        return Ok((manifest, false));
-    }
-    if let Some(metadata) = cargo_manifest.as_ref().and_then(|manifest| {
-        manifest
-            .get("package")
-            .and_then(|value| value.get("metadata"))
-            .and_then(|value| value.get("pi"))
-    }) {
-        let name = cargo_manifest
-            .as_ref()
-            .and_then(|manifest| manifest.get("package"))
-            .and_then(|package| package.get("name"));
-        return Ok((json!({"pi": metadata, "name": name}), false));
-    }
-    let pi_package = package_manifest.is_some();
-    Ok((package_manifest.unwrap_or_else(|| json!({})), pi_package))
-}
-
-// A present manifest is authoritative, including broken links or devices.
-fn read_optional_pi_package_json(root: &Path) -> Result<Option<Value>> {
-    read_optional_manifest(root, "package.json")?
-        .map(|bytes| parse_pi_package_json(&root.join("package.json"), &bytes))
-        .transpose()
-}
-
-fn parse_manifest_object(path: &Path, bytes: &[u8], strip_bom: bool) -> Result<Value> {
-    let input = if strip_bom {
-        bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes)
-    } else {
-        bytes
-    };
-    let value: Value = serde_json::from_slice(input)
-        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
-    if !value.is_object() {
-        return Err(Error::Config(format!(
-            "{} must contain an object",
-            path.display()
-        )));
-    }
-    Ok(value)
-}
-
-fn has_resource_fields(pi: &Value) -> bool {
-    ["extensions", "skills", "prompts", "themes"]
-        .iter()
-        .any(|name| pi.get(name).is_some())
-}
-
-fn resource_patterns(pi: &Value, name: &str) -> Result<Vec<String>> {
-    let patterns = pi
-        .get(name)
-        .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
-        .transpose()?
-        .unwrap_or_default();
-    validate_patterns(&patterns)?;
-    Ok(patterns)
-}
-
-fn validate_pi(pi: &Value) -> Result<()> {
-    if !pi.is_object() {
-        return Err(Error::Config("pi must contain an object".into()));
-    }
-    for name in ["extensions", "skills", "prompts", "themes"] {
-        resource_patterns(pi, name)?;
-    }
-    Ok(())
-}
-
-fn manifest_pi(manifest: &Value) -> Result<&Value> {
-    let pi = manifest.get("pi").unwrap_or(manifest);
-    validate_pi(pi)?;
-    Ok(pi)
-}
-
-// Pi packages describe resources in package.json's `pi` object. Never run
-// package scripts while reading it, and accept Pi's UTF-8 BOM handling.
-fn parse_pi_package_json(path: &Path, bytes: &[u8]) -> Result<Value> {
-    let value = parse_manifest_object(path, bytes, true)?;
-    let pi = value.get("pi");
-    if let Some(pi) = pi {
-        validate_pi(pi)?;
-    }
-    let explicit = pi.is_some_and(has_resource_fields);
-    let mut theme_only = if explicit {
-        json!({"extensions": [], "skills": [], "prompts": [],
-            "themes": pi.and_then(|pi| pi.get("themes")).cloned().unwrap_or_else(|| json!([]))})
-    } else {
-        json!({})
-    };
-    if let Some(path) = pi.and_then(|pi| pi["changelogPath"].as_str()) {
-        theme_only["changelogPath"] = json!(path);
-    }
-    // Treat an explicit Pi resource manifest as authoritative before scanning
-    // native executables; only theme entries are supported from this format.
-    Ok(json!({"pi": theme_only, "version": value.get("version"), "name": value.get("name")}))
 }
 
 struct ResourceFilter {
@@ -970,45 +801,6 @@ impl ResourceFilter {
     }
 }
 
-pub(crate) fn validate_patterns(patterns: &[String]) -> Result<()> {
-    validate_resource_patterns(patterns, false)
-}
-
-fn validate_resource_patterns(patterns: &[String], settings_filter: bool) -> Result<()> {
-    for pattern in patterns
-        .iter()
-        .filter(|pattern| !pattern.starts_with(['+', '-']))
-    {
-        let pattern = pattern
-            .strip_prefix('!')
-            .unwrap_or(pattern)
-            .replace('\\', "/");
-        if settings_filter && pattern.starts_with('#') {
-            continue;
-        }
-        let target = if settings_filter {
-            pattern.trim_start_matches('!')
-        } else {
-            &pattern
-        };
-        resource_glob(target, settings_filter).map_err(|error| {
-            Error::Config(format!("invalid resource pattern {pattern:?}: {error}"))
-        })?;
-    }
-    Ok(())
-}
-
-fn resource_glob(
-    pattern: &str,
-    allow_unclosed_class: bool,
-) -> std::result::Result<globset::Glob, globset::Error> {
-    globset::GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .backslash_escape(false)
-        .allow_unclosed_class(allow_unclosed_class)
-        .build()
-}
-
 pub(crate) fn selected(path: &Path, root: &Path, filters: &[String]) -> bool {
     select_resource(path, root, filters, false)
 }
@@ -1022,43 +814,9 @@ fn select_resource(path: &Path, root: &Path, filters: &[String], directory_roots
 }
 fn extension_selected(path: &Path, root: &Path, filters: &[String]) -> bool {
     select_resource_with(filters, |pattern, exact| {
-        resource_matches(path, root, pattern, exact, true)
-            || path.file_stem().is_some_and(|stem| stem == pattern)
+        resource_matches(path, root, pattern, exact, true) || extension_stem_matches(path, pattern)
     })
 }
-fn select_resource_with(filters: &[String], matches: impl Fn(&str, bool) -> bool) -> bool {
-    if filters.is_empty() {
-        return false;
-    }
-    let plain: Vec<_> = filters
-        .iter()
-        .filter(|filter| !filter.starts_with(['!', '+', '-']))
-        .collect();
-    let mut included = plain.is_empty() || plain.iter().any(|pattern| matches(pattern, false));
-    if filters
-        .iter()
-        .filter_map(|filter| filter.strip_prefix('!'))
-        .any(|pattern| matches(pattern, false))
-    {
-        included = false;
-    }
-    if filters
-        .iter()
-        .filter_map(|filter| filter.strip_prefix('+'))
-        .any(|pattern| matches(pattern, true))
-    {
-        included = true;
-    }
-    if filters
-        .iter()
-        .filter_map(|filter| filter.strip_prefix('-'))
-        .any(|pattern| matches(pattern, true))
-    {
-        included = false;
-    }
-    included
-}
-
 // Match Node's os.homedir(): the platform-specific environment variable takes
 // precedence even when empty; otherwise query the current account.
 fn filter_home_dir() -> Option<PathBuf> {
@@ -1145,8 +903,6 @@ pub(crate) fn resource_matches(
     exact: bool,
     directory_roots: bool,
 ) -> bool {
-    let path = dunce::simplified(path);
-    let root = dunce::simplified(root);
     let normalize = |path: &Path| path.to_string_lossy().replace('\\', "/");
     // Upstream removes one leading ./ or .\ from exact overrides before
     // expanding a tilde or converting a file URL.
@@ -1187,125 +943,7 @@ pub(crate) fn resource_matches(
         .as_deref()
         .map(normalize)
         .unwrap_or_else(|| pattern.replace('\\', "/"));
-    let (pattern, negated) = if !exact && !directory_roots {
-        if pattern.starts_with('#') {
-            return false;
-        }
-        let target = pattern.trim_start_matches('!');
-        (target, (pattern.len() - target.len()) % 2 == 1)
-    } else {
-        (pattern.as_str(), false)
-    };
-    let pattern = if exact {
-        pattern
-    } else {
-        pattern.trim_start_matches("./")
-    };
-    let mut candidates = vec![
-        normalize(path),
-        normalize(path.strip_prefix(root).unwrap_or(path)),
-    ];
-    if path.file_name().is_some_and(|name| name == "SKILL.md")
-        && let Some(parent) = path.parent()
-    {
-        candidates.push(normalize(parent));
-        candidates.push(normalize(parent.strip_prefix(root).unwrap_or(parent)));
-        if !exact && let Some(name) = parent.file_name() {
-            candidates.push(name.to_string_lossy().into_owned());
-        }
-    }
-    if exact {
-        return candidates.iter().any(|candidate| candidate == pattern);
-    }
-    if let Some(name) = path.file_name() {
-        candidates.push(name.to_string_lossy().into_owned());
-    }
-    let positive_extglob = package_diagnostic::extglob_regex(pattern).flatten();
-    let negative_extglob = if directory_roots {
-        None
-    } else {
-        package_diagnostic::negative_extglob_regex(pattern)
-    };
-    if positive_extglob.is_some() || negative_extglob.is_some() {
-        // The bounded translators match ASCII paths without hidden components.
-        // Keep using the native matcher for other paths or a backtracking error.
-        let mut matched = false;
-        candidates.retain(|candidate| {
-            if !candidate.is_ascii() || candidate.split('/').any(|part| part.starts_with('.')) {
-                return true;
-            }
-            let extglob_match = if let Some(regex) = &negative_extglob {
-                regex.is_match(candidate).ok()
-            } else {
-                positive_extglob
-                    .as_ref()
-                    .map(|regex| regex.is_match(candidate))
-            };
-            if let Some(extglob_match) = extglob_match {
-                matched |= extglob_match != negated;
-                false
-            } else {
-                true
-            }
-        });
-        if matched || candidates.is_empty() {
-            return matched;
-        }
-    }
-    let Ok(glob) = resource_glob(pattern, !directory_roots) else {
-        return false;
-    };
-    let matcher = glob.compile_matcher();
-    candidates.iter().any(|candidate| {
-        // Pi passes each spelling to minimatch separately, including when
-        // that glob is negated.
-        let matches = matcher.is_match(candidate)
-            && (directory_roots || matches_hidden_filter_segments(candidate, pattern));
-        (matches != negated)
-            || (directory_roots
-                && !pattern.contains(['*', '?', '[', '{'])
-                && candidate.starts_with(&format!("{pattern}/")))
-    })
-}
-
-// Minimatch requires a leading dot in the pattern segment that matches a
-// hidden component. A globstar can skip zero segments or consume visible ones.
-fn matches_hidden_filter_segments(candidate: &str, pattern: &str) -> bool {
-    if !candidate.split('/').any(|segment| segment.starts_with('.')) {
-        return true;
-    }
-    if pattern.contains('{') {
-        // Keep the existing glob match for brace combinations outside the
-        // bounded expansion. A leading dot can come from any alternative.
-        return package_diagnostic::expand_diagnostic_braces(pattern).is_none_or(|variants| {
-            variants
-                .iter()
-                .any(|variant| matches_hidden_filter_segments(candidate, variant))
-        });
-    }
-    let components: Vec<_> = candidate.split('/').collect();
-    let mut matched = vec![false; components.len() + 1];
-    matched[0] = true;
-    for segment in pattern.split('/') {
-        if segment == "**" {
-            for (index, component) in components.iter().enumerate() {
-                matched[index + 1] |= matched[index] && !component.starts_with('.');
-            }
-            continue;
-        }
-        let Ok(glob) = resource_glob(segment, true) else {
-            return false;
-        };
-        let matcher = glob.compile_matcher();
-        let allows_dot = segment.starts_with('.') || segment.starts_with("[.]");
-        for (index, component) in components.iter().enumerate().rev() {
-            matched[index + 1] = matched[index]
-                && (allows_dot || !component.starts_with('.'))
-                && matcher.is_match(component);
-        }
-        matched[0] = false;
-    }
-    matched[components.len()]
+    ResourceMatcher::new(&pattern, exact, directory_roots).matches(path, root)
 }
 
 fn source_field(value: &Value) -> Option<&str> {
@@ -2195,7 +1833,7 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
             .iter()
             .flat_map(|pattern| {
                 let pattern = pattern.replace('\\', "/");
-                if pattern.contains(['*', '?', '[', '{']) {
+                if has_path_glob(&pattern) {
                     if !pattern.trim_start_matches("./").contains('/') {
                         let mut legacy = legacy_prompt_candidates(root, None, true);
                         legacy.retain(|path| resource_matches(path, root, &pattern, false, true));
@@ -2622,21 +2260,11 @@ fn executable_files(path: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(path)? {
         let path = entry?.path();
-        if !path.is_file() {
-            continue;
-        }
-        #[cfg(unix)]
+        if let Ok(metadata) = path.metadata()
+            && is_native_executable(&path, &metadata)
         {
-            use std::os::unix::fs::PermissionsExt;
-            if path.metadata()?.permissions().mode() & 0o111 == 0 {
-                continue;
-            }
+            files.push(path);
         }
-        #[cfg(windows)]
-        if path.extension().is_none_or(|extension| extension != "exe") {
-            continue;
-        }
-        files.push(path);
     }
     Ok(files)
 }
@@ -4097,6 +3725,153 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
             &["extensions".into(), "-extensions/unexpected".into()]
         ));
     }
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn sdk_and_cli_agree_on_native_manifest_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let manifest = root.join("pi-package.json");
+        for relative in [
+            "extensions/helper.exe",
+            "extensions/runner.exe",
+            "extensions/skip.exe",
+            "tools/explicit.exe",
+            "skills/public/SKILL.md",
+            "skills/public-guide/SKILL.md",
+            "skills/public-guide/internal/SKILL.md",
+            "skills/private/SKILL.md",
+            "prompts/guide/example.md",
+            "prompts/guide/excluded.md",
+            "themes/nested/example.json",
+            "themes/other.json",
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+            #[cfg(unix)]
+            if relative.ends_with(".exe") {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        std::fs::create_dir(root.join("public")).unwrap();
+
+        for pi in [
+            json!({"extensions":["extensions/@(helper|runner).exe"], "skills":["public"]}),
+            json!({"extensions":["helper","tools/explicit.exe"], "skills":["skills/public-*"]}),
+            json!({"extensions":["!helper","+helper","-runner"], "skills":["skills","!public-*","+skills/public-guide","-skills/private"]}),
+            json!({"prompts":["example.md","!excluded.md"], "themes":["example.json"]}),
+            json!({"prompts":["prompts/guid*","!excluded.md"], "themes":["themes/**/*.json","!other.json"]}),
+            json!({"extensions":[],"skills":[],"prompts":[],"themes":[]}),
+        ] {
+            std::fs::write(&manifest, json!({"pi": &pi}).to_string()).unwrap();
+            let mut cli = collect_package_resources(root, &pi, Vec::new()).unwrap();
+            let sdk = pi_rs_workbench::package_resources::PackageResourcePaths::discover(&[
+                root.to_path_buf()
+            ])
+            .unwrap();
+            for (actual, expected) in [
+                (&mut cli.extensions, sdk.extension_candidates),
+                (&mut cli.skills, sdk.skills),
+                (&mut cli.prompts, sdk.prompts),
+                (&mut cli.themes, sdk.themes),
+            ] {
+                actual.sort();
+                assert_eq!(*actual, expected, "{pi}");
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_prompt_and_theme_extglob_sources_follow_native_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for relative in [
+            "@(one).md",
+            "prompts/one.md",
+            "prompts/two.md",
+            "prompts/@(one).md",
+            "prompts/+(one).md",
+            "themes/one.json",
+            "themes/two.json",
+            "themes/@(one).json",
+            "themes/+(one).json",
+            ".themes/@(fallback(inner)).json",
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+
+        for (kind, patterns, expected) in [
+            (
+                "prompts",
+                &["prompts/@(one).md"][..],
+                &["prompts/@(one).md"][..],
+            ),
+            ("prompts", &["prompts/@(one)*.md"], &["prompts/@(one).md"]),
+            ("prompts", &["@(one).md"], &["@(one).md", "prompts/one.md"]),
+            (
+                "prompts",
+                &[
+                    "prompts/one.md",
+                    "+prompts/@(one).md",
+                    "+prompts/+(one).md",
+                    "-prompts/@(one).md",
+                ],
+                &["prompts/+(one).md", "prompts/one.md"],
+            ),
+            (
+                "prompts",
+                &[
+                    "prompts",
+                    "!prompts/@(one).md",
+                    "+prompts/one.md",
+                    "-prompts/+(one).md",
+                ],
+                &["prompts/@(one).md", "prompts/one.md", "prompts/two.md"],
+            ),
+            ("themes", &["themes/@(one).json"], &["themes/one.json"]),
+            (
+                "themes",
+                &[".themes/@(fallback(inner)).json"],
+                &[".themes/@(fallback(inner)).json"],
+            ),
+            (
+                "themes",
+                &[
+                    "themes/one.json",
+                    "+themes/@(one).json",
+                    "+themes/+(one).json",
+                    "-themes/@(one).json",
+                ],
+                &["themes/+(one).json", "themes/one.json"],
+            ),
+            (
+                "themes",
+                &["themes", "!themes/@(one).json", "-themes/+(one).json"],
+                &["themes/@(one).json", "themes/two.json"],
+            ),
+        ] {
+            let pi = json!({(kind): patterns});
+            std::fs::write(root.join("pi-package.json"), json!({"pi": pi}).to_string()).unwrap();
+            let native = collect_package_resources(root, &pi, Vec::new()).unwrap();
+            let sdk = pi_rs_workbench::package_resources::PackageResourcePaths::discover(&[
+                root.to_path_buf()
+            ])
+            .unwrap();
+            let (mut native, sdk) = if kind == "prompts" {
+                (native.prompts, sdk.prompts)
+            } else {
+                (native.themes, sdk.themes)
+            };
+            native.sort();
+            let expected: Vec<_> = expected.iter().map(|path| root.join(path)).collect();
+            assert_eq!(native, expected, "native {pi}");
+            assert_eq!(sdk, expected, "SDK {pi}");
+        }
+    }
+
     #[test]
     fn absent_manifest_keeps_default_discovery_and_oversized_manifests_fail() {
         let directory = tempfile::tempdir().unwrap();

@@ -1,6 +1,7 @@
 //! Owned session API for embedding the agent in long-lived native applications.
+use crate::journal::CycledModelSelection;
 use crate::runtime::time as platform_time;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -108,6 +109,61 @@ pub struct SdkSessionStats {
     pub totals: crate::SessionStats,
     /// Active branch usage for the host-configured context window, if known.
     pub context_usage: Option<crate::ContextUsage>,
+}
+
+/// Direction in the host's ordered model list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModelCycleDirection {
+    #[default]
+    Forward,
+    Backward,
+}
+
+/// An exact, case-sensitive provider and model identity for model cycling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelCycleEntry<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    /// A per-model default in the available list, or an explicit override in the scope.
+    pub thinking: Option<&'a str>,
+}
+
+impl<'a> ModelCycleEntry<'a> {
+    fn identity(&self) -> (&'a str, &'a str) {
+        (self.provider, self.model)
+    }
+}
+
+/// The selected identity and effective thinking level committed to the session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelCycleResult {
+    pub provider: String,
+    pub model: String,
+    pub thinking: String,
+    pub is_scoped: bool,
+}
+
+struct ModelSelection {
+    client: Arc<dyn Model>,
+    provider: Option<String>,
+    name: String,
+    thinking: Option<String>,
+}
+
+fn next_cycle_index(
+    current: Option<usize>,
+    count: usize,
+    direction: ModelCycleDirection,
+) -> Option<usize> {
+    match (current, count, direction) {
+        (_, 0, _) | (Some(_), 1, _) => None,
+        (None, _, ModelCycleDirection::Forward) => Some(0),
+        (None, _, ModelCycleDirection::Backward) => Some(count - 1),
+        (Some(index), _, ModelCycleDirection::Forward) => Some((index + 1) % count),
+        (Some(index), _, ModelCycleDirection::Backward) => {
+            Some(index.checked_sub(1).unwrap_or(count - 1))
+        }
+    }
 }
 
 // Admission tickets serialize independent control operations without holding a
@@ -841,10 +897,16 @@ impl SessionControl {
                 .registry
                 .upgrade()
                 .ok_or_else(|| Error::Config("session is closed".into()))?;
-            let model = branch_client(&registry, journal.session_id(), provider.as_deref(), &name)
-                .ok_or_else(|| {
-                    Error::Config(format!("session branch requires registered model {name}"))
-                })?;
+            let model = selected_branch_client(
+                &registry,
+                &journal,
+                journal.head(),
+                provider.as_deref(),
+                &name,
+            )?
+            .ok_or_else(|| {
+                Error::Config(format!("session branch requires registered model {name}"))
+            })?;
             config.model = Arc::downgrade(&model);
             config.model_name = name;
         } else {
@@ -1222,6 +1284,30 @@ fn branch_client(
     }
 }
 
+fn selected_branch_client(
+    registry: &Registry,
+    journal: &Session,
+    target: u64,
+    provider: Option<&str>,
+    name: &str,
+) -> Result<Option<Arc<dyn Model>>> {
+    Ok(match journal.cycled_model_at(target)? {
+        Some(selection) => registry.cycled_model(journal.session_id(), &selection),
+        None => branch_client(registry, journal.session_id(), provider, name),
+    })
+}
+
+type CycledModelResolver = dyn Fn(&str, &str, &str) -> Result<Option<Arc<dyn Model>>> + Send + Sync;
+
+fn resolve_cycled_client(
+    resolver: Option<&CycledModelResolver>,
+    selection: &CycledModelSelection,
+) -> Result<Option<Arc<dyn Model>>> {
+    resolver.map_or(Ok(None), |resolve| {
+        resolve(&selection.provider, &selection.model, &selection.thinking)
+    })
+}
+
 /// A host-resolved client for a provider-qualified historical selection.
 /// The host must resolve the effective endpoint and credentials from trusted
 /// configuration; the SDK cannot inspect a model client's endpoint.
@@ -1291,6 +1377,7 @@ pub struct SessionBuilder {
     branch_models: std::collections::BTreeMap<String, Arc<dyn Model>>,
     provider_models: std::collections::BTreeMap<(String, String), Arc<dyn Model>>,
     historical_model_resolver: Option<Arc<dyn HistoricalModelResolver>>,
+    cycled_model_resolver: Option<Arc<CycledModelResolver>>,
 }
 impl SessionBuilder {
     pub fn new(model: Arc<dyn Model>, model_name: impl Into<String>) -> Self {
@@ -1305,6 +1392,7 @@ impl SessionBuilder {
             branch_models: Default::default(),
             provider_models: Default::default(),
             historical_model_resolver: None,
+            cycled_model_resolver: None,
         }
     }
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -1366,6 +1454,17 @@ impl SessionBuilder {
         self.historical_model_resolver = Some(resolver);
         self
     }
+    /// Resolve a previously cycled selection using its recorded effective
+    /// thinking level. Return a host-authorized client configured for that
+    /// exact level, or `None` if unavailable. This callback runs synchronously.
+    pub fn cycled_model_resolver(
+        mut self,
+        resolver: impl Fn(&str, &str, &str) -> Result<Option<Arc<dyn Model>>> + Send + Sync + 'static,
+    ) -> Self {
+        self.cycled_model_resolver = Some(Arc::new(resolver));
+        self
+    }
+
     pub fn open(self, path: impl AsRef<Path>) -> Result<AgentSession> {
         let path = std::path::absolute(path)?;
         let mut session = self.build(Session::open(&path)?)?;
@@ -1390,17 +1489,42 @@ impl SessionBuilder {
         if self.model_name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
         }
+        let reservation = self
+            .registry
+            .reserve_startup_model_bindings(session.session_id())?;
         // Session::open already recovers interrupted handoffs, but callers can
         // also supply a custom store whose temporary branch is still checked out.
         crate::extension_boundary::repair_plan_on_open(&mut session)?;
-        if self.historical_model_resolver.is_some() {
+        if self.historical_model_resolver.is_some() || self.cycled_model_resolver.is_some() {
             session.recover_tree_trigger_handoff()?;
         }
         // Resolve and commit any replacement before changing shared client
         // registrations, so resolver or journal failures cannot replace them.
         let mut resolved = None;
         let mut model_fallback = None;
-        if let Some(resolver) = &self.historical_model_resolver
+        let cycled = session.cycled_model_at(session.head())?;
+        let mut refreshed_cycles = Vec::new();
+        if let Some(resolve) = self.cycled_model_resolver.as_deref() {
+            // A new owner reauthorizes its selected binding and any distinct
+            // binding startup needs to resume an interrupted tree trigger.
+            let mut required_cycles = cycled.as_slice().to_vec();
+            for target in session.pending_tree_trigger_heads() {
+                if let Some(selection) = session.cycled_model_at(target)?
+                    && !required_cycles.contains(&selection)
+                {
+                    required_cycles.push(selection);
+                }
+            }
+            for selection in required_cycles {
+                if let Some(client) =
+                    resolve(&selection.provider, &selection.model, &selection.thinking)?
+                {
+                    refreshed_cycles.push((selection, client));
+                }
+            }
+        }
+        if cycled.is_none()
+            && let Some(resolver) = &self.historical_model_resolver
             && let Some((Some(provider), name, _)) = session.model_identity_at(session.head())
             && !(self.model_provider.as_deref() == Some(&provider) && self.model_name == name)
             && !self
@@ -1433,8 +1557,8 @@ impl SessionBuilder {
                 HistoricalModelResolution::Unavailable => {}
             }
         }
-        // Stage every builder binding and reserve the session before any write.
-        // The fallback identity must not replace a different opaque client.
+        // Stage every builder binding before publishing. The fallback
+        // identity must not replace a different opaque client.
         if let Some((provider, name, client)) = &resolved {
             let same_default = self.model_provider.as_deref() == Some(provider.as_str())
                 && self.model_name == *name;
@@ -1471,10 +1595,13 @@ impl SessionBuilder {
         // qualified choice before its first request, while leaving existing
         // historical selections (including unqualified ones) untouched.
         let initial_selection = session.model_identity_at(session.head()).is_none();
-        let (_, _revoked) = self.registry.commit_session_model_bindings(
-            session.session_id(),
+        self.registry.commit_session_model_bindings(
+            &reservation,
             bindings,
             guarded,
+            self.cycled_model_resolver
+                .is_some()
+                .then_some(refreshed_cycles.as_slice()),
             || {
                 if let (Some((provider, name, _)), Some(_)) = (&resolved, &model_fallback) {
                     session.select_provider_model_atomic(provider, name)?;
@@ -1484,6 +1611,7 @@ impl SessionBuilder {
                 Ok(())
             },
         )?;
+        drop(reservation);
         if let Some((provider, name, client)) = resolved {
             self.model = client;
             self.model_name = name;
@@ -1492,12 +1620,13 @@ impl SessionBuilder {
         // Registered historical models must be active even before startup
         // hooks run: synchronous checkout and fork can be called immediately.
         let model_identity_resolved = match session.model_identity_at(session.head()) {
-            Some((provider, name, _)) => match branch_client(
+            Some((provider, name, _)) => match selected_branch_client(
                 &self.registry,
-                session.session_id(),
+                &session,
+                session.head(),
                 provider.as_deref(),
                 &name,
-            ) {
+            )? {
                 Some(client) => {
                     self.model = client;
                     self.model_name = name;
@@ -1572,6 +1701,7 @@ impl SessionBuilder {
             session_file: None,
             model_fallback,
             historical_model_resolver: self.historical_model_resolver,
+            cycled_model_resolver: self.cycled_model_resolver,
         })
     }
 }
@@ -1598,10 +1728,17 @@ pub struct AgentSession {
     session_file: Option<PathBuf>,
     model_fallback: Option<HistoricalModelFallback>,
     historical_model_resolver: Option<Arc<dyn HistoricalModelResolver>>,
+    cycled_model_resolver: Option<Arc<CycledModelResolver>>,
 }
 
 #[derive(Clone)]
 enum BranchResolution {
+    Cycled {
+        selection: CycledModelSelection,
+        client: Arc<dyn Model>,
+        require_existing: bool,
+        inherited: bool,
+    },
     Registered,
     Legacy {
         model: String,
@@ -1636,8 +1773,45 @@ impl AgentSession {
     pub fn model_fallback(&self) -> Option<&HistoricalModelFallback> {
         self.model_fallback.as_ref()
     }
+    fn resolve_cycled_branch(
+        &self,
+        selection: CycledModelSelection,
+        inherited: bool,
+    ) -> Result<BranchResolution> {
+        let existing = self.registry.cycled_model(self.session_id, &selection);
+        let require_existing = existing.is_some();
+        let client = match existing {
+            Some(client) => Some(client),
+            None => resolve_cycled_client(self.cycled_model_resolver.as_deref(), &selection)?,
+        }
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "session branch requires a client for cycled model {}/{} at {}",
+                selection.provider, selection.model, selection.thinking,
+            ))
+        })?;
+        Ok(BranchResolution::Cycled {
+            selection,
+            client,
+            require_existing,
+            inherited,
+        })
+    }
+
     fn resolve_branch_model(&self, journal: &Session, target: u64) -> Result<BranchResolution> {
+        if let Some(selection) = journal.cycled_model_at(target)? {
+            return self.resolve_cycled_branch(selection, false);
+        }
         let Some((provider, name, _)) = journal.model_identity_at(target) else {
+            let selection = if journal.session_id() == self.session_id {
+                journal.cycled_model_at(journal.head())?
+            } else {
+                let source = self.journal()?;
+                source.cycled_model_at(source.head())?
+            };
+            if let Some(selection) = selection {
+                return self.resolve_cycled_branch(selection, true);
+            }
             let current = if journal.session_id() == self.session_id {
                 journal.model_identity_at(journal.head())
             } else {
@@ -1756,11 +1930,17 @@ impl AgentSession {
         )))
     }
 
-    fn restore_branch_model(&mut self, provider: Option<&str>, name: String) -> Result<()> {
+    fn restore_branch_model(
+        &mut self,
+        journal: &Session,
+        provider: Option<&str>,
+        name: String,
+    ) -> Result<()> {
         let model =
-            branch_client(&self.registry, self.session_id, provider, &name).ok_or_else(|| {
-                Error::Config(format!("session branch requires registered model {name}"))
-            })?;
+            selected_branch_client(&self.registry, journal, journal.head(), provider, &name)?
+                .ok_or_else(|| {
+                    Error::Config(format!("session branch requires registered model {name}"))
+                })?;
         self.model = model;
         self.model_name = name;
         self.model_provider = provider.map(str::to_owned);
@@ -1831,6 +2011,12 @@ impl AgentSession {
             session.conversation_at(session.head())
         }
     }
+    /// Text of the latest qualifying assistant reply on the active branch.
+    /// A normally completed reply with no text returns `None`. A busy journal
+    /// returns an error, as with [`Self::messages`].
+    pub fn get_last_assistant_text(&self) -> Result<Option<String>> {
+        Ok(self.journal()?.last_assistant_text())
+    }
     /// Usage and message counts across the complete durable session.
     pub fn statistics(&self) -> Result<crate::SessionStats> {
         Ok(self.journal()?.statistics())
@@ -1857,18 +2043,23 @@ impl AgentSession {
     /// Resolve the configured or provider-reported context window within the model timeout.
     pub async fn context_usage(&self) -> Result<Option<crate::ContextUsage>> {
         self.ensure_open()?;
-        let selection = {
+        let (name, model) = {
             let journal = self.session.lock().await;
-            journal.model_identity_at(journal.head())
-        };
-        let (name, model) = if let Some((provider, name, _)) = selection {
-            let model = branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
+            if let Some((provider, name, _)) = journal.model_identity_at(journal.head()) {
+                let model = selected_branch_client(
+                    &self.registry,
+                    &journal,
+                    journal.head(),
+                    provider.as_deref(),
+                    &name,
+                )?
                 .ok_or_else(|| {
                     Error::Config(format!("session branch requires registered model {name}"))
                 })?;
-            (name, model)
-        } else {
-            (self.model_name.clone(), self.model.clone())
+                (name, model)
+            } else {
+                (self.model_name.clone(), self.model.clone())
+            }
         };
         let window = match self.limits.context_window {
             Some(window) => Some(window),
@@ -1920,6 +2111,14 @@ impl AgentSession {
     pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
         self.registry.registered_tool_info()
     }
+
+    /// Look up a configured tool by its exact registered name, including inactive tools.
+    /// Like the full inventory, this describes the session's configured registry,
+    /// without per-request refreshes or authorization decisions.
+    pub fn registered_tool(&self, name: &str) -> Option<crate::RegisteredToolInfo> {
+        self.registry.registered_tool(name)
+    }
+
     /// Snapshot the configured tool renderer chain for host presentation.
     pub fn tool_renderers(&self) -> crate::ToolRendererRegistry {
         self.registry.tool_renderers()
@@ -2075,12 +2274,13 @@ impl AgentSession {
                 .is_none_or(|(provider, name, _)| {
                     provider.as_deref() == self.model_provider.as_deref() && name == self.model_name
                 });
-        let registered = branch_client(
+        let registered = selected_branch_client(
             &self.registry,
-            self.session_id,
+            &journal,
+            journal.head(),
             self.model_provider.as_deref(),
             &self.model_name,
-        )
+        )?
         .is_some_and(|client| Arc::ptr_eq(&client, &self.model));
         if !self.model_identity_resolved || !matches_selection || !registered {
             return Err(Error::Config(
@@ -2142,51 +2342,103 @@ impl AgentSession {
         provider: Option<&str>,
         name: String,
     ) -> Result<()> {
+        self.apply_model_selection(&ModelSelection {
+            client: model,
+            provider: provider.map(str::to_owned),
+            name,
+            thinking: None,
+        })
+    }
+
+    fn apply_model_selection(&mut self, selection: &ModelSelection) -> Result<()> {
         self.ensure_open()?;
-        if name.trim().is_empty() || provider.is_some_and(|provider| provider.trim().is_empty()) {
+        if selection.name.trim().is_empty()
+            || selection
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider.trim().is_empty())
+        {
             return Err(Error::Config("provider or model name is empty".into()));
         }
         let session = self.session.clone();
         let mut journal = session
             .try_lock()
             .map_err(|_| Error::Session("session journal is in use".into()))?;
+        self.commit_model_selection(&mut journal, selection)
+    }
+
+    fn commit_model_selection(
+        &mut self,
+        journal: &mut Session,
+        selection: &ModelSelection,
+    ) -> Result<()> {
+        let ModelSelection {
+            client,
+            provider,
+            name,
+            thinking,
+        } = selection;
+        let provider = provider.as_deref();
         let count = journal.records().len();
-        let replaces_selected_client =
-            journal.model_identity_at(journal.head()).is_some_and(
-                |(selected_provider, selected_name, _)| {
-                    selected_provider.as_deref() == provider && selected_name == name
-                },
-            ) && branch_client(&self.registry, self.session_id, provider, &name)
-                .is_some_and(|existing| !Arc::ptr_eq(&existing, &model));
-        if replaces_selected_client && let Some(provider) = provider {
-            journal.select_provider_model_atomic(provider, &name)?;
-        } else {
-            journal.select_provider_model(provider, &name, None)?;
-        }
-        if let Some(provider) = provider {
-            self.registry.register_session_provider_model(
+        let revoked = if let (Some(provider), Some(thinking)) = (provider, thinking) {
+            let exact = CycledModelSelection {
+                id: Uuid::new_v4(),
+                provider: provider.into(),
+                model: name.clone(),
+                thinking: thinking.clone(),
+            };
+            let (_, revoked) = self.registry.commit_cycled_model(
                 self.session_id,
-                provider,
-                &name,
-                model.clone(),
+                &exact,
+                client.clone(),
+                false,
+                || journal.select_cycled_model(&exact),
             )?;
+            revoked
         } else {
-            self.registry.register_session_branch_model(
-                self.session_id,
-                name.clone(),
-                model.clone(),
-            )?;
-        }
+            let replaces_selected_client =
+                journal.model_identity_at(journal.head()).is_some_and(
+                    |(selected_provider, selected_name, _)| {
+                        selected_provider.as_deref() == provider && selected_name == *name
+                    },
+                ) && branch_client(&self.registry, self.session_id, provider, name)
+                    .is_some_and(|existing| !Arc::ptr_eq(&existing, client));
+            if replaces_selected_client && let Some(provider) = provider {
+                journal.select_provider_model_atomic(provider, name)?;
+            } else {
+                journal.select_provider_model(provider, name, None)?;
+            }
+            if let Some(provider) = provider {
+                self.registry.register_session_provider_model(
+                    self.session_id,
+                    provider,
+                    name,
+                    client.clone(),
+                )?;
+            } else {
+                self.registry.register_session_branch_model(
+                    self.session_id,
+                    name.clone(),
+                    client.clone(),
+                )?;
+            }
+            false
+        };
         if count != journal.records().len()
             && let (Some(events), Some(record)) = (&self.events, journal.records().last())
         {
             emit(events, &Notification::Committed(record));
         }
-        self.model = model;
-        self.model_name = name;
+        self.model = client.clone();
+        self.model_name = name.clone();
         self.model_provider = provider.map(str::to_owned);
-        self.model_identity_resolved = true;
+        self.model_identity_resolved = !revoked;
         self.refresh_run_config();
+        if revoked {
+            return Err(Error::Config(
+                "model client was revoked during selection".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2211,14 +2463,130 @@ impl AgentSession {
             Some(_) => return Err(Error::Config("invalid model provider".into())),
             None => None,
         };
-        let (fallback_previous, startup_error, _) = self
-            .start_with_fallback(
-                Some((model.clone(), provider.clone(), name.clone())),
-                true,
-                false,
-                None,
+        self.select_model_with_hooks(
+            ModelSelection {
+                client: model,
+                provider,
+                name,
+                thinking: None,
+            },
+            descriptor,
+            previous_descriptor,
+            crate::ModelSelectSource::Set,
+        )
+        .await
+    }
+
+    /// Cycle through an ordered snapshot of models authorized by the host.
+    ///
+    /// A nonempty scope replaces the available order and is filtered using the
+    /// snapshot's exact provider and model identities. Duplicate identities keep
+    /// their first entry in each list. An absent current identity starts at the
+    /// first or last eligible entry, depending on direction. A no-op leaves the
+    /// session untouched and skips the binding callback and selection hooks.
+    ///
+    /// The host supplies a synchronous callback to bind the selected identity
+    /// and requested thinking level to an already authorized client. It returns
+    /// the client and its effective thinking level (after any capability clamp).
+    /// Requested levels prefer an explicit scope override, per-model default,
+    /// global default, then the current SDK level (implicitly `off`).
+    /// The SDK commits the model and effective level in a single session record
+    /// before selection hooks. As with [Self::set_model_with_hooks], an error
+    /// after commit can leave the new selection active. Application settings
+    /// and the scope remain host-owned.
+    pub async fn cycle_model(
+        &mut self,
+        direction: ModelCycleDirection,
+        available: &[ModelCycleEntry<'_>],
+        scoped: &[ModelCycleEntry<'_>],
+        default_thinking: Option<&str>,
+        bind: impl FnOnce(&str, &str, &str) -> Result<(Arc<dyn Model>, String)>,
+    ) -> Result<Option<ModelCycleResult>> {
+        self.ensure_open()?;
+        let ((current_provider, current_model, current_thinking), supports_metadata) = {
+            let journal = self.journal()?;
+            let head = journal
+                .pending_tree_trigger_handoff()
+                .map_or(journal.head(), |(_, return_to)| return_to);
+            (
+                journal.model_identity_at(head).unwrap_or_else(|| {
+                    (self.model_provider.clone(), self.model_name.clone(), None)
+                }),
+                journal.supports_record_metadata(),
             )
+        };
+        let is_scoped = !scoped.is_empty();
+        let authorized: HashSet<_> = available.iter().map(ModelCycleEntry::identity).collect();
+        let order = if is_scoped { scoped } else { available };
+        let mut seen = HashSet::new();
+        let eligible: Vec<_> = order
+            .iter()
+            .filter(|entry| authorized.contains(&entry.identity()) && seen.insert(entry.identity()))
+            .collect();
+        let current = eligible.iter().position(|entry| {
+            Some(entry.provider) == current_provider.as_deref() && entry.model == current_model
+        });
+        let Some(index) = next_cycle_index(current, eligible.len(), direction) else {
+            return Ok(None);
+        };
+        if !supports_metadata {
+            return Err(Error::Session(
+                "model cycling requires a store with record metadata".into(),
+            ));
+        }
+        let next = eligible[index];
+        if next.provider.trim().is_empty() || next.model.trim().is_empty() {
+            return Err(Error::Config("provider or model name is empty".into()));
+        }
+        let requested = next
+            .thinking
+            .or_else(|| {
+                available
+                    .iter()
+                    .find(|entry| entry.identity() == next.identity())
+                    .and_then(|entry| entry.thinking)
+            })
+            .or(default_thinking)
+            .or(current_thinking.as_deref())
+            .unwrap_or("off");
+        let (client, thinking) = bind(next.provider, next.model, requested)?;
+        if thinking.trim().is_empty() {
+            return Err(Error::Config("effective thinking level is empty".into()));
+        }
+        let result = ModelCycleResult {
+            provider: next.provider.into(),
+            model: next.model.into(),
+            thinking,
+            is_scoped,
+        };
+        self.select_model_with_hooks(
+            ModelSelection {
+                client,
+                provider: Some(result.provider.clone()),
+                name: result.model.clone(),
+                thinking: Some(result.thinking.clone()),
+            },
+            serde_json::json!({"provider": result.provider, "id": result.model}),
+            None,
+            crate::ModelSelectSource::Cycle,
+        )
+        .await?;
+        Ok(Some(result))
+    }
+
+    async fn select_model_with_hooks(
+        &mut self,
+        selection: ModelSelection,
+        descriptor: serde_json::Value,
+        previous_descriptor: Option<serde_json::Value>,
+        source: crate::ModelSelectSource,
+    ) -> Result<()> {
+        let (fallback_previous, startup_error, _) = self
+            .start_with_fallback(Some(&selection), true, false, None)
             .await?;
+        // A cycle that supplied the startup fallback has already committed
+        // both the model and the effective thinking level.
+        let needs_commit = fallback_previous.is_none() || selection.thinking.is_none();
         let (previous_provider, previous_name, previous_level) = match fallback_previous {
             Some(previous) => previous,
             None => {
@@ -2237,14 +2605,26 @@ impl AgentSession {
                 )
             }
         };
-        self.set_model_identity(model, provider.as_deref(), name.clone())?;
-        if previous_level != "off" {
+        if needs_commit {
+            self.apply_model_selection(&selection)?;
+        }
+        let level = selection.thinking.as_deref().unwrap_or("off");
+        if previous_level != level {
             self.notify_selection_event(crate::LifecycleEvent::ThinkingLevelSelect {
-                level: "off".into(),
+                level: level.into(),
                 previous_level,
             })
             .await?;
         }
+        let previous_descriptor = previous_descriptor.or_else(|| {
+            matches!(source, crate::ModelSelectSource::Cycle).then(|| {
+                let mut descriptor = serde_json::json!({"id": previous_name});
+                if let Some(provider) = &previous_provider {
+                    descriptor["provider"] = serde_json::json!(provider);
+                }
+                descriptor
+            })
+        });
         let descriptor_changed = previous_descriptor.as_ref().is_some_and(|previous| {
             previous
                 .get("provider")
@@ -2255,11 +2635,14 @@ impl AgentSession {
                     .zip(descriptor.get("id"))
                     .is_some_and(|(left, right)| left != right)
         });
-        if previous_name != name || previous_provider != provider || descriptor_changed {
+        if previous_name != selection.name
+            || previous_provider != selection.provider
+            || descriptor_changed
+        {
             self.notify_selection_event(crate::LifecycleEvent::ModelSelect {
                 model: descriptor,
                 previous_model: previous_descriptor,
-                source: crate::ModelSelectSource::Set,
+                source,
             })
             .await?;
         }
@@ -2406,6 +2789,37 @@ impl AgentSession {
                 .try_lock()
                 .map_err(|_| Error::Session("session journal is in use".into()))?;
             let revoked = match &resolution {
+                BranchResolution::Cycled {
+                    selection,
+                    client,
+                    require_existing,
+                    inherited,
+                } => {
+                    self.registry
+                        .commit_cycled_model(
+                            self.session_id,
+                            selection,
+                            client.clone(),
+                            *require_existing,
+                            || {
+                                if *inherited {
+                                    journal
+                                        .append_cycled_model_transition(
+                                            crate::Event::BranchModelSelected {
+                                                target: record,
+                                                provider: selection.provider.clone(),
+                                                model: selection.model.clone(),
+                                            },
+                                            selection,
+                                        )
+                                        .map(|_| ())
+                                } else {
+                                    journal.checkout(record)
+                                }
+                            },
+                        )?
+                        .1
+                }
                 BranchResolution::Legacy { model, client, .. } => {
                     self.registry
                         .commit_existing_legacy_model(
@@ -2484,7 +2898,20 @@ impl AgentSession {
             };
             (
                 revoked,
-                journal.model_identity_at(journal.head()),
+                journal
+                    .model_identity_at(journal.head())
+                    .map(|(provider, model, _)| {
+                        let client = selected_branch_client(
+                            &self.registry,
+                            &journal,
+                            journal.head(),
+                            provider.as_deref(),
+                            &model,
+                        )?;
+                        Ok::<_, Error>(client.map(|client| (provider, model, client)))
+                    })
+                    .transpose()?
+                    .flatten(),
                 journal.records().last().cloned().expect("checkout record"),
                 InputHooks::new(&self.registry, &journal),
             )
@@ -2503,7 +2930,8 @@ impl AgentSession {
             self.refresh_run_config();
         }
         match resolution {
-            BranchResolution::Legacy { .. }
+            BranchResolution::Cycled { .. }
+            | BranchResolution::Legacy { .. }
             | BranchResolution::Historical { .. }
             | BranchResolution::Inherited { .. }
             | BranchResolution::Existing { .. } => {
@@ -2526,11 +2954,7 @@ impl AgentSession {
             BranchResolution::Registered => self.model_fallback = None,
         }
         *self.control.input_hooks.lock().expect("SDK input hooks") = hooks;
-        if !revoked
-            && let Some((provider, model, _)) = selection
-            && let Some(client) =
-                branch_client(&self.registry, self.session_id, provider.as_deref(), &model)
-        {
+        if !revoked && let Some((provider, model, client)) = selection {
             self.model = client;
             self.model_name = model;
             self.model_provider = provider;
@@ -2605,6 +3029,21 @@ impl AgentSession {
         let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tree_resolution = match &resolution {
             BranchResolution::Registered => None,
+            BranchResolution::Cycled {
+                selection,
+                client,
+                require_existing,
+                inherited,
+            } => Some(crate::agent::TreeModelResolution {
+                provider: selection.provider.clone(),
+                model: selection.model.clone(),
+                client: client.clone(),
+                fallback: *inherited,
+                require_existing: *require_existing,
+                legacy: false,
+                cycle: Some(selection.clone()),
+                revoked: revoked.clone(),
+            }),
             BranchResolution::Legacy { model, client, .. } => {
                 Some(crate::agent::TreeModelResolution {
                     provider: String::new(),
@@ -2613,6 +3052,7 @@ impl AgentSession {
                     fallback: false,
                     require_existing: true,
                     legacy: true,
+                    cycle: None,
                     revoked: revoked.clone(),
                 })
             }
@@ -2627,6 +3067,7 @@ impl AgentSession {
                 fallback: false,
                 require_existing: true,
                 legacy: false,
+                cycle: None,
                 revoked: revoked.clone(),
             }),
             BranchResolution::Inherited {
@@ -2640,6 +3081,7 @@ impl AgentSession {
                 fallback: true,
                 require_existing: true,
                 legacy: false,
+                cycle: None,
                 revoked: revoked.clone(),
             }),
             BranchResolution::Historical {
@@ -2653,6 +3095,7 @@ impl AgentSession {
                 fallback: false,
                 require_existing: false,
                 legacy: false,
+                cycle: None,
                 revoked: revoked.clone(),
             }),
             BranchResolution::Fallback {
@@ -2667,6 +3110,7 @@ impl AgentSession {
                 fallback: true,
                 require_existing: false,
                 legacy: false,
+                cycle: None,
                 revoked: revoked.clone(),
             }),
         };
@@ -2698,7 +3142,7 @@ impl AgentSession {
             if !revoked.load(std::sync::atomic::Ordering::SeqCst)
                 && let Some((provider, model, _)) = journal.model_identity_at(journal.head())
             {
-                let restored = self.restore_branch_model(provider.as_deref(), model);
+                let restored = self.restore_branch_model(&journal, provider.as_deref(), model);
                 if result.is_ok() && restored.is_ok() {
                     result = restored;
                 } else if restored.is_err() {
@@ -2790,7 +3234,7 @@ impl AgentSession {
     // can trigger work, while retaining the old selection for notifications.
     async fn start_with_fallback(
         &mut self,
-        fallback: Option<(Arc<dyn Model>, Option<String>, String)>,
+        fallback: Option<&ModelSelection>,
         drain_triggers: bool,
         defer_startup: bool,
         correlated_preflight: Option<Uuid>,
@@ -2839,47 +3283,21 @@ impl AgentSession {
             selected.or_else(|| missing_legacy.then(|| (None, self.model_name.clone(), None)));
         if let Some((provider, name, level)) = current {
             if !missing_legacy
-                && branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
-                    .is_some()
+                && selected_branch_client(
+                    &self.registry,
+                    &journal,
+                    journal.head(),
+                    provider.as_deref(),
+                    &name,
+                )?
+                .is_some()
             {
-                self.restore_branch_model(provider.as_deref(), name)?;
-            } else if let Some((model, replacement_provider, replacement)) = fallback {
-                let before = journal.records().len();
-                journal.select_provider_model(
-                    replacement_provider.as_deref(),
-                    &replacement,
-                    None,
-                )?;
-                if let Some(provider) = &replacement_provider {
-                    self.registry.register_session_provider_model(
-                        self.session_id,
-                        provider,
-                        &replacement,
-                        model.clone(),
-                    )?;
-                } else {
-                    self.registry.register_session_branch_model(
-                        self.session_id,
-                        replacement.clone(),
-                        model.clone(),
-                    )?;
-                }
-                if journal.records().len() != before {
-                    emit(
-                        self.events.as_ref().expect("open session"),
-                        &Notification::Committed(
-                            journal.records().last().expect("model selection"),
-                        ),
-                    );
-                }
-                self.model = model;
-                self.model_name = replacement;
-                self.model_provider = replacement_provider;
-                self.model_identity_resolved = true;
-                self.refresh_run_config();
+                self.restore_branch_model(&journal, provider.as_deref(), name)?;
+            } else if let Some(selection) = fallback {
+                self.commit_model_selection(&mut journal, selection)?;
                 replaced = Some((provider, name, level.unwrap_or_else(|| "off".into())));
             } else if !missing_legacy {
-                self.restore_branch_model(provider.as_deref(), name)?;
+                self.restore_branch_model(&journal, provider.as_deref(), name)?;
             } else {
                 return Err(Error::Config(format!(
                     "session branch requires registered model {name}"
@@ -2938,9 +3356,21 @@ impl AgentSession {
             self.control.observe(&event);
             emit(&events, &event);
         };
+        let cycled = journal.cycled_model_at(journal.head())?;
+        let model = match &cycled {
+            Some(selection) => self
+                .registry
+                .cycled_model(self.session_id, selection)
+                .ok_or_else(|| {
+                    Error::Config("session branch requires its cycled model client".into())
+                })?,
+            None => self.model.clone(),
+        };
         let agent = Agent {
-            model: self.model.as_ref(),
-            model_name: &self.model_name,
+            model: model.as_ref(),
+            model_name: cycled
+                .as_ref()
+                .map_or(&self.model_name, |selection| &selection.model),
             registry: &self.registry,
             system_prompt: &self.system_prompt,
             limits: self.limits.clone(),
@@ -3090,6 +3520,30 @@ impl AgentSession {
     }
 
     fn fork_snapshot(&self, mut session: Session, resolution: BranchResolution) -> Result<Self> {
+        if let BranchResolution::Cycled {
+            selection,
+            client,
+            require_existing,
+            inherited,
+        } = &resolution
+        {
+            if *inherited {
+                session.select_cycled_model(selection)?;
+            }
+            let (fork, revoked) = self.registry.commit_cycled_model(
+                self.session_id,
+                selection,
+                client.clone(),
+                *require_existing,
+                || self.fork_session(session, resolution.clone()),
+            )?;
+            if revoked {
+                return Err(Error::Config(
+                    "cycled model client was revoked while preparing fork".into(),
+                ));
+            }
+            return Ok(fork);
+        }
         if let BranchResolution::Fallback {
             provider, model, ..
         } = &resolution
@@ -3243,7 +3697,8 @@ impl AgentSession {
         let selection = session.model_identity_at(session.head());
         let (provider, model_name, model) = if let Some((provider, name, _)) = selection {
             let model = match &resolution {
-                BranchResolution::Legacy { client, .. }
+                BranchResolution::Cycled { client, .. }
+                | BranchResolution::Legacy { client, .. }
                 | BranchResolution::Existing { client, .. }
                 | BranchResolution::Inherited { client, .. }
                 | BranchResolution::Historical { client, .. }
@@ -3308,6 +3763,23 @@ impl AgentSession {
         fork.registry = Arc::new(fork_registry);
         fork.extension_registration_scope = self.extension_registration_scope.clone();
         match resolution {
+            BranchResolution::Cycled {
+                selection, client, ..
+            } => {
+                let (_, revoked) = fork.registry.commit_cycled_model(
+                    fork.session_id,
+                    &selection,
+                    client,
+                    false,
+                    || Ok(()),
+                )?;
+                if revoked {
+                    return Err(Error::Config(
+                        "cycled model client was revoked while preparing fork".into(),
+                    ));
+                }
+                fork.model_identity_resolved = true;
+            }
             BranchResolution::Existing {
                 provider,
                 model,
@@ -3365,6 +3837,7 @@ impl AgentSession {
             BranchResolution::Legacy { .. } | BranchResolution::Registered => {}
         }
         fork.historical_model_resolver = self.historical_model_resolver.clone();
+        fork.cycled_model_resolver = self.cycled_model_resolver.clone();
         fork.refresh_run_config();
         *fork.pending_start.lock().expect("session startup") =
             Some((crate::SessionStartReason::Fork, self.session_file.clone()));
@@ -4857,6 +5330,961 @@ mod tests {
         assert!(
             matches!(&observed[1], crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Set } if model["id"] == "second" && previous["id"] == "first")
         );
+    }
+
+    fn cycle_entry<'a>(
+        provider: &'a str,
+        model: &'a str,
+        thinking: Option<&'a str>,
+    ) -> ModelCycleEntry<'a> {
+        ModelCycleEntry {
+            provider,
+            model,
+            thinking,
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_filters_scopes_and_commits_effective_level_before_hooks() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .extension(Arc::new(SelectionHook(observed.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let available = [
+            cycle_entry("b", "shared", Some("low")),
+            cycle_entry("unlisted", "shared", None),
+            cycle_entry("a", "shared", None),
+            cycle_entry("c", "other", None),
+        ];
+        let scope = [
+            cycle_entry("missing", "shared", None),
+            cycle_entry("c", "other", None),
+            cycle_entry("a", "shared", None),
+            cycle_entry("b", "shared", Some("xhigh")),
+            cycle_entry("b", "shared", Some("off")),
+        ];
+        let before = session.journal().unwrap().records().len();
+        let result = session
+            .cycle_model(
+                ModelCycleDirection::Forward,
+                &available,
+                &scope,
+                Some("medium"),
+                |provider, model, requested| {
+                    assert_eq!((provider, model, requested), ("b", "shared", "xhigh"));
+                    Ok((Arc::new(ProviderBranchModel("b")), "high".into()))
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            ModelCycleResult {
+                provider: "b".into(),
+                model: "shared".into(),
+                thinking: "high".into(),
+                is_scoped: true,
+            }
+        );
+        assert_eq!(session.model_provider().unwrap(), Some("b"));
+        {
+            let journal = session.journal().unwrap();
+            assert!(matches!(&journal.records()[before..], [record]
+                if matches!(&record.event, crate::Event::ModelSelected { provider: Some(provider), model, thinking: Some(level) }
+                    if provider == "b" && model == "shared" && level == "high")));
+        }
+        {
+            let hooks = observed.lock().unwrap();
+            assert!(matches!(hooks.as_slice(), [
+                crate::LifecycleEvent::ThinkingLevelSelect { level, previous_level },
+                crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Cycle },
+            ] if level == "high" && previous_level == "off"
+                && model["provider"] == "b" && previous["provider"] == "a"
+                && model["id"] == "shared" && previous["id"] == "shared"));
+        }
+        assert_eq!(session.prompt("which client?").await.unwrap(), "b");
+        for (direction, expected) in [
+            (ModelCycleDirection::Forward, "c"),
+            (ModelCycleDirection::Backward, "b"),
+            (ModelCycleDirection::Backward, "a"),
+            (ModelCycleDirection::Backward, "c"),
+        ] {
+            let result = session
+                .cycle_model(
+                    direction,
+                    &available,
+                    &scope,
+                    None,
+                    |provider, _, requested| {
+                        assert_eq!(provider, expected);
+                        Ok((Arc::new(WaitingModel), requested.into()))
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.provider, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_preserves_historical_clients_across_fork_checkout_and_reopen() {
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a-default")), "shared")
+            .provider("a")
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let available = [
+            cycle_entry("a", "shared", None),
+            cycle_entry("b", "shared", None),
+        ];
+        let mut high = 0;
+        for (provider, level, reply) in [
+            ("a", "high", "a-high"),
+            ("b", "off", "b-off"),
+            ("a", "low", "a-low"),
+        ] {
+            if level == "high" {
+                // Start from another provider so cycling chooses the first a binding.
+                session
+                    .set_provider_model(Arc::new(ProviderBranchModel("b-default")), "b", "shared")
+                    .unwrap();
+            }
+            let result = session
+                .cycle_model(
+                    ModelCycleDirection::Forward,
+                    &available,
+                    &[],
+                    Some(level),
+                    |actual_provider, id, requested| {
+                        assert_eq!(
+                            (actual_provider, id, requested),
+                            (provider, "shared", level)
+                        );
+                        Ok((Arc::new(ProviderBranchModel(reply)), requested.into()))
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.thinking, level);
+            if level == "high" {
+                high = session.journal().unwrap().head();
+            }
+        }
+        let low = session.journal().unwrap().head();
+        assert_eq!(session.prompt("current").await.unwrap(), "a-low");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fork.jsonl");
+        let mut fork = session.fork_to(high, &path).unwrap();
+        assert_eq!(fork.model_provider().unwrap(), Some("a"));
+        assert_eq!(
+            fork.journal().unwrap().model_selection(),
+            Some(("shared".into(), Some("high".into())))
+        );
+        assert_eq!(fork.prompt("fork").await.unwrap(), "a-high");
+        fork.close().await.unwrap();
+        drop(fork);
+
+        let mut unresolved =
+            SessionBuilder::new(Arc::new(ProviderBranchModel("a-wrong")), "shared")
+                .provider("a")
+                .unwrap()
+                .historical_model_resolver(Arc::new(|_: &str, _: &str| {
+                    panic!("identity-only resolver must not resolve a cycle binding")
+                }))
+                .open(&path)
+                .unwrap();
+        assert!(unresolved.model_provider().is_err());
+        let before = unresolved.journal().unwrap().records().len();
+        assert!(unresolved.prompt("unresolved").await.is_err());
+        assert_eq!(unresolved.journal().unwrap().records().len(), before);
+        drop(unresolved);
+
+        let mut reopened = SessionBuilder::new(Arc::new(ProviderBranchModel("a-wrong")), "shared")
+            .provider("a")
+            .unwrap()
+            .cycled_model_resolver(|provider, model, level| {
+                assert_eq!((provider, model, level), ("a", "shared", "high"));
+                Ok(Some(Arc::new(ProviderBranchModel("a-high-restored"))))
+            })
+            .open(&path)
+            .unwrap();
+        assert_eq!(reopened.model_provider().unwrap(), Some("a"));
+        assert_eq!(
+            reopened
+                .journal()
+                .unwrap()
+                .model_selection()
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            reopened.prompt("reopened").await.unwrap(),
+            "a-high-restored"
+        );
+        reopened
+            .set_provider_model(Arc::new(ProviderBranchModel("a-manual")), "a", "shared")
+            .unwrap();
+        assert_eq!(
+            reopened.journal().unwrap().model_selection().unwrap().1,
+            None
+        );
+        assert_eq!(reopened.prompt("manual setter").await.unwrap(), "a-manual");
+
+        session
+            .navigate_tree(
+                high,
+                crate::TreeNavigationOptions {
+                    summary: None,
+                    replace_instructions: false,
+                    label: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.prompt("tree").await.unwrap(), "a-high");
+        session.checkout(low).unwrap();
+        assert_eq!(session.prompt("latest selection").await.unwrap(), "a-low");
+        session.checkout(high).unwrap();
+        assert_eq!(session.model_provider().unwrap(), Some("a"));
+        assert_eq!(
+            session
+                .journal()
+                .unwrap()
+                .model_selection()
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(session.prompt("checked out").await.unwrap(), "a-high");
+        session.checkout(1).unwrap();
+        assert_eq!(
+            session
+                .journal()
+                .unwrap()
+                .model_selection()
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            session.prompt("inherited selection").await.unwrap(),
+            "a-high"
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_reopen_reauthorizes_bindings_in_a_reused_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let registry = Registry::default();
+        let builder = || {
+            SessionBuilder::new(Arc::new(ProviderBranchModel("generic")), "shared")
+                .provider("a")
+                .unwrap()
+                .registry(registry.clone())
+        };
+        let mut original = builder().open(&path).unwrap();
+        let available = [
+            cycle_entry("b", "shared", Some("high")),
+            cycle_entry("a", "shared", Some("low")),
+        ];
+        for _ in 0..2 {
+            original
+                .cycle_model(
+                    ModelCycleDirection::Forward,
+                    &available,
+                    &[],
+                    None,
+                    |_, _, level| Ok((Arc::new(ProviderBranchModel("stale")), level.into())),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let (session_id, current, historical, historical_target) = {
+            let journal = original.journal().unwrap();
+            let target = journal
+                .records()
+                .iter()
+                .find(|record| {
+                    journal
+                        .record_metadata(record.id)
+                        .is_some_and(|metadata| metadata["sdkCycleThinking"] == "high")
+                })
+                .unwrap()
+                .id;
+            (
+                journal.session_id(),
+                journal.cycled_model_at(journal.head()).unwrap().unwrap(),
+                journal.cycled_model_at(target).unwrap().unwrap(),
+                target,
+            )
+        };
+        original.close().await.unwrap();
+        drop(original);
+        // Seed stale host registrations explicitly. Closing a session may clear
+        // its clients before a new owner opens the same journal.
+        let seed_stale = |selections: &[&CycledModelSelection]| {
+            registry.remove_session_branch_models(session_id);
+            for selection in selections {
+                registry
+                    .commit_cycled_model(
+                        session_id,
+                        selection,
+                        Arc::new(ProviderBranchModel("stale")),
+                        false,
+                        || Ok(()),
+                    )
+                    .unwrap();
+            }
+        };
+        seed_stale(&[&current, &historical]);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let mut authorized = builder()
+            .cycled_model_resolver(move |provider, model, level| {
+                seen.lock().unwrap().push((
+                    provider.to_owned(),
+                    model.to_owned(),
+                    level.to_owned(),
+                ));
+                Ok(Some(Arc::new(ProviderBranchModel("authorized"))))
+            })
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [("a".into(), "shared".into(), "low".into())]
+        );
+        assert_eq!(authorized.prompt("current").await.unwrap(), "authorized");
+        let head = authorized.journal().unwrap().head();
+        let mut fork = authorized
+            .fork_to(head, directory.path().join("fork.jsonl"))
+            .unwrap();
+        assert_eq!(fork.prompt("fork").await.unwrap(), "authorized");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(registry.cycled_model(session_id, &historical).is_none());
+        authorized.checkout(historical_target).unwrap();
+        assert_eq!(
+            calls.lock().unwrap()[1],
+            ("b".into(), "shared".into(), "high".into())
+        );
+        assert_eq!(authorized.prompt("historical").await.unwrap(), "authorized");
+        authorized.close().await.unwrap();
+        drop(authorized);
+        seed_stale(&[&historical]);
+
+        let denied = Arc::new(AtomicUsize::new(0));
+        let observed = denied.clone();
+        let mut refused = builder()
+            .cycled_model_resolver(move |provider, model, level| {
+                assert_eq!((provider, model, level), ("b", "shared", "high"));
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            })
+            .open(&path)
+            .unwrap();
+        assert_eq!(denied.load(Ordering::SeqCst), 1);
+        assert!(registry.cycled_model(session_id, &historical).is_none());
+        assert!(refused.model_provider().is_err());
+        let before = refused.journal().unwrap().head();
+        assert!(refused.prompt("denied").await.is_err());
+        assert_eq!(refused.journal().unwrap().head(), before);
+    }
+
+    #[test]
+    fn sdk_model_cycle_reopen_honors_revocation_inside_resolver() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        let selection = CycledModelSelection {
+            id: Uuid::new_v4(),
+            provider: "provider".into(),
+            model: "shared".into(),
+            thinking: "high".into(),
+        };
+        journal.select_cycled_model(&selection).unwrap();
+        let session_id = journal.session_id();
+        drop(journal);
+
+        let registry = Registry::default();
+        let stale = Arc::new(ProviderBranchModel("stale"));
+        registry
+            .register_session_provider_model(session_id, "provider", "shared", stale.clone())
+            .unwrap();
+        registry
+            .commit_cycled_model(session_id, &selection, stale, false, || Ok(()))
+            .unwrap();
+        let resolver_registry = registry.clone();
+        let result = SessionBuilder::new(Arc::new(ProviderBranchModel("generic")), "shared")
+            .provider("provider")
+            .unwrap()
+            .registry(registry.clone())
+            .cycled_model_resolver(move |provider, model, level| {
+                assert_eq!((provider, model, level), ("provider", "shared", "high"));
+                resolver_registry.remove_session_branch_models(session_id);
+                assert!(
+                    resolver_registry
+                        .register_session_provider_model(
+                            session_id,
+                            provider,
+                            model,
+                            Arc::new(ProviderBranchModel("racing"))
+                        )
+                        .is_err()
+                );
+                Ok(Some(Arc::new(ProviderBranchModel(
+                    "authorized before revocation",
+                ))))
+            })
+            .open(&path);
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("revoked during open"))
+        );
+        assert!(
+            registry
+                .provider_branch_config(session_id, "provider", "shared")
+                .is_none()
+        );
+        assert!(registry.cycled_model(session_id, &selection).is_none());
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_reopen_authorizes_pending_tree_handoff_atomically() {
+        for outcome in [
+            "resolver error",
+            "refused",
+            "revoked before start",
+            "authorized",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            let mut journal = Session::open(&path).unwrap();
+            let origin = CycledModelSelection {
+                id: Uuid::new_v4(),
+                provider: "provider".into(),
+                model: "shared".into(),
+                thinking: "high".into(),
+            };
+            let selected = CycledModelSelection {
+                id: Uuid::new_v4(),
+                thinking: "low".into(),
+                ..origin.clone()
+            };
+            journal.select_cycled_model(&origin).unwrap();
+            let id = Uuid::new_v4();
+            let message = crate::CustomMessage {
+                custom_type: "tree-trigger".into(),
+                content: crate::ContextContent::Text("pending trigger".into()),
+                display: true,
+                details: None,
+            };
+            journal
+                .append(crate::Event::TreeMessageQueued {
+                    input: crate::QueuedCustomMessage {
+                        id,
+                        message: message.clone(),
+                        delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    },
+                })
+                .unwrap();
+            journal.set_run_id(Some(id));
+            journal
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: None,
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::CustomMessageDelivered { id, message })
+                .unwrap();
+            journal.set_run_id(None);
+            journal.checkout(1).unwrap();
+            journal.select_cycled_model(&selected).unwrap();
+            let return_to = journal.head();
+            journal.begin_tree_trigger_handoff(id).unwrap().unwrap();
+            let session_id = journal.session_id();
+            drop(journal);
+
+            let registry = Registry::default();
+            let stale: Arc<dyn Model> = Arc::new(ProviderBranchModel("stale"));
+            registry
+                .register_session_provider_model(session_id, "provider", "shared", stale.clone())
+                .unwrap();
+            for selection in [&selected, &origin] {
+                registry
+                    .commit_cycled_model(session_id, selection, stale.clone(), false, || Ok(()))
+                    .unwrap();
+            }
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let seen = calls.clone();
+            let reopened = SessionBuilder::new(Arc::new(ProviderBranchModel("generic")), "shared")
+                .provider("provider")
+                .unwrap()
+                .registry(registry.clone())
+                .cycled_model_resolver(move |provider, model, level| {
+                    assert_eq!((provider, model), ("provider", "shared"));
+                    seen.lock().unwrap().push(level.to_owned());
+                    match level {
+                        "low" => Ok(Some(Arc::new(ProviderBranchModel("selected authorized")))),
+                        "high" if outcome == "resolver error" => {
+                            Err(Error::Config("origin resolver failed".into()))
+                        }
+                        "high" if outcome == "refused" => Ok(None),
+                        "high" => Ok(Some(Arc::new(ProviderBranchModel("origin authorized")))),
+                        _ => panic!("unexpected thinking level {level}"),
+                    }
+                })
+                .open(&path);
+            assert_eq!(*calls.lock().unwrap(), ["low", "high"]);
+
+            if outcome == "resolver error" {
+                assert!(
+                    matches!(reopened, Err(Error::Config(message)) if message == "origin resolver failed")
+                );
+                let (named, _) = registry
+                    .provider_branch_config(session_id, "provider", "shared")
+                    .unwrap();
+                assert!(Arc::ptr_eq(&named, &stale));
+                for selection in [&selected, &origin] {
+                    assert!(Arc::ptr_eq(
+                        &registry.cycled_model(session_id, selection).unwrap(),
+                        &stale
+                    ));
+                }
+                continue;
+            }
+
+            let mut session = reopened.unwrap();
+            assert_eq!(session.journal().unwrap().head(), return_to);
+            if outcome == "revoked before start" {
+                let client = registry.cycled_model(session_id, &selected).unwrap();
+                registry.remove_session_branch_models(session_id);
+                registry
+                    .commit_cycled_model(session_id, &selected, client, false, || Ok(()))
+                    .unwrap();
+            }
+            let started = session.start().await;
+            if outcome != "authorized" {
+                assert_eq!(*calls.lock().unwrap(), ["low", "high"]);
+                assert!(started.is_err());
+                let journal = session.journal().unwrap();
+                assert_eq!(journal.head(), return_to);
+                assert_eq!(journal.pending_custom_trigger(), Some(id));
+                assert!(journal.pending_tree_trigger_handoff().is_none());
+                assert!(
+                    !journal
+                        .records()
+                        .iter()
+                        .any(|record| matches!(record.event, crate::Event::ModelRequested { .. }))
+                );
+                continue;
+            }
+
+            started.unwrap();
+            let answer = session.prompt("selected prompt").await.unwrap();
+            assert_eq!(answer, "selected authorized");
+            assert_eq!(*calls.lock().unwrap(), ["low", "high"]);
+            let journal = session.journal().unwrap();
+            assert!(journal.pending_custom_trigger().is_none());
+            assert!(journal.pending_tree_trigger_handoff().is_none());
+            assert!(
+                journal
+                    .path(journal.head())
+                    .iter()
+                    .any(|record| record.id == return_to)
+            );
+            assert!(journal.records().iter().any(|record| {
+                record.run_id == Some(id)
+                    && matches!(&record.event,
+                    crate::Event::Assistant { content, .. } if content == "origin authorized")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_reopen_rejects_invalid_markers_and_preserves_ordinary_history() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let binding = Uuid::new_v4();
+        for (index, metadata) in [
+            json!({"sdkCycleBinding": binding}),
+            json!({"sdkCycleThinking": "high"}),
+            json!({"sdkThinkingOnly": true}),
+            json!({"sdkCycleBinding": "broken", "sdkCycleThinking": "high"}),
+            json!({"sdkCycleBinding": Uuid::nil(), "sdkCycleThinking": "high"}),
+            json!({"sdkCycleBinding": binding, "sdkCycleThinking": null}),
+            json!({"sdkCycleBinding": binding, "sdkCycleThinking": " "}),
+            json!({"sdkCycleBinding": binding, "sdkCycleThinking": "low"}),
+            json!({"sdkCycleBinding": binding, "sdkCycleThinking": "high", "sdkThinkingOnly": "true"}),
+        ].into_iter().enumerate() {
+            let path = directory.path().join(format!("corrupt-{index}.jsonl"));
+            let mut journal = Session::open(&path).unwrap();
+            let invalid = journal.append_with_record_metadata(crate::Event::ModelSelected {
+                provider: Some("historical".into()),
+                model: "shared".into(),
+                thinking: Some("high".into()),
+            }, metadata).unwrap().id;
+            drop(journal);
+            let builder = || SessionBuilder::new(Arc::new(ProviderBranchModel("legacy")), "shared")
+                .historical_model_resolver(Arc::new(|_: &str, _: &str| panic!("legacy fallback")))
+                .cycled_model_resolver(|_, _, _| panic!("malformed binding reached resolver"));
+            let original = std::fs::read(&path).unwrap();
+            assert!(matches!(builder().open(&path), Err(Error::Session(message)) if message.contains("invalid SDK cycle binding")));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+
+            let mut journal = Session::open(&path).unwrap();
+            journal.append_with_record_metadata(crate::Event::ModelSelected {
+                provider: None,
+                model: "shared".into(),
+                thinking: Some("low".into()),
+            }, json!({"unrelatedHistory": true})).unwrap();
+            drop(journal);
+            let mut legacy = builder().open(&path).unwrap();
+            assert!(matches!(legacy.checkout(invalid), Err(Error::Session(message)) if message.contains("invalid SDK cycle binding")));
+            assert_eq!(legacy.model_provider().unwrap(), None);
+            assert_eq!(legacy.prompt("ordinary history").await.unwrap(), "legacy");
+        }
+
+        let path = directory.path().join("thinking-only.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        journal.append_with_record_metadata(crate::Event::ModelSelected {
+            provider: Some("historical".into()),
+            model: "shared".into(),
+            thinking: Some("high".into()),
+        }, json!({"sdkCycleBinding": binding, "sdkCycleThinking": "high", "sdkThinkingOnly": true})).unwrap();
+        drop(journal);
+        let mut reopened = SessionBuilder::new(Arc::new(ProviderBranchModel("generic")), "shared")
+            .cycled_model_resolver(|provider, model, level| {
+                assert_eq!((provider, model, level), ("historical", "shared", "high"));
+                Ok(Some(Arc::new(ProviderBranchModel("thinking-only"))))
+            })
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            reopened.prompt("thinking-only marker").await.unwrap(),
+            "thinking-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_available_order_and_absent_current() {
+        use ModelCycleDirection::{Backward, Forward};
+        let available = [
+            cycle_entry("z", "shared", None),
+            cycle_entry("a", "shared", None),
+        ];
+        for (current, order, direction, expected) in [
+            (Some("absent"), &available[..], Forward, "z"),
+            (None, &available[..], Backward, "a"),
+            (Some("a"), &available[..], Forward, "z"),
+            (Some("z"), &available[..], Backward, "a"),
+            (Some("a"), &available[..1], Forward, "z"),
+            (Some("z"), &available[1..], Backward, "a"),
+        ] {
+            let builder = SessionBuilder::new(Arc::new(WaitingModel), "shared");
+            let mut session = match current {
+                Some(provider) => builder.provider(provider).unwrap(),
+                None => builder,
+            }
+            .in_memory()
+            .unwrap();
+            let result = session
+                .cycle_model(direction, order, &[], None, |provider, id, level| {
+                    assert_eq!((provider, id, level), (expected, "shared", "off"));
+                    Ok((Arc::new(WaitingModel), level.into()))
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.provider, expected);
+            assert!(!result.is_scoped);
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_noops_have_no_side_effects() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .extension(Arc::new(ReplacementStartupHook(observed.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let before = session.journal().unwrap().records().len();
+        let available = [
+            cycle_entry("a", "shared", None),
+            cycle_entry("b", "other", None),
+        ];
+        let unavailable = [
+            cycle_entry("A", "shared", None),
+            cycle_entry("missing", "other", None),
+        ];
+        for (list, scope) in [
+            (&[][..], &[][..]),
+            (&available[..1], &[][..]),
+            (&available[..], &unavailable[..]),
+            (&available[..], &available[..1]),
+        ] {
+            for direction in [ModelCycleDirection::Forward, ModelCycleDirection::Backward] {
+                let result = session
+                    .cycle_model(direction, list, scope, None, |_, _, _| {
+                        panic!("no-op must not bind a client")
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(result, None);
+            }
+        }
+        assert_eq!(session.journal().unwrap().records().len(), before);
+        assert_eq!(session.model_provider().unwrap(), Some("a"));
+        assert!(observed.lock().unwrap().is_empty());
+        session.start().await.unwrap();
+        assert!(matches!(
+            observed.lock().unwrap().as_slice(),
+            [crate::LifecycleEvent::SessionStart { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_thinking_precedence() {
+        for (scoped, per_model, global, current, expected) in [
+            (
+                Some("minimal"),
+                Some("low"),
+                Some("medium"),
+                Some("high"),
+                "minimal",
+            ),
+            (None, Some("low"), Some("medium"), Some("high"), "low"),
+            (None, None, Some("medium"), Some("high"), "medium"),
+            (None, None, None, Some("high"), "high"),
+            (None, None, None, None, "off"),
+        ] {
+            let mut session = SessionBuilder::new(Arc::new(WaitingModel), "old")
+                .in_memory()
+                .unwrap();
+            session
+                .journal()
+                .unwrap()
+                .select_model("old", current)
+                .unwrap();
+            let scope = [cycle_entry("provider", "new", scoped)];
+            let available = [cycle_entry("provider", "new", per_model)];
+            let result = session
+                .cycle_model(
+                    ModelCycleDirection::Forward,
+                    &available,
+                    &scope,
+                    global,
+                    |_, _, level| {
+                        assert_eq!(level, expected);
+                        Ok((Arc::new(WaitingModel), level.into()))
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.thinking, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_recovers_missing_client_with_one_selection_before_startup() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", Some("high"))
+            .unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "default")
+            .extension(Arc::new(ReplacementStartupHook(observed.clone())))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let before = session.journal().unwrap().records().len();
+        assert!(session.model_provider().is_err());
+        let available = [cycle_entry("authorized", "shared", Some("low"))];
+        session
+            .cycle_model(
+                ModelCycleDirection::Forward,
+                &available,
+                &[],
+                None,
+                |_, _, level| Ok((Arc::new(ProviderBranchModel("authorized")), level.into())),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.model_provider().unwrap(), Some("authorized"));
+        let journal = session.journal().unwrap();
+        let records = &journal.records()[before..];
+        assert!(
+            matches!(&records[0].event, crate::Event::ModelSelected { provider: Some(provider), thinking: Some(level), .. }
+            if provider == "authorized" && level == "low")
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, crate::Event::ModelSelected { .. }))
+                .count(),
+            1
+        );
+        assert!(records.iter().any(|record| matches!(&record.event, crate::Event::ModelRequested { model, .. } if model == "shared")));
+        let hooks = observed.lock().unwrap();
+        assert!(matches!(hooks.as_slice(), [
+            crate::LifecycleEvent::SessionStart { .. },
+            crate::LifecycleEvent::ThinkingLevelSelect { previous_level, level },
+            crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Cycle },
+        ] if previous_level == "high" && level == "low"
+            && previous["provider"] == "historical" && model["provider"] == "authorized"));
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_uses_the_logical_selection_during_handoff_recovery() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("temporary"), "shared", None)
+            .unwrap();
+        let temporary = journal.head();
+        journal.checkout(1).unwrap();
+        journal
+            .select_provider_model(Some("selected"), "shared", Some("high"))
+            .unwrap();
+        let selected = journal.head();
+        journal
+            .append(crate::Event::TreeTriggerHandoff {
+                run_id: Uuid::new_v4(),
+                return_to: selected,
+            })
+            .unwrap();
+        journal.checkout(temporary).unwrap();
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "shared")
+            .provider("selected")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let order = [
+            cycle_entry("replacement", "shared", None),
+            cycle_entry("temporary", "shared", None),
+            cycle_entry("selected", "shared", None),
+        ];
+        assert!(
+            session
+                .cycle_model(
+                    ModelCycleDirection::Forward,
+                    &order[2..],
+                    &[],
+                    None,
+                    |_, _, _| panic!("the lone model is already logically selected"),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_tree_trigger_handoff()
+                .is_some()
+        );
+        let result = session
+            .cycle_model(
+                ModelCycleDirection::Forward,
+                &order,
+                &[],
+                None,
+                |provider, _, level| {
+                    assert_eq!((provider, level), ("replacement", "high"));
+                    Ok((Arc::new(WaitingModel), level.into()))
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.provider, "replacement");
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_tree_trigger_handoff()
+                .is_none()
+        );
+    }
+
+    struct FailedCycleStore(SeededStore);
+
+    impl crate::SessionStore for FailedCycleStore {
+        fn load(&mut self) -> Result<Vec<Record>> {
+            self.0.load()
+        }
+        fn append(&mut self, record: &Record) -> Result<()> {
+            self.0.append(record)
+        }
+        fn supports_record_metadata(&self) -> bool {
+            true
+        }
+        fn append_with_metadata(
+            &mut self,
+            record: &Record,
+            metadata: Option<&serde_json::Value>,
+        ) -> Result<()> {
+            assert!(metadata.is_some());
+            self.0.append(record)
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_model_cycle_failed_append_does_not_install_the_client_or_emit_hooks() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let journal = Session::with_store(FailedCycleStore(SeededStore {
+            records: Arc::new(Mutex::new(original.records().to_vec())),
+            writes: Arc::new(AtomicUsize::new(0)),
+            fail_on: 1,
+        }))
+        .unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("old")), "shared")
+            .provider("old")
+            .unwrap()
+            .extension(Arc::new(SelectionHook(observed.clone())))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let available = [cycle_entry("new", "shared", Some("low"))];
+        let error = session
+            .cycle_model(
+                ModelCycleDirection::Forward,
+                &available,
+                &[],
+                None,
+                |_, _, level| Ok((Arc::new(ProviderBranchModel("new")), level.into())),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("fixture append failure"));
+        assert_eq!(session.model_provider().unwrap(), Some("old"));
+        assert!(
+            branch_client(&session.registry, session.session_id, Some("new"), "shared").is_none()
+        );
+        assert!(observed.lock().unwrap().is_empty());
     }
 
     struct ReplacementStartupHook(Arc<Mutex<Vec<crate::LifecycleEvent>>>);
@@ -7748,43 +9176,90 @@ mod tests {
                     client: Arc::new(ProviderBranchModel("fallback")),
                 })
             });
-            let mut session =
-                SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
-                    .provider("current")
-                    .unwrap()
-                    .registry(registry)
-                    .historical_model_resolver(resolver)
-                    .build(journal)
-                    .unwrap();
-            assert_eq!(
-                session.journal().unwrap().model_provider(),
-                Some("fallback")
-            );
+            let id = journal.session_id();
+            let result = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+                .provider("current")
+                .unwrap()
+                .registry(registry.clone())
+                .historical_model_resolver(resolver)
+                .build(journal);
             if revoke {
                 assert!(
-                    branch_client(
-                        &session.registry,
-                        session.session_id,
-                        Some("current"),
-                        "shared"
-                    )
-                    .is_none()
+                    matches!(result, Err(Error::Config(message)) if message.contains("revoked during open"))
                 );
-                assert!(
-                    branch_client(
-                        &session.registry,
-                        session.session_id,
-                        Some("fallback"),
-                        "shared"
-                    )
-                    .is_none()
-                );
-                assert!(session.prompt("no dispatch").await.is_err());
+                for provider in ["current", "fallback"] {
+                    assert!(branch_client(&registry, id, Some(provider), "shared").is_none());
+                }
             } else {
+                let mut session = result.unwrap();
+                assert_eq!(
+                    session.journal().unwrap().model_provider(),
+                    Some("fallback")
+                );
                 assert_eq!(session.prompt("test").await.unwrap(), "fallback");
+                session.close().await.unwrap();
             }
-            session.close().await.unwrap();
         }
+    }
+
+    #[test]
+    fn startup_fallback_revoked_by_resolver_leaves_journal_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        journal
+            .select_provider_model(Some("old"), "shared", Some("high"))
+            .unwrap();
+        let id = journal.session_id();
+        drop(journal);
+        let before = std::fs::read(&path).unwrap();
+
+        let registry = Registry::default();
+        let client: Arc<dyn Model> = Arc::new(ProviderBranchModel("cached"));
+        let other_id = Uuid::new_v4();
+        let cycle = CycledModelSelection {
+            id: Uuid::new_v4(),
+            provider: "cached".into(),
+            model: "shared".into(),
+            thinking: "high".into(),
+        };
+        for session_id in [id, other_id] {
+            registry
+                .register_session_provider_model(session_id, "cached", "shared", client.clone())
+                .unwrap();
+            registry
+                .commit_cycled_model(session_id, &cycle, client.clone(), false, || Ok(()))
+                .unwrap();
+        }
+        let resolver_registry = registry.clone();
+        let result = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(Arc::new(move |provider: &str, model: &str| {
+                assert_eq!((provider, model), ("old", "shared"));
+                resolver_registry.remove_session_branch_models(id);
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "fallback".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("fallback")),
+                })
+            }))
+            .open(&path);
+
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("revoked during open"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        for provider in ["cached", "current", "fallback"] {
+            assert!(branch_client(&registry, id, Some(provider), "shared").is_none());
+        }
+        assert!(registry.cycled_model(id, &cycle).is_none());
+
+        let other_named = branch_client(&registry, other_id, Some("cached"), "shared").unwrap();
+        let other_cycle = registry.cycled_model(other_id, &cycle).unwrap();
+        assert!(Arc::ptr_eq(&other_named, &client));
+        assert!(Arc::ptr_eq(&other_cycle, &client));
     }
 
     #[test]
@@ -7815,8 +9290,9 @@ mod tests {
             .unwrap()
             .registry(registry.clone())
             .historical_model_resolver(resolver);
+        let reservation = registry.reserve_startup_model_bindings(id).unwrap();
         registry
-            .commit_session_model_bindings(id, vec![], None, || {
+            .commit_session_model_bindings(&reservation, vec![], None, None, || {
                 assert!(builder.build(journal).is_err());
                 Ok(())
             })
@@ -10558,6 +12034,341 @@ mod tests {
                     usage: None,
                 }),
             ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_last_assistant_text_treats_custom_finish_reason_without_calls_as_stop() {
+        struct CustomFinish;
+        #[async_trait::async_trait]
+        impl Model for CustomFinish {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("reply".into())),
+                    Ok(ModelEvent::Metadata(crate::ModelMetadata {
+                        finish_reason: Some("vendor-complete".into()),
+                        ..Default::default()
+                    })),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        let mut session = SessionBuilder::new(Arc::new(CustomFinish), "fixture")
+            .in_memory()
+            .unwrap();
+        session.prompt("older").await.unwrap();
+        session.prompt("newer").await.unwrap();
+        let mut journal = session.journal().unwrap();
+        let target = journal.current_message_entries().last().unwrap().0;
+        journal
+            .edit_context(target, Some(crate::ContextContent::Blocks(vec![])))
+            .unwrap();
+        drop(journal);
+        assert_eq!(session.get_last_assistant_text().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn sdk_last_assistant_text_tracks_edits_branches_and_compaction() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.get_last_assistant_text().unwrap(), None);
+        session.prompt("first").await.unwrap();
+        let first = session.journal().unwrap().head();
+        session.prompt("second").await.unwrap();
+        let second = session
+            .journal()
+            .unwrap()
+            .current_message_entries()
+            .last()
+            .unwrap()
+            .0;
+        let original = session.journal().unwrap().head();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("answer 2")
+        );
+
+        session
+            .journal()
+            .unwrap()
+            .edit_context(second, Some(crate::ContextContent::Blocks(vec![])))
+            .unwrap();
+        assert_eq!(session.get_last_assistant_text().unwrap(), None);
+        session
+            .journal()
+            .unwrap()
+            .edit_context(second, None)
+            .unwrap();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("answer 1")
+        );
+
+        session.checkout(first).unwrap();
+        session.prompt("sibling").await.unwrap();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("answer 3")
+        );
+        session.checkout(original).unwrap();
+        session
+            .journal()
+            .unwrap()
+            .edit_context(
+                second,
+                Some(crate::ContextContent::Text(
+                    "\u{feff}\u{00a0}\u{0085} revised\u{3000}".into(),
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("\u{0085} revised")
+        );
+
+        for (retain_from, expected) in [(Some(second), Some("\u{0085} revised")), (None, None)] {
+            session
+                .journal()
+                .unwrap()
+                .append(crate::Event::Compacted {
+                    summary: "summary".into(),
+                    system_prompt: None,
+                    retain_from,
+                    tokens_before: None,
+                    states: Default::default(),
+                    usage: None,
+                    usage_metadata: None,
+                })
+                .unwrap();
+            assert_eq!(
+                session.get_last_assistant_text().unwrap().as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_last_assistant_text_includes_failed_and_cancelled_turn_partials() {
+        struct PartialModel(AtomicUsize);
+        #[async_trait::async_trait]
+        impl Model for PartialModel {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                assert!(!request.messages.iter().any(|message| matches!(message,
+                    Message::Assistant { content, .. } if content.contains("partial"))));
+                let (text, error) = match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => ("failed partial", Error::Model("fixture failure".into())),
+                    1 => ("cancelled partial", Error::Cancelled),
+                    _ => ("\u{feff}\u{00a0}", Error::Model("fixture failure".into())),
+                };
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text(text.into())),
+                    Err(error),
+                ])))
+            }
+        }
+        let mut session =
+            SessionBuilder::new(Arc::new(PartialModel(AtomicUsize::new(0))), "fixture")
+                .in_memory()
+                .unwrap();
+        for (input, expected) in [
+            ("fail", "failed partial"),
+            ("cancel", "cancelled partial"),
+            ("blank failure", "cancelled partial"),
+        ] {
+            assert!(session.prompt(input).await.is_err());
+            assert_eq!(
+                session.get_last_assistant_text().unwrap().as_deref(),
+                Some(expected)
+            );
+            assert!(
+                session
+                    .messages()
+                    .unwrap()
+                    .iter()
+                    .all(|message| !matches!(message, Message::Assistant { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_last_assistant_text_omits_partial_only_when_retry_is_scheduled() {
+        struct RetryPartialModel {
+            calls: AtomicUsize,
+            terminal_text: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl Model for RetryPartialModel {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                assert!(request.messages.iter().all(|message| !matches!(message,
+                    Message::Assistant { content, .. } if content.contains("partial"))));
+                let events = match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => vec![
+                        Ok(ModelEvent::Text("previous answer".into())),
+                        Ok(ModelEvent::Complete {
+                            calls: vec![],
+                            usage: Some(crate::Usage {
+                                input_tokens: 83,
+                                output_tokens: 7,
+                            }),
+                        }),
+                    ],
+                    attempt => vec![
+                        Ok(ModelEvent::Text(
+                            if attempt == 1 {
+                                "first partial"
+                            } else {
+                                self.terminal_text
+                            }
+                            .into(),
+                        )),
+                        Err(Error::RetryableModel("fixture failure".into())),
+                    ],
+                };
+                Ok(Box::pin(futures_util::stream::iter(events)))
+            }
+        }
+
+        for (retry, cancel, terminal_text, expected) in [
+            (false, false, "", "first partial"),
+            (true, true, "", "previous answer"),
+            (true, false, "", "previous answer"),
+            (true, false, "terminal partial", "terminal partial"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("retry.jsonl");
+            let model = Arc::new(RetryPartialModel {
+                calls: AtomicUsize::new(0),
+                terminal_text,
+            });
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .open(&path)
+                .unwrap();
+            let controls = session.controls();
+            controls
+                .set_retry_settings(crate::RetrySettings {
+                    enabled: retry,
+                    max_retries: 1,
+                    base_delay_ms: if cancel { 60_000 } else { 0 },
+                    max_agent_delay_ms: 60_000,
+                })
+                .unwrap();
+            session
+                .journal()
+                .unwrap()
+                .append(crate::Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session.prompt("first question").await.unwrap();
+            let mut first_partial = None;
+            let mut omission_committed = false;
+            let error = session
+                .prompt_with_observer("second question", &mut |notification| match notification {
+                    crate::Notification::Committed(record) => match &record.event {
+                        crate::Event::ModelFinished {
+                            partial,
+                            failure: Some(crate::ModelFailure::Retryable),
+                            usage: crate::UsageReport::Unconfirmed,
+                            ..
+                        } if partial == "first partial" => first_partial = Some(record.id),
+                        crate::Event::SourceEntry { format, .. }
+                            if format == crate::journal::RETRY_SCHEDULED =>
+                        {
+                            omission_committed = true
+                        }
+                        _ => {}
+                    },
+                    crate::Notification::Retry(crate::RetryEvent::Start { .. }) => {
+                        assert!(omission_committed);
+                        if cancel {
+                            controls.abort_retry().unwrap();
+                        }
+                    }
+                    _ => {}
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(matches!(error, Error::Cancelled), cancel);
+            assert_eq!(omission_committed, retry);
+            assert_eq!(
+                model.calls.load(Ordering::SeqCst),
+                if retry && !cancel { 3 } else { 2 }
+            );
+            assert_eq!(
+                session.get_last_assistant_text().unwrap().as_deref(),
+                Some(expected)
+            );
+            drop(session);
+
+            let reopened = SessionBuilder::new(model, "fixture").open(&path).unwrap();
+            assert_eq!(
+                reopened.get_last_assistant_text().unwrap().as_deref(),
+                Some(expected)
+            );
+            let journal = reopened.journal().unwrap();
+            assert_eq!(journal.context_budget_estimate().usage_tokens, 90);
+            assert_eq!(journal.context_usage_estimate().usage_tokens, 90);
+            assert!(
+                !journal
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, crate::Event::ContextEdited { .. }))
+            );
+            let partial = &journal.records()[first_partial.unwrap() as usize - 1];
+            assert!(matches!(&partial.event,
+                crate::Event::ModelFinished { partial, usage: crate::UsageReport::Unconfirmed, .. }
+                    if partial == "first partial"));
+            assert!(
+                journal
+                    .current_messages()
+                    .iter()
+                    .all(|message| !matches!(message,
+                Message::Assistant { content, .. } if content.contains("partial")))
+            );
+            assert!(
+                journal
+                    .current_messages()
+                    .iter()
+                    .any(|message| matches!(message,
+                Message::Assistant { content, .. } if content.is_empty()))
+            );
+            if retry && cancel {
+                let mut records = journal.records().to_vec();
+                let marker = records.iter_mut().find(|record| matches!(&record.event,
+                    crate::Event::SourceEntry { format, .. } if format == crate::journal::RETRY_SCHEDULED)).unwrap();
+                marker.event = crate::Event::ContextEdited {
+                    target: partial.id,
+                    replacement: None,
+                };
+                let legacy = Session::from_records(records).unwrap();
+                assert_eq!(
+                    legacy.last_assistant_text().as_deref(),
+                    Some("previous answer")
+                );
+                assert_eq!(
+                    legacy.context_budget_estimate(),
+                    journal.context_budget_estimate()
+                );
+                assert_eq!(
+                    legacy.context_usage_estimate(),
+                    journal.context_usage_estimate()
+                );
+                assert_eq!(legacy.current_messages(), journal.current_messages());
+
+                let mut before_retry = Session::from_records(journal.records().to_vec()).unwrap();
+                before_retry.checkout(partial.id).unwrap();
+                assert_eq!(
+                    before_retry.last_assistant_text().as_deref(),
+                    Some("first partial")
+                );
+            }
         }
     }
 
