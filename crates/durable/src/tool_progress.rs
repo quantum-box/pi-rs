@@ -209,7 +209,10 @@ fn encode_completed(partial: &Option<Value>) -> Result<Vec<u8>, Error> {
     Ok(bytes)
 }
 
-use pi_rs_core::{ExtensionResult, Outcome, ToolHost, ToolSpec, UiRequest, UiResponse};
+use pi_rs_core::{
+    CancellationToken, CustomEntry, CustomEntryRecord, CustomMessage, CustomMessageDelivery,
+    ExtensionResult, Outcome, ToolHost, ToolSpec, UiRequest, UiResponse,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -222,8 +225,8 @@ pub trait Sink: Send + Sync {
     async fn update(&self, partial: Value) -> ExtensionResult<()>;
 }
 
-/// Invocation-scoped forwarding host. Dropping the scope stops new callbacks;
-/// a callback already in flight must be fenced by the host's atomic store checks.
+/// Invocation-scoped progress reporting. Dropping the scope stops new reports.
+/// An in-flight report must be fenced by the host's atomic store checks.
 pub struct Scope {
     open: Arc<AtomicBool>,
 }
@@ -253,6 +256,9 @@ pub fn scoped_host(inner: Arc<dyn ToolHost>, sink: Arc<dyn Sink>) -> (Arc<dyn To
 }
 #[async_trait::async_trait]
 impl ToolHost for ProgressHost {
+    fn callback_scope_owner(&self) -> Option<Uuid> {
+        self.inner.callback_scope_owner()
+    }
     fn tools(&self) -> Vec<ToolSpec> {
         self.inner.tools()
     }
@@ -272,18 +278,87 @@ impl ToolHost for ProgressHost {
     async fn ui(&self, request: UiRequest) -> ExtensionResult<UiResponse> {
         self.inner.ui(request).await
     }
+    fn supports_custom_messages(&self) -> bool {
+        self.inner.supports_custom_messages()
+    }
+    async fn send_message(
+        &self,
+        message: CustomMessage,
+        delivery: CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        self.inner.send_message(message, delivery).await
+    }
+    fn supports_custom_entries(&self) -> bool {
+        self.inner.supports_custom_entries()
+    }
+    fn close_custom_entry_scope(&self) {
+        self.inner.close_custom_entry_scope();
+    }
+    async fn append_entry(&self, entry: CustomEntry) -> ExtensionResult<()> {
+        self.inner.append_entry(entry).await
+    }
+    fn supports_custom_entry_read(&self) -> bool {
+        self.inner.supports_custom_entry_read()
+    }
+    async fn custom_entries(
+        &self,
+        custom_type: Option<&str>,
+    ) -> ExtensionResult<Vec<CustomEntryRecord>> {
+        self.inner.custom_entries(custom_type).await
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        self.inner.supports_keyed_messages()
+    }
+    async fn send_message_with_key(
+        &self,
+        message: CustomMessage,
+        delivery: CustomMessageDelivery,
+        key: &str,
+    ) -> ExtensionResult<()> {
+        self.inner
+            .send_message_with_key(message, delivery, key)
+            .await
+    }
+    fn for_extension(&self, extension_id: &str) -> Option<Arc<dyn ToolHost>> {
+        self.inner.for_extension(extension_id).map(|inner| {
+            Arc::new(Self {
+                inner,
+                sink: self.sink.clone(),
+                open: self.open.clone(),
+            }) as Arc<dyn ToolHost>
+        })
+    }
     async fn call(&self, name: &str, arguments: Value) -> Outcome {
         self.inner.call(name, arguments).await
     }
+    fn cancellation_safe_calls(&self) -> bool {
+        self.inner.cancellation_safe_calls()
+    }
+    async fn call_with_cancellation(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Outcome {
+        self.inner
+            .call_with_cancellation(name, arguments, cancellation)
+            .await
+    }
     async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
         self.inner.call_batch(calls).await
+    }
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        self.inner.supports_prevalidated_call_accounting()
+    }
+    async fn call_batch_prevalidated(&self, calls: Vec<(String, Option<Value>)>) -> Vec<Outcome> {
+        self.inner.call_batch_prevalidated(calls).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_rs_core::{CancellationToken, Tool, ToolContext};
+    use pi_rs_core::{Tool, ToolContext};
     use serde_json::json;
     use std::time::Duration;
 
@@ -296,6 +371,119 @@ mod tests {
         async fn call(&self, _: &str, _: Value) -> Outcome {
             Outcome::Skipped("unused".into())
         }
+    }
+    struct ExtensionHost {
+        closed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolHost for ExtensionHost {
+        fn callback_scope_owner(&self) -> Option<Uuid> {
+            Some(Uuid::from_u128(7))
+        }
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![]
+        }
+        fn for_extension(&self, extension: &str) -> Option<Arc<dyn ToolHost>> {
+            (extension == "example").then(|| {
+                Arc::new(Self {
+                    closed: self.closed.clone(),
+                }) as Arc<dyn ToolHost>
+            })
+        }
+        fn supports_custom_entries(&self) -> bool {
+            !self.closed.load(Ordering::Acquire)
+        }
+        fn close_custom_entry_scope(&self) {
+            self.closed.store(true, Ordering::Release);
+        }
+        async fn call(&self, _: &str, _: Value) -> Outcome {
+            panic!("wrapped cancellation-aware calls must reach the matching host method")
+        }
+        async fn call_with_cancellation(
+            &self,
+            name: &str,
+            _: Value,
+            cancellation: CancellationToken,
+        ) -> Outcome {
+            assert!(cancellation.is_cancelled());
+            Outcome::Skipped(name.into())
+        }
+        fn supports_prevalidated_call_accounting(&self) -> bool {
+            true
+        }
+        async fn call_batch_prevalidated(
+            &self,
+            calls: Vec<(String, Option<Value>)>,
+        ) -> Vec<Outcome> {
+            calls
+                .into_iter()
+                .map(|(name, arguments)| {
+                    if arguments.is_some() {
+                        Outcome::Succeeded(name)
+                    } else {
+                        Outcome::Skipped(name)
+                    }
+                })
+                .collect()
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingSink(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl Sink for CountingSink {
+        async fn update(&self, _: Value) -> ExtensionResult<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_wrapper_preserves_host_capabilities_and_extension_scope() {
+        let sink = Arc::new(CountingSink::default());
+        let (host, scope) = scoped_host(
+            Arc::new(ExtensionHost {
+                closed: Arc::new(AtomicBool::new(false)),
+            }),
+            sink.clone(),
+        );
+        assert!(host.for_extension("unregistered").is_none());
+        let child = host.for_extension("example").unwrap();
+        assert_eq!(child.callback_scope_owner(), Some(Uuid::from_u128(7)));
+        assert!(child.supports_custom_entries());
+        child.close_custom_entry_scope();
+        assert!(!host.supports_custom_entries());
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            child
+                .call_with_cancellation("cancelled", Value::Null, cancelled)
+                .await,
+            Outcome::Skipped("cancelled".into()),
+        );
+        assert!(child.supports_prevalidated_call_accounting());
+        assert_eq!(
+            child
+                .call_batch_prevalidated(vec![
+                    ("oversized".into(), None),
+                    ("accepted".into(), Some(Value::Null)),
+                ])
+                .await,
+            [
+                Outcome::Skipped("oversized".into()),
+                Outcome::Succeeded("accepted".into())
+            ],
+        );
+
+        child.report_progress(Value::Null).await.unwrap();
+        assert_eq!(sink.0.load(Ordering::Relaxed), 1);
+        drop(scope);
+        child.report_progress(Value::Null).await.unwrap();
+        host.report_progress(Value::Null).await.unwrap();
+        assert_eq!(sink.0.load(Ordering::Relaxed), 1);
     }
     struct Checkpoint {
         store: Arc<Store>,

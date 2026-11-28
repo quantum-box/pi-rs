@@ -24,6 +24,15 @@ enum TurnNormalized {
 }
 
 const TOOL_TIMEOUT_SETTLEMENT_WINDOW: Duration = Duration::from_millis(250);
+const TOOL_PROGRESS_HOOK_BUDGET: Duration = Duration::from_millis(250);
+const MAX_TOOL_PROGRESS_ARGUMENT_BYTES: usize = 16 * 1024;
+
+fn progress_arguments(arguments: &str) -> serde_json::Value {
+    if arguments.len() > MAX_TOOL_PROGRESS_ARGUMENT_BYTES {
+        return serde_json::Value::Null;
+    }
+    crate::parse_tool_arguments(arguments).unwrap_or(serde_json::Value::Null)
+}
 
 const MAX_PI_ARGUMENT_ISSUES: usize = 32;
 const MAX_PI_ARGUMENT_PREVIEW_BYTES: usize = 64 * 1024;
@@ -2954,9 +2963,12 @@ impl Agent<'_> {
                                 let (finish_progress, mut finish_signal) = oneshot::channel();
                                 let progress_output = progress_output.clone();
                                 let progress_registry = self.registry.clone();
-                                let progress_cancel = calls[index].cancellation.clone();
                                 let progress_states = states.clone();
+                                let bounded_progress_hooks = matches!(&prepared, TurnPreparation::Ready { tool, .. } if tool.tool.bounds_progress_hooks());
                                 let progress_timeout = self.limits.model_timeout;
+                                let mut hook_budget = bounded_progress_hooks.then(|| progress_timeout.min(TOOL_PROGRESS_HOOK_BUDGET));
+                                let stop_progress_hooks = calls[index].cancellation.child_token();
+                                let hook_cancel = stop_progress_hooks.clone();
                                 let hook_host = lifecycle_host.clone();
                                 let progress_worker = async move {
                                     let mut errors = Vec::new();
@@ -2969,13 +2981,30 @@ impl Agent<'_> {
                                         match message {
                                             TurnProgress::Event(event) => {
                                                 let _ = progress_output.send(TurnProgress::Event(event.clone())).await;
-                                                if observe_progress {
+                                                if observe_progress && !hook_cancel.is_cancelled() && hook_budget.is_none_or(|remaining| !remaining.is_zero()) {
+                                                    let began = platform_time::Instant::now();
                                                     let mut collect = |notification: Notification<'_>| {
                                                         if let Notification::ExtensionLifecycleError { extension, event, message } = notification {
                                                             errors.push((extension.to_owned(), event, message.to_owned()));
                                                         }
                                                     };
-                                                    tokio::select! { biased; _ = progress_cancel.cancelled() => {}, _ = crate::lifecycle::notify_with_host(&progress_registry, *event, &progress_states, progress_timeout, &mut collect, hook_host.clone()) => {} }
+                                                    let notify = crate::lifecycle::notify_with_host(
+                                                        &progress_registry, *event, &progress_states, hook_budget.unwrap_or(progress_timeout), &mut collect, hook_host.clone()
+                                                    );
+                                                    tokio::select! {
+                                                        biased;
+                                                        _ = hook_cancel.cancelled() => {},
+                                                        _ = async {
+                                                            if let Some(remaining) = hook_budget {
+                                                                let _ = platform_time::timeout(remaining, notify).await;
+                                                            } else {
+                                                                notify.await;
+                                                            }
+                                                        } => {}
+                                                    }
+                                                    if let Some(remaining) = &mut hook_budget {
+                                                        *remaining = remaining.saturating_sub(began.elapsed());
+                                                    }
                                                 }
                                             }
                                             TurnProgress::Custom(input, reply) => { let _ = progress_output.send(TurnProgress::Custom(input, reply)).await; }
@@ -2988,12 +3017,39 @@ impl Agent<'_> {
                                 let progress_worker = tokio::spawn(progress_worker);
                                 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
                                 let progress_worker = async move { progress_worker.await.unwrap_or_else(|error| vec![("tool-progress".into(), "tool_execution_update", error.to_string())]) };
-                                let host = Arc::new(NestedHost { ui: ui.clone(), requests: requests.clone(), specs: specs.clone(), parent_operation: calls[index].invocation.operation_id, cancellation, depth: calls[index].depth, call_count: calls[index].call_count.clone(), progress: Some(ProgressReporter { sender: ProgressSink::Turn(updates.clone()), tool_call_id: calls[index].invocation.call.id.clone(), tool_name: calls[index].invocation.call.name.clone(), args: crate::parse_tool_arguments(&calls[index].invocation.call.arguments).unwrap_or(serde_json::Value::Null), parent_tool_call_id: calls[index].parent.clone() }) });
+                                let reporter = ProgressReporter {
+                                    sender: ProgressSink::Turn(updates.clone()),
+                                    tool_call_id: calls[index].invocation.call.id.clone(),
+                                    tool_name: calls[index].invocation.call.name.clone(),
+                                    args: progress_arguments(&calls[index].invocation.call.arguments),
+                                    parent_tool_call_id: calls[index].parent.clone(),
+                                    settlement: Arc::default(),
+                                };
+                                let host = Arc::new(NestedHost { ui: ui.clone(), requests: requests.clone(), specs: specs.clone(), parent_operation: calls[index].invocation.operation_id, cancellation, depth: calls[index].depth, call_count: calls[index].call_count.clone(), progress: Some(reporter.clone()) });
                                 let cancel = calls[index].cancellation.clone(); let programmatic = calls[index].depth > 0;
                                 let omit = self.registry.omit_default_tool_timeout; let timeout = self.limits.tool_timeout;
                                 calls[index].phase = TurnPhase::Running;
-                                let flush = updates.clone();
-                                futures.push(async move { let invoke = async move { let start = crate::runtime::Monotonic::now(); let reply = Self::turn_invoke(prepared, &cancel, host, programmatic, omit, timeout).await; let duration = ran.then(|| start.elapsed().as_millis().min(u64::MAX as u128) as u64); let (send, receive) = oneshot::channel(); if flush.send(TurnProgress::Flush(send)).await.is_ok() { let _ = receive.await; } let _ = finish_progress.send(()); (reply, duration) }; let ((reply, duration), errors) = futures_util::future::join(invoke, progress_worker).await; TurnEvent::Ran(index, reply, duration, errors) }.boxed());
+                                futures.push(async move {
+                                    let invoke = async move {
+                                        let start = crate::runtime::Monotonic::now();
+                                        let reply = Self::turn_invoke(prepared, &cancel, host, programmatic, omit, timeout).await;
+                                        let duration = ran.then(|| start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                                        // Forward queued events and settlement without waiting for
+                                        // extension observers once the tool has returned.
+                                        if bounded_progress_hooks {
+                                            stop_progress_hooks.cancel();
+                                        }
+                                        if let Some(settlement) = reporter.close() {
+                                            let _ = updates.send(settlement).await;
+                                        }
+                                        let (send, receive) = oneshot::channel();
+                                        if updates.send(TurnProgress::Flush(send)).await.is_ok() { let _ = receive.await; }
+                                        let _ = finish_progress.send(());
+                                        (reply, duration)
+                                    };
+                                    let ((reply, duration), errors) = futures_util::future::join(invoke, progress_worker).await;
+                                    TurnEvent::Ran(index, reply, duration, errors)
+                                }.boxed());
                     }
                     TurnEvent::Ran(index, mut reply, duration, errors) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
@@ -3139,6 +3195,224 @@ mod start_tests {
     use super::*;
     use crate::Tool;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn progress_reporter(sender: mpsc::Sender<TurnProgress>) -> ProgressReporter {
+        ProgressReporter {
+            sender: ProgressSink::Turn(sender),
+            tool_call_id: "parent".into(),
+            tool_name: "codemode".into(),
+            args: serde_json::json!({"code":"fixture"}),
+            parent_tool_call_id: None,
+            settlement: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn progress_bounds_the_complete_event_and_the_parent_source() {
+        use serde_json::json;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut reporter = progress_reporter(sender);
+        let source = json!({"code":"x".repeat(MAX_TOOL_PROGRESS_ARGUMENT_BYTES)}).to_string();
+        assert!(progress_arguments(&source).is_null());
+        assert_eq!(
+            progress_arguments(r#"{"code":"echo"}"#),
+            json!({"code":"echo"})
+        );
+        // Escaping makes the parent source and each update fit individually,
+        // while the complete event exceeds the queue's byte bound.
+        reporter.args = json!({"code":"\"".repeat(320 * 1024)});
+        let token = CancellationToken::new();
+        let small = json!({"content":[]});
+        let large = json!({"content":"x".repeat(512 * 1024)});
+        assert!(reporter.report(large.clone(), None, true, &token).is_err());
+        assert!(
+            reporter
+                .report(small.clone(), Some(large), true, &token)
+                .is_err()
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(reporter.close().is_none());
+    }
+
+    #[test]
+    fn saturated_progress_keeps_the_latest_final_omission_count() {
+        use serde_json::json;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let reporter = progress_reporter(sender);
+        let token = CancellationToken::new();
+        let snapshot = |omitted| json!({"content":[],"details":{"omittedCalls":omitted}});
+        // The last queued live update cleared the previous fallback. Final
+        // snapshots must survive a full channel even with no calls running.
+        reporter.report(snapshot(0), None, true, &token).unwrap();
+        assert!(reporter.report(snapshot(1), None, true, &token).is_err());
+        assert!(reporter.report(snapshot(12), None, true, &token).is_err());
+        let omitted = |event| {
+            let TurnProgress::Event(event) = event else {
+                panic!("expected progress")
+            };
+            let crate::LifecycleEvent::ToolExecutionUpdate { partial_result, .. } = *event else {
+                panic!("expected progress update")
+            };
+            partial_result["details"]["omittedCalls"].as_u64().unwrap()
+        };
+        assert_eq!(omitted(receiver.try_recv().unwrap()), 0);
+        assert_eq!(omitted(reporter.close().unwrap()), 12);
+        assert!(reporter.close().is_none());
+    }
+
+    #[derive(Default)]
+    struct ProgressProbe {
+        bounded_hooks: bool,
+        finish_on_first_hook: bool,
+        entered: tokio::sync::Notify,
+        starts: AtomicUsize,
+        completions: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ProgressProbe {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "progress_probe".into(),
+                description: "Reports fixture updates".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+
+        fn bounds_progress_hooks(&self) -> bool {
+            self.bounded_hooks
+        }
+
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            unreachable!("fixture needs a host")
+        }
+
+        async fn invoke_with_host(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            for index in 0..5 {
+                host.report_progress(serde_json::json!({"content":[],"details":index}))
+                    .await
+                    .unwrap();
+            }
+            if self.finish_on_first_hook {
+                self.entered.notified().await;
+            } else {
+                platform_time::sleep(Duration::from_millis(400)).await;
+            }
+            Outcome::Succeeded("done".into())
+        }
+    }
+
+    struct ProgressExtension(Arc<ProgressProbe>);
+    #[async_trait::async_trait]
+    impl crate::Extension for ProgressExtension {
+        fn id(&self) -> &str {
+            "progress-test"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![self.0.clone()]
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_updates(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::ToolExecutionUpdate { .. }) {
+                self.0.starts.fetch_add(1, Ordering::SeqCst);
+                self.0.entered.notify_one();
+                platform_time::sleep(Duration::from_millis(100)).await;
+                self.0.completions.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    struct ProgressModel;
+    #[async_trait::async_trait]
+    impl crate::Model for ProgressModel {
+        async fn stream(&self, request: crate::ModelRequest) -> Result<crate::ModelStream> {
+            let called = request
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool { .. }));
+            let mut events = Vec::new();
+            let calls = if called {
+                events.push(Ok(crate::ModelEvent::Text("answer".into())));
+                vec![]
+            } else {
+                vec![crate::ToolCall {
+                    id: "progress".into(),
+                    name: "progress_probe".into(),
+                    arguments: "{}".into(),
+                }]
+            };
+            events.push(Ok(crate::ModelEvent::Complete { calls, usage: None }));
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_hooks_only_cut_off_for_tools_that_opt_in() {
+        for (bounded_hooks, finish_on_first_hook) in
+            [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let probe = Arc::new(ProgressProbe {
+                bounded_hooks,
+                finish_on_first_hook,
+                ..Default::default()
+            });
+            let mut session = crate::SessionBuilder::new(Arc::new(ProgressModel), "fixture")
+                .extension(Arc::new(ProgressExtension(probe.clone())))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+            let started = platform_time::Instant::now();
+            let mut updates = Vec::new();
+            let answer = session
+                .prompt_with_observer("fixture", &mut |event| {
+                    if let Notification::ToolProgress(
+                        crate::LifecycleEvent::ToolExecutionUpdate { partial_result, .. },
+                    ) = event
+                    {
+                        updates.push(partial_result["details"].as_u64().unwrap());
+                    }
+                })
+                .await
+                .unwrap();
+            assert_eq!(answer, "answer");
+            assert_eq!(updates, [0, 1, 2, 3, 4]);
+            if !bounded_hooks {
+                assert_eq!(probe.starts.load(Ordering::SeqCst), 5);
+                assert_eq!(probe.completions.load(Ordering::SeqCst), 5);
+                assert!(started.elapsed() >= Duration::from_millis(500));
+            } else if finish_on_first_hook {
+                assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+                assert_eq!(probe.completions.load(Ordering::SeqCst), 0);
+                assert!(started.elapsed() < Duration::from_millis(100));
+            } else {
+                assert_eq!(probe.starts.load(Ordering::SeqCst), 3);
+                assert_eq!(probe.completions.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
 
     const PROBE_TIMEOUT: Duration = Duration::from_millis(20);
 
