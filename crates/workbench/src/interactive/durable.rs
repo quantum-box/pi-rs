@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::ui::input::{InputEvent, Reader};
+use crate::ui::picker::TreeEntryKind;
 
 // The companion counts the whole UTF-8 RPC line, including its newline.
 const MAX_RPC_REQUEST_BYTES: usize = 4 * 1024 * 1024;
@@ -108,20 +109,59 @@ impl Drop for Companion {
 struct Conversation {
     active: bool,
     submissions: BTreeMap<Uuid, pi_rs::QueuedMessage>,
+    tree: Option<TerminalTree>,
+    tree_request: Option<Uuid>,
+    fork_pending: bool,
 }
 
 impl Conversation {
     fn busy(&self) -> bool {
-        self.active || !self.submissions.is_empty()
+        self.active || self.fork_pending || !self.submissions.is_empty()
     }
 
     fn event(&mut self, view: &mut View, args: &mut Cli, event: Value) {
         match event["type"].as_str() {
             Some("response") => {
-                let pending = event["id"]
-                    .as_str()
-                    .and_then(|id| Uuid::parse_str(id).ok())
-                    .and_then(|id| self.submissions.remove(&id));
+                let id = entry_id(&event["id"]);
+                let command = event["command"].as_str();
+                if command == Some("get_entries") {
+                    if id.is_some() && id == self.tree_request {
+                        self.tree_request = None;
+                        self.show_tree(view, args, &event, None);
+                    }
+                    return;
+                }
+                if command == Some("set_session_label") {
+                    let focus = id.and_then(|id| view.picker.as_mut()?.take_tree_label(id));
+                    if let Some(focus) = focus {
+                        self.show_tree(view, args, &event, Some(focus));
+                    }
+                    return;
+                }
+                if command == Some("fork_at_entry") {
+                    self.fork_pending = false;
+                    if event["success"] == true {
+                        self.tree = None;
+                        view.picker = None;
+                        view.streaming.clear();
+                        view.session_name = event["data"]["sessionId"].as_str().map(str::to_owned);
+                        if let Some(model) = event["data"]["model"]["id"].as_str() {
+                            args.model = model.to_owned();
+                        }
+                        restore_messages(view, &event["data"]);
+                        view.append("Forked to new session");
+                        view.viewport.follow();
+                        return;
+                    }
+                    if let Some(picker) = view.picker.as_mut() {
+                        picker.show_feedback(Err(event["error"]
+                            .as_str()
+                            .unwrap_or("Durable fork failed")
+                            .into()));
+                        return;
+                    }
+                }
+                let pending = id.and_then(|id| self.submissions.remove(&id));
                 if event["success"] != true {
                     if let Some(pending) = pending {
                         restore_draft(view, pending);
@@ -143,13 +183,7 @@ impl Conversation {
                         }
                     }
                     Some("get_messages") => {
-                        if let Some(messages) = event["data"]["messages"].as_array() {
-                            view.lines.clear();
-                            append_session_reference(view);
-                            for message in messages {
-                                append_message(view, message);
-                            }
-                        }
+                        restore_messages(view, &event["data"]);
                     }
                     Some("prompt") if event["data"]["disposition"] == "started" => {
                         self.active = true;
@@ -160,6 +194,13 @@ impl Conversation {
             }
             Some("agent_start") => self.active = true,
             Some("agent_end") => self.active = false,
+            Some("tool_execution_start") => {
+                show_tool(view, &event["durableInvocation"], &Value::Null);
+            }
+            Some("tool_execution_update") => view.update_tool_progress(&event),
+            Some("tool_execution_end") => {
+                show_tool(view, &event["durableInvocation"], &event["durableOutcome"]);
+            }
             Some("message_start") if event["message"]["role"] == "user" => {
                 append_message(view, &event["message"]);
                 view.viewport.follow();
@@ -184,7 +225,7 @@ impl Conversation {
         follow_up: bool,
         send: impl FnOnce(&[u8]) -> Result<()>,
     ) -> Result<()> {
-        if view.clipboard.is_some() {
+        if view.clipboard.is_some() || self.fork_pending {
             return Ok(());
         }
         let text = &view.editor.text;
@@ -214,6 +255,249 @@ impl Conversation {
         view.draft_images.clear();
         self.submissions.insert(id, input);
         Ok(())
+    }
+
+    fn request_tree(&mut self, worker: &mut Companion) -> Result<()> {
+        if self.tree_request.is_none() && !self.fork_pending {
+            let id = Uuid::new_v4();
+            worker.send(json!({"type":"get_entries","id":id}))?;
+            self.tree_request = Some(id);
+        }
+        Ok(())
+    }
+
+    fn show_tree(&mut self, view: &mut View, args: &Cli, response: &Value, focus: Option<u64>) {
+        let filter = TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
+        let result = if response["success"] == true {
+            TerminalTree::from_rpc(&response["data"], filter)
+        } else {
+            Err(Error::Config(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("Session tree unavailable")
+                    .into(),
+            ))
+        };
+        match result {
+            Ok(Some((picker, tree))) => {
+                self.tree = Some(tree);
+                if let (Some(focus), Some(old_picker)) = (focus, view.picker.as_mut()) {
+                    old_picker.refresh_tree(picker, focus);
+                } else {
+                    view.picker = Some(picker);
+                }
+            }
+            Ok(None) => view.append("No entries in session"),
+            Err(error) => {
+                if let Some(picker) = view.picker.as_mut() {
+                    picker.show_feedback(Err(error.to_string()));
+                } else {
+                    view.append(&error.to_string());
+                }
+            }
+        }
+    }
+
+    fn pick_tree(
+        &mut self,
+        view: &mut View,
+        worker: &mut Companion,
+        key: Option<KeyEvent>,
+        keys: &Keys,
+    ) -> Result<bool> {
+        let Some(tree) = &self.tree else {
+            return Ok(false);
+        };
+        let Some(mut picker) = view.picker.take() else {
+            return Ok(false);
+        };
+        if self.fork_pending {
+            view.picker = Some(picker);
+            return Ok(true);
+        }
+        let input = match key {
+            Some(key) => picker.input(key, keys),
+            None => picker.activate_mouse_selection(keys),
+        };
+        match input {
+            Input::Cancel => {
+                self.tree = None;
+                return Ok(true);
+            }
+            Input::Select(Selection::Checkout(record)) => {
+                if let Some(row) = tree.row(record) {
+                    if Some(row.id) == tree.leaf {
+                        self.tree = None;
+                        view.append("Already at this point");
+                        return Ok(true);
+                    } else if self.busy() {
+                        picker
+                            .show_feedback(Err("Wait for the current turn before forking".into()));
+                    } else {
+                        worker.send(json!({"type":"fork_at_entry","entryId":row.id}))?;
+                        self.fork_pending = true;
+                    }
+                }
+            }
+            Input::CopyTreeRecord(record) => {
+                if let Some(row) = tree.row(record) {
+                    picker.show_feedback(
+                        sessions::copy_text(&row.text)
+                            .map(|()| "Copied entry".into())
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+            }
+            Input::SetTreeLabel(record, label) => {
+                if let Some(row) = tree.row(record) {
+                    let request = Uuid::new_v4();
+                    worker.send(json!({
+                        "type":"set_session_label","target":row.id,"label":label,"id":request
+                    }))?;
+                    picker.track_tree_label(request, record);
+                }
+            }
+            _ => {}
+        }
+        view.picker = Some(picker);
+        Ok(true)
+    }
+}
+
+fn entry_id(value: &Value) -> Option<Uuid> {
+    Uuid::parse_str(value.as_str()?).ok()
+}
+
+fn restore_messages(view: &mut View, data: &Value) {
+    if let Some(messages) = data["messages"].as_array() {
+        view.graphics.reset();
+        view.regular.committed = 0;
+        view.regular.redraw = true;
+        view.lines.clear();
+        view.clear_markdown_renderings();
+        append_session_reference(view);
+        for message in messages {
+            append_message(view, message);
+        }
+    }
+}
+
+struct TerminalTree {
+    rows: Vec<TreeRow>,
+    leaf: Option<Uuid>,
+}
+
+struct TreeRow {
+    id: Uuid,
+    text: String,
+}
+
+impl TerminalTree {
+    fn row(&self, record: u64) -> Option<&TreeRow> {
+        self.rows.get(usize::try_from(record.checked_sub(1)?).ok()?)
+    }
+
+    fn from_rpc(data: &Value, filter: TreeFilter) -> Result<Option<(Picker, Self)>> {
+        use session_tree::{tree_description, tree_preview};
+
+        let invalid = || Error::Config("Invalid Durable session history".into());
+        let entries = data["entries"].as_array().ok_or_else(invalid)?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let mut ids = BTreeMap::new();
+        let mut rows = Vec::with_capacity(entries.len());
+        let mut parents = BTreeMap::new();
+        let mut labels = BTreeMap::new();
+        let mut timestamps = BTreeMap::new();
+        let mut descriptions = BTreeMap::new();
+        let mut items = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let id = entry_id(&entry["id"]).ok_or_else(invalid)?;
+            let record = rows.len() as u64 + 1;
+            let parent = entry_id(&entry["parentId"]).and_then(|id| ids.get(&id).copied());
+            if ids.insert(id, record).is_some() {
+                return Err(invalid());
+            }
+            let message = &entry["message"];
+            let (kind, heading, role, text) = match entry["type"].as_str() {
+                Some("message") => {
+                    let (kind, heading, role) = match message["role"].as_str() {
+                        Some("user") => (TreeEntryKind::User, "user: ", "accent"),
+                        Some("assistant") => (TreeEntryKind::Message, "assistant: ", "success"),
+                        Some("toolResult") => (TreeEntryKind::Tool, "[tool]: ", "muted"),
+                        _ => (TreeEntryKind::Message, "[system]: ", "dim"),
+                    };
+                    (kind, heading.to_owned(), role, message_text(message))
+                }
+                Some("compaction") => (
+                    TreeEntryKind::Message,
+                    "[compaction]: ".into(),
+                    "borderAccent",
+                    entry["summary"].as_str().unwrap_or_default().to_owned(),
+                ),
+                Some("session_info") => (
+                    TreeEntryKind::Bookkeeping,
+                    "[title]: ".into(),
+                    "dim",
+                    entry["name"].as_str().unwrap_or_default().to_owned(),
+                ),
+                Some("label") => {
+                    let value = entry["label"].as_str();
+                    if let Some(target) =
+                        entry_id(&entry["targetId"]).and_then(|id| ids.get(&id).copied())
+                    {
+                        if let Some(label) = value {
+                            labels.insert(target, label.to_owned());
+                            if let Some(timestamp) = entry["timestamp"].as_str() {
+                                timestamps.insert(target, timestamp.to_owned());
+                            }
+                        } else {
+                            labels.remove(&target);
+                            timestamps.remove(&target);
+                        }
+                    }
+                    (
+                        TreeEntryKind::Bookkeeping,
+                        "[label]: ".into(),
+                        "dim",
+                        value.unwrap_or_default().to_owned(),
+                    )
+                }
+                Some("custom") => (
+                    TreeEntryKind::Bookkeeping,
+                    format!(
+                        "[custom: {}]: ",
+                        entry["customType"].as_str().unwrap_or_default()
+                    ),
+                    "dim",
+                    entry.get("data").map(Value::to_string).unwrap_or_default(),
+                ),
+                _ => (
+                    TreeEntryKind::Bookkeeping,
+                    "[entry]".into(),
+                    "dim",
+                    String::new(),
+                ),
+            };
+            let description = tree_description(heading, role, tree_preview(&text, 200));
+            items.push(Item {
+                label: format!("{id} {}{}", description.heading, description.body),
+                selection: Selection::Checkout(record),
+            });
+            parents.insert(record, (parent, kind));
+            descriptions.insert(record, description);
+            rows.push(TreeRow { id, text });
+        }
+        let leaf = entry_id(&data["leafId"]);
+        let head = leaf
+            .and_then(|id| ids.get(&id).copied())
+            .unwrap_or_default();
+        let mut picker = Picker::tree(items, parents, labels, head, filter);
+        picker.title = "Session tree (Enter to fork)".into();
+        picker.set_tree_descriptions(descriptions);
+        picker.set_label_timestamps(timestamps);
+        Ok(Some((picker, Self { rows, leaf })))
     }
 }
 
@@ -246,8 +530,42 @@ fn append_message(view: &mut View, message: &Value) {
                 view.add_images(&attachments);
             }
         }
-        Some("assistant") if !text.is_empty() => view.append_entry(Entry::Assistant(text.into())),
+        Some("assistant") => {
+            if !text.is_empty() {
+                view.append_entry(Entry::Assistant(text.into()));
+            }
+            if let Some(invocations) = message["durableInvocations"].as_array() {
+                for invocation in invocations {
+                    show_tool(view, invocation, &Value::Null);
+                }
+            }
+        }
+        Some("toolResult") => {
+            show_tool(
+                view,
+                &message["durableInvocation"],
+                &message["durableOutcome"],
+            );
+        }
         _ => {}
+    }
+}
+
+fn show_tool(view: &mut View, invocation: &Value, outcome: &Value) {
+    let Ok(invocation) = serde_json::from_value::<pi_rs::Invocation>(invocation.clone()) else {
+        return;
+    };
+    let operation = invocation.operation_id.to_string();
+    if !view
+        .lines
+        .iter()
+        .rev()
+        .any(|row| matches!(row, Entry::Tool { id, .. } if id == &operation))
+    {
+        view.add_tool(&invocation, None);
+    }
+    if let Ok(outcome) = serde_json::from_value::<pi_rs::Outcome>(outcome.clone()) {
+        view.finish_tool(&operation, &outcome, None);
     }
 }
 
@@ -435,6 +753,12 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
         dirty = true;
         match input.next(Duration::from_millis(32))? {
             Some(InputEvent::Event(Event::Key(key))) if key.kind != KeyEventKind::Release => {
+                if key.code == KeyCode::Esc && conversation.tree_request.take().is_some() {
+                    continue;
+                }
+                if conversation.pick_tree(&mut view, &mut worker, Some(key), &keys)? {
+                    continue;
+                }
                 if let Some(action) = keys.viewport_action(key) {
                     view.viewport.navigate(action);
                     view.scrollbar_activity = Some(Instant::now());
@@ -458,6 +782,8 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                         view.editor.take();
                         view.draft_images.clear();
                     }
+                    "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
+                    "app.session.tree" => conversation.request_tree(&mut worker)?,
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
                     "app.message.dequeue" => {
                         worker.send(json!({"type":"clear_queue","includeContent":true}))?
@@ -467,6 +793,12 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                         worker.send(json!({"type":"abort"}))?;
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
+                    "tui.input.submit"
+                        if view.editor.text.trim() == "/tree" && view.draft_images.is_empty() =>
+                    {
+                        view.editor.take();
+                        conversation.request_tree(&mut worker)?;
+                    }
                     "tui.input.submit" | "app.message.followUp" => {
                         conversation.submit(
                             &mut view,
@@ -486,11 +818,32 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                 }
             }
             Some(InputEvent::Event(Event::Mouse(mouse)))
+                if args.tui_mode != Some(TuiMode::Regular) && view.picker.is_some() =>
+            {
+                let picker = view.picker.as_mut().expect("checked above");
+                if usize::from(mouse.column) < view.fullscreen_width
+                    && let Some(row) =
+                        usize::from(mouse.row).checked_sub(view.fullscreen_header_rows)
+                {
+                    if matches!(picker.mouse(mouse.kind, row), MouseInput::Activate) {
+                        conversation.pick_tree(&mut view, &mut worker, None, &keys)?;
+                    }
+                } else {
+                    picker.clear_mouse_press();
+                }
+            }
+            Some(InputEvent::Event(Event::Mouse(mouse)))
                 if args.tui_mode != Some(TuiMode::Regular) =>
             {
                 dirty = view.fullscreen_mouse(mouse, &args);
             }
-            Some(InputEvent::Event(Event::Paste(text))) => view.paste_editor_text(&text),
+            Some(InputEvent::Event(Event::Paste(text))) => {
+                if let Some(picker) = &mut view.picker {
+                    picker.paste(&text);
+                } else {
+                    view.paste_editor_text(&text);
+                }
+            }
             Some(InputEvent::Event(Event::Resize(_, _))) => (),
             #[cfg(any(unix, windows))]
             Some(InputEvent::CellSize { width, height }) => {
@@ -625,6 +978,28 @@ mod tests {
     }
 
     #[test]
+    fn durable_tree_projects_stable_entries_into_the_native_picker() {
+        let first = Uuid::from_u128(1);
+        let last = Uuid::from_u128(2);
+        let response = json!({
+            "leafId":last,
+            "entries":[
+                {"id":first,"parentId":null,"type":"message","message":{
+                    "role":"user","content":[{"type":"text","text":"Earlier prompt"}]
+                }},
+                {"id":last,"parentId":first,"type":"label","targetId":first,"label":"bookmark"}
+            ]
+        });
+        let (picker, tree) = TerminalTree::from_rpc(&response, TreeFilter::LabeledOnly)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tree.leaf, Some(last));
+        assert_eq!(tree.row(1).unwrap().id, first);
+        assert_eq!(tree.row(1).unwrap().text, "Earlier prompt");
+        assert!(matches!(picker.selected(), Some(Selection::Checkout(1))));
+    }
+
+    #[test]
     fn oversized_prompt_preserves_the_entire_draft_and_never_writes_to_rpc() {
         let mut view = View::default();
         let mut conversation = Conversation::default();
@@ -720,6 +1095,92 @@ mod tests {
             &view.lines[..],
             [Entry::Notice(text), Entry::User(_)] if text == &format!("Durable session ID {session}")
         ));
+    }
+
+    #[test]
+    fn durable_fork_replaces_the_session_reference_and_redraws_regular_history() {
+        let original = Uuid::from_u128(1).to_string();
+        let fork = Uuid::from_u128(2).to_string();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.tui_mode = Some(TuiMode::Regular);
+        let mut view = View::default();
+        let mut conversation = Conversation::default();
+        view.session_name = Some(original.clone());
+        append_session_reference(&mut view);
+        view.regular.committed = 1;
+        view.regular.redraw = false;
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({
+                "type":"response","command":"fork_at_entry","success":true,
+                "data":{"sessionId":fork,"messages":[]}
+            }),
+        );
+        assert_eq!(view.session_name.as_deref(), Some(fork.as_str()));
+        assert_eq!(view.regular.committed, 0);
+        assert!(view.regular.redraw);
+        assert!(matches!(
+            &view.lines[..],
+            [Entry::Notice(reference), Entry::Notice(_)]
+                if reference == &format!("Durable session ID {fork}")
+        ));
+    }
+
+    #[test]
+    fn durable_tool_cards_use_the_native_result_renderer_without_duplicates() {
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        let mut view = View::default();
+        let mut conversation = Conversation::default();
+        let invocation = pi_rs::Invocation {
+            operation_id: Uuid::new_v4(),
+            call: pi_rs::ToolCall {
+                id: "call".into(),
+                name: "edit".into(),
+                arguments: r#"{"path":"file"}"#.into(),
+            },
+        };
+        let outcome = pi_rs::Outcome::StructuredWithDetails {
+            data: json!({"content":[{"type":"text","text":"edited"}], "isError":false}),
+            attachments: Vec::new(),
+            details: json!({"diff":"- old\n+ new"}),
+        };
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({
+                "type":"message_end",
+                "message":{"role":"assistant","content":[], "durableInvocations":[invocation]}
+            }),
+        );
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({
+                "type":"tool_execution_start","durableInvocation":invocation
+            }),
+        );
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({
+                "type":"tool_execution_update","toolCallId":"call","toolName":"edit",
+                "partialResult":{"content":[{"type":"text","text":"working"}]}
+            }),
+        );
+        assert!(
+            matches!(&view.lines[..], [Entry::Tool {output, finished: false, ..}] if output == "working")
+        );
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({
+                "type":"tool_execution_end","durableInvocation":invocation,"durableOutcome":outcome
+            }),
+        );
+        assert!(
+            matches!(&view.lines[..], [Entry::Tool {output, numbered_diff: true, finished: true, ..}] if output == "- old\n+ new")
+        );
     }
 
     #[test]

@@ -38,6 +38,9 @@ struct Args {
         conflicts_with = "conversation"
     )]
     model: Option<String>,
+    /// Enable local read, write, edit and bash in this workspace. Use the same directory on resume.
+    #[arg(long, value_name = "WORKSPACE")]
+    coding_tools: Option<PathBuf>,
     /// Conversation ID printed when the conversation was created.
     #[arg(long)]
     conversation: Option<Uuid>,
@@ -58,6 +61,7 @@ struct RoutedModel {
     client: Arc<dyn Model>,
     suffix: String,
     has_image_adapter: bool,
+    has_coding_tools: bool,
 }
 
 impl RoutedModel {
@@ -67,7 +71,7 @@ impl RoutedModel {
             .filter(|name| !name.is_empty())
             .ok_or_else(|| {
                 pi_rs_core::Error::Config(
-                    "durable conversation uses a different provider route".into(),
+                    "durable conversation uses a different provider route or coding tools workspace".into(),
                 )
             })
     }
@@ -98,10 +102,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     // Persist only a route fingerprint in the model identifier. Recovery checks
     // it on every request before forwarding the original model name.
-    let suffix = format!(
+    let mut suffix = format!(
         "|openai-responses:{:x}",
         Sha256::digest(args.endpoint.as_bytes())
     );
+    let tools = if let Some(workspace) = &args.coding_tools {
+        let workspace = workspace.canonicalize()?;
+        if !workspace.is_dir() {
+            return Err("coding tools workspace must be a directory".into());
+        }
+        // Include the execution profile in the saved route so recovery never
+        // silently changes the working directory or enables tools.
+        suffix.push_str(&format!(
+            "|coding-tools-v1:{:x}",
+            Sha256::digest(workspace.as_os_str().as_encoded_bytes())
+        ));
+        pi_rs_durable::coding_tools::local(&workspace)?
+    } else {
+        Vec::new()
+    };
     let adapter = OpenAiResponsesAdapter::new(&args.endpoint, key)
         .ok()
         .map(|adapter| Arc::new(adapter.with_model_route_suffix(suffix.clone())));
@@ -109,12 +128,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client,
         suffix,
         has_image_adapter: adapter.is_some(),
+        has_coding_tools: !tools.is_empty(),
     });
     let options = Options {
         model: model.clone(),
-        tools: Vec::new(),
+        tools,
         restart_limit: 3,
-        max_turns: 1,
+        max_turns: if model.has_coding_tools { 32 } else { 1 },
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
     let mut scheduler = match adapter {
