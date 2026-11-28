@@ -177,10 +177,11 @@ fn has_opaque_credentials(headers: &HeaderMap) -> bool {
 pub(super) async fn http_error_message(
     mut response: reqwest::Response,
     request_headers: &HeaderMap,
+    label: &str,
 ) -> String {
     const MAX_ERROR_BODY: usize = 16 * 1024;
     let status = response.status().as_u16();
-    let fallback = || format!("Pi Decision returned HTTP {status}");
+    let fallback = || format!("{label} returned HTTP {status}");
     if response
         .content_length()
         .is_some_and(|length| length > MAX_ERROR_BODY as u64)
@@ -220,7 +221,7 @@ pub(super) async fn http_error_message(
                 | "server_error"
                 | "service_unavailable"
                 | "unauthorized"),
-            ) => format!("Pi Decision returned HTTP {status} ({code})"),
+            ) => format!("{label} returned HTTP {status} ({code})"),
             _ => fallback(),
         };
     }
@@ -247,10 +248,10 @@ pub(super) async fn http_error_message(
     };
     match (clean("code", 64), clean("message", 512)) {
         (Some(code), Some(message)) => {
-            format!("Pi Decision returned HTTP {status} ({code}): {message}")
+            format!("{label} returned HTTP {status} ({code}): {message}")
         }
         (Some(detail), None) | (None, Some(detail)) => {
-            format!("Pi Decision returned HTTP {status}: {detail}")
+            format!("{label} returned HTTP {status}: {detail}")
         }
         (None, None) => fallback(),
     }

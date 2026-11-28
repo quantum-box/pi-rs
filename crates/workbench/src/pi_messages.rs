@@ -147,7 +147,7 @@ impl PiMessages {
         self.catalog_for(&binding, Some(&token)).await
     }
 
-    pub(super) async fn classifier_catalog_with_token(
+    pub(super) async fn operation_catalog_with_token(
         &self,
     ) -> Result<Option<(Arc<radius_catalog::Catalog>, String)>> {
         if self.radius.is_none() {
@@ -707,6 +707,7 @@ mod tool_status_tests {
                 base: Url::parse(endpoint).unwrap(),
                 models: vec![],
                 classifiers: vec![],
+                images: vec![],
             }),
         };
         *cache.lock().await = Some(update("https://one.example/v1"));

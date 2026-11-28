@@ -57,6 +57,8 @@ enum Api {
     WorkersAiSystemOne,
     #[serde(rename = "openrouter-images")]
     OpenRouterImages,
+    #[serde(rename = "pi-image")]
+    PiImage,
     #[serde(rename = "llama-cpp-classify")]
     LlamaCppClassifier,
 }
@@ -70,7 +72,7 @@ impl Api {
             | Self::PiClassifier
             | Self::PiDecision
             | Self::LlamaCppClassifier => Kind::Classifier,
-            Self::OpenRouterImages => Kind::Image,
+            Self::OpenRouterImages | Self::PiImage => Kind::Image,
         }
     }
 
@@ -82,6 +84,7 @@ impl Api {
             Self::SystemOne => "systemone",
             Self::WorkersAiSystemOne => "run",
             Self::OpenRouterImages => "chat/completions",
+            Self::PiImage => "image",
             Self::LlamaCppClassifier => "completion",
         }
     }
@@ -344,9 +347,14 @@ async fn send_model_request(
             return Err(Error::Model("OpenAI Decisions error (504): the request timed out at the gateway. Very large inputs (above roughly 600K tokens) currently exceed its time limit.".into()));
         }
         if attempt == retries || !retryable_classifier_response(&response) {
-            if matches!(api, Api::PiDecision) {
+            let label = match api {
+                Api::PiDecision => Some("Pi Decision"),
+                Api::PiImage => Some("Pi Image"),
+                _ => None,
+            };
+            if let Some(label) = label {
                 return Err(Error::Model(
-                    pi_classifier::http_error_message(response, request.headers()).await,
+                    pi_classifier::http_error_message(response, request.headers(), label).await,
                 ));
             }
             return Err(Error::Model(format!(
@@ -357,7 +365,9 @@ async fn send_model_request(
         let delay = match classifier_retry_delay(response.headers(), attempt, chrono::Utc::now()) {
             Ok(delay) => delay,
             Err(Error::Model(reason)) if matches!(api, Api::PiDecision) => {
-                let message = pi_classifier::http_error_message(response, request.headers()).await;
+                let message =
+                    pi_classifier::http_error_message(response, request.headers(), "Pi Decision")
+                        .await;
                 return Err(Error::Model(format!("{message}. {reason}")));
             }
             Err(error) => return Err(error),
@@ -461,17 +471,20 @@ struct Entry {
 pub(super) struct Catalogue(Vec<Entry>);
 
 /// Whether the provider defaults describe operations rather than chat routes.
-pub(super) fn decision_operation_defaults(provider: &Value) -> bool {
+pub(super) fn pi_operation_defaults(provider: &Value) -> bool {
     if !provider["api"].is_null() {
-        return provider["api"] == "pi-decision";
+        return matches!(provider["api"].as_str(), Some("pi-decision" | "pi-image"));
     }
     provider["models"].as_array().is_some_and(|models| {
         models
             .iter()
             .all(|model| matches!(model["type"].as_str(), Some("classifier" | "image")))
-            && models
-                .iter()
-                .any(|model| model["type"] == "classifier" && model["api"] == "pi-decision")
+            && models.iter().any(|model| {
+                matches!(
+                    (model["type"].as_str(), model["api"].as_str()),
+                    (Some("classifier"), Some("pi-decision")) | (Some("image"), Some("pi-image"))
+                )
+            })
     })
 }
 
@@ -483,7 +496,7 @@ impl Catalogue {
         let mut decision_profiles = Vec::new();
         for (provider, configured) in providers {
             let name = provider.to_ascii_lowercase();
-            let operation_defaults = decision_operation_defaults(configured);
+            let operation_defaults = pi_operation_defaults(configured);
             let Some(configured) = configured.as_object() else {
                 continue;
             };
@@ -554,7 +567,7 @@ impl Catalogue {
                 providers
                     .iter()
                     .find(|(key, _)| key.eq_ignore_ascii_case(&name))
-                    .filter(|(_, configured)| !decision_operation_defaults(configured))
+                    .filter(|(_, configured)| !pi_operation_defaults(configured))
                     .and_then(|(_, configured)| {
                         if name == "cloudflare-workers-ai" {
                             configured["models"]
@@ -631,7 +644,7 @@ impl Catalogue {
                 // Pi Decision is an explicitly configured route. A known
                 // provider name does not establish an official decision endpoint.
                 let default_base = match api {
-                    Api::PiDecision => None,
+                    Api::PiDecision | Api::PiImage => None,
                     _ => official_base(&name),
                 };
                 let base = configured
@@ -950,7 +963,7 @@ impl Entry {
     }
 
     fn is_official(&self) -> bool {
-        if matches!(self.api, Api::PiDecision) {
+        if matches!(self.api, Api::PiDecision | Api::PiImage) {
             return false;
         }
         if self.provider == "github-copilot" {
@@ -1190,8 +1203,9 @@ impl Operations {
         })
     }
 
-    async fn radius_classifiers(
+    async fn radius_operations(
         &self,
+        kind: Kind,
         cancel: &pi_rs::CancellationToken,
         available_only: bool,
     ) -> Result<Vec<Entry>> {
@@ -1205,7 +1219,7 @@ impl Operations {
             let Ok(Some(catalog)) = radius.catalog().await else {
                 return Vec::new();
             };
-            radius_entries(&catalog)
+            radius_entries(&catalog, kind)
         };
         tokio::select! {
             biased;
@@ -1214,17 +1228,18 @@ impl Operations {
         }
     }
 
-    async fn radius_classifier(
+    async fn radius_operation(
         &self,
+        kind: Kind,
         model_id: Option<&str>,
     ) -> Result<Option<(Entry, String, HeaderMap)>> {
         let Some(radius) = self.radius_client(false).await? else {
             return Ok(None);
         };
-        let Some((catalog, token)) = radius.classifier_catalog_with_token().await? else {
+        let Some((catalog, token)) = radius.operation_catalog_with_token().await? else {
             return Ok(None);
         };
-        Ok(radius_entries(&catalog)
+        Ok(radius_entries(&catalog, kind)
             .into_iter()
             .find(|entry| Some(entry.model.id.as_str()) == model_id)
             .map(|entry| (entry, token, radius.context_headers())))
@@ -1284,36 +1299,73 @@ impl Operations {
     }
 }
 
-fn radius_entries(catalog: &radius_catalog::Catalog) -> Vec<Entry> {
+fn radius_entries(catalog: &radius_catalog::Catalog, kind: Kind) -> Vec<Entry> {
+    let api = match kind {
+        Kind::Classifier => Api::PiDecision,
+        Kind::Image => Api::PiImage,
+        Kind::Chat => return Vec::new(),
+    };
     let base = &catalog.base;
-    let endpoint = Url::parse(&format!("{}/decision", base.as_str().trim_end_matches('/')))
-        .expect("validated Radius base URL");
-    catalog
-        .classifiers
-        .iter()
-        .map(|model| Entry {
+    let mut endpoint = base.clone();
+    endpoint.set_path(&format!(
+        "{}/{}",
+        base.path().trim_end_matches('/'),
+        api.route()
+    ));
+    let entry =
+        |id: &str, name: &str, input: &[String], output, context_window, cost: &Cost| Entry {
             provider: "radius".into(),
             model: Configured {
-                id: model.id.clone(),
-                name: Some(model.name.clone()),
-                api: Some(Api::PiDecision),
+                id: id.into(),
+                name: Some(name.into()),
+                api: Some(api),
                 base_url: None,
-                input: Some(model.input.clone()),
-                output: None,
+                input: Some(input.to_vec()),
+                output,
                 input_limits: None,
-                context_window: Some(model.context_window),
-                cost: model.cost.clone(),
+                context_window,
+                cost: cost.clone(),
                 headers: BTreeMap::new(),
                 compat: Compat::default(),
             },
-            api: Api::PiDecision,
+            api,
             base: base.clone(),
             endpoint: endpoint.clone(),
             api_key: None,
             cloudflare_default: false,
             llama_root: None,
-        })
-        .collect()
+        };
+    match kind {
+        Kind::Classifier => catalog
+            .classifiers
+            .iter()
+            .map(|model| {
+                entry(
+                    &model.id,
+                    &model.name,
+                    &model.input,
+                    None,
+                    Some(model.context_window),
+                    &model.cost,
+                )
+            })
+            .collect(),
+        Kind::Image => catalog
+            .images
+            .iter()
+            .map(|model| {
+                entry(
+                    &model.id,
+                    &model.name,
+                    &model.input,
+                    Some(model.output.clone()),
+                    None,
+                    &model.cost,
+                )
+            })
+            .collect(),
+        Kind::Chat => Vec::new(),
+    }
 }
 
 impl Extension for Operations {
@@ -1341,7 +1393,9 @@ impl Tool for Operations {
                 "available":{"type":"boolean"},"context":{"type":"object"},
                 "options":{"type":"object","properties":{
                     "aspectRatio":{"type":"string","minLength":1},
-                    "size":{"type":"string","minLength":1}
+                    "size":{"type":"string","minLength":1},
+                    "sessionId":{"type":"string"},
+                    "metadata":{"type":"object"}
                 },"additionalProperties":false}
             },"required":["action"],"additionalProperties":false}),
         }
@@ -1361,8 +1415,14 @@ impl Tool for Operations {
                     && Some(model.provider.as_str()) == provider
                     && Some(model.model.id.as_str()) == args["id"].as_str()
             });
-            let found = if !found && kind == Some(Kind::Classifier) && provider == Some("radius") {
-                match self.radius_classifiers(&context.cancellation, true).await {
+            let found = if !found
+                && provider == Some("radius")
+                && let Some(kind @ (Kind::Classifier | Kind::Image)) = kind
+            {
+                match self
+                    .radius_operations(kind, &context.cancellation, true)
+                    .await
+                {
                     Ok(entries) => entries
                         .iter()
                         .any(|entry| Some(entry.model.id.as_str()) == args["id"].as_str()),
@@ -1449,10 +1509,9 @@ impl Tool for Operations {
                     }
                     entries = catalogue.list(kind, provider, id, args["available"] == true, &keys) => entries,
                 };
-                if kind == Kind::Classifier && provider.is_none_or(|provider| provider == "radius")
-                {
+                if provider.is_none_or(|provider| provider == "radius") {
                     let discovered = match self
-                        .radius_classifiers(&context.cancellation, args["available"] == true)
+                        .radius_operations(kind, &context.cancellation, args["available"] == true)
                         .await
                     {
                         Ok(entries) => entries,
@@ -1462,7 +1521,7 @@ impl Tool for Operations {
                         id.is_none_or(|id| entry.model.id == id)
                             && !catalogue.0.iter().any(|model| {
                                 model.provider == "radius"
-                                    && model.api.kind() == Kind::Classifier
+                                    && model.api.kind() == kind
                                     && model.model.id == entry.model.id
                             })
                     }) {
@@ -1486,31 +1545,39 @@ impl Tool for Operations {
                 && Some(model.provider.as_str()) == provider
                 && Some(model.model.id.as_str()) == args["id"].as_str()
         });
-        let keys = match load_operation_keys(&context.cancellation).await {
-            Ok(keys) => keys,
-            Err(error) => {
-                if matches!(error, Error::Cancelled)
-                    && let Some(entry) = configured
-                {
+        let unavailable = |error| {
+            if matches!(error, Error::Cancelled) {
+                if let Some(entry) = configured {
                     return finish_operation(operation_result(entry), Err(error));
                 }
-                return Outcome::Failed(error.to_string());
-            }
-        };
-        let radius =
-            if configured.is_none() && kind == Kind::Classifier && provider == Some("radius") {
-                let binding = tokio::select! {
-                    biased;
-                    _ = context.cancellation.cancelled() => Err(Error::Cancelled),
-                    result = self.radius_classifier(args["id"].as_str()) => result,
-                };
-                match binding {
-                    Ok(binding) => binding,
-                    Err(error) => return Outcome::Failed(error.to_string()),
+                if kind == Kind::Image
+                    && provider == Some("radius")
+                    && let Some(id) = args["id"].as_str().filter(|id| !id.is_empty())
+                {
+                    let mut data = json!({"provider":"radius","model":id,"output":[]});
+                    initialize_result(Api::PiImage, &mut data);
+                    return finish_operation(data, Err(error));
                 }
-            } else {
-                None
+            }
+            Outcome::Failed(error.to_string())
+        };
+        let keys = match load_operation_keys(&context.cancellation).await {
+            Ok(keys) => keys,
+            Err(error) => return unavailable(error),
+        };
+        let radius = if configured.is_none() && provider == Some("radius") {
+            let binding = tokio::select! {
+                biased;
+                _ = context.cancellation.cancelled() => Err(Error::Cancelled),
+                result = self.radius_operation(kind, args["id"].as_str()) => result,
             };
+            match binding {
+                Ok(binding) => binding,
+                Err(error) => return unavailable(error),
+            }
+        } else {
+            None
+        };
         let Some(model) = configured.or(radius.as_ref().map(|(model, _, _)| model)) else {
             return Outcome::Failed("unknown model for this operation".into());
         };
@@ -1565,7 +1632,7 @@ fn operation_result(entry: &Entry) -> Value {
     } else {
         data["output"] = json!([]);
     }
-    initialize_result(entry, &mut data);
+    initialize_result(entry.api, &mut data);
     data
 }
 
@@ -1584,9 +1651,9 @@ fn finish_operation(mut data: Value, result: Result<()>) -> Outcome {
     }
 }
 
-fn initialize_result(entry: &Entry, data: &mut Value) {
+fn initialize_result(api: Api, data: &mut Value) {
     if data.get("timestamp").is_none() {
-        data["api"] = json!(entry.api);
+        data["api"] = json!(api);
         data["timestamp"] = json!(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1679,7 +1746,7 @@ impl Operations {
     ) -> Result<()> {
         let resolved = entry.resolved_cloudflare(keys)?;
         let entry = &resolved;
-        initialize_result(entry, data);
+        initialize_result(entry.api, data);
         let HttpOptions {
             client,
             radius_decision_client,
@@ -1697,6 +1764,7 @@ impl Operations {
             Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
             Api::PiClassifier | Api::PiDecision => (pi_classifier::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context, options)?, false),
+            Api::PiImage => (wire::pi_image_payload(entry, context, options)?, false),
         };
         let (endpoint, mut headers) = if let Some((token, configured)) = radius_auth {
             let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
@@ -1764,6 +1832,12 @@ impl Operations {
                     .as_array_mut()
                     .expect("image operation output is initialized as an array");
                 image_output(&body, output)?;
+            }
+            Api::PiImage => {
+                if let Some(id) = body["responseId"].as_str() {
+                    data["responseId"] = json!(id);
+                }
+                data["output"] = wire::pi_image_output(&body["output"])?;
             }
             Api::LlamaCppClassifier => unreachable!("handled before the single request"),
         }
@@ -2073,7 +2147,38 @@ mod tests {
                     "q":{"type":"bool","instructions":"match?","criteria":{"true":"yes","false":"no"}}
                 }}
             });
+            let image_list = json!({"action":"list","type":"image","provider":"radius"});
+            let image_id = if args.offline {
+                "rotated-paint"
+            } else {
+                "radius-paint"
+            };
+            if mode == "cancel-discovery" {
+                let cancel = context();
+                let token = cancel.cancellation.clone();
+                let pending = super::super::config::agent_dir().join("image-catalogue-started");
+                let invoke = json!({"action":"generateImages","provider":"radius","id":image_id,
+                    "context":{"input":[{"type":"text","text":"draw"}]}});
+                let (reply, ()) = tokio::time::timeout(Duration::from_secs(8), async {
+                    tokio::join!(operation.invoke(invoke, cancel), async {
+                        while !pending.is_file() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        token.cancel();
+                    })
+                })
+                .await
+                .expect("cancel pending image discovery");
+                assert!(matches!(reply, Outcome::Structured { data, .. }
+                    if data["stopReason"] == "aborted" && data["output"] == json!([])
+                        && data["api"] == "pi-image" && data["model"] == image_id));
+                return;
+            }
             if mode == "wrong-account" {
+                assert!(matches!(
+                    operation.invoke(image_list, context()).await,
+                    Outcome::Structured { data, .. } if data == json!([])
+                ));
                 assert!(matches!(
                     operation.invoke(available, context()).await,
                     Outcome::Structured { data, .. } if data == json!([])
@@ -2116,6 +2221,15 @@ mod tests {
             assert_eq!(data.as_array().unwrap().len(), 1, "{data}");
             assert_eq!(data[0]["api"], "pi-decision");
             assert_eq!(data[0]["contextWindow"], 8192);
+            let Outcome::Structured { data: images, .. } =
+                operation.invoke(image_list, context()).await
+            else {
+                panic!("Radius image catalogue should be available from the account cache");
+            };
+            assert_eq!(images.as_array().unwrap().len(), 1, "{images}");
+            assert_eq!(images[0]["id"], image_id);
+            assert_eq!(images[0]["api"], "pi-image");
+            assert_eq!(images[0]["output"], json!(["text", "image"]));
             if !args.offline {
                 assert_eq!(data[0]["id"], "radius-judge");
                 let operation = Operations::new(&args).unwrap();
@@ -2138,6 +2252,58 @@ mod tests {
                 assert_eq!(data["api"], "pi-decision");
                 assert_eq!(data["responseId"], "fixture-decision");
                 assert_eq!(data["usage"]["totalTokens"], 4.0);
+                let image_request = json!({"action":"generateImages","provider":"radius","id":image_id,
+                    "context":{"input":[{"type":"text","text":"draw"}]},"options":{"size":"1K"}});
+                let mut unsupported = image_request.clone();
+                unsupported["context"]["input"][0] =
+                    json!({"type":"image","data":"YQ==","mimeType":"image/png"});
+                assert!(matches!(operation.invoke(unsupported, context()).await,
+                    Outcome::Structured { data, .. } if data["stopReason"] == "error" &&
+                        data["errorMessage"].as_str().unwrap().contains("does not support image input")));
+                let Outcome::Structured { data, .. } =
+                    operation.invoke(image_request.clone(), context()).await
+                else {
+                    panic!("Radius image invocation failed");
+                };
+                assert_eq!(data["stopReason"], "stop", "{data}");
+                assert_eq!(data["responseId"], "fixture-image");
+                assert_eq!(
+                    data["output"],
+                    json!([{"type":"text","text":"caption"},
+                    {"type":"image","mimeType":"image/png","data":"YQ=="}])
+                );
+                assert_eq!(data["usage"]["cost"]["total"], 0.25);
+                for diagnostic in [
+                    "Pi Image returned an invalid image block",
+                    "Pi Image returned HTTP 503 (service_unavailable)",
+                ] {
+                    let Outcome::Structured { data, .. } =
+                        operation.invoke(image_request.clone(), context()).await
+                    else {
+                        panic!("Radius image failure should return a structured result");
+                    };
+                    assert_eq!(data["stopReason"], "error", "{data}");
+                    assert_eq!(data["output"], json!([]));
+                    assert!(
+                        data["errorMessage"].as_str().unwrap().contains(diagnostic),
+                        "{data}"
+                    );
+                }
+                let cancelled = context();
+                let token = cancelled.cancellation.clone();
+                let pending = super::super::config::agent_dir().join("image-response-started");
+                let (reply, ()) = tokio::time::timeout(Duration::from_secs(8), async {
+                    tokio::join!(operation.invoke(image_request, cancelled), async {
+                        while !pending.is_file() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        token.cancel();
+                    })
+                })
+                .await
+                .expect("in-flight image request should cancel");
+                assert!(matches!(reply, Outcome::Structured { data, .. }
+                    if data["stopReason"] == "aborted" && data["output"] == json!([])));
                 for status in [503, 404, 307] {
                     let Outcome::Structured { data, .. } =
                         operation.invoke(classify.clone(), context()).await
@@ -2179,7 +2345,7 @@ mod tests {
                 let legacy = Operations::new(&legacy_args).unwrap();
                 assert!(
                     legacy
-                        .radius_classifiers(&context().cancellation, false)
+                        .radius_operations(Kind::Classifier, &context().cancellation, false)
                         .await
                         .unwrap()
                         .iter()
@@ -2239,12 +2405,16 @@ mod tests {
             json!({"providers":{"radius":{"headers":{"x-fixture-tenant":"test"}}}}).to_string(),
         )
         .unwrap();
+        let pending = home.path().join("image-response-started");
+        let catalogue_pending = home.path().join("image-catalogue-started");
         let server = tokio::spawn(async move {
             const CONFIG: &str = "GET /v1/config HTTP/1.1";
             const DECIDE: &str = "POST /relay/v1/decision HTTP/1.1";
             const CLASSIFY: &str = "POST /legacy/v1/classify HTTP/1.1";
+            const IMAGE: &str = "POST /relay/v1/image HTTP/1.1";
             const KEY: &str = "radius-fixture-key";
             for (method, key, status, config_base) in [
+                (CONFIG, KEY, 206, &base),
                 (CONFIG, KEY, 200, &foreign_base),
                 (CONFIG, KEY, 200, &foreign_base),
                 (CONFIG, KEY, 200, &foreign_base),
@@ -2252,6 +2422,10 @@ mod tests {
                 (CONFIG, KEY, 503, &base),
                 (CONFIG, KEY, 200, &base),
                 (DECIDE, KEY, 200, &base),
+                (IMAGE, KEY, 200, &base),
+                (IMAGE, KEY, 201, &base),
+                (IMAGE, KEY, 503, &base),
+                (IMAGE, KEY, 206, &base),
                 (DECIDE, KEY, 503, &base),
                 (DECIDE, KEY, 404, &base),
                 (DECIDE, KEY, 307, &base),
@@ -2285,10 +2459,30 @@ mod tests {
                 }
                 assert!(authorized, "{method}");
                 if method == CONFIG {
+                    if status == 206 {
+                        request.get_mut().write_all(b"HTTP/1.1 200 Fixture\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{").await.unwrap();
+                        std::fs::write(&catalogue_pending, []).unwrap();
+                        let mut remaining = [0; 1];
+                        assert_eq!(
+                            tokio::time::timeout(
+                                Duration::from_secs(8),
+                                request.read(&mut remaining)
+                            )
+                            .await
+                            .expect("cancelled catalogue should close the socket")
+                            .unwrap(),
+                            0
+                        );
+                        continue;
+                    }
                     let result = json!({"baseUrl":config_base,"models":[],"classifiers":[
                         {"id":if key == "rotated-fixture-key" {"rotated-judge"} else {"radius-judge"},
                         "name":"Judge","contextWindow":8192,"input":["text"],"cost":{"input":1.2}},
                         {"id":"bad","name":"Bad","contextWindow":0,"input":["text"],"cost":{"input":1.2}},
+                    ],"images":[
+                        {"id":if key == "rotated-fixture-key" {"rotated-paint"} else {"radius-paint"},
+                         "name":"Paint","input":["text"],"output":["text","image"],"cost":{"imageOutput":2}},
+                        {"id":"bad","name":"Bad","input":["text"],"output":["audio"],"cost":{}}
                     ]});
                     let body = if status == 200 {
                         result.to_string()
@@ -2297,6 +2491,45 @@ mod tests {
                     };
                     request.get_mut().write_all(format!(
                         "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+                    ).as_bytes()).await.unwrap();
+                } else if method == IMAGE {
+                    assert!(tenant);
+                    let mut body = vec![0; length];
+                    request.read_exact(&mut body).await.unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&body).unwrap(),
+                        json!({
+                            "model":"radius-paint","context":{"input":[{"type":"text","text":"draw"}]},
+                            "options":{"size":"1K"}
+                        })
+                    );
+                    if status == 206 {
+                        request.get_mut().write_all(b"HTTP/1.1 200 Fixture\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{").await.unwrap();
+                        std::fs::write(&pending, []).unwrap();
+                        let mut remaining = [0; 1];
+                        assert_eq!(
+                            tokio::time::timeout(
+                                Duration::from_secs(8),
+                                request.read(&mut remaining)
+                            )
+                            .await
+                            .expect("cancelled image request should close the socket")
+                            .unwrap(),
+                            0
+                        );
+                        continue;
+                    }
+                    let body = match status {
+                        200 => json!({"responseId":"fixture-image",
+                            "usage":{"cost":{"total":0.25,"totalFromProvider":true}},
+                            "output":[{"type":"text","text":"caption"},
+                                {"type":"image","mimeType":"image/png","data":"YQ=="}]}),
+                        201 => json!({"output":[{"type":"text","text":"caption"},
+                            {"type":"image","mimeType":"image/png","data":""}]}),
+                        _ => json!({"error":{"code":"service_unavailable","message":format!("rejected token {key}")}}),
+                    }.to_string();
+                    request.get_mut().write_all(format!(
+                        "HTTP/1.1 {status} Fixture\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
                     ).as_bytes()).await.unwrap();
                 } else {
                     assert_eq!(tenant, method == DECIDE);
@@ -2337,7 +2570,13 @@ mod tests {
             }
             listener
         });
-        for mode in ["foreign", "online", "offline", "wrong-account"] {
+        for mode in [
+            "cancel-discovery",
+            "foreign",
+            "online",
+            "offline",
+            "wrong-account",
+        ] {
             if mode == "offline" {
                 std::fs::write(
                     home.path().join("models.json"),
@@ -2391,6 +2630,7 @@ mod tests {
                 endpoint: base.clone(),
                 base,
                 models: vec![],
+                images: vec![],
                 classifiers: vec![radius_catalog::Classifier {
                     id: "judge".into(),
                     name: "Judge".into(),
@@ -2399,7 +2639,7 @@ mod tests {
                     cost: Cost::default(),
                 }],
             };
-            let entries = radius_entries(&catalog);
+            let entries = radius_entries(&catalog, Kind::Classifier);
             assert_eq!(entries[0].descriptor()["api"], "pi-decision");
             assert_eq!(entries[0].endpoint.path(), path);
             assert_eq!(entries[0].endpoint.origin(), catalog.base.origin());
@@ -3554,6 +3794,77 @@ mod tests {
         assert_eq!(data["api"], "typesafe-system-one");
         assert!(data["timestamp"].as_u64().unwrap() > 0);
         assert_eq!(data["answers"], json!({}));
+    }
+
+    #[test]
+    fn pi_image_configuration_does_not_override_radius_chat_defaults() {
+        for provider_level in [false, true] {
+            let mut provider = json!({
+                "baseUrl":"https://images.invalid/relay/v1",
+                "apiKey":"fixture-key",
+                "models":[{"type":"image","id":"paint"}]
+            });
+            if provider_level {
+                provider["api"] = json!("pi-image");
+            } else {
+                provider["models"][0]["api"] = json!("pi-image");
+            }
+            let profiles = super::super::model_profiles::Profiles::parse(&json!({
+                "providers":{"radius":provider}
+            }))
+            .unwrap();
+            let chat = profiles.provider("radius").unwrap();
+            assert_eq!(profiles.endpoint(&chat), chat.default_endpoint());
+            assert!(
+                profiles
+                    .credential(&chat, profiles.endpoint(&chat))
+                    .is_none()
+            );
+            let operations = profiles.operations();
+            let image = operations
+                .0
+                .iter()
+                .find(|entry| entry.model.id == "paint")
+                .unwrap();
+            assert!(matches!(image.api, Api::PiImage));
+            assert_eq!(
+                image.endpoint.as_str(),
+                "https://images.invalid/relay/v1/image"
+            );
+            assert_eq!(image.api_key.as_deref(), Some("fixture-key"));
+        }
+    }
+
+    #[test]
+    fn pi_image_wire_preserves_blocks_and_optional_options() {
+        let provider = json!({"fixture":{"baseUrl":"http://127.0.0.1:9/v1/",
+            "models":[{"id":"paint","type":"image","api":"pi-image","input":["text","image"]}]}});
+        let catalogue = Catalogue::parse(provider.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "fixture" && entry.model.id == "paint")
+            .unwrap();
+        assert_eq!(entry.endpoint.path(), "/v1/image");
+        let input = json!([{"type":"text","text":"draw"},
+            {"type":"image","mimeType":"image/png","data":"YQ=="}]);
+        let context = json!({"input":input});
+        assert_eq!(
+            wire::pi_image_payload(entry, &context, &Value::Null).unwrap(),
+            json!({"model":"paint","context":{"input":input}})
+        );
+        let options =
+            json!({"aspectRatio":"1:1","size":"1K","sessionId":"fixture","metadata":{"key":1}});
+        assert_eq!(
+            wire::pi_image_payload(entry, &context, &options).unwrap()["options"],
+            options
+        );
+        assert_eq!(wire::pi_image_output(&input).unwrap(), input);
+        assert!(
+            wire::pi_image_output(&json!([{"type":"image","data":"","mimeType":"image/png"}]))
+                .is_err()
+        );
+        assert!(wire::pi_image_output(&json!([{"type":"unknown"}])).is_err());
     }
 
     #[test]

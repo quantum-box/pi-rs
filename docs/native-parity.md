@@ -6287,6 +6287,20 @@ spills the generated text to a file. No live OpenRouter account was used.
 [Pinned OpenRouter image request](https://github.com/earendil-works/pi/blob/8d9408574325a12e2e34898bb8fa22784120e479/packages/ai/src/api/openrouter-images.ts#L68-L85)
 [Pinned Codemode image calls](https://github.com/earendil-works/pi/blob/8d9408574325a12e2e34898bb8fa22784120e479/packages/coding-agent/src/extensions/codemode/execute.ts#L792-L810)
 
+### Radius image generation
+
+Codemode lists Radius image models from the authenticated gateway catalogue.
+The local catalogue cache is bound to the gateway and account, and supports
+offline listing. Generation sends a single `POST <baseUrl>/image` with the
+declared model, ordered input blocks, and supplied image options. The
+authenticated route uses the same origin check as Radius chat and decision
+discovery, and the request is never retried or redirected. Responses preserve
+ordered text and image blocks, the response ID, and usage, including a
+provider-reported cost without token counts. Native Codemode validates image
+MIME types and base64 and rejects malformed output without publishing a
+partial image result.
+[Pinned Pi Image protocol](https://github.com/earendil-works/pi/blob/2126569de40d5595dd3f41f7af126001f04c1de0/packages/ai/src/api/pi-image.ts)
+
 ### Chat model connection and compatibility
 
 Codemode's chat-model catalogue includes declared input modalities, reasoning

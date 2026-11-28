@@ -18,6 +18,7 @@ pub(super) struct Catalog {
     pub endpoint: Url,
     pub models: Vec<Model>,
     pub classifiers: Vec<Classifier>,
+    pub images: Vec<ImageModel>,
 }
 
 impl Catalog {
@@ -36,6 +37,16 @@ pub(super) struct Classifier {
     pub name: String,
     pub input: Vec<String>,
     pub context_window: u32,
+    pub cost: super::operation_models::Cost,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ImageModel {
+    pub id: String,
+    pub name: String,
+    pub input: Vec<String>,
+    pub output: Vec<String>,
     pub cost: super::operation_models::Cost,
 }
 
@@ -134,6 +145,8 @@ struct Config {
     models: Vec<Value>,
     #[serde(default)]
     classifiers: Value,
+    #[serde(default)]
+    images: Value,
 }
 
 pub(super) async fn load(client: &Client, gateway: &Url, token: &str) -> Result<Catalog> {
@@ -229,11 +242,34 @@ fn parse(config: Config, gateway: &Url) -> Result<Catalog> {
                 && seen.insert(model.id.clone())
         })
         .collect();
+    seen.clear();
+    let images = config
+        .images
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| serde_json::from_value::<ImageModel>(model.clone()).ok())
+        .filter(|model| {
+            !model.id.trim().is_empty()
+                && model.id.len() <= 256
+                && !model.name.is_empty()
+                && !model.input.is_empty()
+                && model.output.iter().any(|kind| kind == "image")
+                && model
+                    .input
+                    .iter()
+                    .chain(&model.output)
+                    .all(|kind| matches!(kind.as_str(), "text" | "image"))
+                && model.cost.valid()
+                && seen.insert(model.id.clone())
+        })
+        .collect();
     Ok(Catalog {
         base,
         endpoint,
         models,
         classifiers,
+        images,
     })
 }
 
@@ -281,7 +317,7 @@ pub(super) fn remember(gateway: &Url, account: &str, catalog: &Catalog) -> Resul
         &json!({
             "origin":gateway.as_str(), "account":account,
             "baseUrl":catalog.base.as_str(), "models":catalog.models,
-            "classifiers":catalog.classifiers,
+            "classifiers":catalog.classifiers, "images":catalog.images,
         }),
     )
 }
@@ -332,6 +368,7 @@ mod tests {
                     base_url: "https://gateway.example/v1".into(),
                     models,
                     classifiers: Value::Null,
+                    images: Value::Null,
                 },
                 &gateway,
             )
