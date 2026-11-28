@@ -1816,6 +1816,10 @@ fn malformed_models_json_warns_and_keeps_the_builtin_listing() {
 
     for malformed in [
         "{",
+        "{,}",
+        "[,]",
+        "{ // comment\n ,}",
+        r#"{"providers":[,]}"#,
         "[]",
         r#"{"providers":{"anthropic":{"baseUrl":"http://unapproved.example.test","apiKey":"fixture-secret"}}}"#,
     ] {
@@ -2147,11 +2151,40 @@ fn catalog_fallback_requires_confirmation_for_a_shadowed_saved_model() {
     assert!(configured.status.success(), "{configured:?}");
     assert!(String::from_utf8_lossy(&configured.stdout).contains("openai-completions"));
 
-    std::fs::write(&models, "{").unwrap();
-    let rejected = catalog_fallback_rpc(root.path(), &[]);
-    assert!(!rejected.status.success(), "{rejected:?}");
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("confirm the custom route"));
-    assert!(rejected.stdout.is_empty(), "{rejected:?}");
+    for malformed in [
+        "{",
+        "{,}",
+        "[,]",
+        "{ // comment\n ,}",
+        r#"{"providers":[,]}"#,
+    ] {
+        std::fs::write(&models, malformed).unwrap();
+        let rejected = catalog_fallback_rpc(root.path(), &[]);
+        assert!(!rejected.status.success(), "{malformed}: {rejected:?}");
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("confirm the custom route"));
+        assert!(rejected.stdout.is_empty(), "{rejected:?}");
+        let auth = catalog_fallback_command(root.path())
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--provider",
+                "openai",
+                "auth",
+                "check",
+                "--json",
+                "--no-refresh",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(auth.status.code(), Some(2), "{malformed}: {auth:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&auth.stdout).unwrap()["reason"],
+            "invalid_state"
+        );
+        assert_eq!(std::fs::read_to_string(&models).unwrap(), malformed);
+    }
 
     for flags in [
         &["--provider", "openai", "--model", model][..],

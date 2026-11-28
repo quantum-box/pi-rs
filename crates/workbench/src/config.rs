@@ -1251,7 +1251,7 @@ fn read_json_object(
             };
             let normalized;
             let input = if path.file_name().is_some_and(|name| name == "models.json") {
-                normalized = normalize_models_json(input);
+                normalized = super::models_json::normalize(input);
                 normalized.as_slice()
             } else {
                 input
@@ -1274,53 +1274,6 @@ fn read_json_object(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
         Err(error) => Err(JsonObjectError::Read(error)),
     }
-}
-
-// Pi allows line comments and trailing commas in models.json. Replace them
-// with whitespace so malformed input retains its original line and column.
-fn normalize_models_json(input: &[u8]) -> Vec<u8> {
-    let mut output = input.to_vec();
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut in_comment = false;
-    let mut comma = None;
-    for (index, &byte) in input.iter().enumerate() {
-        if in_comment {
-            if byte == b'\n' {
-                in_comment = false;
-            } else {
-                output[index] = b' ';
-            }
-        } else if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-        } else {
-            match byte {
-                b'/' if input.get(index + 1) == Some(&b'/') => {
-                    in_comment = true;
-                    output[index] = b' ';
-                }
-                b',' => comma = Some(index),
-                b'}' | b']' => {
-                    if let Some(comma) = comma.take() {
-                        output[comma] = b' ';
-                    }
-                }
-                b'"' => {
-                    in_string = true;
-                    comma = None;
-                }
-                b' ' | b'\t' | b'\n' | b'\r' => {}
-                _ => comma = None,
-            }
-        }
-    }
-    output
 }
 
 #[cfg(test)]

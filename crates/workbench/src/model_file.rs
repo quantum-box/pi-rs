@@ -115,8 +115,9 @@ impl ModelFileReadGrants {
         else {
             return Ok(catalog.build());
         };
-        let config: ModelFile = serde_json::from_slice(&normalize_model_json(text))
-            .map_err(|_| Error::Config("invalid models file JSON".into()))?;
+        let config: ModelFile =
+            serde_json::from_slice(&crate::models_json::normalize(text.as_bytes()))
+                .map_err(|_| Error::Config("invalid models file JSON".into()))?;
         for (provider, routes) in authorized {
             let mut clients = BTreeMap::<_, Arc<dyn Model>>::new();
             let Some(value) = config.providers.get(provider) else {
@@ -210,44 +211,6 @@ fn client_for_route(
         HostCredential::new(HostCredentialKind::ApiKey, key)?,
     )?;
     ModelClientFactory::new(auth.build()).client(route.api, provider, endpoint)
-}
-
-// Pi accepts line comments and trailing commas. Mask them without changing
-// string contents, then let serde_json validate the remaining syntax.
-fn normalize_model_json(text: String) -> Vec<u8> {
-    let mut bytes = text.into_bytes();
-    let mut index = 0;
-    let mut in_string = false;
-    let mut previous = None;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if in_string {
-            match byte {
-                b'\\' => index += 1,
-                b'"' => in_string = false,
-                _ => {}
-            }
-        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
-            let end = bytes[index + 2..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(bytes.len(), |offset| index + 2 + offset);
-            bytes[index..end].fill(b' ');
-            index = end;
-            continue;
-        } else if !matches!(byte, b' ' | b'\r' | b'\n' | b'\t') {
-            if matches!(byte, b']' | b'}')
-                && let Some(comma) = previous
-                && bytes[comma] == b','
-            {
-                bytes[comma] = b' ';
-            }
-            in_string = byte == b'"';
-            previous = Some(index);
-        }
-        index += 1;
-    }
-    bytes
 }
 
 fn api_name(api: NativeModelApi) -> &'static str {

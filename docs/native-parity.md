@@ -5159,7 +5159,9 @@ endpoint. Named custom providers, per-model overrides and credential
 commands remain in progress.
 
 Native `models.json` accepts the same optional UTF-8 BOM, `//` line comments,
-and trailing commas as Pi. Quoted strings retain their contents.
+and trailing commas as Pi. Quoted strings retain their contents. Unlike Pi’s
+normalizer, native rejects bare or repeated commas in empty containers instead of
+repairing malformed JSON; strict credential and granted SDK reads reject them too.
 
 If the CLI's user-level `models.json` is malformed or unreadable, model listing
 and session startup warn and use the built-in catalog. Reload uses that fallback

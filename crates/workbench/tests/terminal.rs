@@ -881,7 +881,7 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
     let home = root.path().join("home");
     std::fs::create_dir(&home).unwrap();
     let models = home.join("models.json");
-    std::fs::write(&models, "{").unwrap();
+    std::fs::write(&models, "{,}").unwrap();
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let mut size = libc::winsize {

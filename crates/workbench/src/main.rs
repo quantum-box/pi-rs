@@ -45,6 +45,7 @@ mod model_auth;
 mod model_listing;
 mod model_profiles;
 mod model_selection;
+mod models_json;
 mod openrouter_auth;
 mod operation_models;
 mod packages;

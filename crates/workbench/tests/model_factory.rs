@@ -1157,6 +1157,40 @@ async fn granted_model_file_composes_saved_auth_with_exact_api_and_base_routes()
 }
 
 #[test]
+fn granted_model_file_rejects_bare_and_repeated_commas() {
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("models.json");
+    let grants = ModelFileReadGrants {
+        file: file.clone(),
+        routes: vec![ModelFileRoute {
+            provider: "relay".into(),
+            api: NativeModelApi::OpenAiChat,
+            base_url: "https://relay.example.test/v1".into(),
+            endpoint: "https://relay.example.test/v1/chat/completions".into(),
+        }],
+    };
+    let factory = ModelClientFactory::default();
+    for malformed in [
+        "{,}",
+        "[,]",
+        "{ // comment\n ,}",
+        r#"{"providers":{"relay":{,}}}"#,
+        r#"{"providers":[,]}"#,
+        r#"{"providers":{},,}"#,
+    ] {
+        std::fs::write(&file, malformed).unwrap();
+        assert!(
+            matches!(grants.load(&factory), Err(pi_rs::Error::Config(message)) if message == "invalid models file JSON"),
+            "{malformed}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), malformed);
+    }
+    std::fs::write(&file, "{\"providers\":{}, // valid\n }").unwrap();
+    assert_eq!(grants.load(&factory).unwrap().identities().len(), 0);
+}
+
+#[test]
 fn configured_model_key_grants_reject_codex_oauth_routes() {
     use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
 
