@@ -121,6 +121,42 @@ fn reservation_key(task: Uuid, name: &str) -> Vec<u8> {
     key.extend_from_slice(name.as_bytes());
     key
 }
+
+pub(crate) fn reserved_foreground_child(
+    store: &durable_store::Store,
+    owner: &TaskOwner,
+    name: &str,
+    notify: &SubmissionNotify,
+) -> Result<Uuid, Error> {
+    let task = notify.task_id;
+    let row = store
+        .get(&reservation_key(task, name))?
+        .ok_or_else(invalid)?;
+    let stored: StoredAdmission = serde_json::from_slice(&row.value)?;
+    let admission = stored.admission;
+    let edge = ownership_edge::EdgeStore::new(store)
+        .get(admission.child)
+        .map_err(|error| Error::Invalid(error.to_string()))?
+        .ok_or_else(invalid)?
+        .edge;
+    if admission.task != task
+        || &admission.task_owner != owner
+        || admission.key != name
+        || admission.mode != Mode::Foreground
+        || admission
+            .submission
+            .and_then(|submission| submission.notify)
+            .as_ref()
+            != Some(notify)
+        || edge.task != task
+        || &edge.task_owner != owner
+        || edge.mode != Mode::Foreground
+    {
+        return Err(invalid());
+    }
+    Ok(admission.child)
+}
+
 pub(crate) const NOTIFICATION_BINDING_PREFIX: &[u8] = b"durable/owned-subagent-notify/";
 /// Reserved destinations are permanent, including after settlement and reopen.
 pub(crate) fn notification_binding_key(notify: &SubmissionNotify) -> Vec<u8> {

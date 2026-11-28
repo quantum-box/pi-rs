@@ -23902,38 +23902,17 @@ impl Scheduler {
             ))?;
         }
         let foreground_receiver = if let Some((parent, config, allowed_tools)) = foreground {
-            validate_allowed_tools(&allowed_tools)?;
-            harness.conversation(parent)?;
-            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-            let mut worker = harness.worker();
-            worker.extensions =
-                Arc::new(std::sync::RwLock::new(crate::extension::Registry::default()));
-            let (extension, handler) = crate::foreground_subagent::extension(
-                worker,
+            let tasks = tasks.as_mut().ok_or_else(|| {
+                Error::Invalid("foreground extension requires task driver".into())
+            })?;
+            Some(Self::configure_foreground(
+                &harness,
+                tasks,
                 parent,
                 config,
                 allowed_tools,
-                sender,
-            );
-            if !tasks
-                .as_mut()
-                .ok_or_else(|| Error::Invalid("foreground extension requires task driver".into()))?
-                .register_shared(crate::foreground_subagent::KIND, true, handler)
-            {
-                return Err(Error::Invalid(
-                    "foreground task kind already registered".into(),
-                ));
-            }
-            tasks.as_mut().expect("task registry checked").set_abort(
-                crate::foreground_subagent::KIND,
-                |_: &crate::task::Task| {
-                    Ok(crate::task_scheduler::Step::Succeed(
-                        serde_json::Value::Null,
-                    ))
-                },
-            );
-            harness.install_extension(extension)?;
-            Some(receiver)
+                false,
+            )?)
         } else {
             None
         };
@@ -23972,6 +23951,139 @@ impl Scheduler {
         scheduler.start_reporter();
         Ok((scheduler, driver))
     }
+    fn configure_foreground(
+        harness: &Harness,
+        tasks: &mut crate::task_scheduler::Registry,
+        parent: Uuid,
+        config: Config,
+        allowed_tools: Option<Vec<String>>,
+        paused: bool,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Uuid>, Error> {
+        use crate::foreground_subagent::{self, Binding, KIND};
+
+        validate_config(&config)?;
+        validate_allowed_tools(&allowed_tools)?;
+        harness.conversation(parent)?;
+        let mut bindings = HashMap::from([(
+            parent,
+            Binding {
+                parent,
+                config,
+                allowed_tools,
+            },
+        )]);
+        // The driver validates pending task bindings across the store. Recover
+        // each binding from its saved adapter identity, even when the paused
+        // host will only schedule the selected conversation.
+        for id in harness.conversations()? {
+            if id == parent {
+                continue;
+            }
+            let (conversation, _) = harness.load(id)?;
+            let Phase::TaskPending {
+                identity: Some(identity),
+                ..
+            } = conversation.phase
+            else {
+                continue;
+            };
+            if identity.kind != KIND
+                || !conversation
+                    .extensions
+                    .contains(&foreground_subagent::extension_name(id))
+            {
+                continue;
+            }
+            let binding: Binding = serde_json::from_value(
+                identity
+                    .direct_binding()
+                    .cloned()
+                    .ok_or_else(|| Error::Invalid("foreground task binding missing".into()))?,
+            )?;
+            if binding.parent != id {
+                return Err(Error::Invalid(
+                    "foreground task owner binding mismatch".into(),
+                ));
+            }
+            validate_config(&binding.config)?;
+            validate_allowed_tools(&binding.allowed_tools)?;
+            bindings.insert(id, binding);
+        }
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut worker = harness.worker();
+        worker.extensions = Arc::new(std::sync::RwLock::new(crate::extension::Registry::default()));
+        let handler = foreground_subagent::handler(
+            worker,
+            bindings.clone(),
+            paused.then_some(parent),
+            sender,
+        );
+        if !tasks.register_shared(KIND, true, handler.clone()) {
+            return Err(Error::Invalid(
+                "foreground task kind already registered".into(),
+            ));
+        }
+        tasks.set_abort(crate::foreground_subagent::KIND, |_: &crate::task::Task| {
+            Ok(crate::task_scheduler::Step::Succeed(
+                serde_json::Value::Null,
+            ))
+        });
+        for binding in bindings.values() {
+            harness.install_extension(foreground_subagent::extension(binding, handler.clone()))?;
+        }
+        Ok(receiver)
+    }
+
+    /// Install a parent-bound foreground extension on a paused scheduler
+    /// before submitting or resuming any conversation. The host selects the
+    /// extension on the parent and must keep the returned driver running.
+    pub fn start_foreground_subagent(
+        &mut self,
+        parent: Uuid,
+        config: Config,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<crate::task_driver::Driver, Error> {
+        if self.foreground_worker.is_some()
+            || !self.tasks.is_empty()
+            || self
+                .harness
+                .task_driver
+                .lock()
+                .map_err(|_| Error::Failed)?
+                .as_ref()
+                .and_then(|driver| driver.upgrade())
+                .is_some()
+        {
+            return Err(Error::Invalid(
+                "foreground subagent setup requires a paused scheduler before task dispatch".into(),
+            ));
+        }
+        // A task already waiting for its child's receipt will not invoke its
+        // handler on startup, so it cannot enqueue the child on the new channel.
+        let state = self.harness.conversation(parent)?;
+        let child = match state.phase {
+            Phase::TaskPending { task, .. } if !state.abort_requested => {
+                crate::foreground_subagent::waiting_child(&self.harness, parent, task)?
+            }
+            _ => None,
+        };
+        let mut tasks = crate::task_scheduler::Registry::default();
+        let receiver = Self::configure_foreground(
+            &self.harness,
+            &mut tasks,
+            parent,
+            config,
+            allowed_tools,
+            true,
+        )?;
+        let driver = self.start_tasks(tasks)?;
+        self.start_foreground_worker(receiver);
+        if let Some(child) = child {
+            self.schedule(child);
+        }
+        Ok(driver)
+    }
+
     fn with_harness(
         harness: Harness,
         summary_provider: Option<SummaryProviderIdentity>,

@@ -505,6 +505,15 @@ watch to a listed ID. The Durable RPC stream sends
 `get_foreground_subagent` request takes a tool-owned foreground `conversationId` of the parent, including
 a settled child, and returns
 up to 32 recent native messages with the child's live model and tool output.
+Start the text CLI or RPC companion with `--foreground-subagent` to select
+the built-in `subagent` tool on the conversation. The child uses the same
+provider route and model and starts with an empty tool allowlist. Reopening the
+conversation restores the selection before resuming work. If the parent was
+waiting for a foreground child when the process stopped, the companion resumes
+the original child conversation and delivers its settlement to the parent. A
+separate foreground session can start while that child is parked. The companion
+restores the parked task’s registration using its saved binding and schedules
+its child when the owning conversation is reopened.
 
 Ordinary nested calls support `ToolHost::call_with_cancellation`. Cancelling a
 new call during preparation records a skipped result at its original position.
