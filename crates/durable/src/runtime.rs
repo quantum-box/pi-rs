@@ -13,6 +13,12 @@ use crate::{
     recovery::{ReplayPolicy, ToolRecovery, UncertainPolicy, recover_tool},
     retry_policy::{Decision, Failure, RetryPolicy, RetryState, StopReason, is_context_overflow},
 };
+pub use durable_store::fork_snapshot_packing::{
+    ForkSnapshotPackingCursor, ForkSnapshotPackingPage,
+};
+pub use durable_store::transcript_packing::{
+    PackingCursor as TranscriptPackingCursor, PackingPage as TranscriptPackingPage,
+};
 use durable_store::{
     Check, Expected, Mutation,
     owner::{OwnedStore, OwnerError},
@@ -14408,6 +14414,45 @@ impl Harness {
         }
     }
 
+    /// Capture the upper version of an explicit history-packing pass.
+    pub fn transcript_packing_start(&self) -> Result<TranscriptPackingCursor, Error> {
+        Ok(self.subagent_store()?.transcript_packing_start()?)
+    }
+
+    /// Pack one bounded page of immutable transcript entries.
+    pub fn pack_transcript_history(
+        &self,
+        cursor: &TranscriptPackingCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<TranscriptPackingPage, Error> {
+        Ok(self
+            .subagent_store()?
+            .pack_transcript_history(cursor, limit.get())?)
+    }
+
+    /// Begin a packing pass after fork snapshot keys have aged past the
+    /// specified window. Its eligible boundary survives process restarts.
+    pub fn fork_snapshot_packing_due(
+        &self,
+        retain_for: Duration,
+    ) -> Result<Option<ForkSnapshotPackingCursor>, Error> {
+        let retain_ms = u64::try_from(retain_for.as_millis())
+            .map_err(|_| Error::Invalid("invalid fork snapshot retention".into()))?;
+        Ok(self
+            .subagent_store()?
+            .fork_snapshot_packing_due(unix_ms(), retain_ms)?)
+    }
+
+    pub fn pack_fork_snapshot_history(
+        &self,
+        cursor: &ForkSnapshotPackingCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<ForkSnapshotPackingPage, Error> {
+        Ok(self
+            .subagent_store()?
+            .pack_fork_snapshot_history(cursor, limit.get())?)
+    }
+
     /// Reclaim at most `limit` attempt-local progress snapshots for a settled
     /// task. The caller chooses which terminal tasks to retain for inspection.
     /// Repeat while a full batch is returned. Published transcript, results,
@@ -23345,6 +23390,8 @@ pub struct Scheduler {
     foreground_worker: Option<tokio::task::JoinHandle<()>>,
     progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     published_progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
+    fork_snapshot_packing: Option<tokio::task::JoinHandle<Result<(), Error>>>,
+    transcript_packing: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
     worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
     summary_tasks: HashMap<Uuid, SummaryTask>,
@@ -24171,6 +24218,8 @@ impl Scheduler {
             foreground_worker: None,
             progress_retention: None,
             published_progress_retention: None,
+            fork_snapshot_packing: None,
+            transcript_packing: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -24471,6 +24520,33 @@ impl Scheduler {
         self.harness
             .prune_finished_checkpointable_progress(task, limit)
     }
+    pub fn transcript_packing_start(&self) -> Result<TranscriptPackingCursor, Error> {
+        self.harness.transcript_packing_start()
+    }
+
+    pub fn pack_transcript_history(
+        &self,
+        cursor: &TranscriptPackingCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<TranscriptPackingPage, Error> {
+        self.harness.pack_transcript_history(cursor, limit)
+    }
+
+    pub fn fork_snapshot_packing_due(
+        &self,
+        retain_for: Duration,
+    ) -> Result<Option<ForkSnapshotPackingCursor>, Error> {
+        self.harness.fork_snapshot_packing_due(retain_for)
+    }
+
+    pub fn pack_fork_snapshot_history(
+        &self,
+        cursor: &ForkSnapshotPackingCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<ForkSnapshotPackingPage, Error> {
+        self.harness.pack_fork_snapshot_history(cursor, limit)
+    }
+
     pub fn progress_history_from_now(
         &self,
         conversation: Uuid,
@@ -25857,6 +25933,84 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Losslessly pack aged fork evidence in bounded background passes.
+    /// Reattach after reopening to resume from the last completed page.
+    pub fn start_fork_snapshot_packing(
+        &mut self,
+        retain_for: Duration,
+        interval: Duration,
+    ) -> Result<(), Error> {
+        let retain_ms = u64::try_from(retain_for.as_millis())
+            .ok()
+            .filter(|time| *time > 0)
+            .ok_or_else(|| Error::Invalid("invalid fork snapshot retention".into()))?;
+        if interval.is_zero() || self.fork_snapshot_packing.is_some() {
+            return Err(Error::Invalid(
+                "fork snapshot packing needs a nonzero interval and one worker".into(),
+            ));
+        }
+        let owner = self.harness.owner.clone();
+        let cancel = self.reporter_cancel.clone();
+        self.fork_snapshot_packing = Some(tokio::spawn(async move {
+            while !cancel.is_cancelled() {
+                let owner = owner.clone();
+                tokio::task::spawn_blocking(move || {
+                    owner
+                        .store()
+                        .sweep_fork_snapshot_history(unix_ms(), retain_ms, 4)
+                })
+                .await
+                .map_err(|error| {
+                    Error::Invalid(format!("fork snapshot packing worker: {error}"))
+                })??;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => (),
+                }
+            }
+            Ok(())
+        }));
+        Ok(())
+    }
+
+    /// Losslessly pack transcript entries after the observed retention period.
+    /// Reattach after reopening to resume the persisted sweep.
+    pub fn start_transcript_packing(
+        &mut self,
+        retain_for: Duration,
+        interval: Duration,
+    ) -> Result<(), Error> {
+        let retain_ms = u64::try_from(retain_for.as_millis())
+            .ok()
+            .filter(|time| *time > 0)
+            .ok_or_else(|| Error::Invalid("invalid transcript retention".into()))?;
+        if interval.is_zero() || self.transcript_packing.is_some() {
+            return Err(Error::Invalid(
+                "transcript packing needs a nonzero interval and one worker".into(),
+            ));
+        }
+        let owner = self.harness.owner.clone();
+        let cancel = self.reporter_cancel.clone();
+        self.transcript_packing = Some(tokio::spawn(async move {
+            while !cancel.is_cancelled() {
+                let owner = owner.clone();
+                tokio::task::spawn_blocking(move || {
+                    owner
+                        .store()
+                        .sweep_transcript_history(unix_ms(), retain_ms, 4)
+                })
+                .await
+                .map_err(|error| Error::Invalid(format!("transcript packing worker: {error}")))??;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => (),
+                }
+            }
+            Ok(())
+        }));
+        Ok(())
+    }
+
     /// Most recent background reporter failure, if any. Reopen after storage errors.
     pub fn reporter_error(&self) -> Option<String> {
         self.reporter_error
@@ -26146,6 +26300,8 @@ impl Scheduler {
         for worker in [
             self.progress_retention.take(),
             self.published_progress_retention.take(),
+            self.fork_snapshot_packing.take(),
+            self.transcript_packing.take(),
         ]
         .into_iter()
         .flatten()
