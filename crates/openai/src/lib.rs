@@ -633,6 +633,16 @@ impl OpenAiResponses {
         self
     }
 
+    /// Use an exact provider effort for an explicitly selected level. An off
+    /// effort is sent without requesting a reasoning summary. Use `None` to
+    /// omit the reasoning field, including the Codex default when disabled.
+    pub fn with_exact_reasoning_effort(mut self, enabled: bool, effort: Option<&str>) -> Self {
+        self.thinking = effort.filter(|_| enabled).map(str::to_owned);
+        self.codex_off_effort = effort.filter(|_| !enabled).map(str::to_owned);
+        self.configuration_update_thinking = enabled;
+        self
+    }
+
     /// Resolve per-model system updates on the client's current Responses route.
     pub fn with_mid_conversation_system_policy(
         mut self,

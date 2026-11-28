@@ -27,6 +27,49 @@ pub struct UiComponentSpan {
     pub inverse: bool,
 }
 
+/// The active terminal palette, without theme file paths or session data.
+/// Color strings are CSS hex values, decimal ANSI palette indices, terminal
+/// color names, or "default".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiRenderTheme {
+    pub name: String,
+    pub colors: std::collections::BTreeMap<String, String>,
+    pub dimmed: Vec<String>,
+}
+
+/// Read-only layout information for a mounted header.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeaderRenderContext {
+    pub width: u16,
+    pub theme: UiRenderTheme,
+}
+
+/// A mounted header. Returning `None` uses the built-in header. Empty rows hide it.
+/// The host cancels pending renders and releases this instance when it is unmounted.
+#[async_trait::async_trait]
+pub trait HeaderRenderer: Send + Sync {
+    async fn render(
+        &self,
+        context: &HeaderRenderContext,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>>;
+
+    /// Render until completion or cancellation. Implementations that start
+    /// background work must finish its cleanup before returning.
+    async fn render_with_cancellation(
+        &self,
+        context: &HeaderRenderContext,
+        cancellation: &CancellationToken,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Ok(None),
+            rows = self.render(context) => rows,
+        }
+    }
+}
+
 /// Layout options for an extension's custom transcript message.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +98,11 @@ pub type RenderedExtensionContent = RenderedCustomMessage;
 pub type RenderedExtensionRows = RenderedCustomMessage;
 
 impl RenderedCustomMessage {
+    /// Whether these rows fit the terminal header's limits.
+    pub fn within_header_limits(&self) -> bool {
+        self.lines.len() <= 16 && self.within_limits()
+    }
+
     pub(crate) fn within_limits(&self) -> bool {
         component_lines_within_limits(&self.lines)
             && self
@@ -308,6 +356,52 @@ pub struct WorkingIndicatorOptions {
     pub interval_ms: Option<u64>,
 }
 
+/// Declarative customization of the native draft editor.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UiEditorComponent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default)]
+    pub keybindings: Vec<UiEditorKeybinding>,
+}
+
+impl UiEditorComponent {
+    fn valid(&self) -> bool {
+        self.placeholder
+            .as_ref()
+            .is_none_or(|text| text.len() <= 256 && !text.chars().any(char::is_control))
+            && self.keybindings.len() <= 32
+            && self.keybindings.iter().all(|binding| {
+                !binding.key.trim().is_empty()
+                    && binding.key.len() <= 64
+                    && !binding.key.chars().any(char::is_control)
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiEditorKeybinding {
+    pub key: String,
+    pub action: UiEditorAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiEditorAction {
+    CursorLeft,
+    CursorRight,
+    CursorWordLeft,
+    CursorWordRight,
+    CursorLineStart,
+    CursorLineEnd,
+    DeleteCharBackward,
+    DeleteCharForward,
+    DeleteWordBackward,
+    DeleteWordForward,
+    Undo,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
     tag = "method",
@@ -375,6 +469,13 @@ pub enum UiRequest {
         #[serde(default)]
         lines: Option<Vec<Vec<UiComponentSpan>>>,
     },
+    /// Mount a new instance of the calling extension's header renderer.
+    /// Disable it to restore the built-in header.
+    SetHeaderRenderer {
+        enabled: bool,
+    },
+    /// Request another render after the mounted header's data changes.
+    InvalidateHeaderRenderer,
     /// Replace the session footer with styled rows. Clear it with `None`.
     SetFooter {
         #[serde(default)]
@@ -411,6 +512,13 @@ pub enum UiRequest {
         text: String,
     },
     GetEditorText,
+    /// Customize the native draft editor. Omit the component to restore defaults.
+    SetEditorComponent {
+        #[serde(default)]
+        component: Option<UiEditorComponent>,
+    },
+    /// Read the current native editor component descriptor.
+    GetEditorComponent,
     /// List the frontend's built-in and loaded file themes.
     GetAllThemes,
     /// Look up an exact theme name without selecting the theme.
@@ -514,6 +622,15 @@ impl UiRequest {
         {
             return Err("extension hidden thinking label exceeds its rendering limits".into());
         }
+        if let Self::SetEditorComponent {
+            component: Some(component),
+        } = self
+            && !component.valid()
+        {
+            return Err(
+                "extension editor component exceeds its rendering or keybinding limits".into(),
+            );
+        }
         if let Self::Custom { lines, actions, .. } = self {
             if !component_lines_within_limits(lines) {
                 return Err("extension component exceeds its rendering limits".into());
@@ -543,6 +660,7 @@ impl UiRequest {
             (Self::GetAllThemes, UiResponse::Themes(themes)) => {
                 serde_json::to_vec(themes).is_ok_and(|value| value.len() <= 1024 * 1024)
             }
+            (Self::GetEditorComponent, UiResponse::EditorComponent(component)) => component.valid(),
             (Self::GetTheme { name }, UiResponse::Theme(theme)) => {
                 theme.name == *name
                     && serde_json::to_vec(theme).is_ok_and(|value| value.len() <= 1024 * 1024)
@@ -579,6 +697,7 @@ impl UiRequest {
                 | Self::Editor { .. }
                 | Self::Custom { .. }
                 | Self::GetEditorText
+                | Self::GetEditorComponent
                 | Self::GetAllThemes
                 | Self::GetTheme { .. }
                 | Self::GetActiveTheme
@@ -596,11 +715,31 @@ pub enum UiResponse {
     Themes(Vec<UiThemeInfo>),
     Theme(UiThemePalette),
     ThemeChanged(UiThemeChange),
+    EditorComponent(UiEditorComponent),
     Cancelled,
 }
 
 #[async_trait::async_trait]
 pub trait ExtensionUi: Send + Sync {
+    /// Mount (or clear) a renderer on behalf of an scoped extension callback.
+    fn set_header_renderer(
+        &self,
+        _owner: &str,
+        _renderer: Option<std::sync::Arc<dyn HeaderRenderer>>,
+        _cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        Err("dynamic headers are unavailable in this UI".into())
+    }
+
+    /// Invalidate the header only if it belongs to this callback's extension.
+    fn invalidate_header_renderer(
+        &self,
+        _owner: &str,
+        _cancellation: &CancellationToken,
+    ) -> ExtensionResult<()> {
+        Err("dynamic headers are unavailable in this UI".into())
+    }
+
     async fn request(
         &self,
         request: UiRequest,
@@ -630,6 +769,27 @@ pub fn ui_requester_cancellation() -> Option<CancellationToken> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_component_uses_bounded_native_descriptors() {
+        let descriptor = serde_json::json!({
+            "placeholder":"Draft", "keybindings":[{"key":"f6","action":"undo"}]
+        });
+        let wire = serde_json::json!({"method":"setEditorComponent","component":descriptor});
+        let request: UiRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        assert!(request.validate().is_ok());
+        assert!(!request.needs_response());
+        let response: UiResponse = serde_json::from_value(descriptor.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&response).unwrap(), descriptor);
+        assert!(UiRequest::GetEditorComponent.accepts_response(&response));
+        assert!(!UiRequest::GetEditorText.accepts_response(&response));
+        let invalid: UiRequest = serde_json::from_value(serde_json::json!({
+            "method":"setEditorComponent","component":{"placeholder":"line\nbreak"}
+        }))
+        .unwrap();
+        assert!(invalid.validate().is_err());
+    }
     #[test]
     fn theme_list_uses_typed_responses_without_requiring_file_paths() {
         let wire = serde_json::json!({"method":"getAllThemes"});

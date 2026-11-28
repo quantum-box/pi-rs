@@ -44,15 +44,23 @@ pub mod mcp_refresh;
 mod mcp_resource_compat;
 pub mod model_factory;
 pub mod model_file;
+mod model_thinking_levels;
 #[doc(hidden)]
 pub mod native_pi_messages;
 #[doc(hidden)]
 pub mod oauth_callback;
 #[doc(hidden)]
+pub mod package_manifest;
+#[doc(hidden)]
+pub mod package_pattern;
+pub mod package_resources;
+#[doc(hidden)]
 pub mod process_cleanup;
 pub mod prompt_resources;
 pub mod prompt_template_arguments;
 pub mod resource_factory;
+pub mod session_html;
+mod session_html_output;
 mod shell_config;
 mod shell_output;
 pub mod skill_resources;

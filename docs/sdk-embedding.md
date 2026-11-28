@@ -32,6 +32,43 @@ of [Pi's available thinking levels](https://github.com/earendil-works/pi/blob/db
 The list describes capability metadata. The host still chooses a client
 configured for the selected level.
 
+For native hosts, `ModelFileReadGrants::load` and `load_with_api_keys`
+populate those choices from an explicit `thinkingLevelMap` on an exactly
+granted chat declaration. A `modelOverrides` map replaces only the keys it
+specifies. For reasoning models, `null` disables a choice, omitted ordinary
+levels stay available, and `xhigh` and `max` require a non-null mapping. An
+explicit map on a non-reasoning model yields only `off`. A declaration with
+no map retains `None`.
+
+Use `ModelFileReadGrants::snapshot` to opt into native wire bindings.
+`snapshot_with_api_keys` also accepts the exact file-key grants and variable
+resolver documented for `load_with_api_keys`. The snapshot resolves
+credentials once, keeps each model's merged map, and exposes the ordinary
+catalog through `snapshot.catalog()`. Build a fresh snapshot to adopt edits
+to the file or credentials. In a Tauri app, take the snapshot on a blocking
+worker and keep it in managed Rust state. Binding is synchronous and
+requires neither filesystem access nor credential resolution.
+
+```rust,ignore
+let snapshot = grants.snapshot(&factory)?;
+let client = snapshot.bind_thinking("relay", "chat", "high")?;
+```
+
+The configured client rejects requests for a different model ID. A reasoning
+model needs a declared map to bind. Inside that map, omitted ordinary levels
+use the adapter's default where it can represent the selection. A null entry
+returns `DisabledLevel`, including `off: null` on a reasoning model. An
+unmapped extended level returns `MissingMapping`. The exact model and level
+lookup returns `UnknownModel` or `UnknownLevel`, and a wire format that cannot
+represent the mapping returns `UnsupportedMapping`.
+
+The host can provide this client in the binding callbacks for
+[model cycling](https://github.com/quantum-box/pi-rs/pull/833) and
+[thinking selection](https://github.com/quantum-box/pi-rs/pull/846). Pass the
+selected Pi level alongside the client. For historical branches, resolve the
+recorded level through the snapshot authorized for that binding in
+`cycled_model_resolver`. The browser WASM SDK does not read native model files.
+
 For older journals that recorded a model name without its provider, the host
 may explicitly authorize that name with `session_builder_with_legacy_model`.
 Use this only when the host knows which provider the old name represents; the
@@ -157,6 +194,81 @@ workbench RPC counts Pi-projected message entries and adds usage from its
 native model operations, so message counts and usage totals can differ from
 the SDK snapshot.
 
+## Model cycling
+
+Call `AgentSession::cycle_model` with the current ordered snapshot of models
+your host authorizes and, optionally, its ordered scope. A nonempty scope is
+filtered by exact, case-sensitive provider and model pairs. It stays in effect
+even if every scoped entry is unavailable. An empty scope uses snapshot order.
+Cycling wraps in either direction. If the current model is absent, forward
+selects the first eligible model and backward selects the last, even when only
+one is eligible. The active journal selection supplies the current identity.
+An empty list or a lone current model returns `Ok(None)` without binding a
+client, writing a selection, or running selection hooks.
+
+The SDK asks the host to bind only the chosen model. It passes the requested
+thinking level with the explicit scoped level first, followed by the snapshot's
+per-model default, the host global default, and the current session level. The
+SDK uses its implicit `off` when none is set. The binding callback should return
+a client configured for the effective level and that level after applying
+provider capabilities. A host can use
+`ModelCatalog::get` for a prebuilt client. Hosts that use the native workbench
+factory can prepare clients using `ModelClientFactory` before passing the
+snapshot. The SDK performs no discovery or credential lookup during selection.
+Each cycled journal selection retains its own client binding, including across
+in-process forks and checkouts. Native journal records carry a binding marker,
+so cycling requires a session store with atomic record metadata. When different
+clients can share a provider, model, and thinking level, read the identifier
+with `Session::model_binding_id_at(record_id)` and associate it with the client's
+configuration in host-owned storage. Use `SessionBuilder::cycled_model_resolver_with_id`
+to look up that mapping on reopen or historical checkout. Check the recorded
+provider, model, and level against the host mapping before returning a client.
+The opaque UUID follows the selection through native forks and checkout.
+The journal stores the ID and selection details. Credentials remain with the host.
+
+`SessionBuilder::cycled_model_resolver` supports hosts that resolve solely by
+provider, model, and effective thinking level. Both callbacks apply the host's
+authorization policy and can return `None` to leave the selection unresolved.
+On reopen, a configured cycle resolver reauthorizes the active SDK binding,
+even when the registry has a cached client for the journal. It also reauthorizes
+the bindings needed to resume pending tree triggers. Reopen reserves those
+bindings during authorization so a concurrent revocation prevents publishing
+the clients. Other SDK bindings are resolved when their branches are selected.
+A malformed or incomplete SDK binding on the active selection causes reopen to fail.
+`HistoricalModelResolver` still handles ordinary provider-qualified model
+history. Explicit SDK model setters keep their existing identity-based behavior.
+
+The SDK records the chosen model and effective thinking level together in the
+session journal, then delivers selection hooks with source `cycle`. A host owns
+the scope and any application-wide defaults, including whether to persist the
+new model to settings. See the
+[pinned upstream cycling implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2701-L2774)
+for the reference ordering and scope behavior.
+
+## Thinking level
+
+`AgentSession::set_thinking_level` and `cycle_thinking_level` use
+`ThinkingLevelCapabilities` for the current registered provider and model.
+For a legacy provider-less selection, select an explicit provider model first.
+Supply unique, case-sensitive effective levels in forward cycle order. Cycling
+wraps and starts at the first level if the current level is absent. An empty
+list means thinking changes are unsupported. The SDK treats an unset level
+as `off`. An unsupported or unchanged selection returns `Ok(None)`.
+
+The synchronous binding callback receives the exact provider, model, and
+requested level. Return a `ThinkingLevelBinding` from the host's authorized
+configuration, with the client set up for the effective level after any
+provider clamp. The SDK checks the returned identity against the selected
+model and the effective level against the supplied capabilities. An already
+effective request skips the callback. If a clamp leaves the level unchanged,
+the SDK discards the returned binding and performs no selection.
+
+A change atomically commits the effective level and its historical client
+binding, then emits `thinking_level_select`. This uses the same native binding IDs
+and reopen callbacks as model cycling. Capability policy, client authorization,
+and any application-wide default persistence belong to the host.
+[Pinned Pi thinking-level implementation](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L2782-L2857)
+
 ## Native state and Tauri
 
 The [native host example](../examples/native_sdk_host.rs) demonstrates shared
@@ -280,6 +392,31 @@ This is a Rust API in `pi-rs-core` and also compiles for `wasm32-unknown-unknown
 The JavaScript browser SDK uses a separate `wasm-bindgen` wrapper around the core
 session. Its prompt and resume methods return promises for completed answers,
 and its current bindings do not expose this subscription.
+
+## Native HTML export
+
+Use `pi_rs_workbench::session_html::export_agent_session(&session, &path)`
+from the native host to export the selected branch. The host chooses the
+destination, for example through a native save dialog in a Tauri command.
+Both disk-backed and in-memory sessions use the CLI and RPC renderer. Export
+is synchronous and reports a busy journal through the usual SDK error.
+
+For a shared `Session`, `session_html::render(&journal)` returns the document
+without filesystem access. Use `session_html::export(&journal, &path)` to
+write it to a file.
+
+Both file exporters atomically create a new destination whose parent
+directory already exists. If the destination exists at publication, the
+exporter returns an I/O error with kind `AlreadyExists`. On Unix, a directory
+sync error after publication can leave the HTML in place.
+
+Pi's SDK chooses a default output filename, supports a theme override, and
+uses extension tool HTML renderers. The native SDK export requires an explicit
+path and uses the Workbench's fixed style and built-in tool formatting. It
+exports the journal's selected branch, with escaped Markdown and a restrictive
+content security policy. Browser WASM hosts can request export from a native
+backend. The HTML export API lives in native Workbench.
+[Pinned Pi SDK export](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4462-L4486)
 
 ## Browser WASM status
 

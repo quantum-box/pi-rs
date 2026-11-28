@@ -507,6 +507,12 @@ calling task owns the child and reopening reuses the same conversation and
 submission. A successful result includes the answer and `conversationId`.
 The call uses the registered wait timeout and parent abort drains the child.
 
+Ordinary nested calls support `ToolHost::call_with_cancellation`. Cancelling a
+new call during preparation records a skipped result at its original position.
+Replay reuses that result and the positions of later siblings. Cancellation
+after dispatch retains an uncertain result or an already-published pending
+reference for reconciliation. The token applies to the call and its descendants.
+
 `StandaloneNoHooksHost` constructs a standalone scheduler with an explicit
 host assertion that no hook policy applies. It cannot prove policy outside this
 runtime; do not use it when hooks are required. It cannot attach to a conversation
