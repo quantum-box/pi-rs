@@ -1953,19 +1953,21 @@ fn select_tools(
                 && (!only_code || matches!(tool.name.as_str(), "codemode" | "tool_search"))
         })
         .collect();
-    let mut system_prompt =
-        resources.system_prompt(DEFAULT_SYSTEM_PROMPT, &visible_tools, &args.workspace);
+    let (preamble, mut sections) =
+        resources.system_prompt_sections(DEFAULT_SYSTEM_PROMPT, &visible_tools, &args.workspace);
     if !hidden.is_empty() {
-        system_prompt.push_str("\n\n<mcp_servers>\nUse codemode searchTools() or tool_search to discover tools from these servers.\n");
+        let mut servers = String::from(
+            "Use codemode searchTools() or tool_search to discover tools from these servers.",
+        );
         for connection in mcp_connections {
-            system_prompt.push_str(&format!(
-                "- {}: {}\n",
+            servers.push_str(&format!(
+                "\n- {}: {}",
                 connection.server_name, connection.description
             ));
         }
-        system_prompt.push_str("</mcp_servers>");
+        sections.push(("mcp_servers".into(), servers));
     }
-    Ok(system_prompt)
+    Ok(registry.compose_system_prompt(preamble, sections))
 }
 
 struct LocalCommandPolicy(CommandPolicy);

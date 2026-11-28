@@ -722,7 +722,9 @@ async fn sleep_worker() {
     scheduler
         .select_extensions(id, vec!["b".into(), "a".into()])
         .unwrap();
-    std::fs::write(dir.join("conversation"), id.to_string()).unwrap();
+    let pending = dir.join("conversation.pending");
+    std::fs::write(&pending, id.to_string()).unwrap();
+    std::fs::rename(pending, dir.join("conversation")).unwrap();
     scheduler.submit(id, None, "work".into()).unwrap();
     std::future::pending::<()>().await;
 }
@@ -747,13 +749,31 @@ async fn before_sleep_survives_process_kill_and_wakes_automatically() {
             .spawn()
             .unwrap(),
     );
+    // Before the child initializes a v4 database, Store::open would try to
+    // acquire the same owner lock that the child needs to start.
+    let ready = dir.path().join("conversation");
+    let id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match std::fs::read_to_string(&ready) {
+                Ok(id) => {
+                    break id
+                        .parse::<uuid::Uuid>()
+                        .expect("invalid worker conversation ID");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read sleep worker readiness: {error}"),
+            }
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!("sleep worker exited before initialization: {status}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sleep worker did not initialize");
     let task = wait_sleep(&path).await;
     child.0.kill().unwrap();
     child.0.wait().unwrap();
-    let id: uuid::Uuid = std::fs::read_to_string(dir.path().join("conversation"))
-        .unwrap()
-        .parse()
-        .unwrap();
     let store = durable_store::Store::open(&path).unwrap();
     let key = format!("runtime/extension-memo/{}/sleep-deadline", task.id());
     let memo = store.get(key.as_bytes()).unwrap().unwrap().value;

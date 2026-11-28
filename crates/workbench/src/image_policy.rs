@@ -357,6 +357,10 @@ impl Model for WorkbenchModel {
         ))
     }
 
+    fn can_reuse_measured_context(&self, request: &ModelRequest) -> bool {
+        self.client.can_reuse_measured_context(request)
+    }
+
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
         self.client
             .estimate_request_tokens(&self.filtered(request.clone()))
@@ -637,6 +641,10 @@ impl Model for PreparedWorkbenchModel {
     fn context_identity(&self) -> Option<String> {
         self.identity.clone()
     }
+    fn can_reuse_measured_context(&self, request: &ModelRequest) -> bool {
+        self.inner.can_reuse_measured_context(request)
+    }
+
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
         if self.check_model(&request.model).is_err() {
             return u64::MAX;

@@ -16,7 +16,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::{Cli, observe, output, runtime};
+use super::{Cli, observe, output, rpc_messages::MetadataSource, runtime};
 
 mod queue;
 
@@ -46,6 +46,11 @@ enum Request {
     },
     CacheWarmingChanged,
     TransportChanged,
+    RenderHeader {
+        id: Uuid,
+        renderer: Uuid,
+        context: pi_rs::HeaderRenderContext,
+    },
     RenderTool {
         id: Uuid,
         operation: Uuid,
@@ -307,7 +312,7 @@ impl SessionSnapshot {
                 _ => cursor.invalidate(),
             }
             let _ = replay.take_new_counts();
-            cursor.advance(&records);
+            cursor.advance(&records, None);
         }
         let share_records = records.iter().cloned().map(Arc::new).collect();
         Self {
@@ -440,7 +445,10 @@ impl SessionSnapshot {
                 Err(_) => cursor.invalidate(),
             }
             let _ = snapshot.replay.take_new_counts();
-            cursor.advance(&snapshot.records);
+            cursor.advance(
+                &snapshot.records,
+                Some(MetadataSource::Snapshot(&snapshot.record_metadata)),
+            );
             snapshot.entries = Some(cursor);
         }
         snapshot
@@ -557,7 +565,10 @@ impl SessionSnapshot {
                 *cursor = super::rpc_entries::Cursor::default();
                 cursor.set_verified_counts(self.replay.counts());
                 let _ = self.replay.take_new_counts();
-                cursor.advance(&self.records[..start]);
+                cursor.advance(
+                    &self.records[..start],
+                    Some(MetadataSource::Snapshot(&self.record_metadata)),
+                );
             }
             if (self.records.len() as u64) < end {
                 if !prefix_metadata_same {
@@ -587,7 +598,8 @@ impl SessionSnapshot {
             let mut emitted = Vec::new();
             for index in start..end as usize {
                 emitted.extend(cursor.appended(
-                    &self.records[..=index],
+                    &self.records[..end as usize],
+                    index,
                     self.record_metadata.get(&self.records[index].id),
                     &self.record_metadata,
                 ));
@@ -614,7 +626,10 @@ impl SessionSnapshot {
                 Err(_) => cursor.invalidate(),
             }
             let _ = self.replay.take_new_counts();
-            cursor.advance(&self.records);
+            cursor.advance(
+                &self.records,
+                Some(MetadataSource::Snapshot(&self.record_metadata)),
+            );
         }
         Vec::new()
     }
@@ -705,7 +720,7 @@ impl SessionSnapshot {
             return Vec::new();
         }
         if changed {
-            self.replay = pi_rs::pi_import::StreamVerifier::new();
+            self.replay.restart();
             *cursor = super::rpc_entries::Cursor::default();
         }
         #[cfg(test)]
@@ -739,13 +754,17 @@ impl SessionSnapshot {
             }
         }
         if changed {
-            cursor.advance(&self.records[..start]);
+            cursor.advance(
+                &self.records[..start],
+                Some(MetadataSource::Snapshot(&self.record_metadata)),
+            );
             self.verified_metadata = self.record_metadata.clone();
         }
         let mut emitted = Vec::new();
         for index in start..observed_end {
             emitted.extend(cursor.appended(
-                &self.records[..=index],
+                &self.records[..observed_end],
+                index,
                 self.record_metadata.get(&self.records[index].id),
                 &self.record_metadata,
             ));
@@ -999,14 +1018,14 @@ async fn run_worker(
     let (shell_completed, mut shell_results) = mpsc::channel(1);
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
+    let discover_resources = runtime.registry.has_resource_discovery_hooks();
     let snapshot = Arc::new(Mutex::new(open_initial_snapshot(
         &args,
         args.mode == Some(super::OutputMode::Rpc),
     )?));
     let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
-    let (resources_ready, ready_receiver) =
-        tokio::sync::watch::channel(!runtime.registry.has_resource_discovery_hooks());
+    let (resources_ready, ready_receiver) = tokio::sync::watch::channel(!discover_resources);
     let (share_ready, share_receiver) = tokio::sync::watch::channel(false);
     read_requests(
         commands,
@@ -1060,7 +1079,9 @@ async fn run_worker(
     )
     .await;
     let mut session = Session::snapshot(&args.session)?;
-    if session.host_binding().is_none() {
+    // The terminal recovers its journal before spawning this worker. Only
+    // reopen for writing when a discovery hook may save state.
+    if (!args.terminal_managed_worker || discover_resources) && session.host_binding().is_none() {
         session = args.open_session()?;
     }
     let discovered = runtime
@@ -1317,6 +1338,7 @@ async fn run_worker(
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
+                ui.clear_header_renderer().await;
                 share_ready.send_replace(false);
                 if runtime.registry.has_resource_discovery_hooks() {
                     resources_ready.send_replace(false);
@@ -2027,6 +2049,7 @@ async fn run_worker(
                 .await;
         }
     }
+    ui.clear_header_renderer().await;
     cancel_active(&active);
     let shell_pending = active.lock().expect("worker control").shell.is_some();
     if shell_pending && let Some(shell) = shell_results.recv().await {
@@ -2357,6 +2380,23 @@ fn read_requests(
                 }
             };
             match request {
+                Request::RenderHeader {
+                    id,
+                    renderer,
+                    context,
+                } => {
+                    if !terminal_managed {
+                        continue;
+                    }
+                    if let Some(render) = ui.admit_header_render(renderer, context) {
+                        runtime.spawn(async move {
+                            let rendered = render.await;
+                            output(json!({"type":"header_rendered","id":id,"rendered":rendered}));
+                        });
+                    } else {
+                        output(json!({"type":"header_rendered","id":id,"rendered":null}));
+                    }
+                }
                 Request::RenderTool {
                     id,
                     operation,
