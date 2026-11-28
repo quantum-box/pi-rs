@@ -932,6 +932,14 @@ changes rerender the active presentation with the host theme. Live tool
 calls render progressively parsed arguments and execution updates render
 partial content before the committed result.
 
+Rust SDK hosts can opt in to live `tool_execution_update` payloads with
+`AgentSession::subscribe_tool_progress()`. Direct and control-triggered runs
+forward the scheduler's partial results, including parent call IDs for nested
+tools. The bounded stream reports lag and closes with the session. Final tool
+results stay on the existing record stream. The JavaScript browser wrapper
+continues to return completed prompt and resume results.
+[Pinned Pi event dispatch](https://github.com/earendil-works/pi/blob/bf3f6a2228710cf457604f74b0aceb7bcc8a6b9e/packages/coding-agent/src/core/agent-session.ts#L1209-L1213)
+
 ### Executable cross-tool renderers
 
 Executable extensions advertise ordered exact and prefix matches for tool
@@ -1674,6 +1682,14 @@ usable. The caller owns the lifetime of each client and should load the file
 off the UI thread. Unresolved variable or command references and OAuth entries
 leave the route unconfigured. The SDK host controls ambient environment access,
 OAuth, and any credential writes.
+
+For SDK reloads, the host loads one immutable credential snapshot and builds a
+complete replacement with `ModelClientFactory::catalog` before publishing it.
+This preserves the last valid catalog on a read or build failure, following
+Pi's snapshot retention on auth reload errors. A replacement changes future
+lookups. Retained clients keep their original credentials and exact routes.
+The SDK rebuild is explicit and performs no provider discovery or OAuth
+refresh. See [the embedding guide](sdk-embedding.md#reload-saved-keys-and-model-routes).
 
 ### Native SDK model file catalogs
 
@@ -4250,6 +4266,22 @@ Session and owned SDK name reads trim ECMAScript whitespace from the latest
 stored name, as Pi does, including names imported from external JSONL. A
 whitespace-only name clears the title without falling back to an older name;
 reading preserves internal line breaks and does not rewrite the journal.
+
+### SDK model-facing tool selection
+
+An owned Rust session exposes `active_tool_names` and `set_active_tools` for
+the configured model-facing tool selection. Native branch checkpoints preserve
+their recorded loadout. The runtime intersects that loadout with the selected
+registry tools and uses current schemas. A selected tool can therefore be absent
+from a request on a restored branch. Request-time registry hooks can also
+change the advertised list.
+
+The setter requires mutable ownership and an available journal, so hosts apply
+it to future runs. Pi can apply a selection on the next turn of an active run.
+Native registry validation rejects unknown names without replacing the previous
+selection. Native nested orchestration can call registered tools regardless of
+selection. In Pi, inactive callable tools must have `codemode` or `deferred`
+exposure.
 
 ### SDK queued input inspection
 

@@ -786,9 +786,10 @@ fn terminal_hyperlink_capabilities_reprobe_tmux_after_override() {
         let features = root.path().join("features");
         let probe_log = root.path().join("probe-log");
         let tmux = root.path().join("tmux");
+        std::fs::write(&probe_log, "").unwrap();
         std::fs::write(
             &tmux,
-            "#!/bin/sh\nprintf 'probe\\n' >> \"$PI_TEST_TMUX_PROBE_LOG\"\n/bin/cat \"$PI_TEST_TMUX_FEATURES\"\n",
+            "#!/bin/sh\nprintf 'probe\\n' >> \"$PI_TEST_TMUX_PROBE_LOG\"\nIFS= read -r features < \"$PI_TEST_TMUX_FEATURES\"\nprintf '%s\\n' \"$features\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -842,6 +843,21 @@ fn terminal_hyperlink_capabilities_reprobe_tmux_after_override() {
         master.write_all(b"/reload\r").unwrap();
         output_until(&mut master, |text| {
             text.contains("Reloaded settings") && text.contains(&osc_link)
+        });
+        assert_eq!(probes(), 1, "{mode}");
+
+        // Force a visual change on the next automatic probe. Regular mode
+        // retains the existing link when explicit and detected support agree.
+        std::fs::write(&settings, br#"{"terminal":{"hyperlinks":false}}"#).unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.split("\x1b[?2026h").skip(1).any(|frame| {
+                frame.split_once("\x1b[?2026l").is_some_and(|(body, _)| {
+                    body.contains("Reloaded settings")
+                        && body.contains(&fallback)
+                        && !body.contains(&osc_link)
+                })
+            })
         });
         assert_eq!(probes(), 1, "{mode}");
 
