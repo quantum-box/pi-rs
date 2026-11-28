@@ -823,6 +823,50 @@ async fn gpt_mapping_summary_and_unsupported_cache_models() {
 }
 
 #[tokio::test]
+async fn explicit_binding_preserves_resolved_replay_and_summary_policy() {
+    let request = request("fixture-profile", 1024);
+    for summary in [false, true] {
+        let (body, _) = capture(
+            "us-east-1",
+            |client| {
+                let client = client
+                    .with_force_cache(true)
+                    .with_cache_retention(CacheRetention::Short)
+                    .with_reasoning_resolver(|model| {
+                        assert_eq!(model, "fixture-profile");
+                        pi_rs_bedrock::ModelReasoning {
+                            level: Some(pi_rs_bedrock::ReasoningLevel::Low),
+                            mapped_effort: Some("resolver-low".into()),
+                            off_effort: Some("none".into()),
+                            supports_replay: Some(false),
+                            ..Default::default()
+                        }
+                    })
+                    .with_model_reasoning(&request.model, None, "high", Some("exact"))
+                    .unwrap();
+                assert!(!client.can_reuse_measured_context(&request));
+                client
+            },
+            request.clone(),
+            summary,
+        )
+        .await;
+        let expected = if summary { "none" } else { "exact" };
+        assert_eq!(
+            body["additionalModelRequestFields"]["reasoning_effort"],
+            expected
+        );
+        let checkpoints = body["system"].as_array().unwrap();
+        assert_eq!(
+            checkpoints
+                .iter()
+                .any(|block| block.get("cachePoint").is_some()),
+            !summary,
+        );
+    }
+}
+
+#[tokio::test]
 async fn insufficient_budget_fails_before_network() {
     let config = aws_sdk_bedrockruntime::Config::builder()
         .behavior_version_latest()
