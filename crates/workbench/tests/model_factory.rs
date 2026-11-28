@@ -1971,6 +1971,53 @@ async fn file_thinking_uses_native_adapter_shapes() {
     }
 }
 
+#[test]
+fn file_thinking_bedrock_keeps_the_adapter_context_reuse_policy() {
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use serde_json::json;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("models.json");
+    let endpoint = "https://bedrock-runtime.us-east-1.amazonaws.com";
+    let provider = "amazon-bedrock";
+    let model = "moonshotai.kimi-k3";
+    std::fs::write(
+        &file,
+        json!({"providers":{(provider):{
+            "api":"bedrock-converse-stream", "baseUrl":endpoint,
+            "models":[{"id":model,"reasoning":true,"thinkingLevelMap":{"high":"high"}}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        provider,
+        endpoint,
+        HostCredential::new(HostCredentialKind::Bearer, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    let snapshot = ModelFileReadGrants {
+        file,
+        routes: vec![ModelFileRoute {
+            provider: provider.into(),
+            api: NativeModelApi::BedrockConverse,
+            base_url: endpoint.into(),
+            endpoint: endpoint.into(),
+        }],
+    }
+    .snapshot(&ModelClientFactory::new(auth.build()))
+    .unwrap();
+    let bound = snapshot.bind_thinking(provider, model, "high").unwrap();
+    let request = pi_rs::ModelRequest {
+        model: model.into(),
+        messages: vec![],
+        tools: vec![],
+        max_output_tokens: 2048,
+    };
+    assert!(!bound.can_reuse_measured_context(&request));
+}
+
 #[tokio::test]
 async fn bedrock_snapshot_effort_reaches_converse_fields() {
     use serde_json::json;
