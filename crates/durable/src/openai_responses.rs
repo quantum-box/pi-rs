@@ -492,6 +492,18 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
         let status = response.status();
         if !status.is_success() {
+            if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let overflow = pi_rs_core::provider_context_overflow_stream(
+                    response.bytes_stream(),
+                    std::slice::from_ref(&self.token),
+                )
+                .await;
+                return Err(if overflow {
+                    Error::Model("context window exceeded".into())
+                } else {
+                    response_error(None, Some(status))
+                });
+            }
             let info =
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                     Some(
