@@ -9,7 +9,7 @@ use crate::config::NoticeKind;
 use crate::ui::{
     color::ColorMode,
     editor::Editor,
-    images::{self, Cleanup, InlineImage, Renderer},
+    images::{self, Cleanup, InlineAttachment, Renderer},
     keys::Keys,
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
@@ -110,12 +110,13 @@ pub(super) fn latest_session(
                 .is_some_and(|value| value == "jsonl")
         })
         .filter(|entry| {
-            super::session_import::read(&entry.path()).is_ok_and(|session| {
-                session.working_directory().is_some_and(|cwd| {
-                    std::path::Path::new(cwd)
-                        .canonicalize()
-                        .is_ok_and(|cwd| cwd == workspace)
-                })
+            Session::snapshot(entry.path()).is_ok_and(|session| {
+                session.host_binding().is_none()
+                    && session.working_directory().is_some_and(|cwd| {
+                        std::path::Path::new(cwd)
+                            .canonicalize()
+                            .is_ok_and(|cwd| cwd == workspace)
+                    })
             })
         })
         .filter_map(|entry| {
@@ -305,7 +306,7 @@ impl Terminal {
         Ok(true)
     }
 
-    fn switch_mode(&mut self, alternate: bool, view: &mut View) -> Result<()> {
+    fn switch_mode(&mut self, alternate: bool, view: &mut View, args: &Cli) -> Result<()> {
         if self.alternate == alternate {
             return Ok(());
         }
@@ -324,7 +325,12 @@ impl Terminal {
                 DisableMouseCapture,
                 LeaveAlternateScreen
             )?;
-            view.regular.layout = None;
+            let image_layout_changed = view.regular.layout.as_ref().is_some_and(|layout| {
+                layout.output.inline_images != view.inline_image_options(args)
+            });
+            if !image_layout_changed {
+                view.regular.layout = None;
+            }
             view.regular.max_rows = 0;
             view.regular.committed_rows = 0;
         }
@@ -1220,9 +1226,71 @@ enum SelectionDefault {
 #[derive(Default)]
 struct ExtensionChrome {
     header: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
+    dynamic_header: Option<DynamicHeader>,
     footer: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
     working: ExtensionWorkingStatus,
     hidden_thinking_label: Option<String>,
+    editor: Option<crate::ui::editor::ExtensionEditor>,
+}
+
+struct DynamicHeader {
+    renderer: uuid::Uuid,
+    rows: Option<pi_rs::RenderedExtensionRows>,
+    attempted: Option<(u16, Theme)>,
+    pending: Option<uuid::Uuid>,
+}
+
+impl DynamicHeader {
+    fn request(&mut self, width: u16, theme: &Theme) -> Option<(uuid::Uuid, Value)> {
+        if self.pending.is_some() || self.was_requested(width, theme) {
+            return None;
+        }
+        let id = uuid::Uuid::new_v4();
+        self.pending = Some(id);
+        self.rows = None;
+        self.attempted = Some((width, theme.clone()));
+        let context = pi_rs::HeaderRenderContext {
+            width,
+            theme: theme.extension_render_theme(),
+        };
+        Some((
+            id,
+            json!({"type":"render_header","id":id,"renderer":self.renderer,"context":context}),
+        ))
+    }
+
+    fn was_requested(&self, width: u16, theme: &Theme) -> bool {
+        self.attempted
+            .as_ref()
+            .is_some_and(|(columns, palette)| *columns == width && palette == theme)
+    }
+
+    fn invalidate(&mut self) -> bool {
+        // The pending request still holds the worker's slot, but this
+        // generation can no longer accept its response or display its rows.
+        self.attempted = None;
+        self.rows.take().is_some()
+    }
+
+    fn receive(&mut self, event: &Value, width: u16, theme: &Theme) -> bool {
+        if self.pending.is_none_or(|id| event["id"] != json!(id)) {
+            return false;
+        }
+        self.pending = None;
+        if !self.was_requested(width, theme) {
+            self.attempted = None;
+            return false;
+        }
+        let rows =
+            serde_json::from_value::<pi_rs::RenderedExtensionRows>(event["rendered"].clone())
+                .ok()
+                .filter(pi_rs::RenderedExtensionRows::within_header_limits);
+        if self.rows == rows {
+            return false;
+        }
+        self.rows = rows;
+        true
+    }
 }
 
 #[derive(Default)]
@@ -1673,7 +1741,9 @@ impl View {
                 }
             }
             pi_rs::UiRequest::SetHeader { lines } => {
-                if self.extension_chrome.header != lines {
+                if self.extension_chrome.dynamic_header.take().is_some()
+                    || self.extension_chrome.header != lines
+                {
                     self.extension_chrome.header = lines;
                     self.regular.redraw = true;
                 }
@@ -1707,6 +1777,21 @@ impl View {
             }
             pi_rs::UiRequest::PasteToEditor { text } => self.paste_editor_text(&text),
             pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
+            pi_rs::UiRequest::SetEditorComponent { component } => {
+                self.extension_chrome.editor = component
+                    .map(crate::ui::editor::ExtensionEditor::new)
+                    .transpose()?;
+            }
+            pi_rs::UiRequest::GetEditorComponent => {
+                let response = self
+                    .extension_chrome
+                    .editor
+                    .as_ref()
+                    .map_or(pi_rs::UiResponse::Cancelled, |editor| {
+                        pi_rs::UiResponse::EditorComponent(editor.component.clone())
+                    });
+                return Ok(Some((id, response)));
+            }
             pi_rs::UiRequest::GetTheme { .. }
             | pi_rs::UiRequest::GetActiveTheme
             | pi_rs::UiRequest::SetTheme { .. } => {
@@ -1737,9 +1822,22 @@ impl View {
         }
         Ok(None)
     }
+    fn mount_header_renderer(&mut self, renderer: Option<uuid::Uuid>) {
+        self.extension_chrome.header = None;
+        self.extension_chrome.dynamic_header = renderer.map(|renderer| DynamicHeader {
+            renderer,
+            rows: None,
+            attempted: None,
+            pending: None,
+        });
+        self.regular.redraw = true;
+    }
+
     fn clear_extension_chrome(&mut self) -> bool {
-        let header_changed = self.extension_chrome.header.take().is_some();
+        let static_header = self.extension_chrome.header.take().is_some();
+        let header_changed = self.extension_chrome.dynamic_header.take().is_some() || static_header;
         let label_changed = self.extension_chrome.hidden_thinking_label.take().is_some();
+        let editor_changed = self.extension_chrome.editor.take().is_some();
         self.regular.redraw |= header_changed || label_changed;
         if label_changed {
             self.panel_press = None;
@@ -1748,6 +1846,7 @@ impl View {
         self.extension_chrome.footer.take().is_some()
             || header_changed
             || label_changed
+            || editor_changed
             || working.message.is_some()
             || working.hidden
             || working.indicator.is_some()
@@ -1763,6 +1862,17 @@ impl View {
     ) -> Vec<Line> {
         if let Some(lines) = &self.extension_chrome.header {
             return crate::ui::render::component_lines_bounded(lines, theme, width, max.min(16));
+        }
+        if let Some(rows) = self
+            .extension_chrome
+            .dynamic_header
+            .as_ref()
+            .filter(|header| {
+                u16::try_from(width).is_ok_and(|width| header.was_requested(width, theme))
+            })
+            .and_then(|header| header.rows.as_ref())
+        {
+            return crate::ui::render::extension_rows_bounded(rows, theme, width, max.min(16));
         }
         if !show_startup_header(args) {
             return Vec::new();
@@ -2191,11 +2301,11 @@ impl View {
                 for block in blocks {
                     match block {
                         pi_rs::ContentBlock::Text { text: value, .. } => text.push(value.as_str()),
-                        pi_rs::ContentBlock::Image { data, mime_type } => {
-                            images.push(pi_rs::ImageContent {
+                        pi_rs::ContentBlock::Image { data, mime_type } if !data.is_empty() => {
+                            images.push(InlineAttachment::new(pi_rs::ImageContent {
                                 data: data.clone(),
                                 mime_type: mime_type.clone(),
-                            })
+                            }))
                         }
                         _ => {}
                     }
@@ -2207,10 +2317,8 @@ impl View {
             rendered: None,
             custom_type: message.custom_type.clone(),
             text: text.join("\n"),
+            images,
         });
-        if !images.is_empty() {
-            self.add_images(&images);
-        }
     }
     fn refresh_transcript_extension_renderers(&mut self) -> bool {
         self.custom_render_pending = None;
@@ -2715,7 +2823,13 @@ impl View {
             return true;
         };
         *output = crate::ui::render::strip_shell_ansi(&display_tool_blocks(blocks));
-        *parts = tool_result_parts(&update["content"], self.graphics.enabled());
+        *parts = tool_result_parts(&update["content"]);
+        if name == "codemode"
+            && let Some(text) = codemode_progress_text(&update["details"])
+        {
+            output.clone_from(&text);
+            parts.push(ToolPart::Text(text));
+        }
         records.progress = records.progress.wrapping_add(1);
         self.partial_tool_results.insert(
             id.clone(),
@@ -3403,6 +3517,34 @@ impl View {
             })
             .collect();
         let branch = session.branch();
+        let mut empty_pi_summary_sources = branch
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::SourceEntry { format, entry }
+                    if format == "pi"
+                        && entry["type"] == "branch_summary"
+                        && entry["summary"] == "" =>
+                {
+                    Some(record.id)
+                }
+                _ => None,
+            })
+            .peekable();
+        let hidden_summaries: std::collections::HashSet<_> =
+            if empty_pi_summary_sources.peek().is_some() {
+                let conversions = session.validated_pi_conversion_counts().unwrap_or_default();
+                // Imported summary usage can precede the summary in its conversion.
+                empty_pi_summary_sources
+                    .filter_map(|id| {
+                        conversions
+                            .get(&id)
+                            .filter(|&&count| count > 0)
+                            .map(|count| id + count)
+                    })
+                    .collect()
+            } else {
+                Default::default()
+            };
         let assistant_records: std::collections::HashMap<_, _> = branch
             .iter()
             .filter_map(|&record| match record.event {
@@ -3558,8 +3700,10 @@ impl View {
                 }
                 _ => {}
             }
-            self.add_summary(record, Some(session));
-            self.show_summary_billing(record, records);
+            if !hidden_summaries.contains(&record.id) {
+                self.add_summary(record, Some(session));
+                self.show_summary_billing(record, records);
+            }
             self.observe_cache(record, args);
             self.observe_reasoning_drop(record);
         }
@@ -3586,14 +3730,13 @@ impl View {
         Ok(())
     }
     fn add_images(&mut self, images: &[pi_rs::ImageContent]) {
-        if self.graphics.enabled() {
-            self.lines.extend(
-                images
-                    .iter()
-                    .filter_map(InlineImage::decode)
-                    .map(Entry::Image),
-            );
-        }
+        self.lines.extend(
+            images
+                .iter()
+                .cloned()
+                .map(InlineAttachment::new)
+                .map(Entry::Image),
+        );
     }
     fn add_tool(&mut self, invocation: &pi_rs::Invocation, record: Option<u64>) {
         if invocation.call.name == super::operation_models::TOOL {
@@ -3633,10 +3776,15 @@ impl View {
             }
             return;
         }
+        let nested_progress = self
+            .partial_tool_results
+            .get(operation)
+            .and_then(|partial| partial.details.as_ref())
+            .and_then(codemode_progress_text);
         let mut rendered_parts = match outcome {
             pi_rs::Outcome::Structured { data, .. }
             | pi_rs::Outcome::StructuredWithDetails { data, .. } => {
-                tool_result_parts(&data["content"], self.graphics.enabled())
+                tool_result_parts(&data["content"])
             }
             _ => Vec::new(),
         };
@@ -3675,6 +3823,15 @@ impl View {
             };
             *numbered_diff = diff.is_some();
             *output = diff.map_or_else(|| display_tool_result(outcome), str::to_owned);
+            if name == "codemode"
+                && let Some(text) = nested_progress
+            {
+                if parts.is_empty() {
+                    parts.push(ToolPart::Text(output.clone()));
+                }
+                output.insert_str(0, &format!("{text}\n"));
+                parts.insert(0, ToolPart::Text(text));
+            }
             *failed = !matches!(
                 outcome,
                 pi_rs::Outcome::Succeeded(_)
@@ -3972,15 +4129,12 @@ render_call_id: None,
                     }
                     Some("tool_finished" | "tool_reconciled") => {
                         self.phase = Some("処理を継続中");
-                        if let Some(record) = value["record"]["id"].as_u64() {
-                            self.track_tool_render(event["operation_id"].as_str().unwrap_or_default(), record, false);
-                        }
+                        let operation = event["operation_id"].as_str().unwrap_or_default();
                         if let Ok(outcome) = serde_json::from_value(event["outcome"].clone()) {
-                            self.finish_tool(
-                                event["operation_id"].as_str().unwrap_or_default(),
-                                &outcome,
-                                None,
-                            );
+                            self.finish_tool(operation, &outcome, None);
+                        }
+                        if let Some(record) = value["record"]["id"].as_u64() {
+                            self.track_tool_render(operation, record, false);
                         }
                     }
                     Some("compacted" | "branch_summary") => self.summarizing = false,
@@ -4226,6 +4380,19 @@ render_call_id: None,
         let (mut rows, cursor, column) = self
             .editor
             .visible_rows(self.editor_width, self.editor_page);
+        if self.editor.text.is_empty()
+            && self.draft_images.is_empty()
+            && self.dialog().is_none()
+            && self.picker.is_none()
+            && let Some(placeholder) = self
+                .extension_chrome
+                .editor
+                .as_ref()
+                .and_then(|editor| editor.component.placeholder.as_ref())
+            && let Some(row) = rows.first_mut()
+        {
+            *row = clip(placeholder, self.editor_width);
+        }
         if padding > 0 {
             let left = " ".repeat(padding);
             for row in &mut rows {
@@ -4254,17 +4421,25 @@ render_call_id: None,
         let hardware_cursor = args.settings.show_hardware_cursor();
         let (prompt, cursor_row, column) = self.prompt_rows(args, width, height);
         let prompt_height = prompt.len();
-        let modal = self.picker.is_some() || self.dialog().is_some();
-        let min_body = if modal { 3 } else { 1 };
+        let dialog = self.dialog().is_some();
+        let modal = self.picker.is_some() || dialog;
+        let searching = !modal && self.search.is_some();
+        let min_body = if searching {
+            Search::OVERLAY_HEIGHT
+        } else if modal {
+            3
+        } else {
+            1
+        };
         let chrome_space = height.saturating_sub(prompt_height + 2 + min_body);
         let footer_limit = chrome_space.saturating_sub(usize::from(!modal));
         let mut footer = self.footer_lines(args, theme, width, footer_limit, true);
-        if modal {
+        if modal || searching {
             footer.truncate(footer_limit);
         }
         let header_limit = chrome_space.saturating_sub(footer.len());
         let mut header = self.header_lines(args, theme, width, header_limit, true);
-        if modal {
+        if modal || searching {
             header.truncate(header_limit);
         }
         let header_rows = header.len();
@@ -4275,17 +4450,30 @@ render_call_id: None,
         }
         self.fullscreen_header_rows = header_rows;
         let available = height.saturating_sub(prompt_height + 2 + header_rows + footer.len());
-        let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
-        below.truncate(
-            height
-                .saturating_sub(prompt_height + 4 + footer.len())
-                .min(available.saturating_sub(min_body)),
-        );
-        if self.dialog().is_some() {
-            below.clear();
-        }
+        // Lay out the focused picker before the dock takes any of its rows.
+        let picker = self.picker.as_ref().filter(|_| !dialog);
+        let picker_lines =
+            picker.map(|picker| picker.render_in_terminal(theme, width, available, height, keys));
+        let widget_space =
+            available.saturating_sub(min_body.max(picker_lines.as_ref().map_or(0, Vec::len)));
+        let (above, below) = if dialog {
+            (Vec::new(), Vec::new())
+        } else {
+            let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
+            below.truncate(
+                height
+                    .saturating_sub(prompt_height + 4 + footer.len())
+                    .min(widget_space),
+            );
+            let mut above = self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor);
+            above.truncate(widget_space - below.len());
+            (above, below)
+        };
         let output = self.transcript_options(args, false);
-        let body_height = available.saturating_sub(below.len());
+        let body_height = available.saturating_sub(above.len() + below.len());
+        if let Some(picker) = picker {
+            picker.limit_mouse_height(body_height);
+        }
         let mut lines = Vec::new();
         let mut prompts = Vec::new();
         let mut panels = Vec::new();
@@ -4360,14 +4548,13 @@ render_call_id: None,
                 output,
             ));
         }
-        if let Some(picker) = &self.picker {
-            lines = picker.render_in_terminal(theme, width, body_height, height, keys);
+        if let Some(picker_lines) = picker_lines {
+            lines = picker_lines;
         }
         let modal_cursor = if let Some(dialog) = self.dialog() {
             lines = dialog.render(theme, width, body_height, keys);
             dialog.cursor(width, body_height)
         } else {
-            lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
             self.picker
                 .as_ref()
                 .and_then(|picker| picker.tree_input_cursor(width, body_height))
@@ -4416,7 +4603,7 @@ render_call_id: None,
         let search_overlay = self.search.as_ref().filter(|_| !modal).map(|search| {
             let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
             let left = width.saturating_sub(search_width + 1);
-            let top = usize::from(body_height > 3);
+            let top = usize::from(body_height > Search::OVERLAY_HEIGHT);
             let (mut lines, cursor_row, cursor_column) = search.overlay(theme, keys, search_width);
             if !hardware_cursor && let Some(line) = lines.get_mut(cursor_row) {
                 line.mark_cursor(cursor_column);
@@ -4483,6 +4670,11 @@ render_call_id: None,
                 queue!(out, MoveTo((width - 1) as u16, (row + header_rows) as u16))?;
                 Line::themed(glyph, theme, role).draw(&mut out, 1, color_mode)?;
             }
+        }
+        // Widget rows belong to the input dock, outside transcript navigation and clipping.
+        for (row, line) in above.iter().enumerate() {
+            queue!(out, MoveTo(0, (header_rows + body_height + row) as u16))?;
+            line.draw(&mut out, width, color_mode)?;
         }
         let border_row = height - prompt_height - 2 - footer.len() - below.len();
         queue!(out, MoveTo(0, border_row as u16))?;
@@ -4613,8 +4805,7 @@ render_call_id: None,
             code_block_indent: None,
             hyperlinks,
             notices: args.settings.notices(),
-            image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
-                .then(|| args.settings.terminal_image_width()),
+            inline_images: self.inline_image_options(args),
             padding: args.settings.output_padding(),
             expand_key: self.expand_key,
             mermaid: match (args.settings.mermaid_mode(), streaming) {
@@ -4623,6 +4814,32 @@ render_call_id: None,
                 (_, false) => Mermaid::Final,
             },
         }
+    }
+
+    fn inline_image_options(&self, args: &Cli) -> Option<(images::Protocol, usize)> {
+        self.graphics
+            .protocol()
+            .filter(|_| args.settings.show_terminal_images())
+            .map(|protocol| (protocol, args.settings.terminal_image_width()))
+    }
+
+    fn update_image_protocol(&mut self, args: &Cli, terminal: Option<&Terminal>) -> Result<bool> {
+        let previous = self.graphics.protocol();
+        let protocol = self
+            .graphics
+            .resolve_protocol(args.settings.terminal_image_override());
+        if protocol == previous {
+            return Ok(false);
+        }
+        let fullscreen = terminal.map_or(args.tui_mode != Some(TuiMode::Regular), |terminal| {
+            terminal.alternate
+        });
+        self.graphics
+            .set_protocol(protocol, fullscreen, &mut std::io::stdout().lock())?;
+        if previous.is_none() && protocol.is_some() {
+            images::query_cell_size()?;
+        }
+        Ok(true)
     }
 
     fn debug_log(&self, args: &Cli, theme: &Theme, width: usize, height: usize) -> Result<String> {
@@ -4784,10 +5001,27 @@ render_call_id: None,
             output: base_output,
             code_block_indent: args.settings.code_block_indent().to_owned(),
         };
-        let redraw = self.regular.layout.is_some()
-            && (self.regular.redraw
-                || self.regular.layout.as_ref() != Some(&layout)
-                || self.lines.len() < self.regular.committed);
+        // An image setting can change without affecting any rows in the
+        // restored transcript. Keep scrollback in that case.
+        if let Some(previous) = &mut self.regular.layout
+            && previous.output.inline_images != layout.output.inline_images
+            && self.graphics.regular_image_protocol().is_none()
+            && (layout.output.inline_images.is_none()
+                || !self
+                    .lines
+                    .iter()
+                    .take(self.regular.committed)
+                    .any(|entry| entry.has_inline_images(self.expand_tools)))
+        {
+            previous.output.inline_images = layout.output.inline_images;
+        }
+        let stale_iterm2 = self.graphics.regular_image_protocol() == Some(images::Protocol::Iterm2)
+            && self.graphics.protocol() != Some(images::Protocol::Iterm2);
+        let redraw = stale_iterm2
+            || (self.regular.layout.is_some()
+                && (self.regular.redraw
+                    || self.regular.layout.as_ref() != Some(&layout)
+                    || self.lines.len() < self.regular.committed));
         self.regular.layout = Some(layout);
         self.regular.redraw = false;
         if self.lines.len() < self.regular.committed {
@@ -5023,10 +5257,10 @@ render_call_id: None,
     }
 }
 
-fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
+fn tool_result_parts(content: &Value) -> Vec<ToolPart> {
     content
         .as_array()
-        .filter(|blocks| images && blocks.iter().any(|block| block["type"] == "image"))
+        .filter(|blocks| blocks.iter().any(|block| block["type"] == "image"))
         .into_iter()
         .flatten()
         .filter_map(|value| match value["type"].as_str() {
@@ -5036,7 +5270,7 @@ fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
             Some("image") => {
                 let image = serde_json::from_value::<pi_rs::ImageContent>(value.clone())
                     .ok()
-                    .and_then(|content| InlineImage::decode(&content));
+                    .map(InlineAttachment::new);
                 Some(match image {
                     Some(image) => ToolPart::Image(image),
                     None => ToolPart::Text("[image unavailable]".into()),
@@ -5045,6 +5279,38 @@ fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
             _ => None,
         })
         .collect()
+}
+
+fn codemode_progress_text(details: &Value) -> Option<String> {
+    const VISIBLE_CALLS: usize = 6;
+    let calls = details["calls"].as_array()?;
+    if calls.is_empty() {
+        return None;
+    }
+    let hidden = calls.len().saturating_sub(VISIBLE_CALLS);
+    let mut lines = Vec::new();
+    if hidden > 0 {
+        lines.push(format!("… {hidden} earlier calls"));
+    }
+    for call in &calls[hidden..] {
+        let status = match call["status"].as_str()? {
+            "running" => "…",
+            "ok" => "✓",
+            "error" => "✗",
+            "cancelled" => "⊘",
+            _ => continue,
+        };
+        let name = call["name"].as_str()?;
+        let args = call["args"].as_str().unwrap_or_default();
+        let duration = call["durationMs"]
+            .as_u64()
+            .map_or(String::new(), |ms| format!(" {ms}ms"));
+        lines.push(format!("{status} {name} {args}{duration}"));
+    }
+    if let Some(omitted) = details["omittedCalls"].as_u64().filter(|count| *count > 0) {
+        lines.push(format!("… {omitted} additional calls omitted"));
+    }
+    Some(crate::ui::render::strip_shell_ansi(&lines.join("\n")))
 }
 
 fn display_tool_blocks(blocks: &[Value]) -> String {
@@ -6243,6 +6509,7 @@ pub(super) async fn run(
         async_transitions: true,
         expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
+        graphics: Renderer::new(args.settings.terminal_image_override()),
         ..View::default()
     };
     let changelog_path = super::config::agent_dir().join("pi-rs-changelog.json");
@@ -6391,10 +6658,11 @@ pub(super) async fn run(
                 dirty = true;
             }
         }
+        dirty |= view.update_image_protocol(&args, _terminal.as_ref())?;
         if let Some(terminal) = &mut _terminal {
             let alternate = args.tui_mode != Some(TuiMode::Regular);
             if terminal.alternate != alternate {
-                terminal.switch_mode(alternate, &mut view)?;
+                terminal.switch_mode(alternate, &mut view, &args)?;
                 dirty = true;
             }
         }
@@ -6658,6 +6926,15 @@ pub(super) async fn run(
             }
         }
         if let Some(active) = &mut worker {
+            if view
+                .extension_chrome
+                .dynamic_header
+                .as_ref()
+                .is_some_and(|header| Some(header.renderer) != active.header_renderer)
+            {
+                view.mount_header_renderer(None);
+                dirty = true;
+            }
             if (active.busy || active.bashing) && view.request_started.is_none() {
                 view.request_started = Some(Instant::now());
             }
@@ -6689,6 +6966,42 @@ pub(super) async fn run(
                     view.tool_preview_pending = None;
                     dirty |= view.invalidate_tool_renderings();
                 }
+                if value["type"] == "header_renderer_changed" {
+                    active.header_renderer = serde_json::from_value(value["renderer"].clone()).ok();
+                    view.mount_header_renderer(active.header_renderer);
+                    dirty = true;
+                    continue;
+                }
+                if value["type"] == "header_renderer_invalidated" {
+                    if let Some(header) = &mut view.extension_chrome.dynamic_header
+                        && value["renderer"] == json!(header.renderer)
+                        && header.invalidate()
+                    {
+                        view.regular.redraw = true;
+                        dirty = true;
+                    }
+                    continue;
+                }
+                if value["type"] == "header_rendered" {
+                    if active
+                        .pending_header_render
+                        .is_none_or(|id| value["id"] != json!(id))
+                    {
+                        continue;
+                    }
+                    active.pending_header_render = None;
+                    if let Some(header) = &mut view.extension_chrome.dynamic_header
+                        && header.receive(
+                            &value,
+                            terminal::size().map_or(0, |(width, _)| width.max(1)),
+                            &theme,
+                        )
+                    {
+                        view.regular.redraw = true;
+                        dirty = true;
+                    }
+                    continue;
+                }
                 if value["type"] == "tool_rendered" {
                     dirty |= view.receive_tool_render(value);
                     continue;
@@ -6717,7 +7030,11 @@ pub(super) async fn run(
                     match view.ui_request(&value) {
                         Ok(Some((id, value))) => active
                             .send(json!({"type":"extension_ui_response","id":id,"value":value}))?,
-                        Ok(None) => {}
+                        Ok(None) => {
+                            if value["method"] == "setHeader" {
+                                active.header_renderer = None;
+                            }
+                        }
                         Err(error) => {
                             view.append(&error.to_string());
                             active.send(json!({"type":"extension_ui_response","id":value["id"],"value":null}))?;
@@ -6852,6 +7169,19 @@ pub(super) async fn run(
                     }
                 }
                 dirty = true;
+            }
+            // The worker slot remains occupied across replacement mounts
+            // until the old renderer has finished cancelling.
+            if active.pending_header_render.is_none()
+                && let Some(header) = &mut view.extension_chrome.dynamic_header
+                && let Ok((width, _)) = terminal::size()
+                && let Some((id, request)) = header.request(width.max(1), &theme)
+            {
+                if active.send(request).is_ok() {
+                    active.pending_header_render = Some(id);
+                } else {
+                    header.pending = None;
+                }
             }
             dirty |= view.prepare_transcript_extension_render(active, &args);
             dirty |= view.prepare_tool_render(active, &args);
@@ -8097,11 +8427,16 @@ pub(super) async fn run(
                 let action = if submit_completion {
                     "tui.input.submit"
                 } else {
-                    keys.action(
-                        key,
-                        view.editor.text.is_empty() && view.draft_images.is_empty(),
-                    )
-                    .unwrap_or("")
+                    let default = keys
+                        .action(
+                            key,
+                            view.editor.text.is_empty() && view.draft_images.is_empty(),
+                        )
+                        .unwrap_or("");
+                    view.extension_chrome
+                        .editor
+                        .as_ref()
+                        .map_or(default, |editor| editor.action(key, default))
                 };
                 if action != "app.interrupt" || is_busy(&worker) {
                     last_idle_interrupt = None;
@@ -8406,6 +8741,9 @@ pub(super) async fn run(
                             args.settings =
                                 args.settings.reload_latest(&args.workspace, args.trusted)?;
                             args.extension_theme = None;
+                            // Fullscreen exit replay uses the new protocol even
+                            // if reload preparation is interrupted.
+                            dirty |= view.update_image_protocol(&args, _terminal.as_ref())?;
                             for warning in args.settings.diagnostics() {
                                 view.append(warning);
                             }
@@ -10313,6 +10651,7 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         "defaultThinkingLevel",
         "httpProxy",
         "sessionDir",
+        "externalEditor",
         "shellPath",
         "shellCommandPrefix",
         "defaultTools",
@@ -10550,7 +10889,7 @@ fn select(
                         .unwrap_or_else(|| std::path::Path::new(""))
                 ),
                 "fullscreenWheelScrollLines" => json!("auto"),
-                "shellPath" | "shellCommandPrefix" | "httpProxy" => json!(""),
+                "externalEditor" | "shellPath" | "shellCommandPrefix" | "httpProxy" => json!(""),
                 "defaultProjectTrust" => json!("ask"),
                 "defaultTools" => json!(["read", "bash", "edit", "write"]),
                 "modelThinkingLevels" => json!({}),
@@ -10566,18 +10905,38 @@ fn select(
                 }
                 _ => json!([]),
             };
-            let value = args.settings.value().get(&key).unwrap_or(&default);
+            let (value, description) = match key.as_str() {
+                "externalEditor" => {
+                    let user_value = args
+                        .settings
+                        .stored_layer(&crate::config::agent_dir())
+                        .and_then(|layer| layer.get(&key))
+                        .unwrap_or(&default);
+                    let project_override = args.trusted
+                        && args
+                            .settings
+                            .stored_layer(&args.workspace.join(".pi"))
+                            .is_some_and(|layer| layer.get(&key).is_some());
+                    let description = if project_override {
+                        "user setting, overridden by the project"
+                    } else {
+                        "user setting, applies to the next editor launch"
+                    };
+                    (user_value, description)
+                }
+                "steeringMode" | "followUpMode" => (
+                    args.settings.value().get(&key).unwrap_or(&default),
+                    "default for new sessions",
+                ),
+                _ => (
+                    args.settings.value().get(&key).unwrap_or(&default),
+                    "applies on reload/startup",
+                ),
+            };
             let dialog = crate::ui::dialog::Dialog::new(
                 uuid::Uuid::new_v4(),
                 pi_rs::UiRequest::Editor {
-                    title: format!(
-                        "Edit {key} as JSON · {}",
-                        if matches!(key.as_str(), "steeringMode" | "followUpMode") {
-                            "default for new sessions"
-                        } else {
-                            "applies on reload/startup"
-                        }
-                    ),
+                    title: format!("Edit {key} as JSON · {description}"),
                     initial_value: Some(serde_json::to_string_pretty(value)?),
                     timeout: None,
                 },
@@ -11592,6 +11951,78 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editor_component_preserves_expanded_draft_and_open_dialog() {
+        use super::*;
+        use clap::Parser;
+
+        let args = Cli::parse_from(["pi"]);
+        let mut view = View::default();
+        let draft = "pasted content\n".repeat(11);
+        view.editor.paste(&draft);
+        let visible = view.prompt_rows(&args, 80, 30);
+        assert!(visible.0[0].contains("[paste #1"));
+        let dialog = uuid::Uuid::new_v4();
+        view.ui_request(&json!({"method":"input","id":dialog,"title":"Still open","initialValue":"dialog draft"}))
+            .unwrap();
+        let id = uuid::Uuid::new_v4();
+        let component = json!({
+            "placeholder":"Editor placeholder",
+            "keybindings":[{"key":"f6","action":"deleteCharBackward"},{"key":"tab","action":"undo"}]
+        });
+        view.ui_request(&json!({"method":"setEditorComponent","id":id,"component":component}))
+            .unwrap();
+        let get = json!({"method":"getEditorComponent","id":id});
+        let (_, response) = view.ui_request(&get).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), component);
+        let custom = view.extension_chrome.editor.as_ref().unwrap();
+        assert_eq!(
+            custom.action(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), ""),
+            "tui.editor.deleteCharBackward"
+        );
+        assert_eq!(
+            custom.action(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                "tui.input.tab"
+            ),
+            "tui.input.tab"
+        );
+        assert!(
+            view.ui_request(
+                &json!({"method":"setEditorComponent","id":id,"component":{"keybindings":[
+                    {"key":"f6","action":"undo"},{"key":"F6","action":"cursorLeft"}
+                ]}})
+            )
+            .is_err()
+        );
+        let (_, response) = view.ui_request(&get).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), component);
+        assert_eq!(view.dialog().unwrap().id, dialog);
+        view.dialog_mut().unwrap().paste("!");
+        view.ui_request(&json!({"method":"setEditorComponent","id":id,"component":null}))
+            .unwrap();
+        assert_eq!(
+            view.ui_request(&get).unwrap(),
+            Some((id, pi_rs::UiResponse::Cancelled))
+        );
+        assert_eq!(view.dialog().unwrap().id, dialog);
+        assert_eq!(
+            view.dialog_mut().unwrap().input(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &Keys::default(),
+            ),
+            Some(pi_rs::UiResponse::Text("dialog draft!".into())),
+        );
+        view.cancel_extension_dialog(&json!(dialog));
+        assert_eq!(view.prompt_rows(&args, 80, 30), visible);
+        let text = view
+            .ui_request(&json!({"method":"getEditorText","id":id}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, (id, pi_rs::UiResponse::Text(draft.clone())));
+        assert_eq!(view.editor.take(), draft);
+    }
+
     #[test]
     fn live_model_changes_use_the_latest_thinking_default() {
         use clap::Parser;
@@ -12948,14 +13379,27 @@ mod tests {
                 unreachable!()
             };
             assert!(*finished);
-            if enabled {
-                assert!(
-                    matches!(parts.as_slice(), [ToolPart::Text(a), ToolPart::Image(_), ToolPart::Text(b)] if a == "before" && b == "after")
-                );
-            } else {
-                assert!(parts.is_empty());
-                assert!(output.contains("[image · image/png]"));
-            }
+            assert!(
+                matches!(parts.as_slice(), [ToolPart::Text(a), ToolPart::Image(_), ToolPart::Text(b)] if a == "before" && b == "after")
+            );
+            assert!(output.contains("[image · image/png]"));
+            let render = |view: &View| {
+                entry
+                    .render(
+                        &Theme::system(),
+                        96,
+                        true,
+                        true,
+                        view.transcript_options(&args, false),
+                    )
+                    .iter()
+                    .any(|line| line.image.is_some())
+            };
+            assert_eq!(render(&view), enabled);
+            view.graphics
+                .set_protocol(Some(images::Protocol::Kitty), true, &mut Vec::new())
+                .unwrap();
+            assert!(render(&view));
         }
     }
 
@@ -13708,21 +14152,17 @@ exit {exit}
                     .unwrap(),
                 "cleanup did not encounter the held session-store lock"
             );
-            // `started_rx` means logout already owns the auth lock. Reading
-            // through that lock waits for durable local removal, keeping slow
-            // filesystem syncs outside the event-delivery deadline below.
             assert!(matches!(
                 view.remote_task.as_ref().unwrap().receiver.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
             ));
             drop(session_lock);
-            let auth =
-                super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
-            assert!(auth.get("openai-chatgpt").is_none());
             let task = view.remote_task.take().unwrap();
+            // Dropping the session-store lock lets cleanup proceed. Wait for
+            // its notification before reading the credentials again.
             assert!(matches!(
                 task.receiver
-                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .recv_timeout(std::time::Duration::from_secs(15))
                     .unwrap(),
                 super::RemoteEvent::ForgetModelKey("openai-chatgpt")
             ));
@@ -14182,6 +14622,122 @@ exit {exit}
             Some(("fixture".into(), Some("high".into())))
         );
     }
+    #[test]
+    fn restore_hides_empty_pi_branch_summaries_without_losing_billing() {
+        use super::{Cli, Entry, NoticeKind, SummaryKind, View};
+        use clap::Parser;
+        use pi_rs::{Event, Session};
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"root"}}),
+            json!({"type":"message","id":"away","parentId":"root","message":{"role":"user","content":"away"}}),
+            json!({"type":"branch_summary","id":"billed","parentId":"root","fromId":"away","summary":"","usage":{"input":2,"output":1,"cost":{"total":0.125}}}),
+            json!({"type":"branch_summary","id":"empty","parentId":"billed","fromId":"away","summary":""}),
+            json!({"type":"branch_summary","id":"sibling","parentId":"root","fromId":"away","summary":" ","usage":{"input":4,"output":2,"cost":{"total":0.25}}}),
+            json!({"type":"message","id":"leaf","parentId":"empty","message":{"role":"user","content":"continuation"}}),
+        ];
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let path = directory.path().join("native.jsonl");
+        imported.export_jsonl(&path).unwrap();
+        let mut session = Session::open(&path).unwrap();
+        let leaf = session.head();
+        let branch = session.branch();
+        let summaries: Vec<_> = branch
+            .into_iter()
+            .filter(|record| matches!(&record.event, Event::BranchSummary { summary, .. } if summary.is_empty()))
+            .collect();
+        assert_eq!(summaries.len(), 2);
+        let billed = summaries[0];
+        let (usage, metadata) = billed.summary_usage(session.records()).unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (2, 1));
+        assert_eq!(
+            metadata
+                .and_then(|details| details.metadata.cost_usd)
+                .and_then(|cost| cost.as_f64()),
+            Some(0.125)
+        );
+        assert_eq!(session.statistics().cost, Some(0.375));
+
+        let native_summary = summaries[1].clone();
+        let args = Cli::parse_from(["pi", "--offline"]);
+        let mut view = View::default();
+        let summary_count = |view: &View| {
+            view.lines
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        Entry::Summary {
+                            kind: SummaryKind::Branch,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        let billing_count = |view: &View| {
+            view.lines
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        Entry::TranscriptNotice {
+                            kind: NoticeKind::CompactionCosts,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        view.restore_session(&args, &session).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (0, 0));
+
+        let sibling = session.records().iter().find(|record| {
+            matches!(&record.event, Event::BranchSummary { summary, .. } if summary == " ")
+        }).unwrap().id;
+        session.checkout(sibling).unwrap();
+        view.restore_session(&args, &session).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (1, 1));
+
+        session.checkout(leaf).unwrap();
+        view.restore_session(&args, &session).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (0, 0));
+        assert_eq!(session.statistics().cost, Some(0.375));
+
+        session.checkout(native_summary.parent.unwrap()).unwrap();
+        let mut records = session.records().to_vec();
+        let metadata = records
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|metadata| (record.id, metadata))
+            })
+            .collect();
+        let native_id = records.len() as u64 + 1;
+        records.push(pi_rs::Record {
+            id: native_id,
+            version: records.last().unwrap().version,
+            ..native_summary
+        });
+        let mixed = Session::from_records_with_metadata(records, metadata).unwrap();
+        view.restore_session(&args, &mixed).unwrap();
+        assert_eq!((summary_count(&view), billing_count(&view)), (1, 0));
+    }
+
     #[test]
     fn imported_branch_checkout_fork_and_switch_restore_selection() {
         use clap::Parser;
@@ -15138,6 +15694,83 @@ exit {exit}
     }
 
     #[test]
+    fn dynamic_header_renders_current_width_theme_and_data_in_the_shared_header_slot() {
+        use clap::Parser;
+        let args = super::Cli::parse_from(["pi"]);
+        let dark = Theme::load("dark", &[], &args.workspace, false, false).unwrap();
+        let light = Theme::load("light", &[], &args.workspace, false, false).unwrap();
+        let mut view = View::default();
+        let renderer = uuid::Uuid::new_v4();
+        view.mount_header_renderer(Some(renderer));
+        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
+        let (_, first) = header.request(80, &dark).unwrap();
+        assert_eq!(first["context"]["width"], 80);
+        assert_eq!(first["context"]["theme"]["name"], "dark");
+        assert!(first["context"]["theme"]["colors"]["accent"].is_string());
+        assert!(header.request(80, &dark).is_none());
+
+        let response = |request: &Value, text| {
+            json!({
+                "id": request["id"], "rendered":{"lines":[[{"text":text,"color":"accent"}]]}
+            })
+        };
+        assert!(!header.receive(&response(&first, "stale"), 66, &dark));
+        let (_, resized) = header.request(66, &dark).unwrap();
+        assert_eq!(resized["context"]["width"], 66);
+        assert!(header.receive(&response(&resized, "resized"), 66, &dark));
+
+        for fullscreen in [false, true] {
+            for (width, theme) in [(80, &dark), (66, &light)] {
+                assert!(
+                    view.header_lines(&args, theme, width, 2, fullscreen)
+                        .iter()
+                        .flat_map(|row| &row.spans)
+                        .all(|span| span.text != "resized")
+                );
+            }
+        }
+        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
+        let (_, themed) = header.request(66, &light).unwrap();
+        assert_eq!(themed["context"]["theme"]["name"], "light");
+        assert!(!header.invalidate());
+        assert!(!header.receive(&response(&themed, "old data"), 66, &light));
+        let (_, invalidated) = header.request(66, &light).unwrap();
+        assert!(header.receive(&response(&invalidated, "changed"), 66, &light));
+        assert!(header.request(66, &light).is_none());
+
+        for fullscreen in [false, true] {
+            let rows = view.header_lines(&args, &light, 66, 2, fullscreen);
+            assert_eq!(rows[0].spans[0].text, "changed");
+            assert_eq!(rows[0].spans[0].color, light.color("accent"));
+        }
+        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
+        assert!(header.invalidate());
+        for fullscreen in [false, true] {
+            assert!(
+                view.header_lines(&args, &light, 66, 2, fullscreen)
+                    .iter()
+                    .flat_map(|row| &row.spans)
+                    .all(|span| span.text != "changed")
+            );
+        }
+        view.ui_request(&json!({"id":renderer,"method":"setHeader","lines":[[{"text":"static"}]]}))
+            .unwrap();
+        assert!(view.extension_chrome.dynamic_header.is_none());
+        assert_eq!(
+            view.header_lines(&args, &light, 66, 2, false)[0].spans[0].text,
+            "static"
+        );
+        view.mount_header_renderer(Some(uuid::Uuid::new_v4()));
+        assert!(view.extension_chrome.header.is_none());
+        let header = view.extension_chrome.dynamic_header.as_mut().unwrap();
+        let (_, replacement) = header.request(66, &light).unwrap();
+        assert!(!header.receive(&response(&invalidated, "previous mount"), 66, &light));
+        assert!(header.receive(&response(&replacement, "replacement"), 66, &light));
+        assert!(view.clear_extension_chrome());
+        assert!(view.extension_chrome.dynamic_header.is_none());
+    }
+
+    #[test]
     fn extension_header_footer_follow_theme_and_restore_independently() {
         use clap::Parser;
         let mut args = super::Cli::parse_from(["pi"]);
@@ -15380,6 +16013,44 @@ exit {exit}
         view.track_tool_render(&operation, 4, false);
         view.tool_render_cursor = Some(0);
         assert_eq!(view.next_journal_tool_render().unwrap().0, 1);
+    }
+
+    #[test]
+    fn codemode_displays_live_and_cancelled_calls_alongside_script_output() {
+        let mut view = super::View::default();
+        let operation_id = uuid::Uuid::new_v4();
+        let operation = operation_id.to_string();
+        view.add_tool(
+            &pi_rs::Invocation {
+                operation_id,
+                call: pi_rs::ToolCall {
+                    id: "script".into(),
+                    name: "codemode".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            Some(1),
+        );
+        view.track_tool_render(&operation, 2, true);
+        let update = |status| {
+            json!({
+                "toolCallId":"script","toolName":"codemode",
+                "partialResult":{"content":[],"details":{"calls":[{"name":"echo","args":"{}","status":status}]}}
+            })
+        };
+        assert!(view.render_tool_progress(&update("running")));
+        assert!(matches!(&view.lines[0], Entry::Tool { output, .. } if output.contains("… echo")));
+        assert!(view.render_tool_progress(&update("cancelled")));
+        view.finish_tool(
+            &operation,
+            &pi_rs::Outcome::Failed("retained output".into()),
+            None,
+        );
+        view.track_tool_render(&operation, 3, false);
+        assert!(
+            matches!(&view.lines[0], Entry::Tool { output, finished: true, .. }
+            if output.contains("⊘ echo") && output.contains("retained output"))
+        );
     }
 
     #[test]
@@ -15682,6 +16353,10 @@ exit {exit}
                     data: String::new(),
                     mime_type: "image/png".into(),
                 },
+                pi_rs::ContentBlock::Image {
+                    data: "bm90IGEgUE5H".into(),
+                    mime_type: "image/png".into(),
+                },
                 pi_rs::ContentBlock::Text {
                     text: "second".into(),
                     text_signature: None,
@@ -15694,6 +16369,7 @@ exit {exit}
         assert!(
             matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**first**\nsecond")
         );
+        assert!(!view.lines[0].has_inline_images(true));
     }
 
     #[test]
@@ -17528,8 +18204,21 @@ exit {exit}
         drop(session);
         let invalid = directory.path().join("invalid.jsonl");
         std::fs::write(&invalid, "invalid").unwrap();
+        let falsy_native = directory.path().join("falsy-native.jsonl");
+        let mut invalid_native = std::fs::read(&valid).unwrap();
+        invalid_native.extend_from_slice(b"false\n");
+        std::fs::write(&falsy_native, invalid_native).unwrap();
         let late = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
-        for path in [&foreign, &invalid] {
+        let pi_source = directory.path().join("external.jsonl");
+        let header = json!({"type":"session","version":3,"id":"external","cwd":workspace});
+        std::fs::write(&pi_source, format!("null\n{header}\nfalse\n{{")).unwrap();
+        assert!(crate::session_import::read(&pi_source).is_ok());
+        let managed = directory.path().join("managed.jsonl");
+        let mut session = pi_rs::Session::open(&managed).unwrap();
+        session.bind_host("test-scope").unwrap();
+        session.set_working_directory(&workspace).unwrap();
+        drop(session);
+        for path in [&foreign, &invalid, &falsy_native, &pi_source, &managed] {
             std::fs::File::options()
                 .write(true)
                 .open(path)

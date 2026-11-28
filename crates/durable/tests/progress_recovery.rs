@@ -705,7 +705,7 @@ async fn merged_progress_watch_pages_atomic_commits_and_reopens() {
         terminal.commit_sequence
     );
     let mut invalid = serde_json::to_value(&cursor).unwrap();
-    invalid["version"] = serde_json::json!(3);
+    invalid["version"] = serde_json::json!(4);
     let invalid = serde_json::from_value(invalid).unwrap();
     assert!(h.merged_progress(&invalid, NonZeroUsize::MIN).is_err());
     let mut skipped = serde_json::to_value(&cursor).unwrap();
@@ -853,6 +853,178 @@ async fn merged_watch_groups_documents_and_replays_deletion_after_reopen() {
             .unwrap()
             .frames
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn unified_and_merged_history_follow_owned_task_documents_through_retirement() {
+    use durable_store::{Expected, Store};
+    use pi_rs_durable::{
+        document::{Address, Transaction},
+        task::{Checkpoint, Task, TaskOwner},
+        task_store::{Save, TaskStore},
+    };
+    use std::{num::NonZeroUsize, time::Duration};
+
+    async fn next(
+        harness: &Harness,
+        cursor: &pi_rs_durable::runtime::UnifiedHistoryCursor,
+    ) -> pi_rs_durable::runtime::UnifiedHistoryPage {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.watch_unified_history(cursor, NonZeroUsize::MIN, Duration::from_millis(10)),
+        )
+        .await
+        .expect("document commit did not reach unified history")
+        .unwrap()
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("owned-documents.db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut harness = Harness::open_paused(&path, opts(model.clone())).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 100,
+    };
+    let conversation = harness.create_conversation(config.clone()).unwrap();
+    let other = harness.create_conversation(config).unwrap();
+    let checkpoint = Checkpoint {
+        phase: "initial".into(),
+        data: serde_json::Value::Null,
+    };
+    let task = |owner| Task::new(uuid::Uuid::new_v4(), owner, checkpoint.clone(), 3).unwrap();
+    let parent = task(TaskOwner::Conversation(conversation));
+    let child = task(TaskOwner::Task(parent.id()));
+    let foreign = task(TaskOwner::Conversation(other));
+    let address = |scope: String, key: &str| Address {
+        scope,
+        name: "note".into(),
+        key: key.into(),
+    };
+    let shared = address(conversation.to_string(), "conversation");
+    let owned = address(format!("pi.task/{}", child.id()), "owned");
+    let lookalike = address(owned.scope.clone(), "unowned");
+    // An explicit task route takes precedence even when a host chooses an
+    // address that looks like it belongs to a different conversation.
+    let conflicting_scope = address(other.to_string(), "conflict");
+    let foreign_doc = address(format!("pi.task/{}", foreign.id()), "foreign");
+
+    let start = harness.merged_progress_from_now(conversation).unwrap();
+    let other_start = harness.merged_progress_from_now(other).unwrap();
+    let unified_start = harness.unified_history_from_now(conversation).unwrap();
+    let store = Store::open(&path).unwrap();
+    let tasks = TaskStore::new(&store);
+    tasks
+        .save(&[
+            Save::Create(&parent),
+            Save::Create(&child),
+            Save::Create(&foreign),
+        ])
+        .unwrap();
+
+    let mut tx = Transaction::new();
+    tx.acquire_task_document(&owned, child.id()).unwrap();
+    tx.acquire_task_document(&conflicting_scope, child.id())
+        .unwrap();
+    tx.acquire_task_document(&foreign_doc, foreign.id())
+        .unwrap();
+    for item in [
+        &shared,
+        &owned,
+        &lookalike,
+        &conflicting_scope,
+        &foreign_doc,
+    ] {
+        tx.put(item, Expected::Missing, &serde_json::Map::new())
+            .unwrap();
+    }
+    tx.commit(&store).unwrap();
+
+    let merged = harness.merged_progress(&start, NonZeroUsize::MIN).unwrap();
+    assert_eq!(merged.frames.len(), 1);
+    let created = &merged.frames[0];
+    let actual = created
+        .documents
+        .iter()
+        .map(|change| &change.address)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(actual, [&shared, &owned, &conflicting_scope].into());
+    let other_merged = harness
+        .merged_progress(&other_start, NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(other_merged.frames[0].documents.len(), 1);
+    assert_eq!(other_merged.frames[0].documents[0].address, foreign_doc);
+
+    let mut legacy = serde_json::to_value(start).unwrap();
+    legacy["version"] = serde_json::json!(2);
+    let old_merged = harness
+        .merged_progress(&serde_json::from_value(legacy).unwrap(), NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(old_merged.frames[0].documents.len(), 1);
+    assert_eq!(old_merged.frames[0].documents[0].address, shared);
+
+    let unified = next(&harness, &unified_start).await;
+    assert_eq!(unified.commits[0].sequence, created.commit_sequence);
+    let actual = unified.commits[0]
+        .documents
+        .iter()
+        .map(|(address, _)| address)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(actual, [&shared, &owned, &conflicting_scope].into());
+
+    let mut old_unified = serde_json::to_value(&unified_start).unwrap();
+    old_unified
+        .as_object_mut()
+        .unwrap()
+        .remove("include_task_documents");
+    let old_unified = next(&harness, &serde_json::from_value(old_unified).unwrap()).await;
+    assert_eq!(old_unified.commits[0].documents.len(), 1);
+    assert_eq!(old_unified.commits[0].documents[0].0, shared);
+
+    let saved_merged = serde_json::to_vec(&merged.next).unwrap();
+    let saved_unified = serde_json::to_vec(&unified.next).unwrap();
+    tasks
+        .update(&tasks.load(child.id()).unwrap().unwrap(), |task| {
+            task.start()?;
+            task.succeed(serde_json::Value::Null)
+        })
+        .unwrap();
+    drop(store);
+    drop(harness);
+
+    let harness = Harness::open_paused(&path, opts(model)).unwrap();
+    let retired = harness
+        .merged_progress(
+            &serde_json::from_slice(&saved_merged).unwrap(),
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+    assert_eq!(retired.frames.len(), 1);
+    let changes = &retired.frames[0].documents;
+    assert_eq!(
+        changes
+            .iter()
+            .map(|change| &change.address)
+            .collect::<std::collections::HashSet<_>>(),
+        [&owned, &conflicting_scope].into()
+    );
+    assert!(changes.iter().all(|change| change.document.is_none()));
+    let retired_unified = next(&harness, &serde_json::from_slice(&saved_unified).unwrap()).await;
+    assert_eq!(
+        retired_unified.commits[0].sequence,
+        retired.frames[0].commit_sequence
+    );
+    assert_eq!(retired_unified.commits[0].documents.len(), 2);
+    assert!(
+        retired_unified.commits[0]
+            .documents
+            .iter()
+            .all(|(_, change)| change.retired && change.document.is_none())
     );
 }
 

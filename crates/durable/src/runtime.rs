@@ -2218,11 +2218,10 @@ fn stop_at_unsafe_park_boundary(stage: &str, state: &Conversation) {
     let Some(root) = std::env::var_os("PI_UNSAFE_BOUNDARY_DIR") else {
         return;
     };
-    std::fs::write(
+    crate::publish_ready_marker(
         std::path::PathBuf::from(root).join("boundary"),
         serde_json::to_vec(&state.tool_attempt()).unwrap(),
-    )
-    .unwrap();
+    );
     loop {
         std::thread::park();
     }
@@ -2509,6 +2508,16 @@ impl Conversation {
     /// predate answer IDs and return None.
     pub fn answer_id(&self, submission: Uuid) -> Option<Uuid> {
         self.answer_ids.get(&submission).copied()
+    }
+
+    /// Whether ordinary input would be queued behind an active run.
+    pub fn input_run_active(&self) -> bool {
+        self.active.is_some()
+            || pending_failure_continuation(self)
+            || matches!(
+                self.phase,
+                Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
+            )
     }
 
     /// Current model request identity for a submission placed in this run.
@@ -3322,7 +3331,7 @@ pub struct MergedProgressCursor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     document_position: Option<u64>,
 }
-/// One conversation-scoped document's final state in a transaction.
+/// The final state of a conversation or owned task document in a transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MergedDocumentChange {
     pub address: crate::document::Address,
@@ -3746,6 +3755,8 @@ pub struct UnifiedHistoryCursor {
     conversation: Uuid,
     after: u64,
     through: u64,
+    #[serde(default)]
+    include_task_documents: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3756,7 +3767,7 @@ pub struct UnifiedHistoryCommit {
     pub applications: Option<Vec<crate::application_entry::ApplicationEntry>>,
     /// Generation and tool progress committed alongside any other records.
     pub progress: Vec<ProgressHistoryFrame>,
-    /// Document changes in the conversation's explicit address scope.
+    /// Changes to documents in the conversation's scope and its owned task documents.
     pub documents: Vec<(
         crate::document::Address,
         crate::document::DocumentOperationFrame,
@@ -13616,6 +13627,7 @@ impl Harness {
             conversation: id,
             after: 0,
             through: store.commit_sequence()?,
+            include_task_documents: true,
         })
     }
 
@@ -13628,6 +13640,7 @@ impl Harness {
             conversation: id,
             after: sequence,
             through: sequence,
+            include_task_documents: true,
         })
     }
 
@@ -13657,8 +13670,10 @@ impl Harness {
             limit.get() + 1,
         )?;
         let scope = crate::document::Address::conversation_scope_prefix(cursor.conversation);
-        let document_commits = store.scoped_document_commit_positions(
+        let task_documents = cursor.include_task_documents.then_some(cursor.conversation);
+        let document_commits = store.conversation_document_commit_positions(
             &scope,
+            task_documents,
             cursor.after,
             cursor.through,
             limit.get() + 1,
@@ -13720,14 +13735,13 @@ impl Harness {
                 }
             }
             let documents = if let Some(revision) = document_commit {
-                let changes =
-                    store.scoped_document_changes_at_commit(&scope, revision, sequence)?;
-                crate::document::scoped_document_operations(
-                    store,
-                    cursor.conversation,
+                let changes = store.conversation_document_changes_at_commit(
+                    &scope,
+                    task_documents,
                     revision,
-                    changes,
-                )?
+                    sequence,
+                )?;
+                crate::document::committed_document_operations(store, revision, changes)?
             } else {
                 Vec::new()
             };
@@ -13827,12 +13841,15 @@ impl Harness {
         &self,
         conversation: Uuid,
         after: u64,
+        include_task_documents: bool,
     ) -> Result<Option<(u64, u64, Vec<MergedDocumentChange>)>, Error> {
         let prefix = crate::document::Address::conversation_scope_prefix(conversation);
-        let Some((revision, sequence, changes)) = self
-            .owner
-            .store()
-            .next_scoped_document_commit(&prefix, after)?
+        let Some((revision, sequence, changes)) =
+            self.owner.store().next_conversation_document_commit(
+                &prefix,
+                include_task_documents.then_some(conversation),
+                after,
+            )?
         else {
             return Ok(None);
         };
@@ -13840,9 +13857,6 @@ impl Harness {
             .into_iter()
             .map(|(key, entry)| -> Result<_, Error> {
                 let address = crate::document::Address::from_storage_key(&key)?;
-                if address.scope != conversation.to_string() {
-                    return Err(Error::Invalid("document scope mismatch".into()));
-                }
                 Ok(MergedDocumentChange {
                     address,
                     document: crate::document::Documents::decode(entry)?,
@@ -13852,7 +13866,7 @@ impl Harness {
         Ok(Some((revision, sequence, changes)))
     }
     /// Attach a lifecycle-aware merged watch from now or after a consumed cursor.
-    /// Both v1 and v2 cursor semantics are preserved on resume.
+    /// Older cursors keep their original document selection on resume.
     pub fn watch_merged_progress_handle(
         &self,
         conversation: Uuid,
@@ -13914,7 +13928,7 @@ impl Harness {
                 continue;
             }
             let cursor = MergedProgressCursor {
-                version: 2,
+                version: 3,
                 conversation,
                 after_sequence: before,
                 observation_position: observation,
@@ -13929,9 +13943,9 @@ impl Harness {
         ))
     }
     fn validate_merged_progress_cursor(&self, cursor: &MergedProgressCursor) -> Result<(), Error> {
-        if !matches!(cursor.version, 1 | 2)
+        if !matches!(cursor.version, 1..=3)
             || (cursor.version == 1 && cursor.document_position.is_some())
-            || (cursor.version == 2 && cursor.document_position.is_none())
+            || (cursor.version >= 2 && cursor.document_position.is_none())
             || cursor.after_sequence > self.owner.store().commit_sequence()?
         {
             return Err(Error::Invalid("invalid merged progress cursor".into()));
@@ -13990,7 +14004,9 @@ impl Harness {
             self.merged_progress_record(cursor.conversation, cursor.progress_position)?;
         let documents = cursor
             .document_position
-            .map(|position| self.merged_document_record(cursor.conversation, position))
+            .map(|position| {
+                self.merged_document_record(cursor.conversation, position, cursor.version >= 3)
+            })
             .transpose()?
             .flatten();
         if observation
@@ -16074,6 +16090,47 @@ impl Harness {
             }
         }
     }
+    /// Withdraw all queued inputs in one commit and return them in admission order.
+    /// Inputs that have already entered a run remain part of that run.
+    pub fn clear_input_queue(&mut self, id: Uuid) -> Result<Vec<WithdrawnInput>, Error> {
+        self.load(id)?;
+        let gate = self.owner.conversation_controls().get(id).callback_start;
+        let _start_lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
+        loop {
+            let (mut state, version) = self.load(id)?;
+            let mut withdrawn = Vec::new();
+            for input in &mut state.submissions {
+                if input.status == Status::Queued {
+                    let mode = state
+                        .input_modes
+                        .get(&input.id)
+                        .copied()
+                        .unwrap_or(InputMode::FollowUp);
+                    withdrawn.push(WithdrawnInput {
+                        conversation_id: id,
+                        mode,
+                        submission: input.clone(),
+                    });
+                    input.status = Status::Unanswered {
+                        reason: "aborted".into(),
+                    };
+                }
+            }
+            if withdrawn.is_empty() {
+                return Ok(withdrawn);
+            }
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&state, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
+                Ok(()) => return Ok(withdrawn),
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Persist the abort mark and withdraw the inputs queued at this commit.
     /// The caller must stop any executing worker before driving the mark.
     pub fn request_abort(&mut self, id: Uuid) -> Result<(), Error> {
@@ -24817,6 +24874,11 @@ impl Scheduler {
     ) -> Result<WithdrawResult, Error> {
         self.harness.withdraw_submission(id, submission)
     }
+    /// Withdraw all queued inputs, keeping the currently running input.
+    pub fn clear_input_queue(&mut self, id: Uuid) -> Result<Vec<WithdrawnInput>, Error> {
+        self.harness.clear_input_queue(id)
+    }
+
     pub fn blocked(&self, id: Uuid) -> Result<Option<(Uuid, String)>, Error> {
         self.harness.blocked(id)
     }
@@ -37846,6 +37908,57 @@ mod scheduler_tests {
         );
         scheduler.shutdown().await.unwrap();
     }
+    #[tokio::test]
+    async fn clears_both_input_queues_without_aborting_the_active_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let active = scheduler.submit(id, None, "first".into()).unwrap();
+        model.started.acquire().await.unwrap().forget();
+        let follow_up = scheduler.submit(id, None, "follow-up".into()).unwrap();
+        let steer = scheduler
+            .submit_with_mode(id, None, "steer".into(), InputMode::Steer)
+            .unwrap();
+        let cleared = scheduler.clear_input_queue(id).unwrap();
+        assert_eq!(
+            cleared
+                .iter()
+                .map(|entry| (entry.submission.id, entry.mode))
+                .collect::<Vec<_>>(),
+            [(follow_up, InputMode::FollowUp), (steer, InputMode::Steer)]
+        );
+        assert!(scheduler.clear_input_queue(id).unwrap().is_empty());
+        model.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        let state = scheduler.conversation(id).unwrap();
+        assert!(matches!(state.submissions[0].status, Status::Done { .. }));
+        assert_eq!(state.submissions[0].id, active);
+        assert!(state.submissions[1..].iter().all(|input| {
+            matches!(&input.status, Status::Unanswered { reason } if reason == "aborted")
+        }));
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
+        scheduler.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn restart_processes_abort_mark_before_recovery_can_redispatch() {
         let dir = tempfile::tempdir().unwrap();

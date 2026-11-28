@@ -152,6 +152,22 @@ async fn capture_model_headers(
     model: std::sync::Arc<dyn pi_rs::Model>,
     request: pi_rs::ModelRequest,
 ) -> String {
+    capture_model_response(
+        &listener,
+        model,
+        request,
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .0
+}
+
+async fn capture_model_response(
+    listener: &tokio::net::TcpListener,
+    model: std::sync::Arc<dyn pi_rs::Model>,
+    request: pi_rs::ModelRequest,
+    response: &str,
+) -> (String, pi_rs::Result<pi_rs::ModelStream>) {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -168,20 +184,14 @@ async fn capture_model_headers(
                 break;
             }
         }
-        socket
-            .write_all(
-                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .await
-            .unwrap();
+        socket.write_all(response.as_bytes()).await.unwrap();
         String::from_utf8(bytes).unwrap()
     };
-    let (captured, _) = tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(serve, model.stream(request))
     })
     .await
-    .unwrap();
-    captured
+    .unwrap()
 }
 
 #[tokio::test]
@@ -551,6 +561,135 @@ fn auth_file_snapshot_binds_only_granted_routes() {
     );
     std::fs::remove_file(&file).unwrap();
     assert!(grants.load().unwrap().get("compatible", endpoint).is_none());
+}
+
+#[tokio::test]
+async fn auth_reload_publishes_only_a_complete_catalog_and_keeps_clients_route_bound() {
+    use pi_rs::{ModelCatalog, ModelRequest};
+    use pi_rs_workbench::auth_factory::{AuthFileReadGrants, AuthRoute};
+    use pi_rs_workbench::model_factory::NativeModelDefinition;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    let directory = tempfile::tempdir().unwrap();
+    let granted = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ungranted = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        granted.local_addr().unwrap()
+    );
+    let other_endpoint = format!("http://{}/ungranted", ungranted.local_addr().unwrap());
+    let grants = AuthFileReadGrants {
+        file: directory.path().join("auth.json"),
+        routes: vec![AuthRoute {
+            provider: "relay".into(),
+            endpoint: endpoint.clone(),
+        }],
+    };
+    let definition = |model| NativeModelDefinition {
+        api: NativeModelApi::OpenAiChat,
+        provider: "relay",
+        endpoint: &endpoint,
+        model,
+        info: None,
+    };
+    let save = |key| {
+        let auth = serde_json::json!({ "relay": { "type": "api_key", "key": key } });
+        std::fs::write(&grants.file, auth.to_string()).unwrap();
+    };
+    let reload = |live: &mut ModelCatalog, definitions: Vec<NativeModelDefinition<'_>>| {
+        let factory = ModelClientFactory::new(grants.load()?);
+        *live = factory.catalog(definitions)?;
+        Ok::<_, pi_rs::Error>(())
+    };
+
+    save("Fixture-Old");
+    let mut live = ModelCatalog::default();
+    reload(&mut live, vec![definition("stable")]).unwrap();
+    let retained = live.get("relay", "stable").unwrap();
+    let old_client = Arc::downgrade(&retained);
+
+    std::fs::write(&grants.file, "{").unwrap();
+    assert!(reload(&mut live, vec![definition("stable")]).is_err());
+    assert!(Arc::ptr_eq(
+        &live.get("relay", "stable").unwrap(),
+        &retained
+    ));
+
+    save("Fixture-New");
+    let error = reload(
+        &mut live,
+        vec![
+            definition("candidate-only"),
+            NativeModelDefinition {
+                endpoint: &other_endpoint,
+                ..definition("ungranted")
+            },
+        ],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, pi_rs::Error::Config(message) if message == "model credential is not registered")
+    );
+    assert!(Arc::ptr_eq(
+        &live.get("relay", "stable").unwrap(),
+        &retained
+    ));
+    assert!(live.get("relay", "candidate-only").is_none());
+
+    reload(&mut live, vec![definition("stable")]).unwrap();
+    assert!(live.get("relay", "ungranted").is_none());
+    let replacement = live.get("relay", "stable").unwrap();
+    assert!(!Arc::ptr_eq(&replacement, &retained));
+    let request = || ModelRequest {
+        model: "stable".into(),
+        messages: vec![pi_rs::Message::User {
+            content: "hello".into(),
+        }],
+        tools: vec![],
+        max_output_tokens: 16,
+    };
+    let authorization = |headers: &str, expected: &str| {
+        let values = headers.lines().filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then_some(value.trim())
+        });
+        assert_eq!(values.collect::<Vec<_>>(), [expected]);
+    };
+    let body = "data: [DONE]\n\n";
+    let success = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    for (model, key) in [
+        (replacement.clone(), "Bearer Fixture-New"),
+        (retained.clone(), "Bearer Fixture-Old"),
+    ] {
+        let (headers, result) = capture_model_response(&granted, model, request(), &success).await;
+        assert!(result.is_ok());
+        authorization(&headers, key);
+    }
+    drop(retained);
+    assert!(old_client.upgrade().is_none());
+
+    let redirect = format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {other_endpoint}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let (headers, result) =
+        capture_model_response(&granted, replacement, request(), &redirect).await;
+    let Err(error) = result else {
+        panic!("the redirected request must fail");
+    };
+    assert!(error.to_string().contains("307"));
+    authorization(&headers, "Bearer Fixture-New");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), ungranted.accept())
+            .await
+            .is_err(),
+        "the ungranted endpoint received a connection"
+    );
 }
 
 #[test]
@@ -1010,6 +1149,112 @@ async fn granted_model_file_composes_saved_auth_with_exact_api_and_base_routes()
     assert_eq!(catalog.identities().len(), 2);
     std::fs::remove_file(models_path).unwrap();
     assert_eq!(grants.load(&factory).unwrap().identities().len(), 0);
+}
+
+fn load_file_thinking_catalog(declaration: serde_json::Value) -> pi_rs::ModelCatalog {
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use serde_json::json;
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("models.json");
+    let base_url = "http://127.0.0.1:1/v1";
+    let endpoint = format!("{base_url}/chat/completions");
+    let mut provider = json!({"api":"openai-completions","baseUrl":base_url});
+    provider
+        .as_object_mut()
+        .unwrap()
+        .extend(declaration.as_object().unwrap().clone());
+    std::fs::write(
+        &file,
+        json!({"providers":{"relay":provider,"ungranted":{"models":true}}}).to_string(),
+    )
+    .unwrap();
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "relay",
+        &endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    ModelFileReadGrants {
+        file,
+        routes: vec![ModelFileRoute {
+            provider: "relay".into(),
+            api: NativeModelApi::OpenAiChat,
+            base_url: base_url.into(),
+            endpoint,
+        }],
+    }
+    .load(&ModelClientFactory::new(auth.build()))
+    .unwrap()
+}
+
+#[test]
+fn file_thinking_levels() {
+    let catalog = load_file_thinking_catalog(serde_json::json!({"models":[
+        {"id":"mapped","reasoning":true,
+         "thinkingLevelMap":{"off":null,"medium":null,"xhigh":"strong","max":null}},
+        {"id":"legacy","reasoning":true},
+        {"id":"legacy-nonreasoning","reasoning":false},
+        {"id":"empty-map","reasoning":true,"thinkingLevelMap":{}},
+        {"id":"nonreasoning","reasoning":false,"thinkingLevelMap":{"off":null,"max":"very-strong"}},
+        {"id":"all-disabled","reasoning":true,
+         "thinkingLevelMap":{"off":null,"minimal":null,"low":null,"medium":null,"high":null}}
+    ]}));
+    assert_eq!(
+        catalog.thinking_levels("relay", "mapped").unwrap(),
+        ["minimal", "low", "high", "xhigh"]
+    );
+    assert_eq!(catalog.thinking_levels("relay", "legacy"), None);
+    assert_eq!(
+        catalog.thinking_levels("relay", "legacy-nonreasoning"),
+        None
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "empty-map").unwrap(),
+        ["off", "minimal", "low", "medium", "high"]
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "nonreasoning").unwrap(),
+        ["off"]
+    );
+    assert!(
+        catalog
+            .thinking_levels("relay", "all-disabled")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn file_thinking_overrides() {
+    let catalog = load_file_thinking_catalog(serde_json::json!({
+        "models":[
+            {"id":"mapped","reasoning":true,
+             "thinkingLevelMap":{"off":null,"medium":null,"xhigh":"strong","max":null}},
+            {"id":"override-only","reasoning":false},
+            {"id":"outside","baseUrl":"http://127.0.0.1:2/v1","thinkingLevelMap":true},
+            {"id":"classifier","type":"classifier","thinkingLevelMap":true}
+        ],
+        "modelOverrides":{
+            "mapped":{"thinkingLevelMap":{"medium":"normal","high":null,"xhigh":null,"max":"ultra"}},
+            "override-only":{"reasoning":true,"thinkingLevelMap":{"low":null}},
+            "outside":{"thinkingLevelMap":true},
+            "classifier":{"thinkingLevelMap":true}
+        }
+    }));
+    assert_eq!(
+        catalog.identities().collect::<Vec<_>>(),
+        [("relay", "mapped"), ("relay", "override-only")]
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "mapped").unwrap(),
+        ["minimal", "low", "medium", "max"]
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "override-only").unwrap(),
+        ["off", "minimal", "medium", "high"]
+    );
 }
 
 #[test]

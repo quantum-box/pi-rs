@@ -513,6 +513,12 @@ waiting for a foreground child when the process stopped, the companion resumes
 the original child conversation and delivers its settlement to the parent.
 
 
+Ordinary nested calls support `ToolHost::call_with_cancellation`. Cancelling a
+new call during preparation records a skipped result at its original position.
+Replay reuses that result and the positions of later siblings. Cancellation
+after dispatch retains an uncertain result or an already-published pending
+reference for reconciliation. The token applies to the call and its descendants.
+
 `StandaloneNoHooksHost` constructs a standalone scheduler with an explicit
 host assertion that no hook policy applies. It cannot prove policy outside this
 runtime; do not use it when hooks are required. It cannot attach to a conversation
@@ -2176,6 +2182,11 @@ multiple independently owned task levels under a model-issued root. Each level
 checkpoints its own handle and receives its direct ended children; conversation
 abort propagates through the ownership chain. This is a separate task-backed
 scheduler path from the multi-level `KeyedHost` nested-call support above.
+
+The ordinary tool progress wrapper preserves the capabilities offered by its
+underlying `ToolHost`, including cancellation-aware nested calls, ordered
+prevalidated call accounting, and extension-scoped entries and messages.
+An extension-scoped handle shares the invocation's progress lifetime.
 
 For task-backed tools, `TaskTool::start_child` stages a keyed child and returns a
 serializable `NestedTaskCall`. The handler can checkpoint the handle and return
