@@ -1,5 +1,5 @@
 //! Host-owned, provider-qualified model clients for SDK sessions.
-use std::collections::{BTreeMap, btree_map};
+use std::collections::{BTreeMap, BTreeSet, btree_map};
 use std::sync::Arc;
 
 use crate::{
@@ -83,6 +83,7 @@ pub struct ModelCatalogBuilder {
 struct CatalogBinding {
     client: Arc<dyn Model>,
     info: Option<CatalogModelInfo>,
+    thinking_levels: Option<Vec<String>>,
 }
 
 fn describe_model<'a>(
@@ -123,6 +124,33 @@ impl ModelCatalogBuilder {
         self.register_binding(provider.into(), model.into(), client, Some(info))
     }
 
+    /// Assign the host's selectable thinking levels to an existing exact identity.
+    /// Order is preserved. An empty list records that no levels are selectable.
+    /// Invalid names or levels leave any earlier declaration intact.
+    pub fn set_thinking_levels(
+        &mut self,
+        provider: &str,
+        model: &str,
+        levels: impl IntoIterator<Item = String>,
+    ) -> Result<&mut Self> {
+        let binding = self
+            .clients
+            .get_mut(&(provider.to_owned(), model.to_owned()))
+            .ok_or_else(|| Error::Config("model is not registered in the catalog".into()))?;
+        let levels: Vec<String> = levels.into_iter().collect();
+        let mut seen = BTreeSet::new();
+        if levels
+            .iter()
+            .any(|level| level.trim().is_empty() || !seen.insert(level))
+        {
+            return Err(Error::Config(
+                "thinking levels must be nonempty and unique".into(),
+            ));
+        }
+        binding.thinking_levels = Some(levels);
+        Ok(self)
+    }
+
     fn register_binding(
         &mut self,
         provider: String,
@@ -135,7 +163,11 @@ impl ModelCatalogBuilder {
         }
         match self.clients.entry((provider, model)) {
             btree_map::Entry::Vacant(entry) => {
-                entry.insert(CatalogBinding { client, info });
+                entry.insert(CatalogBinding {
+                    client,
+                    info,
+                    thinking_levels: None,
+                });
                 Ok(self)
             }
             btree_map::Entry::Occupied(_) => Err(Error::Config(
@@ -214,6 +246,16 @@ impl ModelCatalog {
     /// This is not a live capability or credential availability check.
     pub fn info(&self, provider: &str, model: &str) -> Option<&CatalogModelInfo> {
         self.find(provider, model)?.info
+    }
+
+    /// Return host-declared thinking levels in selection order for this exact identity.
+    /// `None` means no declaration is available. An empty slice means the host
+    /// explicitly declared no selectable levels. This lookup never consults a client.
+    pub fn thinking_levels(&self, provider: &str, model: &str) -> Option<&[String]> {
+        self.clients
+            .get(&(provider.to_owned(), model.to_owned()))?
+            .thinking_levels
+            .as_deref()
     }
 
     /// Ordered catalog identities and their optional host-supplied information.
@@ -517,6 +559,45 @@ mod tests {
             serde_json::from_value::<CatalogModelInfo>(json).unwrap(),
             info
         );
+    }
+
+    #[test]
+    fn catalog_thinking_levels_keep_host_order_and_exact_identity() {
+        let client: Arc<dyn Model> = Arc::new(NamedModel("test"));
+        let mut builder = ModelCatalogBuilder::new();
+        for provider in ["one", "two", "three"] {
+            builder
+                .register(provider, "shared", client.clone())
+                .unwrap();
+        }
+
+        let levels = ["off", "high", "low"].map(str::to_owned);
+        builder
+            .set_thinking_levels("one", "shared", levels.clone())
+            .unwrap();
+        builder.set_thinking_levels("two", "shared", []).unwrap();
+        assert!(builder.set_thinking_levels("ONE", "shared", []).is_err());
+        assert!(builder.set_thinking_levels("one", "Shared", []).is_err());
+        for invalid in [["off", "off"], ["off", " "]] {
+            assert!(
+                builder
+                    .set_thinking_levels("one", "shared", invalid.map(str::to_owned))
+                    .is_err()
+            );
+        }
+        assert!(builder.register("one", "shared", client.clone()).is_err());
+
+        let catalog = builder.build().clone();
+        assert_eq!(
+            catalog.thinking_levels("one", "shared"),
+            Some(levels.as_slice())
+        );
+        assert_eq!(catalog.thinking_levels("two", "shared"), Some(&[][..]));
+        assert_eq!(catalog.thinking_levels("three", "shared"), None);
+        assert_eq!(catalog.thinking_levels("ONE", "shared"), None);
+        assert_eq!(catalog.thinking_levels("one", "Shared"), None);
+        assert_eq!(catalog.thinking_levels("missing", "shared"), None);
+        assert!(Arc::ptr_eq(&catalog.get("one", "shared").unwrap(), &client));
     }
 
     #[tokio::test]
