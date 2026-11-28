@@ -877,6 +877,7 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
         "inherited",
         "explicit",
         "bounded",
+        "published-retention",
         "abort",
         "wake",
         "diagnostics",
@@ -922,6 +923,14 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
             uncertain_policy: UncertainPolicy::RequireReconciliation,
         };
         let mut scheduler = Scheduler::open(&path, options.clone()).unwrap();
+        if mode == "published-retention" {
+            scheduler
+                .start_published_checkpointable_progress_retention(
+                    Duration::from_millis(75),
+                    Duration::from_millis(10),
+                )
+                .unwrap();
+        }
         let driver = scheduler.start_tasks(registry).unwrap();
         let id = scheduler
             .create_conversation(Config {
@@ -955,6 +964,22 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
                 .prune_finished_checkpointable_progress(task, NonZeroUsize::MIN)
                 .is_err()
         );
+        if mode == "published-retention" {
+            assert!(
+                scheduler
+                    .progress_history(&progress_cursor, NonZeroUsize::new(32).unwrap())
+                    .unwrap()
+                    .records
+                    .iter()
+                    .flat_map(|record| &record.changes)
+                    .any(|change| matches!(
+                        change,
+                        pi_rs_durable::runtime::ProgressHistoryChange::CheckpointableTool {
+                            task: reported, progress, ..
+                        } if *reported == task && progress.text == "first"
+                    ))
+            );
+        }
         if mode == "abort" {
             tokio::time::timeout(Duration::from_secs(15), scheduler.abort_and_wait(id))
                 .await
@@ -1066,7 +1091,7 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
                 .is_none()
         );
         let published = scheduler.conversation(id).unwrap().messages;
-        let fork = (mode == "bounded").then(|| {
+        let fork = matches!(mode, "bounded" | "published-retention").then(|| {
             let id = scheduler.fork(id).unwrap();
             (id, scheduler.conversation(id).unwrap().messages)
         });
@@ -1099,6 +1124,54 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
                 deleted += count;
             }
             assert_eq!(deleted, if mode == "wake" { 2 } else { 1 });
+        }
+        if mode == "published-retention" {
+            let is_expired = |change: &pi_rs_durable::runtime::ProgressHistoryChange| {
+                matches!(
+                    change,
+                    pi_rs_durable::runtime::ProgressHistoryChange::ExpiredCheckpointableTool {
+                        task: reported, ..
+                    } if *reported == task
+                )
+            };
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let page = scheduler
+                        .progress_history(&progress_cursor, NonZeroUsize::new(32).unwrap())
+                        .unwrap();
+                    if page
+                        .records
+                        .iter()
+                        .flat_map(|record| &record.changes)
+                        .filter(|change| is_expired(change))
+                        .count()
+                        >= 2
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the retention worker expired both published reports");
+            assert_eq!(scheduler.conversation(id).unwrap().messages, published);
+            watch.close();
+            driver.shutdown().unwrap();
+            scheduler.shutdown().await.unwrap();
+            let (fork, messages) = fork.unwrap();
+            let reopened = Scheduler::open(&path, options).unwrap();
+            assert_eq!(reopened.conversation(fork).unwrap().messages, messages);
+            assert!(
+                reopened
+                    .progress_history(&progress_cursor, NonZeroUsize::new(32).unwrap())
+                    .unwrap()
+                    .records
+                    .iter()
+                    .flat_map(|record| &record.changes)
+                    .any(is_expired)
+            );
+            reopened.shutdown().await.unwrap();
+            continue;
         }
         let recorded: Vec<_> = scheduler
             .progress_history(&progress_cursor, NonZeroUsize::new(100).unwrap())

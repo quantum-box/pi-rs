@@ -77,6 +77,40 @@ fn expire_one(
     retain_ms: u64,
 ) -> Result<(), Error> {
     let (id, _) = parse_progress_key(&key)?;
+    expire_report(
+        store,
+        id,
+        ReportExpiry {
+            key,
+            payload: progress,
+            checks: Vec::new(),
+            mutations: Vec::new(),
+        },
+        now_ms,
+        retain_ms,
+    )
+}
+
+pub(crate) struct ReportExpiry {
+    pub key: Vec<u8>,
+    pub payload: Entry,
+    pub checks: Vec<Check>,
+    pub mutations: Vec<Mutation>,
+}
+
+pub(crate) fn expire_report(
+    store: &Store,
+    id: Uuid,
+    expiry: ReportExpiry,
+    now_ms: u64,
+    retain_ms: u64,
+) -> Result<(), Error> {
+    let ReportExpiry {
+        key,
+        payload: progress,
+        mut checks,
+        mut mutations,
+    } = expiry;
     let Some(task) = TaskStore::new(store)
         .load(id)
         .map_err(crate::task_scheduler::Error::from)?
@@ -90,7 +124,7 @@ fn expire_one(
         .as_ref()
         .map(|entry| serde_json::from_slice::<TerminalObservation>(&entry.value))
         .transpose()?;
-    let checks = [
+    checks.extend([
         Check {
             key: task_key(id),
             expected: Expected::Version(task.version),
@@ -105,15 +139,14 @@ fn expire_one(
                 .as_ref()
                 .map_or(Expected::Missing, |e| Expected::Version(e.version)),
         },
-    ];
+    ]);
     if let Some(observation) = observation.filter(|entry| {
         entry.task_version == task.version && entry.progress_version == progress.version
     }) {
         if now_ms.saturating_sub(observation.observed_ms) >= retain_ms {
-            store.commit(
-                &checks,
-                &[Mutation::Delete { key }, Mutation::Delete { key: marker }],
-            )?;
+            mutations.push(Mutation::Delete { key });
+            mutations.push(Mutation::Delete { key: marker });
+            store.commit(&checks, &mutations)?;
         }
     } else {
         let value = serde_json::to_vec(&TerminalObservation {

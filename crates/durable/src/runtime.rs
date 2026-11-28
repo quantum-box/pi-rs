@@ -3264,6 +3264,8 @@ pub enum ProgressHistoryChange {
         attempt: Uuid,
         progress: Box<crate::async_task_tool::DurableToolProgress>,
     },
+    /// The checkpointable report's payload expired; its identity and commit remain.
+    ExpiredCheckpointableTool { task: Uuid, attempt: Uuid },
 }
 fn same_progress_identity(a: &ProgressHistoryChange, b: &ProgressHistoryChange) -> bool {
     match (a, b) {
@@ -3280,10 +3282,30 @@ fn same_progress_identity(a: &ProgressHistoryChange, b: &ProgressHistoryChange) 
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-struct ProgressHistoryRecord {
+pub(crate) struct ProgressHistoryRecord {
     version: u32,
     conversation: Uuid,
     changes: Vec<ProgressHistoryChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpointable: Option<crate::published_progress_retention::Reference>,
+}
+
+impl ProgressHistoryRecord {
+    pub(crate) fn checkpointable_reference(
+        &self,
+        conversation: Uuid,
+    ) -> Result<&crate::published_progress_retention::Reference, Error> {
+        self.checkpointable
+            .as_ref()
+            .filter(|reference| {
+                self.version == 2
+                    && self.conversation == conversation
+                    && self.changes.is_empty()
+                    && !reference.task.is_nil()
+                    && !reference.attempt.is_nil()
+            })
+            .ok_or_else(|| Error::Invalid("invalid checkpointable progress history record".into()))
+    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProgressHistoryFrame {
@@ -3294,20 +3316,46 @@ pub struct ProgressHistoryFrame {
 }
 
 fn decode_progress_history_frame(
+    store: &durable_store::Store,
     record: serde_json::Value,
     conversation: Uuid,
     position: u64,
     commit_sequence: u64,
 ) -> Result<ProgressHistoryFrame, Error> {
     let event: ProgressHistoryRecord = serde_json::from_value(record)?;
-    if event.version != 1
-        || event.conversation != conversation
-        || event.changes.is_empty()
-        || event.changes.len() > 2
-        || position == 0
-    {
+    if position == 0 || event.conversation != conversation {
         return Err(Error::Invalid("invalid progress history record".into()));
     }
+    let changes = match event.version {
+        1 if event.checkpointable.is_none()
+            && !event.changes.is_empty()
+            && event.changes.len() <= 2 =>
+        {
+            event.changes
+        }
+        2 => {
+            let reference = event.checkpointable_reference(conversation)?;
+            let progress = crate::published_progress_retention::read(
+                store,
+                conversation,
+                position,
+                commit_sequence,
+                reference,
+            )?;
+            vec![match progress {
+                Some(progress) => ProgressHistoryChange::CheckpointableTool {
+                    task: reference.task,
+                    attempt: reference.attempt,
+                    progress: Box::new(progress),
+                },
+                None => ProgressHistoryChange::ExpiredCheckpointableTool {
+                    task: reference.task,
+                    attempt: reference.attempt,
+                },
+            }]
+        }
+        _ => return Err(Error::Invalid("invalid progress history record".into())),
+    };
     Ok(ProgressHistoryFrame {
         cursor: ProgressHistoryCursor {
             version: 1,
@@ -3315,7 +3363,7 @@ fn decode_progress_history_frame(
             position,
         },
         commit_sequence,
-        changes: event.changes,
+        changes,
     })
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -3725,6 +3773,7 @@ fn prepare_progress_history(
         version: 1,
         conversation,
         changes,
+        checkpointable: None,
     };
     let value = serde_json::to_value(record)?;
     if serde_json::to_vec(&value)?.len() > MAX_PROGRESS_HISTORY_BYTES {
@@ -3743,7 +3792,30 @@ pub(crate) fn prepare_checkpointable_progress_history(
     attempt: Uuid,
     progress: &crate::async_task_tool::DurableToolProgress,
 ) -> Result<crate::observer::Append, Error> {
-    prepare_progress_history(
+    use crate::published_progress_retention as retention;
+    if retention::enabled(store)? {
+        let payload = serde_json::to_vec(progress)?;
+        let reference = retention::Reference::new(task, attempt, &payload)?;
+        let record = ProgressHistoryRecord {
+            version: 2,
+            conversation,
+            changes: Vec::new(),
+            checkpointable: Some(reference),
+        };
+        let observer = crate::observer::Observer::progress_history(store, conversation);
+        let mut append = observer.prepare_append(&serde_json::to_value(record)?)?;
+        let key = retention::key(conversation, append.cursor.0);
+        append.checks.push(Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        });
+        append.mutations.push(Mutation::Put {
+            key,
+            value: payload,
+        });
+        return Ok(append);
+    }
+    let mut append = prepare_progress_history(
         store,
         conversation,
         vec![ProgressHistoryChange::CheckpointableTool {
@@ -3751,7 +3823,9 @@ pub(crate) fn prepare_checkpointable_progress_history(
             attempt,
             progress: Box::new(progress.clone()),
         }],
-    )
+    )?;
+    append.checks.push(retention::unconfigured_check());
+    Ok(append)
 }
 
 /// Trusted cursor for a finite database-local unified history capture.
@@ -13719,6 +13793,7 @@ impl Harness {
                             .map_err(|_| Error::Invalid("invalid progress history key".into()))?,
                     );
                     progress.push(decode_progress_history_frame(
+                        store,
                         serde_json::from_slice(&entry.value)?,
                         cursor.conversation,
                         position,
@@ -14455,6 +14530,7 @@ impl Harness {
                     .commit_for_version(&key, entry.version)?
                     .ok_or_else(|| Error::Invalid("untracked progress history record".into()))?;
                 decode_progress_history_frame(
+                    self.owner.store(),
                     persisted,
                     cursor.conversation,
                     record.cursor.0,
@@ -23268,6 +23344,7 @@ pub struct Scheduler {
     reporter: Option<tokio::task::JoinHandle<()>>,
     foreground_worker: Option<tokio::task::JoinHandle<()>>,
     progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
+    published_progress_retention: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
     worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
     summary_tasks: HashMap<Uuid, SummaryTask>,
@@ -24093,6 +24170,7 @@ impl Scheduler {
             reporter: None,
             foreground_worker: None,
             progress_retention: None,
+            published_progress_retention: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -25738,6 +25816,47 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Opt into expiry of new published checkpointable progress payloads.
+    ///
+    /// The format opt-in is persisted so every writer uses the same storage,
+    /// including after reopen. Reattach the worker after reopening to continue
+    /// collection. Legacy inline frames, tool outcomes and fork data stay readable.
+    pub fn start_published_checkpointable_progress_retention(
+        &mut self,
+        retain_for: Duration,
+        interval: Duration,
+    ) -> Result<(), Error> {
+        let retain_ms = u64::try_from(retain_for.as_millis())
+            .ok()
+            .filter(|time| *time > 0)
+            .ok_or_else(|| Error::Invalid("invalid published progress retention".into()))?;
+        if interval.is_zero() || self.published_progress_retention.is_some() {
+            return Err(Error::Invalid(
+                "published progress retention needs a nonzero interval and one worker".into(),
+            ));
+        }
+        let reader = self.harness.worker();
+        crate::published_progress_retention::enable(reader.owner.store())?;
+        let cancel = self.reporter_cancel.clone();
+        self.published_progress_retention = Some(tokio::spawn(async move {
+            let mut after = Vec::new();
+            while !cancel.is_cancelled() {
+                crate::published_progress_retention::sweep(
+                    reader.owner.store(),
+                    &mut after,
+                    unix_ms(),
+                    retain_ms,
+                )?;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => (),
+                }
+            }
+            Ok(())
+        }));
+        Ok(())
+    }
+
     /// Most recent background reporter failure, if any. Reopen after storage errors.
     pub fn reporter_error(&self) -> Option<String> {
         self.reporter_error
@@ -26024,7 +26143,13 @@ impl Scheduler {
         {
             error.get_or_insert(Error::Invalid(format!("foreground scheduler task: {e}")));
         }
-        if let Some(worker) = self.progress_retention.take() {
+        for worker in [
+            self.progress_retention.take(),
+            self.published_progress_retention.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             match worker.await {
                 Ok(Ok(())) => (),
                 Ok(Err(e)) => {
