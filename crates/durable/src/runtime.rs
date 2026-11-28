@@ -10543,8 +10543,8 @@ impl Harness {
     }
 
     /// Fork at the commit that first exposed this complete message batch.
-    /// Interior positions require proof of unchanged fork state or a tool-free
-    /// append changing only config; incomplete tool transcripts are rejected.
+    /// Interior positions require a proven append or a replay-authenticated
+    /// reset. Incomplete tool transcripts are rejected.
     pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
         let membership = self.fork_membership_proof(id)?;
         self.fork_at_position_with_membership(id, position, &membership)
@@ -10638,11 +10638,12 @@ impl Harness {
                 .ok_or(crate::fork::Error::InvalidSnapshot)?,
         )?;
         if reference.as_ref() != Some(&position.cursor) {
-            if count != messages.len() {
-                return Err(crate::fork::Error::InvalidSnapshot.into());
-            }
-            let (cut, revision, checks) =
+            let (mut cut, revision, checks) =
                 self.prove_failure_reset_cut(id, &position.cursor, commit)?;
+            let prefix = (count < messages.len()).then_some((count, messages.len()));
+            if prefix.is_some() {
+                Self::exclude_unreached_reset_writes(&mut cut)?;
+            }
             let entry_id = metadata
                 .as_ref()
                 .and_then(|(ids, _, _)| ids.get(count - 1).copied())
@@ -10651,7 +10652,7 @@ impl Harness {
                 id,
                 record.cursor,
                 ForkBoundary::Message { entry_id },
-                None,
+                prefix,
                 None,
                 Some((cut, position.cursor, revision, checks)),
                 None,
@@ -11736,8 +11737,11 @@ impl Harness {
         let anchor: Option<crate::transcript::Cursor> =
             serde_json::from_value(record.value.get("_transcript").cloned().unwrap_or_default())?;
         if anchor.as_ref() != Some(&position.cursor) {
-            let (state, _, _) =
+            let (mut state, _, _) =
                 self.prove_failure_reset_cut(source, &position.cursor, record.cursor.0)?;
+            if !message.history.commit_boundary {
+                Self::exclude_unreached_reset_writes(&mut state)?;
+            }
             let retained: HashSet<_> = state
                 .application_writes
                 .into_iter()
@@ -11746,6 +11750,19 @@ impl Harness {
                 .collect();
             writes.retain(|entry| retained.contains(&entry.id()));
         }
+        Ok(())
+    }
+
+    fn exclude_unreached_reset_writes(cut: &mut Conversation) -> Result<(), Error> {
+        // A custom write placed after this reset follows all of its message
+        // occurrences. Earlier resets' writes remain visible.
+        let reset = cut
+            .resets
+            .last()
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .id;
+        cut.application_writes
+            .retain(|write| write.after_reset != Some(reset));
         Ok(())
     }
 
@@ -12880,6 +12897,21 @@ impl Harness {
                         messages,
                         ..
                     } => (stable_prefix, commit, origin, messages.len()),
+                    TranscriptChange::ReplaceV2 {
+                        commit,
+                        origin,
+                        messages,
+                        ..
+                    } => {
+                        let mut original = serde_json::to_value(&predecessor.next)?;
+                        original["transcript"] = serde_json::to_value(origin)?;
+                        self.verify_failure_reset_cut(
+                            origin,
+                            &serde_json::from_value(original)?,
+                            commit,
+                        )?;
+                        (0, commit, origin, messages.len())
+                    }
                     _ => return Err(crate::fork::Error::InvalidSnapshot.into()),
                 };
                 let current_key = format!("runtime/fork/{source_origin}/{source_commit:020}");

@@ -1978,6 +1978,9 @@ fn limit_failures_keep_staged_reset_path() {
 
 #[test]
 fn atomic_failure_fork_preserves_writes_at_each_reset() {
+    use crate::document::{ConversationDocument, DefinedDocumentFork};
+    use std::num::NonZeroU32;
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let mut h = Harness::open_paused(&path, options()).unwrap();
@@ -1988,6 +1991,14 @@ fn atomic_failure_fork_preserves_writes_at_each_reset() {
             max_output_tokens: 10,
         })
         .unwrap();
+    let document = ConversationDocument {
+        kind: "reset-context".into(),
+        version: NonZeroU32::MIN,
+        initial: serde_json::Map::from_iter([("generation".into(), serde_json::json!(1))]),
+        fork: DefinedDocumentFork::AsOf,
+    };
+    h.session_transaction(id, |tx| tx.edit_defined_document(&document, "", |_| Ok(())))
+        .unwrap();
     h.set_after_failed_run(id, AfterFailedRun::Continue)
         .unwrap();
     h.submit(id, None, "active".into()).unwrap();
@@ -1996,7 +2007,10 @@ fn atomic_failure_fork_preserves_writes_at_each_reset() {
         .reset_with_blocks(
             id,
             Some("first".into()),
-            vec![vec![serde_json::json!({"type":"text","text":"a"})]],
+            vec![
+                vec![serde_json::json!({"type":"text","text":"a"})],
+                vec![serde_json::json!({"type":"text","text":"later in first reset"})],
+            ],
         )
         .unwrap();
     let first_write = h.submit_write(id, None, "app.first".into(), None).unwrap();
@@ -2040,19 +2054,78 @@ fn atomic_failure_fork_preserves_writes_at_each_reset() {
             .unwrap()
             .placed
     );
+    h.session_transaction(id, |tx| {
+        tx.edit_defined_document(&document, "", |value| {
+            value.insert("generation".into(), serde_json::json!(2));
+            Ok(())
+        })
+    })
+    .unwrap();
     drop(h);
     let mut h = Harness::open_paused(&path, options()).unwrap();
     h.set_session_label(id, first_write, Some("first")).unwrap();
     h.set_session_label(id, second_write, Some("second"))
         .unwrap();
-    let fork = h.fork_by_entry_id(id, occurrences[0]).unwrap();
+    let fork = h.fork_by_entry_id(id, occurrences[1]).unwrap();
     let writes = h.conversation(fork).unwrap().application_writes;
     assert_eq!(
         writes.iter().map(|w| w.id).collect::<Vec<_>>(),
         vec![first_write]
     );
     drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let partial = h.fork_by_entry_id(fork, occurrences[0]).unwrap();
+    let original_partial = h.fork_by_entry_id(id, occurrences[0]).unwrap();
+    for branch in [partial, original_partial] {
+        let state = h.conversation(branch).unwrap();
+        assert!(state.application_writes.is_empty());
+        assert_eq!(
+            state
+                .resets
+                .iter()
+                .map(|reset| reset.id)
+                .collect::<Vec<_>>(),
+            [first]
+        );
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(
+            state.messages[0],
+            Message::User {
+                content: "first".into()
+            }
+        );
+        let bindings = state.content_blocks.values().collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].message_id, occurrences[0]);
+        assert_eq!(
+            bindings[0].blocks,
+            [serde_json::json!({"type":"text","text":"a"})]
+        );
+        let saved = h
+            .session_transaction(branch, |tx| tx.defined_document(&document, ""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.value["generation"], 1);
+    }
+    drop(h);
     let h = Harness::open_paused(&path, options()).unwrap();
+    let prefix = h.session_entries_start(partial).unwrap();
+    let prefix_tree = h.session_tree(&prefix).unwrap();
+    assert!(
+        prefix_tree
+            .entries
+            .iter()
+            .any(|node| node.entry.id() == occurrences[0])
+    );
+    for omitted in [occurrences[1], first_write, second_write] {
+        assert!(
+            !prefix_tree
+                .entries
+                .iter()
+                .any(|node| node.entry.id() == omitted)
+        );
+    }
+    assert!(h.session_labels(&prefix).unwrap().is_empty());
     let history = h.session_entries_start(fork).unwrap();
     let tree = h.session_tree(&history).unwrap();
     let write = tree
