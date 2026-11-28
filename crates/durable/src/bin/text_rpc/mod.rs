@@ -326,12 +326,14 @@ async fn respond(
             let include_content = request["includeContent"] == true;
             for input in withdrawn {
                 seen.insert(input.submission.id);
-                let queue = match input.mode {
-                    InputMode::Steer => &mut steering,
-                    InputMode::FollowUp => &mut follow_up,
+                let (queue, mode) = match input.mode {
+                    InputMode::Steer => (&mut steering, "steer"),
+                    InputMode::FollowUp => (&mut follow_up, "followUp"),
                 };
                 if include_content {
-                    inputs.push(submission_message(&input.submission));
+                    let mut message = submission_message(&input.submission);
+                    message["inputMode"] = json!(mode);
+                    inputs.push(message);
                 }
                 let text = input.submission.input_blocks.as_ref()
                     .and_then(|value| value.blocks.first())

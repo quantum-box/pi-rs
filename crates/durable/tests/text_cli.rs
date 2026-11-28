@@ -359,12 +359,16 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
         if !sent && frame["assistantMessageEvent"]["delta"] == "queue base answer" {
             writeln!(
                 stdin,
+                r#"{{"type":"prompt","id":"original-follow","message":"discard follow-up","streamingBehavior":"followUp"}}"#
+            )
+            .unwrap();
+            writeln!(
+                stdin,
                 "{}",
                 json!({"type":"steer","id":"steer","message":"discard steer","images":[image]})
             )
             .unwrap();
             for request in [
-                r#"{"type":"prompt","id":"original-follow","message":"discard follow-up","streamingBehavior":"followUp"}"#,
                 r#"{"type":"get_state","id":"pending"}"#,
                 r#"{"type":"clear_queue","id":"clear","includeContent":true}"#,
                 r#"{"type":"set_follow_up_mode","id":"mode","mode":"all"}"#,
@@ -399,7 +403,11 @@ fn persists_text_conversation_and_rejects_a_changed_provider_route() {
             }
             Some("pending") => assert_eq!(frame["data"]["pendingMessageCount"], 2),
             Some("clear") => {
-                assert_eq!(frame["data"]["inputs"][0]["content"][1], image);
+                let inputs = frame["data"]["inputs"].as_array().unwrap();
+                assert_eq!(inputs.len(), 2);
+                assert_eq!(inputs[0]["inputMode"], "followUp");
+                assert_eq!(inputs[1]["inputMode"], "steer");
+                assert_eq!(inputs[1]["content"][1], image);
                 assert_eq!(
                     frame["data"]["steering"],
                     serde_json::json!(["discard steer"])

@@ -265,8 +265,13 @@ fn restore_queue(view: &mut View, data: &Value) {
     let mut draft = view.draft_message("");
     draft.images.clear();
     let text = if let Some(inputs) = data["inputs"].as_array() {
-        draft.images = inputs.iter().flat_map(message_images).collect();
-        inputs.iter().map(message_text).collect::<Vec<_>>()
+        let mut inputs: Vec<_> = inputs.iter().collect();
+        inputs.sort_by_key(|input| input["inputMode"] == "followUp");
+        draft.images = inputs
+            .iter()
+            .flat_map(|input| message_images(input))
+            .collect();
+        inputs.into_iter().map(message_text).collect::<Vec<_>>()
     } else {
         [&data["steering"], &data["followUp"]]
             .into_iter()
@@ -276,20 +281,24 @@ fn restore_queue(view: &mut View, data: &Value) {
             .map(str::to_owned)
             .collect()
     };
-    if !text.is_empty() {
-        draft.input.content = text.join("\n\n");
-        restore_draft(view, draft);
-    }
+    draft.input.content = text
+        .into_iter()
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    restore_draft(view, draft);
 }
 
 fn restore_draft(view: &mut View, mut input: pi_rs::QueuedMessage) {
-    let existing = view.editor.take();
-    let content = [input.input.content, existing]
-        .into_iter()
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    view.editor.replace(content);
+    if !input.input.content.is_empty() {
+        let existing = view.editor.take();
+        let content = [input.input.content, existing]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        view.editor.replace(content);
+    }
     input.images.append(&mut view.draft_images);
     view.draft_images = input.images;
 }
@@ -720,6 +729,31 @@ mod tests {
             &view.lines[..],
             [Entry::Notice(text), Entry::User(_)] if text == &format!("Durable session ID {session}")
         ));
+    }
+
+    #[test]
+    fn restores_steering_before_follow_up_with_images() {
+        let mut view = View::default();
+        view.editor.replace("draft".into());
+        let image = |data| json!({"type":"image", "mimeType":"image/png", "data":data});
+        let draft_image = image("ZHJhZnQ=");
+        view.draft_images
+            .push(serde_json::from_value(draft_image).unwrap());
+        restore_queue(
+            &mut view,
+            &json!({"inputs":[
+                {"inputMode":"followUp", "content":[{"type":"text","text":"follow-up"}, image("Zm9sbG93")]},
+                {"inputMode":"steer", "content":[image("aW1hZ2U=")]},
+                {"inputMode":"steer", "content":[{"type":"text","text":"steer"}, image("c3RlZXI=")]}
+            ]}),
+        );
+        assert_eq!(view.editor.text, "steer\n\nfollow-up\n\ndraft");
+        let images: Vec<_> = view
+            .draft_images
+            .iter()
+            .map(|image| image.data.as_str())
+            .collect();
+        assert_eq!(images, ["aW1hZ2U=", "c3RlZXI=", "Zm9sbG93", "ZHJhZnQ="]);
     }
 
     #[test]
