@@ -918,7 +918,7 @@ impl Profiles {
         cloudflare_gateway_route: Option<super::cloudflare_gateway::Route>,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
-        use super::operation_models::{Catalogue, decision_operation_defaults};
+        use super::operation_models::{Catalogue, pi_operation_defaults};
 
         let empty = serde_json::Map::new();
         let providers = match data.get("providers") {
@@ -932,7 +932,7 @@ impl Profiles {
         let mut providers = configured_providers.clone();
         for (name, entry) in configured_providers
             .iter()
-            .filter(|(_, entry)| decision_operation_defaults(entry))
+            .filter(|(_, entry)| pi_operation_defaults(entry))
         {
             // Retain explicitly routed chat definitions without inheriting the
             // operation default, its credentials, or its base URL.
@@ -1017,7 +1017,7 @@ impl Profiles {
                 if entry["baseUrl"].as_str().is_none()
                     && !configured_providers
                         .get(name)
-                        .is_some_and(decision_operation_defaults)
+                        .is_some_and(pi_operation_defaults)
                 {
                     return Err(Error::Config(format!(
                         "custom model provider {name} requires baseUrl"
@@ -1165,7 +1165,7 @@ impl Profiles {
                         provider.id(),
                         "cloudflare-workers-ai" | "cloudflare-ai-gateway"
                     ) && configured["api"] != "cloudflare-workers-ai-system-one"
-                        && !decision_operation_defaults(configured)
+                        && !pi_operation_defaults(configured)
                 })
                 .and_then(|configured| configured["baseUrl"].as_str())
                 .map(str::to_owned);

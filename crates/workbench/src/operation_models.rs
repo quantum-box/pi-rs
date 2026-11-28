@@ -471,17 +471,20 @@ struct Entry {
 pub(super) struct Catalogue(Vec<Entry>);
 
 /// Whether the provider defaults describe operations rather than chat routes.
-pub(super) fn decision_operation_defaults(provider: &Value) -> bool {
+pub(super) fn pi_operation_defaults(provider: &Value) -> bool {
     if !provider["api"].is_null() {
-        return provider["api"] == "pi-decision";
+        return matches!(provider["api"].as_str(), Some("pi-decision" | "pi-image"));
     }
     provider["models"].as_array().is_some_and(|models| {
         models
             .iter()
             .all(|model| matches!(model["type"].as_str(), Some("classifier" | "image")))
-            && models
-                .iter()
-                .any(|model| model["type"] == "classifier" && model["api"] == "pi-decision")
+            && models.iter().any(|model| {
+                matches!(
+                    (model["type"].as_str(), model["api"].as_str()),
+                    (Some("classifier"), Some("pi-decision")) | (Some("image"), Some("pi-image"))
+                )
+            })
     })
 }
 
@@ -493,7 +496,7 @@ impl Catalogue {
         let mut decision_profiles = Vec::new();
         for (provider, configured) in providers {
             let name = provider.to_ascii_lowercase();
-            let operation_defaults = decision_operation_defaults(configured);
+            let operation_defaults = pi_operation_defaults(configured);
             let Some(configured) = configured.as_object() else {
                 continue;
             };
@@ -564,7 +567,7 @@ impl Catalogue {
                 providers
                     .iter()
                     .find(|(key, _)| key.eq_ignore_ascii_case(&name))
-                    .filter(|(_, configured)| !decision_operation_defaults(configured))
+                    .filter(|(_, configured)| !pi_operation_defaults(configured))
                     .and_then(|(_, configured)| {
                         if name == "cloudflare-workers-ai" {
                             configured["models"]
@@ -1542,16 +1545,25 @@ impl Tool for Operations {
                 && Some(model.provider.as_str()) == provider
                 && Some(model.model.id.as_str()) == args["id"].as_str()
         });
-        let keys = match load_operation_keys(&context.cancellation).await {
-            Ok(keys) => keys,
-            Err(error) => {
-                if matches!(error, Error::Cancelled)
-                    && let Some(entry) = configured
-                {
+        let unavailable = |error| {
+            if matches!(error, Error::Cancelled) {
+                if let Some(entry) = configured {
                     return finish_operation(operation_result(entry), Err(error));
                 }
-                return Outcome::Failed(error.to_string());
+                if kind == Kind::Image
+                    && provider == Some("radius")
+                    && let Some(id) = args["id"].as_str().filter(|id| !id.is_empty())
+                {
+                    let mut data = json!({"provider":"radius","model":id,"output":[]});
+                    initialize_result(Api::PiImage, &mut data);
+                    return finish_operation(data, Err(error));
+                }
             }
+            Outcome::Failed(error.to_string())
+        };
+        let keys = match load_operation_keys(&context.cancellation).await {
+            Ok(keys) => keys,
+            Err(error) => return unavailable(error),
         };
         let radius = if configured.is_none() && provider == Some("radius") {
             let binding = tokio::select! {
@@ -1561,7 +1573,7 @@ impl Tool for Operations {
             };
             match binding {
                 Ok(binding) => binding,
-                Err(error) => return Outcome::Failed(error.to_string()),
+                Err(error) => return unavailable(error),
             }
         } else {
             None
@@ -1620,7 +1632,7 @@ fn operation_result(entry: &Entry) -> Value {
     } else {
         data["output"] = json!([]);
     }
-    initialize_result(entry, &mut data);
+    initialize_result(entry.api, &mut data);
     data
 }
 
@@ -1639,9 +1651,9 @@ fn finish_operation(mut data: Value, result: Result<()>) -> Outcome {
     }
 }
 
-fn initialize_result(entry: &Entry, data: &mut Value) {
+fn initialize_result(api: Api, data: &mut Value) {
     if data.get("timestamp").is_none() {
-        data["api"] = json!(entry.api);
+        data["api"] = json!(api);
         data["timestamp"] = json!(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1734,7 +1746,7 @@ impl Operations {
     ) -> Result<()> {
         let resolved = entry.resolved_cloudflare(keys)?;
         let entry = &resolved;
-        initialize_result(entry, data);
+        initialize_result(entry.api, data);
         let HttpOptions {
             client,
             radius_decision_client,
@@ -2141,6 +2153,27 @@ mod tests {
             } else {
                 "radius-paint"
             };
+            if mode == "cancel-discovery" {
+                let cancel = context();
+                let token = cancel.cancellation.clone();
+                let pending = super::super::config::agent_dir().join("image-catalogue-started");
+                let invoke = json!({"action":"generateImages","provider":"radius","id":image_id,
+                    "context":{"input":[{"type":"text","text":"draw"}]}});
+                let (reply, ()) = tokio::time::timeout(Duration::from_secs(8), async {
+                    tokio::join!(operation.invoke(invoke, cancel), async {
+                        while !pending.is_file() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        token.cancel();
+                    })
+                })
+                .await
+                .expect("cancel pending image discovery");
+                assert!(matches!(reply, Outcome::Structured { data, .. }
+                    if data["stopReason"] == "aborted" && data["output"] == json!([])
+                        && data["api"] == "pi-image" && data["model"] == image_id));
+                return;
+            }
             if mode == "wrong-account" {
                 assert!(matches!(
                     operation.invoke(image_list, context()).await,
@@ -2373,6 +2406,7 @@ mod tests {
         )
         .unwrap();
         let pending = home.path().join("image-response-started");
+        let catalogue_pending = home.path().join("image-catalogue-started");
         let server = tokio::spawn(async move {
             const CONFIG: &str = "GET /v1/config HTTP/1.1";
             const DECIDE: &str = "POST /relay/v1/decision HTTP/1.1";
@@ -2380,6 +2414,7 @@ mod tests {
             const IMAGE: &str = "POST /relay/v1/image HTTP/1.1";
             const KEY: &str = "radius-fixture-key";
             for (method, key, status, config_base) in [
+                (CONFIG, KEY, 206, &base),
                 (CONFIG, KEY, 200, &foreign_base),
                 (CONFIG, KEY, 200, &foreign_base),
                 (CONFIG, KEY, 200, &foreign_base),
@@ -2424,6 +2459,22 @@ mod tests {
                 }
                 assert!(authorized, "{method}");
                 if method == CONFIG {
+                    if status == 206 {
+                        request.get_mut().write_all(b"HTTP/1.1 200 Fixture\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{").await.unwrap();
+                        std::fs::write(&catalogue_pending, []).unwrap();
+                        let mut remaining = [0; 1];
+                        assert_eq!(
+                            tokio::time::timeout(
+                                Duration::from_secs(8),
+                                request.read(&mut remaining)
+                            )
+                            .await
+                            .expect("cancelled catalogue should close the socket")
+                            .unwrap(),
+                            0
+                        );
+                        continue;
+                    }
                     let result = json!({"baseUrl":config_base,"models":[],"classifiers":[
                         {"id":if key == "rotated-fixture-key" {"rotated-judge"} else {"radius-judge"},
                         "name":"Judge","contextWindow":8192,"input":["text"],"cost":{"input":1.2}},
@@ -2519,7 +2570,13 @@ mod tests {
             }
             listener
         });
-        for mode in ["foreign", "online", "offline", "wrong-account"] {
+        for mode in [
+            "cancel-discovery",
+            "foreign",
+            "online",
+            "offline",
+            "wrong-account",
+        ] {
             if mode == "offline" {
                 std::fs::write(
                     home.path().join("models.json"),
@@ -3737,6 +3794,45 @@ mod tests {
         assert_eq!(data["api"], "typesafe-system-one");
         assert!(data["timestamp"].as_u64().unwrap() > 0);
         assert_eq!(data["answers"], json!({}));
+    }
+
+    #[test]
+    fn pi_image_configuration_does_not_override_radius_chat_defaults() {
+        for provider_level in [false, true] {
+            let mut provider = json!({
+                "baseUrl":"https://images.invalid/relay/v1",
+                "apiKey":"fixture-key",
+                "models":[{"type":"image","id":"paint"}]
+            });
+            if provider_level {
+                provider["api"] = json!("pi-image");
+            } else {
+                provider["models"][0]["api"] = json!("pi-image");
+            }
+            let profiles = super::super::model_profiles::Profiles::parse(&json!({
+                "providers":{"radius":provider}
+            }))
+            .unwrap();
+            let chat = profiles.provider("radius").unwrap();
+            assert_eq!(profiles.endpoint(&chat), chat.default_endpoint());
+            assert!(
+                profiles
+                    .credential(&chat, profiles.endpoint(&chat))
+                    .is_none()
+            );
+            let operations = profiles.operations();
+            let image = operations
+                .0
+                .iter()
+                .find(|entry| entry.model.id == "paint")
+                .unwrap();
+            assert!(matches!(image.api, Api::PiImage));
+            assert_eq!(
+                image.endpoint.as_str(),
+                "https://images.invalid/relay/v1/image"
+            );
+            assert_eq!(image.api_key.as_deref(), Some("fixture-key"));
+        }
     }
 
     #[test]
