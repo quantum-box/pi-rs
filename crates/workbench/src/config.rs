@@ -512,6 +512,9 @@ impl Settings {
     pub fn enable_skill_commands(&self) -> bool {
         self.boolean("enableSkillCommands").unwrap_or(true)
     }
+    pub fn terminal_hyperlinks(&self) -> Option<bool> {
+        self.value["terminal"]["hyperlinks"].as_bool()
+    }
     pub fn terminal_true_color(&self) -> Option<bool> {
         // Like Pi, other JSON values leave capability detection in charge.
         self.value["terminal"]["trueColor"].as_bool()
@@ -1567,6 +1570,38 @@ mod tests {
                 .notices()
                 .shows(NoticeKind::ReasoningDrops)
         );
+    }
+
+    #[test]
+    fn terminal_capability_settings_preserve_non_boolean_values() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        for value in [
+            json!(true),
+            json!(false),
+            json!("auto"),
+            json!(null),
+            json!(1),
+            json!(["legacy"]),
+            json!({"legacy": true}),
+        ] {
+            let terminal = json!({"hyperlinks": value, "trueColor": value});
+            std::fs::write(&path, json!({"terminal": terminal}).to_string()).unwrap();
+            let mut settings = Settings::load_from_paths(directory.path(), false, &path).unwrap();
+            assert_eq!(settings.terminal_hyperlinks(), value.as_bool());
+            assert_eq!(settings.terminal_true_color(), value.as_bool());
+            assert_eq!(settings.value()["terminal"], terminal);
+
+            settings
+                .set_user_member_at(&path, "terminal", "showImages", json!(false))
+                .unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["terminal"]["hyperlinks"], value);
+            assert_eq!(saved["terminal"]["trueColor"], value);
+        }
     }
 
     #[test]
