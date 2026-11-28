@@ -5,7 +5,7 @@ mod turn_scheduler;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -7138,7 +7138,103 @@ struct ProgressReporter {
     tool_name: String,
     args: serde_json::Value,
     parent_tool_call_id: Option<String>,
+    settlement: Arc<Mutex<ProgressSettlement>>,
 }
+
+#[derive(Default)]
+struct ProgressSettlement {
+    closed: bool,
+    pending: Option<TurnProgress>,
+    omitted_calls: u64,
+}
+
+impl ProgressReporter {
+    fn close(&self) -> Option<TurnProgress> {
+        let mut settlement = self.settlement.lock().expect("tool progress settlement");
+        settlement.closed = true;
+        let mut pending = settlement.pending.take()?;
+        if let TurnProgress::Event(event) = &mut pending
+            && let crate::LifecycleEvent::ToolExecutionUpdate { partial_result, .. } =
+                event.as_mut()
+            && let Some(count) = partial_result.pointer_mut("/details/omittedCalls")
+            && count
+                .as_u64()
+                .is_some_and(|reported| reported < settlement.omitted_calls)
+        {
+            *count = settlement.omitted_calls.into();
+        }
+        Some(pending)
+    }
+
+    fn event(&self, partial_result: serde_json::Value) -> crate::ExtensionResult<TurnProgress> {
+        // Leave room for the settlement counter to grow to any u64 value.
+        let counter_bytes = partial_result
+            .pointer("/details/omittedCalls")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |count| {
+                20 - (count.checked_ilog10().unwrap_or(0) as usize + 1)
+            });
+        let event = crate::LifecycleEvent::ToolExecutionUpdate {
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+            args: self.args.clone(),
+            partial_result,
+            parent_tool_call_id: self.parent_tool_call_id.clone(),
+        };
+        // Count the entire event, including escaped arguments and identifiers,
+        // without allocating a second copy of its serialized representation.
+        serde_json::to_writer(ProgressSizeLimit(1024 * 1024 - counter_bytes), &event)
+            .map_err(|_| "tool progress event exceeds size limit".to_owned())?;
+        Ok(TurnProgress::Event(Box::new(event)))
+    }
+
+    fn report(
+        &self,
+        partial_result: serde_json::Value,
+        settlement: Option<serde_json::Value>,
+        retain_if_full: bool,
+        cancellation: &CancellationToken,
+    ) -> crate::ExtensionResult<()> {
+        let live = self.event(partial_result)?;
+        let settlement = settlement.map(|value| self.event(value)).transpose()?;
+        let mut pending = self.settlement.lock().expect("tool progress settlement");
+        if pending.closed || cancellation.is_cancelled() {
+            return Err("tool progress cancelled".into());
+        }
+        match &self.sender {
+            ProgressSink::Turn(sender) => match sender.try_reserve() {
+                Ok(permit) => {
+                    permit.send(live);
+                    pending.pending = settlement;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if retain_if_full {
+                        pending.pending = settlement.or(Some(live));
+                    }
+                    return Err("tool progress queue is full".into());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err("tool has finished".into()),
+            },
+        }
+        Ok(())
+    }
+}
+
+struct ProgressSizeLimit(usize);
+impl std::io::Write for ProgressSizeLimit {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or(std::io::ErrorKind::WriteZero)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 enum ProgressSink {
     Turn(mpsc::Sender<TurnProgress>),
@@ -7163,35 +7259,32 @@ impl ToolHost for NestedHost {
         &self,
         partial_result: serde_json::Value,
     ) -> crate::ExtensionResult<()> {
-        let Some(progress) = &self.progress else {
-            return Ok(());
-        };
-        if serde_json::to_vec(&partial_result)
-            .map_err(|error| error.to_string())?
-            .len()
-            > 1024 * 1024
-        {
-            return Err("tool progress exceeds size limit".into());
-        }
-        let event = crate::LifecycleEvent::ToolExecutionUpdate {
-            tool_call_id: progress.tool_call_id.clone(),
-            tool_name: progress.tool_name.clone(),
-            args: progress.args.clone(),
-            partial_result,
-            parent_tool_call_id: progress.parent_tool_call_id.clone(),
-        };
-        if self.cancellation.is_cancelled() {
-            return Err("tool progress cancelled".into());
-        }
-        match &progress.sender {
-            ProgressSink::Turn(sender) => sender
-                .try_send(TurnProgress::Event(Box::new(event)))
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => "tool progress queue is full".into(),
-                    mpsc::error::TrySendError::Closed(_) => "tool has finished".into(),
-                }),
+        self.progress.as_ref().map_or(Ok(()), |progress| {
+            progress.report(partial_result, None, false, &self.cancellation)
+        })
+    }
+    async fn report_progress_with_settlement(
+        &self,
+        partial_result: serde_json::Value,
+        settlement: Option<serde_json::Value>,
+    ) -> crate::ExtensionResult<()> {
+        self.progress.as_ref().map_or(Ok(()), |progress| {
+            progress.report(partial_result, settlement, true, &self.cancellation)
+        })
+    }
+
+    fn update_progress_omitted_calls(&self, count: u64) {
+        if let Some(progress) = &self.progress {
+            let mut settlement = progress
+                .settlement
+                .lock()
+                .expect("tool progress settlement");
+            if !settlement.closed {
+                settlement.omitted_calls = count;
+            }
         }
     }
+
     fn has_ui(&self) -> bool {
         self.ui.is_some()
     }
