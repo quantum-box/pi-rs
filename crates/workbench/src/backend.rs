@@ -1443,7 +1443,11 @@ async fn run_worker(
             Request::Prompt { rpc: true, id, .. } => Some(id.clone()),
             _ => None,
         };
-        let mut started = prompt_response.is_none();
+        let rpc_agent = prompt_response.is_some()
+            || (args.mode == Some(super::OutputMode::Rpc)
+                && matches!(&request, Request::TriggerCustom { .. }));
+        let mut started = !rpc_agent;
+        let mut agent_preflight = false;
         let mut compact_result = serde_json::Value::Null;
         let cancel = CancellationToken::new();
         let live_model = {
@@ -1460,7 +1464,9 @@ async fn run_worker(
             }
             state.live_model.as_ref().map(|run| run.control.clone())
         };
-        if started {
+        if rpc_agent {
+            output(json!({"type":"agent_preparing"}));
+        } else {
             output(json!({"type":"agent_started"}));
         }
         let mut completed_shells = Vec::new();
@@ -1538,12 +1544,19 @@ async fn run_worker(
                     if pending_worker_run(session) != Some(run_id) {
                         return Err(Error::Session("run is no longer pending".into()));
                     }
-                    let answer = Box::pin(agent.run_correlated_with_events(
+                    agent_preflight = rpc_agent;
+                    let answer = Box::pin(agent.run_correlated_with_start(
                         session,
                         run_id,
                         None,
                         &mut queued,
                         &cancel,
+                        &mut |_| {
+                            if rpc_agent && !started {
+                                started = true;
+                                output(json!({"type":"agent_started"}));
+                            }
+                        },
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
@@ -1572,7 +1585,6 @@ async fn run_worker(
                             "resume the pending run preflight before submitting a prompt".into(),
                         ));
                     }
-                    let mut prompt_acknowledged = false;
                     if queued_only
                         && !agent
                             .apply_queued_inputs_with_lifecycle(session, &cancel, &mut observer)
@@ -1615,7 +1627,6 @@ async fn run_worker(
                         }
                         if let Some(id) = prompt_response.take() {
                             control_response("prompt", id, Ok(json!({"disposition":"handled"})));
-                            prompt_acknowledged = true;
                         }
                         content = None;
                         images.clear();
@@ -1664,14 +1675,7 @@ async fn run_worker(
                     if cancel.is_cancelled() {
                         return Err(Error::Cancelled);
                     }
-                    if let Some(id) = prompt_response.take() {
-                        control_response("prompt", id, Ok(json!({"disposition":"started"})));
-                        prompt_acknowledged = true;
-                    }
-                    if prompt_acknowledged {
-                        started = true;
-                        output(json!({"type":"agent_started"}));
-                    }
+                    agent_preflight = rpc_agent;
                     let run_id = Uuid::new_v4();
                     if !images.is_empty() {
                         agent
@@ -1688,12 +1692,25 @@ async fn run_worker(
                             session.records().last().expect("appended user input"),
                         ));
                     }
-                    let answer = Box::pin(agent.run_correlated_with_events(
+                    let answer = Box::pin(agent.run_correlated_with_start(
                         session,
                         run_id,
                         content,
                         &mut queued,
                         &cancel,
+                        &mut |_| {
+                            if rpc_agent && !started {
+                                if let Some(id) = prompt_response.take() {
+                                    control_response(
+                                        "prompt",
+                                        id,
+                                        Ok(json!({"disposition":"started"})),
+                                    );
+                                }
+                                started = true;
+                                output(json!({"type":"agent_started"}));
+                            }
+                        },
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
@@ -2026,7 +2043,7 @@ async fn run_worker(
             output(json!({"type":"error","message":error.to_string()}));
         }
         output(
-            json!({"type":"agent_settled","success":result.is_ok(),"aborted":matches!(result, Err(Error::Cancelled)),"started":started}),
+            json!({"type":"agent_settled","success":result.is_ok(),"aborted":matches!(result, Err(Error::Cancelled)),"started":started,"preflight":agent_preflight}),
         );
         if let Some(id) = compact_response {
             control_response("compact", id, result.map(|_| compact_result));

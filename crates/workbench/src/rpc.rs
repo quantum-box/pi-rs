@@ -261,13 +261,13 @@ pub(super) fn run(
                     emit(manual_compaction_end(&event, false))?;
                     emit(event)?;
                 }
-                if finished.busy {
+                if finished.busy && stream.rpc_agent_active() {
                     for event in stream.settle(false, status.success()) {
                         emit(event)?;
                     }
                     emit(json!({"type":"agent_settled","aborted":stream.aborted()}))?;
-                    stream.reset();
                 }
+                stream.reset();
                 if let Some(request) = pending_abort.take() {
                     response(&request, Ok(None))?;
                 }
@@ -2657,13 +2657,21 @@ fn forward_event(
             }
             Ok(())
         }
+        Some("agent_preparing") => {
+            *busy = true;
+            Ok(())
+        }
         Some("agent_started") => {
             *busy = true;
-            stream.reset();
             if pending_compact.is_some() {
+                stream.reset();
                 return emit(json!({"type":"compaction_start","reason":"manual"}));
             }
-            emit(json!({"type":"agent_start"}))
+            emit(json!({"type":"agent_start"}))?;
+            for event in stream.start_rpc_agent(args) {
+                emit(event)?;
+            }
+            Ok(())
         }
         Some("agent_settled") if pending_compact.is_some() => {
             // The compact response ends this operation and releases any
@@ -2678,9 +2686,12 @@ fn forward_event(
                     emit(mapped)?;
                 }
             }
-            emit(
-                json!({"type":"agent_settled","aborted":event["aborted"] == true || (event["started"] != false && stream.aborted())}),
-            )?;
+            if event["started"] != false || event["preflight"] != true {
+                emit(
+                    json!({"type":"agent_settled","aborted":event["aborted"] == true || stream.aborted()}),
+                )?;
+            }
+            stream.reset();
             if let Some(request) = pending_abort.take() {
                 response(&request, Ok(None))?;
             }
@@ -2688,8 +2699,10 @@ fn forward_event(
         }
         _ => {
             let suppress_summary_record = stream.suppress_summary_record(&event);
-            for mapped in stream.observe(&event, args) {
-                emit(mapped)?;
+            if !stream.defer_rpc_initial_image(&event) {
+                for mapped in stream.observe(&event, args) {
+                    emit(mapped)?;
+                }
             }
             if suppress_summary_record {
                 return Ok(());

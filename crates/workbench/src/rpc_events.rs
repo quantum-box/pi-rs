@@ -16,6 +16,8 @@ use super::Cli;
 
 #[derive(Default)]
 pub(super) struct Stream {
+    rpc_agent_active: bool,
+    rpc_initial_image: Option<Value>,
     messages: Vec<Value>,
     assistant: Value,
     request_id: Option<Uuid>,
@@ -67,6 +69,31 @@ impl Stream {
         *self = Self::default();
     }
 
+    pub fn rpc_agent_active(&self) -> bool {
+        self.rpc_agent_active
+    }
+
+    pub fn start_rpc_agent(&mut self, args: &Cli) -> Vec<Value> {
+        let image = self.rpc_initial_image.take();
+        self.reset();
+        self.rpc_agent_active = true;
+        image.map_or_else(Vec::new, |event| self.observe(&event, args))
+    }
+
+    pub fn defer_rpc_initial_image(&mut self, event: &Value) -> bool {
+        // The worker journals image prompts before preparing the run. Keep
+        // their message events after agent_start, while forwarding the journal
+        // record immediately.
+        if !self.rpc_agent_active
+            && event["type"] == "record"
+            && event["record"]["event"]["type"] == "user_with_images"
+        {
+            self.rpc_initial_image = Some(event.clone());
+            return true;
+        }
+        false
+    }
+
     pub fn aborted(&self) -> bool {
         self.aborted
     }
@@ -111,6 +138,7 @@ impl Stream {
                 self.summary = true;
                 self.retryable_failure = false;
             }
+            Some("compaction_end") => self.summary = false,
             Some("auto_retry_start" | "auto_retry_end") => {
                 self.retry(event.clone(), &mut events);
             }
@@ -1369,6 +1397,39 @@ mod streaming_tool_tests {
             }
             assert_eq!(stream.messages[0]["content"], expected);
         }
+    }
+
+    #[test]
+    fn rpc_initial_image_waits_for_agent_start() {
+        let record = Record {
+            version: 3,
+            id: 2,
+            parent: Some(1),
+            run_id: None,
+            timestamp: None,
+            event: Event::UserWithImages {
+                content: "image prompt".into(),
+                images: vec![pi_rs::ImageContent {
+                    data: "aW1hZ2U=".into(),
+                    mime_type: "image/png".into(),
+                }],
+                input_id: None,
+            },
+        };
+        let mut stream = Stream::default();
+        let event = json!({"type":"record","record":record});
+        assert!(stream.defer_rpc_initial_image(&event));
+        assert!(stream.messages.is_empty());
+        let events = stream.start_rpc_agent(&Cli::parse_from(["pi"]));
+        let start = events
+            .iter()
+            .find(|event| event["type"] == "message_start")
+            .unwrap();
+        assert_eq!(start["message"]["content"][1]["data"], "aW1hZ2U=");
+        assert_eq!(stream.messages.len(), 1);
+        assert!(!stream.defer_rpc_initial_image(&event));
+        stream.reset();
+        assert!(stream.start_rpc_agent(&Cli::parse_from(["pi"])).is_empty());
     }
 
     #[test]

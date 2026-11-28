@@ -373,7 +373,9 @@ Pi v1.5.0 declares a `restore` source but its session restoration path does not
 emit a model selection event.
 
 To run an extension callback for a submitted user prompt or an idle custom
-trigger, opt into `handles_before_agent_start`. In Rust, implement
+trigger, automatic threshold compaction of prior conversation runs first. A summary failure or compaction veto still allows handlers to run; cancellation stops preflight.
+
+Opt into `handles_before_agent_start`. In Rust, implement
 `before_agent_start` for a custom message or an exact prompt replacement.
 Implement `before_agent_start_with_prompt_options` to also receive the ordered
 section bodies and return edits in `BeforeAgentStartPromptResult::system_prompt_options`.
@@ -407,7 +409,7 @@ Returned messages follow the starting input and the next-turn messages queued
 by the end of preflight. Cancellation interrupts delivery while a returned
 message's lifecycle hook is running. Handler failures are reported while
 subsequent handlers can still contribute within the shared deadline.
-Until the first model request is journaled, the SDK's `resume()` and native CLI
+Until the first turn request is journaled, the SDK's `resume()` and native CLI
 recovery reuse the saved plan and run ID on the selected branch. SDK hosts
 using `run` or `run_with_events` can also resume with the saved run ID and no
 new input, keeping their per-run observer.

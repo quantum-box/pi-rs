@@ -99,6 +99,438 @@ fn output_until(master: &mut File, predicate: impl Fn(&str) -> bool) {
     output_until_with_timeout(master, Duration::from_secs(10), predicate);
 }
 
+fn prestart_compaction_command(root: &std::path::Path, endpoint: &str) -> Command {
+    let session_path = root.join("session.jsonl");
+    let mut events = vec![pi_rs::Event::Created {
+        session_id: uuid::Uuid::new_v4(),
+    }];
+    for question in ["old question", "recent question"] {
+        events.push(pi_rs::Event::User {
+            content: question.into(),
+            input_id: None,
+        });
+        events.push(pi_rs::Event::Assistant {
+            content: "earlier answer".into(),
+            invocations: vec![],
+            request_id: None,
+            usage: Some(pi_rs::Usage {
+                input_tokens: 3950,
+                output_tokens: 5,
+            }),
+        });
+    }
+    let records = events
+        .into_iter()
+        .zip(1..)
+        .map(|(event, id)| pi_rs::Record {
+            id,
+            parent: (id > 1).then_some(id - 1),
+            run_id: None,
+            version: 3,
+            timestamp: None,
+            event,
+        });
+    pi_rs::Session::from_records(records.collect())
+        .unwrap()
+        .export_jsonl(&session_path)
+        .unwrap();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        r#"{"compaction":{"enabled":true,"reserveTokens":4500,"keepRecentTokens":1}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        serde_json::json!({"providers":{"preflight":{
+            "api":"openai-completions","baseUrl":endpoint,"apiKey":"fixture",
+            "models":[{"id":"fixture","contextWindow":8192,"maxTokens":64}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root)
+        .env("PI_RS_HOME", home)
+        .env("TERM", "xterm-256color")
+        .args([
+            "--no-trust",
+            "--no-extensions",
+            "--no-mcp",
+            "--no-tools",
+            "--provider",
+            "preflight",
+            "--model",
+            "fixture",
+            "--context-window",
+            "8192",
+            "--max-output-tokens",
+            "64",
+            "--session",
+        ])
+        .arg(session_path);
+    command
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrestartSummaryFixture {
+    Truncated,
+    HoldForAbort,
+    Overrun,
+}
+
+fn prestart_compaction_fixture(
+    outcome: PrestartSummaryFixture,
+) -> (
+    String,
+    std::sync::mpsc::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (release, gate) = std::sync::mpsc::channel();
+    let (summary_received, received) = tokio::sync::oneshot::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for summary in [true, false] {
+            let mut socket = loop {
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("waiting for model request: {error}"),
+                    }
+                };
+                prepare_gate(&socket);
+                let mut reader = BufReader::new(&socket);
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = header.split_once(':')
+                        && key.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                if !request.starts_with("POST /v1/chat/completions ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let body = String::from_utf8(body).unwrap();
+                assert_eq!(
+                    body.contains("Summarize only this older conversation."),
+                    summary,
+                    "{body}"
+                );
+                assert_eq!(body.contains("next question"), !summary, "{body}");
+                break socket;
+            };
+            if summary && outcome == PrestartSummaryFixture::HoldForAbort {
+                summary_received.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(30)).unwrap();
+                return;
+            }
+            let text = if summary {
+                "discarded summary"
+            } else {
+                "Live output from the turn."
+            };
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\n").unwrap();
+            if !summary {
+                gate.recv_timeout(Duration::from_secs(30)).unwrap();
+            }
+            if summary && outcome == PrestartSummaryFixture::Overrun {
+                socket.write_all(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":65}}\n\ndata: [DONE]\n\n").unwrap();
+                return;
+            }
+            let finish = if summary { "length" } else { "stop" };
+            write!(socket, "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{finish}\"}}]}}\n\ndata: [DONE]\n\n").unwrap();
+        }
+    });
+    (endpoint, release, received, server)
+}
+
+#[tokio::test]
+async fn rpc_prestart_compaction_finishes_before_agent_start_and_can_abort() {
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    for outcome in [
+        PrestartSummaryFixture::Truncated,
+        PrestartSummaryFixture::HoldForAbort,
+        PrestartSummaryFixture::Overrun,
+    ] {
+        let abort_summary = outcome == PrestartSummaryFixture::HoldForAbort;
+        let overrun = outcome == PrestartSummaryFixture::Overrun;
+        let root = tempfile::tempdir().unwrap();
+        let (endpoint, release, received, server) = prestart_compaction_fixture(outcome);
+        let mut child =
+            tokio::process::Command::from(prestart_compaction_command(root.path(), &endpoint))
+                .args(["--mode", "rpc"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let events = tokio::time::timeout(Duration::from_secs(30), async {
+            input
+                .write_all(
+                    b"{\"id\":\"prompt\",\"type\":\"prompt\",\"message\":\"next question\"}\n",
+                )
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            let mut received = Some(received);
+            while let Some(line) = output.next_line().await.unwrap() {
+                let event: Value = serde_json::from_str(&line).unwrap();
+                if abort_summary && event["type"] == "compaction_start" {
+                    received.take().unwrap().await.unwrap();
+                    input
+                        .write_all(b"{\"id\":\"abort\",\"type\":\"abort\"}\n")
+                        .await
+                        .unwrap();
+                }
+                if !abort_summary && !overrun && event["type"] == "agent_start" {
+                    release.send(()).unwrap();
+                }
+                let done = event["type"] == "agent_settled"
+                    || event["id"] == "abort"
+                    || (overrun && event["id"] == "prompt" && event["success"] == false);
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            if abort_summary {
+                release.send(()).unwrap();
+            }
+            input.write_all(b"{\"type\":\"shutdown\"}\n").await.unwrap();
+            drop(input);
+            while let Some(line) = output.next_line().await.unwrap() {
+                events.push(serde_json::from_str(&line).unwrap());
+            }
+            assert!(child.wait().await.unwrap().success());
+            events
+        })
+        .await
+        .expect("RPC pre-start compaction did not settle");
+        server.join().unwrap();
+        let lifecycle: Vec<_> = events
+            .iter()
+            .filter_map(|event| {
+                let kind = event["type"].as_str()?;
+                (matches!(
+                    kind,
+                    "compaction_start"
+                        | "compaction_end"
+                        | "agent_start"
+                        | "agent_end"
+                        | "agent_settled"
+                ) || event["id"] == "prompt")
+                    .then_some(kind)
+            })
+            .collect();
+        if abort_summary || overrun {
+            assert_eq!(
+                lifecycle,
+                ["compaction_start", "compaction_end", "response"],
+                "{events:?}"
+            );
+        } else {
+            assert_eq!(
+                lifecycle,
+                [
+                    "compaction_start",
+                    "compaction_end",
+                    "response",
+                    "agent_start",
+                    "agent_end",
+                    "agent_settled"
+                ],
+                "{events:?}"
+            );
+            assert!(events.iter().any(|event| event["type"] == "message_update"));
+        }
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "compaction_end")
+            .unwrap();
+        assert_eq!(end["aborted"], abort_summary);
+        let prompt = events.iter().find(|event| event["id"] == "prompt").unwrap();
+        assert_eq!(prompt["success"], !abort_summary && !overrun);
+        if overrun {
+            assert!(
+                prompt["error"].as_str().unwrap().contains("budget"),
+                "{prompt}"
+            );
+            assert!(
+                end["errorMessage"].as_str().unwrap().contains("budget"),
+                "{end}"
+            );
+        } else if !abort_summary {
+            assert_eq!(prompt["data"], json!({"disposition":"started"}));
+        }
+    }
+}
+
+#[test]
+fn terminal_streams_live_output_after_rejecting_prestart_summary() {
+    let root = tempfile::tempdir().unwrap();
+    let (endpoint, release, _, server) =
+        prestart_compaction_fixture(PrestartSummaryFixture::Truncated);
+    let (mut master, mut slave) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        prestart_compaction_command(root.path(), &endpoint)
+            .args(["--tui-mode", "fullscreen"])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"next question\r").unwrap();
+    output_until_with_timeout(&mut master, Duration::from_secs(20), |text| {
+        assert!(!text.contains("discarded summary"));
+        text.contains("Live output from the turn.")
+    });
+    release.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn rpc_prestart_abort_during_agent_start_hook_reports_no_agent_lifecycle() {
+    use serde_json::Value;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("agent-start.py");
+    let ready = root.path().join("hook-ready");
+    std::fs::write(&extension, r#"#!/usr/bin/env python3
+import json, pathlib, sys
+if "--pi-rs-extension-v1" in sys.argv:
+    request = json.load(sys.stdin)
+    descriptor = {"id":"agent-start-gate","dependencies":[],"tools":[],"commands":[],"lifecycle_hook":True,"lifecycle_host_calls":True}
+    result = descriptor if request["type"] == "describe" else None
+    print(json.dumps({"version":1,"response":{"Ok":result}}), flush=True)
+else:
+    request = json.loads(sys.stdin.readline())["request"]
+    if request["event"]["type"] == "agent_start":
+        pathlib.Path(__file__).with_name("hook-ready").touch()
+        sys.stdin.read()
+    print(json.dumps({"type":"complete","response":{"Ok":None}}), flush=True)
+"#).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args([
+            "--offline",
+            "--no-tools",
+            "--no-mcp",
+            "--no-trust",
+            "--no-session",
+            "--mode",
+            "rpc",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--extension",
+        ])
+        .arg(extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let events = tokio::time::timeout(Duration::from_secs(20), async {
+        input
+            .write_all(b"{\"id\":\"prompt\",\"type\":\"prompt\",\"message\":\"hello\"}\n")
+            .await
+            .unwrap();
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        input
+            .write_all(b"{\"id\":\"abort\",\"type\":\"abort\"}\n")
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(line) = output.next_line().await.unwrap() {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            if event["id"] == "abort" {
+                assert_eq!(event["success"], true, "{event}");
+                input.write_all(b"{\"type\":\"shutdown\"}\n").await.unwrap();
+            }
+            events.push(event);
+        }
+        assert!(child.wait().await.unwrap().success());
+        events
+    })
+    .await
+    .expect("RPC did not settle after cancelling the agent-start hook");
+    let response = events.iter().find(|event| event["id"] == "prompt").unwrap();
+    assert_eq!(response["success"], false, "{events:?}");
+    assert!(response["error"].as_str().unwrap().contains("cancel"));
+    assert!(events.iter().any(|event| event["id"] == "abort"));
+    assert!(
+        !events.iter().any(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("agent_start" | "agent_end" | "agent_settled")
+            ) || event["record"]["event"]["type"] == "model_requested"
+        }),
+        "{events:?}"
+    );
+}
+
 fn output_until_with_timeout(
     master: &mut File,
     timeout: Duration,

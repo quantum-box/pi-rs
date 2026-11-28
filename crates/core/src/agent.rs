@@ -689,9 +689,43 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut AgentObserver<'_>,
     ) -> Result<String> {
+        self.run_correlated_with_start(
+            session,
+            run_id,
+            input,
+            followups,
+            cancel,
+            &mut |_| {},
+            observer,
+        )
+        .await
+    }
+
+    /// Run with ordered events and notify the host when a run is ready to drive
+    /// its first turn, after preparation and the agent-start lifecycle hooks.
+    /// A run cancelled during preparation does not invoke the start callback.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_correlated_with_start<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        input: Option<String>,
+        followups: &mut mpsc::Receiver<T>,
+        cancel: &CancellationToken,
+        on_started: &mut (dyn FnMut(Uuid) + Send),
+        observer: &mut AgentObserver<'_>,
+    ) -> Result<String> {
         let mut adapter = |event: Notification<'_>| dispatch_agent_event(event, observer);
-        self.run_correlated_inner(session, run_id, input, followups, cancel, &mut adapter)
-            .await
+        self.run_correlated_inner(
+            session,
+            run_id,
+            input,
+            followups,
+            cancel,
+            on_started,
+            &mut adapter,
+        )
+        .await
     }
 
     pub async fn run_correlated<T: Into<AgentInput> + Send>(
@@ -704,10 +738,19 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         let mut adapter = |event: Notification<'_>| dispatch_legacy_event(event, observer);
-        self.run_correlated_inner(session, run_id, input, followups, cancel, &mut adapter)
-            .await
+        self.run_correlated_inner(
+            session,
+            run_id,
+            input,
+            followups,
+            cancel,
+            &mut |_| {},
+            &mut adapter,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_correlated_inner<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
@@ -715,6 +758,7 @@ impl Agent<'_> {
         input: Option<String>,
         followups: &mut mpsc::Receiver<T>,
         cancel: &CancellationToken,
+        on_started: &mut (dyn FnMut(Uuid) + Send),
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         if input.as_ref().is_some_and(|text| text.trim().is_empty()) {
@@ -844,7 +888,9 @@ impl Agent<'_> {
                 .unwrap_or_else(|| self.limits.clone()),
         };
         let mut result = branch_agent
-            .run_turns(session, run_id, input, followups, cancel, observer)
+            .run_turns(
+                session, run_id, input, followups, cancel, on_started, observer,
+            )
             .await;
         session.set_run_id(None);
         if let Some((return_to, _)) = handoff
@@ -933,7 +979,9 @@ impl Agent<'_> {
                     .unwrap_or_else(|| self.limits.clone()),
             };
             let mut trigger_result = branch_agent
-                .run_turns(session, trigger_id, None, followups, cancel, observer)
+                .run_turns(
+                    session, trigger_id, None, followups, cancel, on_started, observer,
+                )
                 .await;
             session.set_run_id(None);
             if let Some(return_to) = handoff
@@ -954,6 +1002,7 @@ impl Agent<'_> {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_turns<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
@@ -961,6 +1010,7 @@ impl Agent<'_> {
         input: Option<String>,
         followups: &mut mpsc::Receiver<T>,
         cancel: &CancellationToken,
+        on_started: &mut (dyn FnMut(Uuid) + Send),
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         use crate::extension_boundary::{
@@ -984,6 +1034,9 @@ impl Agent<'_> {
             .extensions
             .iter()
             .any(|ext| ext.handles_agent_before_settle());
+        let recovered_summary_overrun = cfg!(not(target_family = "wasm"))
+            && recovered.is_none()
+            && Box::pin(self.settle_interrupted_prestart_compaction(session, run_id)).await?;
         let branch = session.branch();
         let accepted = branch.iter().any(
             |record| matches!(record.event, Event::User { input_id: Some(id), .. } | Event::UserWithImages { input_id: Some(id), .. } if id == run_id),
@@ -1008,9 +1061,12 @@ impl Agent<'_> {
             },
             observer,
         )?;
-        let mut prior_result = self
-            .resolve_prior_turn_end(session, run_id, cancel, observer)
-            .await;
+        let mut prior_result = if recovered_summary_overrun {
+            Err(Error::Budget)
+        } else {
+            self.resolve_prior_turn_end(session, run_id, cancel, observer)
+                .await
+        };
         session.set_run_id(Some(run_id));
         if prior_result.is_ok() && recovered.is_none() {
             prior_result = crate::before_agent_start::prepare(
@@ -1026,6 +1082,10 @@ impl Agent<'_> {
             )
             .await;
         }
+        if prior_result.is_ok() && cancel.is_cancelled() {
+            prior_result = Err(Error::Cancelled);
+        }
+        let preflight_failed = prior_result.is_err();
         let mut check_turn_continuation =
             matches!(recovered, Some(RecoveredBoundary::TurnContinue));
         let mut force_request = matches!(recovered, Some(RecoveredBoundary::Continue { .. }));
@@ -1069,11 +1129,21 @@ impl Agent<'_> {
                 prior_result
             };
             prior_result = Ok(());
+            // Active lifecycle delivery can return successfully when its
+            // cancellation branch drops a pending callback.
+            let start = if start.is_ok() && cancel.is_cancelled() {
+                Err(Error::Cancelled)
+            } else {
+                start
+            };
 
             let started = resuming_failed_activity || start.is_ok();
             let mut retry_attempt = 0;
             let mut result = match start {
                 Ok(()) => {
+                    if !in_process_continuation {
+                        on_started(run_id);
+                    }
                     let mut retry_observer = |event: Notification<'_>| {
                         match &event {
                             Notification::Retry(crate::RetryEvent::Start { attempt, .. }) => {
@@ -1129,8 +1199,11 @@ impl Agent<'_> {
                 result = Err(error);
             }
             let settled = ensure_settled(session.operations()).is_ok();
-            if settled {
-                apply_settled_after_turn(session, observer)?;
+            if settled
+                && let Err(error) = apply_settled_after_turn(session, observer)
+                && !preflight_failed
+            {
+                return Err(error);
             }
             let mut ended = false;
             if boundary
@@ -1193,8 +1266,21 @@ impl Agent<'_> {
                     continue;
                 }
             }
-            self.finish_run(session, run_id, &result, lifecycle, ended, observer)
-                .await?;
+            let finish = self
+                .finish_run(
+                    session,
+                    run_id,
+                    &result,
+                    lifecycle && !preflight_failed,
+                    ended,
+                    observer,
+                )
+                .await;
+            // A poisoned journal can also reject the final run marker. Keep
+            // the original preparation error that caused the failure.
+            if !preflight_failed {
+                finish?;
+            }
             return result;
         }
     }
@@ -1994,8 +2080,10 @@ impl Agent<'_> {
             .limits
             .output_tokens_per_run
             .saturating_sub(output_used.min(u64::from(u32::MAX)) as u32);
-        let mut compacted =
-            overflow_recovery_state(session, run_id).is_some_and(|state| state.compacted);
+        // An interrupted pre-start attempt also spends this run's bounded
+        // pre-request compaction attempt. It may already have called a provider.
+        let mut compacted = crate::before_agent_start::compaction_start(&branch, run_id).is_some()
+            || overflow_recovery_state(session, run_id).is_some_and(|state| state.compacted);
         let mut retry_attempt = 0;
         let mut recovery_marker_created_in_run = false;
         let lifecycle = crate::lifecycle::enabled(self.registry);
@@ -2141,6 +2229,7 @@ impl Agent<'_> {
                         session,
                         &states,
                         SummaryScope {
+                            prestart: None,
                             retention,
                             instructions: None,
                             output_limit: summary_limit,
@@ -2500,6 +2589,7 @@ impl Agent<'_> {
                         session,
                         &states,
                         SummaryScope {
+                            prestart: None,
                             retention,
                             instructions: None,
                             output_limit: summary_limit,
@@ -2823,6 +2913,188 @@ impl Agent<'_> {
         Err(Error::Budget)
     }
 
+    /// Settle the recorded summary request and report a confirmed allowance overrun.
+    async fn settle_interrupted_prestart_compaction(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+    ) -> Result<bool> {
+        let branch = session.branch();
+        // A checkout can rewind context, but it cannot undo a summary dispatch.
+        if crate::before_agent_start::compaction_on_another_branch(session, &branch, run_id) {
+            return Err(Error::Session(
+                "resume pre-start compaction from the branch that recorded its attempt".into(),
+            ));
+        }
+        if let Some(started_at) = crate::before_agent_start::interrupted_compaction(&branch, run_id)
+        {
+            let following = &branch[branch.partition_point(|record| record.id <= started_at)..];
+            // Compaction is committed after usage settlement. If interrupted
+            // earlier, settle the original request and skip the ambiguous work.
+            if !following.iter().any(|record| {
+                record.run_id == Some(run_id) && matches!(record.event, Event::Compacted { .. })
+            }) && let Some((id, allowance)) =
+                following.iter().find_map(|record| match record.event {
+                    Event::ModelRequested {
+                        request_id: Some(id),
+                        max_output_tokens,
+                        ..
+                    } if record.run_id == Some(run_id) => Some((id, max_output_tokens)),
+                    _ => None,
+                })
+            {
+                let (usage, metadata) = following
+                    .iter()
+                    .find_map(|record| match &record.event {
+                        Event::ModelFinished {
+                            request_id,
+                            usage,
+                            metadata,
+                            ..
+                        } if *request_id == id => Some((usage.clone(), metadata.clone())),
+                        _ => None,
+                    })
+                    .unwrap_or((UsageReport::Unconfirmed, ModelMetadata::default()));
+                self.settle_usage(id, &usage, &metadata).await?;
+                return Ok(matches!(usage, UsageReport::Measured { usage }
+                    if usage.output_tokens > u64::from(allowance)));
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) async fn compact_before_start<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        followups: &mut mpsc::Receiver<T>,
+    ) -> Result<bool> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let branch = session.branch();
+        let control = session.auto_compaction_control();
+        let tokens = self.compaction_tokens(session);
+        let Some(reserve) = tokens.reserve_tokens.filter(|_| control.enabled()) else {
+            return Ok(false);
+        };
+        // The SDK may already have persisted this run's image prompt. Its
+        // content must not affect the decision about the prior conversation.
+        let history_end = branch.iter().position(|record| matches!(
+            record.event,
+            Event::User { input_id: Some(id), .. } | Event::UserWithImages { input_id: Some(id), .. }
+                if id == run_id
+        )).unwrap_or(branch.len());
+        let history_before = branch.get(history_end).map(|record| record.id);
+        let history = &branch[..history_end];
+        let latest_boundary = history.iter().rposition(|record| {
+            matches!(
+                record.event,
+                Event::Assistant { .. } | Event::Compacted { .. }
+            )
+        });
+        let Some(index) = latest_boundary else {
+            return Ok(false);
+        };
+        let Event::Assistant { request_id, .. } = history[index].event else {
+            return Ok(false);
+        };
+        // A silent-overflow recovery can intentionally leave the old answer
+        // visible. Respect its durable skip when checking the next prompt.
+        let skipped =
+            request_id.is_some_and(|id| {
+                let id = id.to_string();
+                history[index + 1..].iter().any(|record| matches!(&record.event,
+                Event::SourceEntry { format, entry }
+                    if format == "pi-rs:silent-overflow-skipped-v1" && entry["requestId"] == id
+            ))
+            });
+        if skipped || ensure_settled(session.operations()).is_err() {
+            return Ok(false);
+        }
+        let window = match self.limits.context_window {
+            Some(window) => Some(window),
+            None => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                result = platform_time::timeout(self.limits.model_timeout, self.model.context_window(self.model_name)) =>
+                    result.ok().flatten(),
+            },
+        };
+        let Some(window) = window.filter(|window| *window > 0) else {
+            return Ok(false);
+        };
+        let tokens_before = session.context_usage_estimate_for_branch(history).tokens;
+        if tokens_before <= u64::from(window).saturating_sub(reserve) || !control.enabled() {
+            return Ok(false);
+        }
+        let mut retention =
+            configured_retention_for_branch(session, history, tokens.keep_recent_tokens, 1);
+        let Some(boundary) = retention.boundary else {
+            return Ok(false);
+        };
+        retention.keep_turns += usize::from(history_end < branch.len());
+        if !has_summary_prefix(session, Some(boundary)) {
+            return Ok(false);
+        }
+        let summary_budget = self
+            .limits
+            .output_tokens_per_request
+            .min(512)
+            .min(self.limits.output_tokens_per_run / 2);
+        let model_summary_available = self.limits.model_requests > 1
+            && summary_budget >= self.model.minimum_output_tokens().max(1);
+        if !model_summary_available
+            && !self
+                .registry
+                .extensions
+                .iter()
+                .any(|extension| extension.handles_before_summary_compaction())
+        {
+            return Ok(false);
+        }
+
+        let states = self.migrate(session, observer)?;
+        commit(
+            session,
+            Event::SourceEntry {
+                format: crate::before_agent_start::COMPACTION_FORMAT.into(),
+                entry: serde_json::Value::Null,
+            },
+            observer,
+        )?;
+        self.summarize_prefix(
+            session,
+            &states,
+            SummaryScope {
+                prestart: Some(PrestartSummary {
+                    history_before,
+                    tokens_before,
+                }),
+                retention,
+                instructions: None,
+                output_limit: if model_summary_available {
+                    summary_budget
+                } else {
+                    0
+                },
+                cancellation: cancel,
+                reason: crate::CompactionTrigger::Threshold,
+                will_retry: false,
+                skip_without_model: !model_summary_available,
+            },
+            observer,
+            Some(followups),
+        )
+        .await?;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        Ok(true)
+    }
+
     async fn compact_silent_overflow<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
@@ -3057,6 +3329,7 @@ impl Agent<'_> {
                 session,
                 states,
                 SummaryScope {
+                    prestart: None,
                     retention,
                     instructions: None,
                     output_limit,
@@ -3120,6 +3393,7 @@ impl Agent<'_> {
                 states,
                 billing,
                 Some(retention),
+                None,
                 None,
                 cancel,
                 observer,
@@ -3657,6 +3931,7 @@ impl Agent<'_> {
                 )
             })
             .flatten();
+        let mut input_failed = false;
         let collect = async {
             macro_rules! message_update {
                 ($update:expr) => {
@@ -3691,14 +3966,16 @@ impl Agent<'_> {
             let mut stream = loop {
                 tokio::select! {
                     opened = &mut opening => break opened?,
-                    Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
+                    Some(input) = receive_input(&mut inputs) => {
+                        queue_input(session, input.into(), observer).inspect_err(|_| input_failed = true)?;
+                    }
                 }
             };
             loop {
                 let event = tokio::select! {
                     event = crate::provider_hooks::ProviderHooks::scope(provider_hooks.clone(), stream.next()) => event,
                     Some(input) = receive_input(&mut inputs) => {
-                        queue_input(session, input.into(), observer)?;
+                        queue_input(session, input.into(), observer).inspect_err(|_| input_failed = true)?;
                         continue;
                     }
                 };
@@ -4105,10 +4382,13 @@ impl Agent<'_> {
             observer(Notification::Committed(record));
         });
         self.settle_usage(request_id, &usage, &metadata).await?;
-        Ok(ReplyAttempt {
-            outcome: result,
-            partial_request: partial_failure.map(|_| request_id),
-        })
+        match result {
+            Err(error) if input_failed => Err(error),
+            outcome => Ok(ReplyAttempt {
+                outcome,
+                partial_request: partial_failure.map(|_| request_id),
+            }),
+        }
     }
 
     async fn settle_usage(
@@ -4852,7 +5132,7 @@ impl Agent<'_> {
         ensure_settled(session.operations())?;
         let states = self.migrate(session, observer)?;
         self.commit_compaction_with_host::<AgentInput>(
-            session, compaction, &states, None, None, None, cancel, observer, None,
+            session, compaction, &states, None, None, None, None, cancel, observer, None,
         )
         .await
         .map(|_| ())
@@ -4873,6 +5153,7 @@ impl Agent<'_> {
             session,
             compaction,
             &states,
+            None,
             None,
             None,
             None,
@@ -4936,6 +5217,7 @@ impl Agent<'_> {
             &states,
             None,
             Some(retention),
+            None,
             None,
             cancel,
             observer,
@@ -5610,6 +5892,7 @@ impl Agent<'_> {
             session,
             &states,
             SummaryScope {
+                prestart: None,
                 retention,
                 instructions,
                 output_limit: limit,
@@ -5636,6 +5919,7 @@ impl Agent<'_> {
         let reason = scope.reason;
         let will_retry = scope.will_retry;
         let cancellation = scope.cancellation;
+        let prestart = scope.prestart.is_some();
         let mut progress = SummaryProgress::default();
         let result = self
             .summarize_prefix_inner(session, states, scope, observer, inputs, &mut progress)
@@ -5643,6 +5927,24 @@ impl Agent<'_> {
         if matches!(result, Ok(None)) {
             return Ok(None);
         }
+        // Only optional summary failures may fall back to the prompt. A
+        // checkpoint, settlement, or allowance failure must stop the run.
+        let optional_failure = prestart
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(|error| match progress.failure {
+                    SummaryFailure::Optional => true,
+                    SummaryFailure::Fatal => false,
+                    SummaryFailure::ByError => matches!(
+                        error,
+                        Error::Model(_)
+                            | Error::RetryableModel(_)
+                            | Error::Extension { .. }
+                            | Error::Config(_)
+                            | Error::AuthorizationRequired { .. }
+                    ),
+                });
         let event = match &result {
             Ok(Some((_, from_extension))) => crate::LifecycleEvent::SessionCompact {
                 compaction_entry: Box::new(
@@ -5688,7 +5990,7 @@ impl Agent<'_> {
         )
         .await;
         if let Some(mut event) = reported_event {
-            if result.is_ok()
+            if (result.is_ok() || optional_failure)
                 && let Err(error) = &notification
             {
                 event = compaction_failed_event(reason, error, cancellation);
@@ -5697,7 +5999,7 @@ impl Agent<'_> {
             notify_auto_compaction(reason, update, observer);
         }
         if let Err(notification_error) = notification {
-            if result.is_ok() {
+            if result.is_ok() || optional_failure {
                 return Err(notification_error);
             }
             let message = notification_error.to_string();
@@ -5706,6 +6008,9 @@ impl Agent<'_> {
                 event: "session_compact_failed",
                 message: &message,
             });
+        }
+        if optional_failure {
+            return Ok(None);
         }
         result.map(|value| value.map(|(spent, _)| (spent, progress.supplied_without_model)))
     }
@@ -5720,6 +6025,7 @@ impl Agent<'_> {
         progress: &mut SummaryProgress,
     ) -> Result<Option<(u32, bool)>> {
         let SummaryScope {
+            prestart,
             retention,
             instructions,
             output_limit: limit,
@@ -5737,6 +6043,7 @@ impl Agent<'_> {
         let model_summary_available =
             limit >= minimum_output_tokens && self.limits.model_requests > 0;
         if !has_pre_summary_hook && !model_summary_available {
+            progress.failure = SummaryFailure::Optional;
             return Err(Error::Budget);
         }
         let before = retention.boundary;
@@ -5748,18 +6055,26 @@ impl Agent<'_> {
         if !skip_without_model {
             progress.start(reason, observer);
         }
+        let (branch_entries, tokens_before) = if has_pre_summary_hook {
+            let branch = session.branch();
+            let history = match prestart.and_then(|prior| prior.history_before) {
+                Some(id) => &branch[..branch.partition_point(|record| record.id < id)],
+                None => &branch,
+            };
+            (
+                history.iter().map(|entry| (*entry).clone()).collect(),
+                prestart.map_or_else(
+                    || session.context_usage_estimate_for_branch(history).tokens,
+                    |prior| prior.tokens_before,
+                ),
+            )
+        } else {
+            (Vec::new(), 0)
+        };
         let preparation = crate::CompactionPreparation {
-            branch_entries: if has_pre_summary_hook {
-                session.branch().into_iter().cloned().collect()
-            } else {
-                Vec::new()
-            },
+            branch_entries,
             first_kept_entry: before,
-            tokens_before: if has_pre_summary_hook {
-                session.context_usage_estimate().tokens
-            } else {
-                0
-            },
+            tokens_before,
             reason,
             will_retry,
             custom_instructions: instructions.map(str::to_owned),
@@ -5786,7 +6101,10 @@ impl Agent<'_> {
             )
             .await?;
             match result {
-                Ok(Some(result)) if result.cancel => return Err(Error::Cancelled),
+                Ok(Some(result)) if result.cancel => {
+                    progress.failure = SummaryFailure::Optional;
+                    return Err(Error::Cancelled);
+                }
                 Ok(Some(result)) => supplied = result.compaction,
                 Ok(None) => {}
                 Err(message) => observer(Notification::ExtensionLifecycleError {
@@ -5832,6 +6150,7 @@ impl Agent<'_> {
                 result.usage.map(|usage| (usage, None)),
                 Some(retained),
                 Some(&result),
+                prestart.map(|prior| prior.tokens_before),
                 cancel,
                 observer,
                 inputs,
@@ -5843,6 +6162,7 @@ impl Agent<'_> {
             if skip_without_model {
                 return Ok(None);
             }
+            progress.failure = SummaryFailure::Optional;
             return Err(Error::Budget);
         }
         abandon_turn_request_for_summary(session, observer)?;
@@ -5859,6 +6179,7 @@ impl Agent<'_> {
             .await?;
         request.max_output_tokens = request.max_output_tokens.min(limit);
         if request.max_output_tokens < minimum_output_tokens {
+            progress.failure = SummaryFailure::Optional;
             return Err(Error::Budget);
         }
         request.tools.clear();
@@ -5878,8 +6199,9 @@ impl Agent<'_> {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
             result = platform_time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
-                result.map_err(|_| Error::Config("model preparation timed out".into()))??,
-        };
+                result.map_err(|_| Error::Config("model preparation timed out".into()))?,
+        }
+        .inspect_err(|error| progress.failure = SummaryFailure::from_model_error(error))?;
         let active = Agent {
             model: prepared.as_deref().unwrap_or(self.model),
             limits: self.limits.clone(),
@@ -5924,8 +6246,16 @@ impl Agent<'_> {
                 observer,
                 inputs.as_deref_mut(),
             )
-            .await?
-            .outcome?;
+            .await
+            .inspect_err(|_| progress.failure = SummaryFailure::Fatal)?
+            .outcome
+            .inspect_err(|error| progress.failure = SummaryFailure::from_model_error(error))?;
+        let output = reply
+            .usage
+            .map_or(u64::from(allowance), |usage| usage.output_tokens);
+        if output > u64::from(allowance) {
+            return Err(Error::Budget);
+        }
         if reply.truncated {
             return Err(Error::Model(
                 "summary reached the output token limit".into(),
@@ -5935,12 +6265,6 @@ impl Agent<'_> {
             return Err(Error::Model(
                 "summary response attempted a tool call".into(),
             ));
-        }
-        let output = reply
-            .usage
-            .map_or(u64::from(allowance), |usage| usage.output_tokens);
-        if output > u64::from(allowance) {
-            return Err(Error::Budget);
         }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
@@ -5959,6 +6283,7 @@ impl Agent<'_> {
                 billing,
                 Some(retention),
                 None,
+                prestart.map(|prior| prior.tokens_before),
                 cancel,
                 observer,
                 inputs,
@@ -6007,6 +6332,7 @@ impl Agent<'_> {
         billing: Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
         minimum_retention: Option<RetentionPlan>,
         extension_result: Option<&crate::ExtensionCompaction>,
+        prior_tokens: Option<u64>,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
@@ -6110,7 +6436,7 @@ impl Agent<'_> {
         let (usage, usage_metadata) =
             billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
         let tokens_before = extension_result.map_or_else(
-            || session.context_usage_estimate().tokens,
+            || prior_tokens.unwrap_or_else(|| session.context_usage_estimate().tokens),
             |result| result.tokens_before,
         );
         let persist_metadata = (from_extension && extension_result.is_some())
@@ -6649,12 +6975,30 @@ fn configured_retention(
     target: Option<u64>,
     fallback: usize,
 ) -> Result<RetentionPlan> {
-    let Some(target) = target else {
-        return Ok(RetentionPlan::turns(session, fallback));
+    Ok(configured_retention_for_branch(
+        session,
+        &session.branch(),
+        target,
+        fallback,
+    ))
+}
+
+fn configured_retention_for_branch(
+    session: &Session,
+    branch: &[&Record],
+    target: Option<u64>,
+    fallback: usize,
+) -> RetentionPlan {
+    let fallback = || RetentionPlan {
+        keep_turns: fallback,
+        boundary: retain_from(branch, fallback),
+        split_turn: false,
     };
-    let branch = session.branch();
-    let token_index = crate::tokens::SourceTokenIndex::new(session, &branch);
-    let entries = conversation_entries(&branch, session.operations());
+    let Some(target) = target else {
+        return fallback();
+    };
+    let token_index = crate::tokens::SourceTokenIndex::new(session, branch);
+    let entries = conversation_entries(branch, session.operations());
     let candidates: Vec<_> = entries
         .iter()
         .enumerate()
@@ -6667,7 +7011,7 @@ fn configured_retention(
         })
         .collect();
     let Some(&first) = candidates.first() else {
-        return Ok(RetentionPlan::turns(session, fallback));
+        return fallback();
     };
     let mut cut = first;
     let mut accumulated = 0_u64;
@@ -6717,11 +7061,11 @@ fn configured_retention(
         })
         .count()
         .max(1);
-    Ok(RetentionPlan {
+    RetentionPlan {
         keep_turns,
         boundary: Some(branch[boundary_index].id),
         split_turn: matches!(entries[cut].1, Message::Assistant { .. }),
-    })
+    }
 }
 
 fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> {
@@ -6805,7 +7149,14 @@ fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {
     Some(start)
 }
 
+#[derive(Clone, Copy)]
+struct PrestartSummary {
+    history_before: Option<u64>,
+    tokens_before: u64,
+}
+
 struct SummaryScope<'a> {
+    prestart: Option<PrestartSummary>,
     retention: RetentionPlan,
     instructions: Option<&'a str>,
     output_limit: u32,
@@ -6819,6 +7170,27 @@ struct SummaryScope<'a> {
 struct SummaryProgress {
     reported: bool,
     supplied_without_model: bool,
+    failure: SummaryFailure,
+}
+
+#[derive(Default)]
+enum SummaryFailure {
+    #[default]
+    ByError,
+    Optional,
+    Fatal,
+}
+
+impl SummaryFailure {
+    fn from_model_error(error: &Error) -> Self {
+        // An adapter can cancel independently of the caller's token. Its
+        // cancellation and explicit budget errors apply to the whole run.
+        if matches!(error, Error::Budget | Error::Cancelled) {
+            Self::Fatal
+        } else {
+            Self::Optional
+        }
+    }
 }
 
 impl SummaryProgress {
@@ -9211,6 +9583,7 @@ mod tree_tests {
                             &mut session,
                             &ExtensionStates::new(),
                             SummaryScope {
+                                prestart: None,
                                 retention,
                                 instructions: None,
                                 output_limit: 0,
@@ -12087,6 +12460,7 @@ mod tree_tests {
                     &mut session,
                     &ExtensionStates::new(),
                     SummaryScope {
+                        prestart: None,
                         retention,
                         instructions: None,
                         output_limit: 16,
@@ -12836,6 +13210,7 @@ mod tree_tests {
                     &mut session,
                     &ExtensionStates::new(),
                     SummaryScope {
+                        prestart: None,
                         retention,
                         instructions: None,
                         output_limit: 0,

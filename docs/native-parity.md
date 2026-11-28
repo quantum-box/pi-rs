@@ -5974,15 +5974,43 @@ Returned custom messages enter the run after the initial message and next-turn
 messages queued by the end of preflight, including arrivals during handlers.
 The final prompt override applies after request context transforms. A recorded
 preparation plan retains the run-local prompt edits and deduplicates its appended
-messages when the run resumes before its first model request is journaled.
+messages when the run resumes before its first turn request is journaled.
+
+Native checks the prior conversation for automatic threshold compaction before
+invoking the hook for a new user or custom trigger. This follows the order in
+[Pi's pinned `_prepareRun`](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L2005-L2020).
+The new starting message and the hook's prompt override are excluded from the
+summary. The saved prior-history token estimate also excludes the incoming
+image prompt when the SDK has already journaled it. A prior assistant older than the latest
+compaction cannot trigger this check. Provider failures, extension vetoes,
+and an insufficient local summary allowance leave preflight runnable. Adapter
+cancellation, an explicit adapter budget failure, or a summary that exceeds
+its allowance stops the run. If the cancelled summary was dispatched, usage
+settlement runs before preflight returns cancellation. Journal failures, including
+writes requested by the failed-compaction hook, and usage settlement failures
+also stop it. Cancelling preflight or the native agent-start hook stops the run
+before RPC emits `agent_start`. RPC reports a started prompt after compaction
+and the startup hooks complete,
+following [Pi's pinned run startup](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/agent-session.ts#L1958-L1984).
+If a run is interrupted during pre-start compaction, recovery settles the
+recorded summary request first and checks measured output against the request's
+recorded allowance. A confirmed overrun fails the run. Otherwise, recovery
+skips the interrupted attempt and resumes preflight on the same run. A
+committed compaction is retained on resume. An
+explicit resume with the same run ID requires the branch that contains its
+preflight checkpoints, including any summary request and result.
+
+The native pre-start check covers configured threshold compaction. Explicit
+overflow and length-stop recovery use the existing turn recovery paths, and
+request preparation still enforces the context limit after hooks and input
+delivery. Rust and executable extensions can edit named prompt sections or provide
+a full text override.
 
 Rust extensions can opt into the additive `before_agent_start_with_prompt_options`
 callback to read section bodies and return a patch. Executable extensions
 advertise `before_agent_start_prompt_options_v1` to exchange
 `systemPromptOptions.sections` through the v1 request and response. Upstream
-exposes the full mutable prompt builder, including tool selection, and compacts
-incoming prompt context before invoking the hook. The native hook runs before the agent
-loop's automatic compaction checks.
+exposes the full mutable prompt builder, including tool selection.
 
 ### Rust extension lifecycle observation
 

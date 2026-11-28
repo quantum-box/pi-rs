@@ -13,6 +13,7 @@ use crate::{
     Event, Notification, Observer, Record, Result, RunState, Session,
 };
 
+pub(crate) const COMPACTION_FORMAT: &str = "pi-rs:prestart-compaction-v1";
 const PLAN_FORMAT: &str = "pi-rs:before-agent-start-v1";
 type PromptSectionEdits = Vec<(String, Option<String>)>;
 
@@ -37,6 +38,62 @@ fn recorded_plan<'a>(branch: &[&'a Record], run_id: Uuid) -> Option<(u64, &'a Va
         }
         _ => None,
     })
+}
+
+fn is_compaction_start(record: &Record, run_id: Uuid) -> bool {
+    record.run_id == Some(run_id)
+        && matches!(&record.event, Event::SourceEntry { format, .. } if format == COMPACTION_FORMAT)
+}
+
+pub(crate) fn compaction_start(branch: &[&Record], run_id: Uuid) -> Option<u64> {
+    branch
+        .iter()
+        .find(|record| is_compaction_start(record, run_id))
+        .map(|record| record.id)
+}
+
+pub(crate) fn compaction_on_another_branch(
+    session: &Session,
+    branch: &[&Record],
+    run_id: Uuid,
+) -> bool {
+    let mut records = session.records().iter();
+    let Some(start) = records.find(|record| is_compaction_start(record, run_id)) else {
+        return false;
+    };
+    if compaction_start(branch, run_id) != Some(start.id) {
+        return true;
+    }
+    // A checkout may keep the marker but leave its request or result on a
+    // different branch. Check the preflight records through the saved plan.
+    for record in records.filter(|record| record.run_id == Some(run_id)) {
+        let plan =
+            matches!(&record.event, Event::SourceEntry { format, .. } if format == PLAN_FORMAT);
+        if (plan
+            || matches!(
+                record.event,
+                Event::ModelRequested { .. }
+                    | Event::ModelFinished { .. }
+                    | Event::Compacted { .. }
+            ))
+            && branch
+                .binary_search_by_key(&record.id, |entry| entry.id)
+                .is_err()
+        {
+            return true;
+        }
+        if plan {
+            break;
+        }
+    }
+    false
+}
+
+pub(crate) fn interrupted_compaction(branch: &[&Record], run_id: Uuid) -> Option<u64> {
+    if recorded_plan(branch, run_id).is_some() {
+        return None;
+    }
+    compaction_start(branch, run_id)
 }
 
 pub(crate) fn prompt_override(branch: &[&Record], run_id: Uuid) -> Option<String> {
@@ -97,7 +154,8 @@ pub(crate) fn pending_run(session: &Session) -> Option<Uuid> {
     ) {
         return None;
     }
-    let (plan_id, _) = recorded_plan(&branch, run_id)?;
+    let plan_id = recorded_plan(&branch, run_id).map(|(id, _)| id);
+    let preflight_id = plan_id.or_else(|| compaction_start(&branch, run_id))?;
     // A custom trigger already has its own recovery protocol, including branch
     // handoff. Provider dispatch and tool recovery likewise have their own rules.
     let user_run = branch.iter().any(|record| match &record.event {
@@ -109,17 +167,19 @@ pub(crate) fn pending_run(session: &Session) -> Option<Uuid> {
         }
         _ => false,
     });
-    let advanced = session.records()[plan_id as usize..].iter().any(|record| {
-        record.run_id == Some(run_id)
-            && matches!(
-                record.event,
-                Event::ModelRequested { .. }
-                    | Event::Run {
-                        state: RunState::Completed | RunState::Failed | RunState::Cancelled,
-                        ..
-                    }
-            )
-    });
+    let advanced = session.records()[preflight_id as usize..]
+        .iter()
+        .any(|record| {
+            record.run_id == Some(run_id)
+                && (plan_id.is_some() && matches!(record.event, Event::ModelRequested { .. })
+                    || matches!(
+                        record.event,
+                        Event::Run {
+                            state: RunState::Completed | RunState::Failed | RunState::Cancelled,
+                            ..
+                        }
+                    ))
+        });
     (user_run && !advanced).then_some(run_id)
 }
 
@@ -189,27 +249,34 @@ pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
     cancel: &CancellationToken,
     observer: &mut Observer<'_>,
 ) -> Result<()> {
-    if !agent
+    let has_handlers = agent
         .registry
         .extensions
         .iter()
-        .any(|extension| extension.handles_before_agent_start())
-    {
-        return Ok(());
-    }
+        .any(|extension| extension.handles_before_agent_start());
     let branch = session.branch();
+    let compaction_start = compaction_start(&branch, run_id);
     if recorded_plan(&branch, run_id).is_some()
-        || branch.iter().any(|record| {
-            record.run_id == Some(run_id) && matches!(record.event, Event::ModelRequested { .. })
-        })
+        || (compaction_start.is_none()
+            && branch.iter().any(|record| {
+                record.run_id == Some(run_id)
+                    && matches!(record.event, Event::ModelRequested { .. })
+            }))
     {
         return Ok(());
     }
     let Some(trigger) = starting_input(session, &branch, run_id, effective_input) else {
         return Ok(());
     };
+    let attempted_compaction = compaction_start.is_some()
+        || (cfg!(not(target_family = "wasm"))
+            && Box::pin(agent.compact_before_start(session, run_id, cancel, observer, inputs))
+                .await?);
+    if !has_handlers && !attempted_compaction {
+        return Ok(());
+    }
     let (base_prompt, _) = crate::journal::resolve_system_context(
-        &branch,
+        &session.branch(),
         agent.system_prompt,
         Vec::new(),
         agent.registry.host_system_prompt.as_deref(),
@@ -222,7 +289,7 @@ pub(crate) async fn prepare<T: Into<AgentInput> + Send>(
     let states = session.extension_states();
     let mut edits = indexmap::IndexMap::new();
     let mut plan = Plan {
-        captures_next_turn: true,
+        captures_next_turn: has_handlers,
         ..Plan::default()
     };
     let deadline = crate::runtime::time::Instant::now()
@@ -491,6 +558,1190 @@ mod tests {
             })
             .collect();
         assert_eq!(first_request, ["starting input", "queued", "first", "last"]);
+    }
+
+    #[derive(Clone, Copy, Default)]
+    enum SummaryOutcome {
+        #[default]
+        Success,
+        PreparationBudget,
+        PreparationCancelled,
+        PreparationUnavailable,
+        ProviderCancelled,
+        StreamCancelled,
+        ProviderFailure,
+        ProviderIo,
+        ProviderJson,
+        SettlementIo,
+        AllowanceOverrun,
+        BudgetUnavailable,
+        RecoveredSummary {
+            id: Uuid,
+            output_tokens: u64,
+        },
+        Veto,
+    }
+
+    #[derive(Default)]
+    struct CompactionTrace(Mutex<Vec<&'static str>>, SummaryOutcome);
+
+    const PARTIAL_SUMMARY: &str = "unfinished summary";
+
+    fn is_summary_request(request: &ModelRequest) -> bool {
+        matches!(request.messages.last(), Some(Message::User { content })
+            if content.starts_with("Summarize only this older conversation."))
+    }
+
+    #[async_trait::async_trait]
+    impl Model for CompactionTrace {
+        fn minimum_output_tokens(&self) -> u32 {
+            if matches!(self.1, SummaryOutcome::BudgetUnavailable) {
+                17
+            } else {
+                1
+            }
+        }
+
+        async fn prepare_context<'a>(
+            &'a self,
+            request: &ModelRequest,
+        ) -> Result<Option<Arc<dyn Model + 'a>>> {
+            if is_summary_request(request) {
+                let error = match self.1 {
+                    SummaryOutcome::PreparationBudget => Error::Budget,
+                    SummaryOutcome::PreparationCancelled => Error::Cancelled,
+                    SummaryOutcome::PreparationUnavailable => {
+                        std::io::Error::other("summary adapter unavailable").into()
+                    }
+                    _ => return Ok(None),
+                };
+                self.0.lock().unwrap().push("prepare summary");
+                return Err(error);
+            }
+            Ok(None)
+        }
+
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            let summary = is_summary_request(&request);
+            let text = if summary {
+                assert_eq!(user_texts(&request.messages)[0], "oldest question");
+                assert!(!user_texts(&request.messages).contains(&"new question"));
+                assert!(
+                    !request
+                        .messages
+                        .iter()
+                        .any(|message| matches!(message, Message::UserWithImages { .. }))
+                );
+                assert!(
+                    matches!(&request.messages[0], Message::System { content } if content == "base prompt")
+                );
+                self.0.lock().unwrap().push("summary request");
+                match self.1 {
+                    SummaryOutcome::ProviderCancelled => return Err(Error::Cancelled),
+                    SummaryOutcome::StreamCancelled => {
+                        return Ok(Box::pin(futures_util::stream::iter([
+                            Ok(ModelEvent::Text(PARTIAL_SUMMARY.into())),
+                            Err(Error::Cancelled),
+                        ])));
+                    }
+                    SummaryOutcome::ProviderFailure | SummaryOutcome::SettlementIo => {
+                        return Err(Error::RetryableModel("summary provider unavailable".into()));
+                    }
+                    SummaryOutcome::ProviderIo => {
+                        return Err(
+                            std::io::Error::from(std::io::ErrorKind::ConnectionReset).into()
+                        );
+                    }
+                    SummaryOutcome::ProviderJson => {
+                        return Err(serde_json::from_str::<Value>("").unwrap_err().into());
+                    }
+                    _ => {}
+                }
+                "old conversation summary"
+            } else {
+                let mut trace = self.0.lock().unwrap();
+                let prompt = if trace.contains(&"before_agent_start") {
+                    "run prompt"
+                } else {
+                    "base prompt"
+                };
+                assert!(
+                    matches!(&request.messages[0], Message::System { content } if content == prompt)
+                );
+                trace.push("turn request");
+                "answer"
+            };
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text(text.into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(crate::Usage {
+                        input_tokens: 24,
+                        output_tokens: if summary
+                            && matches!(self.1, SummaryOutcome::AllowanceOverrun)
+                        {
+                            u64::from(request.max_output_tokens) + 1
+                        } else {
+                            3
+                        },
+                    }),
+                }),
+            ])))
+        }
+
+        async fn record_usage_with_metadata(
+            &self,
+            request_id: Uuid,
+            usage: &crate::UsageReport,
+            _: &crate::ModelMetadata,
+        ) -> Result<()> {
+            if let SummaryOutcome::RecoveredSummary { id, output_tokens } = self.1
+                && request_id == id
+            {
+                assert_eq!(
+                    *usage,
+                    crate::UsageReport::Measured {
+                        usage: crate::Usage {
+                            input_tokens: 24,
+                            output_tokens
+                        },
+                    }
+                );
+                self.0.lock().unwrap().push("settle measured summary");
+            }
+            if *usage == crate::UsageReport::Unconfirmed {
+                self.0.lock().unwrap().push("settle unconfirmed summary");
+                if matches!(self.1, SummaryOutcome::SettlementIo) {
+                    return Err(std::io::Error::other("summary settlement unavailable").into());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Extension for CompactionTrace {
+        fn id(&self) -> &str {
+            "compaction trace"
+        }
+
+        fn handles_before_agent_start(&self) -> bool {
+            true
+        }
+
+        async fn before_agent_start(
+            &self,
+            _: &BeforeAgentStartEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::BeforeAgentStartResult> {
+            self.0.lock().unwrap().push("before_agent_start");
+            Ok(crate::BeforeAgentStartResult {
+                system_prompt: Some("run prompt".into()),
+                message: Some(message("hook context")),
+            })
+        }
+
+        fn handles_before_summary_compaction(&self) -> bool {
+            true
+        }
+
+        async fn before_summary_compaction(
+            &self,
+            preparation: &crate::CompactionPreparation,
+            _: Option<&ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> ExtensionResult<Option<crate::BeforeSummaryCompactionResult>> {
+            assert!(matches!(
+                preparation.reason,
+                crate::CompactionTrigger::Threshold
+            ));
+            assert!(!preparation.will_retry);
+            assert_eq!(preparation.tokens_before, 3955);
+            assert!(
+                !preparation
+                    .branch_entries
+                    .iter()
+                    .any(|record| matches!(&record.event,
+                        Event::User { content, .. } | Event::UserWithImages { content, .. }
+                            if content == "new question"
+                    ))
+            );
+            self.0.lock().unwrap().push("before compaction");
+            Ok(matches!(self.1, SummaryOutcome::Veto).then_some(
+                crate::BeforeSummaryCompactionResult {
+                    cancel: true,
+                    compaction: None,
+                },
+            ))
+        }
+    }
+
+    fn seed_compaction_history(session: &mut Session, stale: bool) {
+        for content in ["oldest question", "recent question"] {
+            session
+                .append(Event::User {
+                    content: content.into(),
+                    input_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "previous answer".into(),
+                    invocations: vec![],
+                    request_id: None,
+                    usage: Some(crate::Usage {
+                        input_tokens: 3950,
+                        output_tokens: 5,
+                    }),
+                })
+                .unwrap();
+        }
+        if stale {
+            session
+                .append(Event::Compacted {
+                    summary: "already compacted".into(),
+                    system_prompt: None,
+                    retain_from: Some(3),
+                    tokens_before: Some(3955),
+                    states: Default::default(),
+                    usage: None,
+                    usage_metadata: None,
+                })
+                .unwrap();
+        }
+    }
+
+    fn compaction_builder(trace: &Arc<CompactionTrace>) -> SessionBuilder {
+        SessionBuilder::new(trace.clone(), "fixture")
+            .system_prompt("base prompt")
+            .limits(compaction_limits())
+    }
+
+    fn compaction_limits() -> crate::Limits {
+        crate::Limits {
+            context_window: Some(4096),
+            output_tokens_per_request: 32,
+            compaction_tokens: Some(crate::CompactionTokens {
+                reserve_tokens: Some(256),
+                keep_recent_tokens: Some(1),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_threshold_compacts_prior_context_for_new_triggers() {
+        for (trigger, enabled, stale) in [
+            ("text", true, false),
+            ("image", true, false),
+            ("custom", true, false),
+            ("text", false, false),
+            ("text", true, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            seed_compaction_history(&mut Session::open(&path).unwrap(), stale);
+            let trace = Arc::new(CompactionTrace::default());
+            let mut sdk = compaction_builder(&trace)
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+            sdk.controls().set_auto_compaction_enabled(enabled).unwrap();
+            let answer = match trigger {
+                "custom" => sdk
+                    .send_custom_message(message("new question"), true)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "image" => sdk
+                    .prompt_with_images(
+                        "new question",
+                        vec![crate::ImageContent {
+                            data: "AA==".into(),
+                            mime_type: "image/png".into(),
+                        }],
+                    )
+                    .await
+                    .unwrap(),
+                _ => sdk.prompt("new question").await.unwrap(),
+            };
+            assert_eq!(answer, "answer");
+            let expected: &[_] = if enabled && !stale {
+                &[
+                    "before compaction",
+                    "summary request",
+                    "before_agent_start",
+                    "turn request",
+                ]
+            } else {
+                &["before_agent_start", "turn request"]
+            };
+            assert_eq!(*trace.0.lock().unwrap(), expected, "{trigger}");
+            let journal = sdk.journal().unwrap();
+            let branch = journal.branch();
+            let plan = branch
+                .iter()
+                .position(|record| {
+                    matches!(&record.event, Event::SourceEntry {
+                format, ..
+            } if format == PLAN_FORMAT)
+                })
+                .unwrap();
+            if enabled && !stale {
+                let compacted = branch
+                    .iter()
+                    .position(|record| {
+                        matches!(&record.event, Event::Compacted {
+                    summary, tokens_before: Some(3955), ..
+                } if summary.starts_with("old conversation summary"))
+                    })
+                    .unwrap();
+                assert!(compacted < plan);
+            }
+            assert!(
+                journal
+                    .current_messages()
+                    .iter()
+                    .any(|message| match message {
+                        Message::User { content } | Message::UserWithImages { content, .. } =>
+                            content == "new question",
+                        _ => false,
+                    })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prestart_compaction_preserves_structured_prompt_edits() {
+        struct SectionHook;
+        #[async_trait::async_trait]
+        impl Extension for SectionHook {
+            fn id(&self) -> &str {
+                "section-hook"
+            }
+            fn handles_before_agent_start(&self) -> bool {
+                true
+            }
+            async fn before_agent_start_with_prompt_options(
+                &self,
+                _: &BeforeAgentStartEvent,
+                options: &BeforeAgentStartPromptOptions,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<BeforeAgentStartPromptResult> {
+                assert_eq!(options.sections["rules"], "original rules");
+                Ok(BeforeAgentStartPromptResult {
+                    system_prompt_options: crate::BeforeAgentStartPromptChanges {
+                        sections: [("rules".into(), Some("edited rules".into()))]
+                            .into_iter()
+                            .collect(),
+                    },
+                    ..Default::default()
+                })
+            }
+        }
+        struct SummaryCapture(Arc<Mutex<Vec<Vec<Message>>>>);
+        #[async_trait::async_trait]
+        impl Model for SummaryCapture {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                let summary = is_summary_request(&request);
+                self.0.lock().unwrap().push(request.messages);
+                let text = if summary { "summary" } else { "answer" };
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text(text.into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = SummaryCapture(requests.clone());
+        let mut registry = Registry::default();
+        let prompt = registry.compose_system_prompt(
+            "host prompt".into(),
+            vec![("rules".into(), "original rules".into())],
+        );
+        registry.register(Arc::new(SectionHook)).unwrap();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: &prompt,
+            limits: compaction_limits(),
+        };
+        let mut session = Session::open(&path).unwrap();
+        let (_sender, mut followups) = mpsc::channel::<String>(1);
+        agent
+            .run(
+                &mut session,
+                Some("new question".into()),
+                &mut followups,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(
+            session
+                .branch()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            matches!(&requests[0][0], Message::System { content } if content.contains("original rules") && !content.contains("edited rules"))
+        );
+        assert!(
+            matches!(&requests[1][0], Message::System { content } if content.contains("edited rules"))
+        );
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_continues_after_optional_summary_failure_or_veto() {
+        for (summary, with_extension, expected) in [
+            (
+                SummaryOutcome::ProviderFailure,
+                true,
+                &[
+                    "before compaction",
+                    "summary request",
+                    "settle unconfirmed summary",
+                    "before_agent_start",
+                    "turn request",
+                ][..],
+            ),
+            (
+                SummaryOutcome::ProviderFailure,
+                false,
+                &[
+                    "summary request",
+                    "settle unconfirmed summary",
+                    "turn request",
+                ][..],
+            ),
+            (
+                SummaryOutcome::Veto,
+                true,
+                &["before compaction", "before_agent_start", "turn request"][..],
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+            let trace = Arc::new(CompactionTrace(Mutex::default(), summary));
+            let mut builder = compaction_builder(&trace);
+            if with_extension {
+                builder = builder.extension(trace.clone()).unwrap();
+            }
+            let mut sdk = builder.open(path).unwrap();
+
+            assert_eq!(sdk.prompt("new question").await.unwrap(), "answer");
+            assert_eq!(*trace.0.lock().unwrap(), expected);
+            let journal = sdk.journal().unwrap();
+            assert_eq!(journal.pending_before_agent_start_run(), None);
+            assert!(
+                !journal
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, Event::Compacted { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_preserves_model_budget_errors_during_summary_preparation() {
+        for summary in [
+            SummaryOutcome::PreparationBudget,
+            SummaryOutcome::PreparationUnavailable,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+            let trace = Arc::new(CompactionTrace(Mutex::default(), summary));
+            let mut sdk = compaction_builder(&trace)
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+
+            let result = sdk.prompt("new question").await;
+            let seen = trace.0.lock().unwrap();
+            if matches!(summary, SummaryOutcome::PreparationBudget) {
+                assert!(matches!(result, Err(Error::Budget)), "{result:?}");
+                assert_eq!(*seen, ["before compaction", "prepare summary"]);
+                let journal = sdk.journal().unwrap();
+                assert!(!journal.records().iter().any(|record| matches!(
+                    record.event,
+                    Event::ModelRequested { .. } | Event::Compacted { .. }
+                )));
+                assert!(matches!(
+                    journal.records().last().unwrap().event,
+                    Event::Run {
+                        state: RunState::Failed,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(result.unwrap(), "answer");
+                assert_eq!(
+                    *seen,
+                    [
+                        "before compaction",
+                        "prepare summary",
+                        "before_agent_start",
+                        "turn request"
+                    ]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_distinguishes_provider_errors_from_settlement_errors() {
+        for summary in [
+            SummaryOutcome::ProviderIo,
+            SummaryOutcome::ProviderJson,
+            SummaryOutcome::SettlementIo,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+            let trace = Arc::new(CompactionTrace(Mutex::default(), summary));
+            let mut sdk = compaction_builder(&trace)
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+            let result = sdk.prompt("new question").await;
+            let trace = trace.0.lock().unwrap();
+            if matches!(summary, SummaryOutcome::SettlementIo) {
+                assert!(
+                    matches!(result, Err(Error::Io(error)) if error.to_string() == "summary settlement unavailable")
+                );
+                assert_eq!(
+                    *trace,
+                    [
+                        "before compaction",
+                        "summary request",
+                        "settle unconfirmed summary"
+                    ]
+                );
+            } else {
+                assert_eq!(result.unwrap(), "answer");
+                assert_eq!(
+                    *trace,
+                    [
+                        "before compaction",
+                        "summary request",
+                        "settle unconfirmed summary",
+                        "before_agent_start",
+                        "turn request",
+                    ]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_distinguishes_unavailable_budget_from_dispatched_overrun() {
+        for (summary, cancel_on_finish) in [
+            (SummaryOutcome::BudgetUnavailable, false),
+            (SummaryOutcome::AllowanceOverrun, false),
+            (SummaryOutcome::AllowanceOverrun, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+            let trace = Arc::new(CompactionTrace(Mutex::default(), summary));
+            let mut sdk = compaction_builder(&trace)
+                .limits(crate::Limits {
+                    output_tokens_per_run: 32,
+                    ..compaction_limits()
+                })
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+            let controls = sdk.controls();
+            let mut cancelled_after_summary = false;
+            let result = sdk.prompt_with_observer("new question", &mut |event| {
+                if cancel_on_finish
+                    && matches!(event, Notification::Committed(record) if matches!(
+                        record.event, Event::ModelFinished { usage: crate::UsageReport::Measured { usage }, .. }
+                            if usage.output_tokens == 17
+                    ))
+                {
+                    cancelled_after_summary = true;
+                    controls.abort();
+                }
+            }).await;
+            assert_eq!(cancelled_after_summary, cancel_on_finish);
+            let seen = trace.0.lock().unwrap();
+            if matches!(summary, SummaryOutcome::AllowanceOverrun) {
+                assert!(matches!(result, Err(Error::Budget)), "{result:?}");
+                assert_eq!(*seen, ["before compaction", "summary request"]);
+                let journal = sdk.journal().unwrap();
+                assert!(journal.records().iter().any(|record| matches!(
+                    record.event, Event::ModelFinished { usage: crate::UsageReport::Measured { usage }, .. }
+                        if usage.output_tokens == 17
+                )));
+                assert!(matches!(
+                    journal.records().last().unwrap().event,
+                    Event::Run {
+                        state: RunState::Failed,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(result.unwrap(), "answer");
+                assert_eq!(
+                    *seen,
+                    ["before compaction", "before_agent_start", "turn request"]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_surfaces_journal_failure_from_failed_compaction_hook() {
+        struct FailingStore {
+            inner: crate::MemoryStore,
+            cancel_on_failure: Option<CancellationToken>,
+        }
+        impl crate::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.inner.load()
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                if matches!(&record.event, Event::CustomMessageQueued { input }
+                    if input.delivery == CustomMessageDelivery::NextTurn)
+                {
+                    if let Some(cancel) = &self.cancel_on_failure {
+                        cancel.cancel();
+                    }
+                    return Err(std::io::Error::other("compaction callback journal failure").into());
+                }
+                self.inner.append(record)
+            }
+        }
+
+        struct FailureHook;
+        #[async_trait::async_trait]
+        impl Extension for FailureHook {
+            fn id(&self) -> &str {
+                "compaction failure fixture"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&ExtensionState>,
+                host: Arc<dyn crate::ToolHost>,
+            ) -> ExtensionResult<()> {
+                if matches!(event, crate::LifecycleEvent::SessionCompactFailed { .. }) {
+                    host.send_message(message("failed summary"), CustomMessageDelivery::NextTurn)
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+
+        for (cancel_during_write, queued_after_turn) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let trace = Arc::new(CompactionTrace(
+                Mutex::default(),
+                SummaryOutcome::ProviderIo,
+            ));
+            let mut registry = Registry::default();
+            registry.register(trace.clone()).unwrap();
+            registry.register(Arc::new(FailureHook)).unwrap();
+            let cancel = CancellationToken::new();
+            let mut session = Session::with_store(FailingStore {
+                inner: crate::MemoryStore::default(),
+                cancel_on_failure: cancel_during_write.then(|| cancel.clone()),
+            })
+            .unwrap();
+            seed_compaction_history(&mut session, false);
+            let queued_id = Uuid::new_v4();
+            if queued_after_turn {
+                crate::agent::queue_custom_message(
+                    &mut session,
+                    crate::QueuedCustomMessage {
+                        id: queued_id,
+                        delivery: CustomMessageDelivery::AfterTurn,
+                        message: message("pending after-turn message"),
+                    },
+                    &mut |_| {},
+                )
+                .unwrap();
+            }
+            let agent = Agent {
+                model: trace.as_ref(),
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "base prompt",
+                limits: compaction_limits(),
+            };
+            let (_sender, mut inputs) = mpsc::channel::<String>(1);
+            let result = agent
+                .run(
+                    &mut session,
+                    Some("new question".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut |_| {},
+                )
+                .await;
+            assert_eq!(cancel.is_cancelled(), cancel_during_write);
+            assert!(
+                matches!(&result, Err(Error::Io(error)) if error.to_string() == "compaction callback journal failure"),
+                "cancel={cancel_during_write}, after-turn queue={queued_after_turn}: {result:?}"
+            );
+            assert_eq!(
+                *trace.0.lock().unwrap(),
+                [
+                    "before compaction",
+                    "summary request",
+                    "settle unconfirmed summary"
+                ]
+            );
+            assert_eq!(
+                session
+                    .queued_custom_messages()
+                    .iter()
+                    .any(|(_, input)| input.id == queued_id),
+                queued_after_turn
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_adapter_cancellation_stops_preflight_and_settles_dispatch() {
+        for (summary, expected_trace, expected_partial) in [
+            (
+                SummaryOutcome::PreparationCancelled,
+                &["before compaction", "prepare summary"][..],
+                None,
+            ),
+            (
+                SummaryOutcome::ProviderCancelled,
+                &[
+                    "before compaction",
+                    "summary request",
+                    "settle unconfirmed summary",
+                ][..],
+                Some(""),
+            ),
+            (
+                SummaryOutcome::StreamCancelled,
+                &[
+                    "before compaction",
+                    "summary request",
+                    "settle unconfirmed summary",
+                ][..],
+                Some(PARTIAL_SUMMARY),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+            let trace = Arc::new(CompactionTrace(Mutex::default(), summary));
+            let mut sdk = compaction_builder(&trace)
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+
+            let result = sdk.prompt("new question").await;
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert_eq!(*trace.0.lock().unwrap(), expected_trace);
+            let journal = sdk.journal().unwrap();
+            assert_eq!(journal.pending_before_agent_start_run(), None);
+            assert!(matches!(
+                journal.records().last().unwrap().event,
+                Event::Run {
+                    state: RunState::Cancelled,
+                    ..
+                }
+            ));
+            assert!(!journal.records().iter().any(|record| matches!(
+                &record.event,
+                Event::SourceEntry { format, .. } if format == PLAN_FORMAT
+            ) || matches!(
+                record.event,
+                Event::Compacted { .. }
+            )));
+            let requests: Vec<_> = journal
+                .records()
+                .iter()
+                .filter_map(|record| match record.event {
+                    Event::ModelRequested { request_id, .. } => Some(request_id),
+                    _ => None,
+                })
+                .collect();
+            let finished: Vec<_> = journal
+                .records()
+                .iter()
+                .filter_map(|record| match record.event {
+                    Event::ModelFinished {
+                        request_id,
+                        usage: crate::UsageReport::Unconfirmed,
+                        failure: Some(crate::ModelFailure::Cancelled),
+                        ref partial,
+                        ..
+                    } => Some((Some(request_id), partial.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(requests.len(), usize::from(expected_partial.is_some()));
+            let expected: Vec<_> = requests.into_iter().zip(expected_partial).collect();
+            assert_eq!(finished, expected);
+            assert!(!journal.current_messages().iter().any(|message| matches!(
+                message,
+                Message::Assistant { content, .. } if content == PARTIAL_SUMMARY
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_full_cancellation_stops_preflight() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+        let trace = Arc::new(CompactionTrace::default());
+        let mut sdk = compaction_builder(&trace)
+            .extension(trace.clone())
+            .unwrap()
+            .open(path)
+            .unwrap();
+        let control = sdk.controls();
+        let result = sdk
+            .run_with_events(Some("new question".into()), Uuid::new_v4(), &mut |event| {
+                if matches!(
+                    event,
+                    crate::AgentEvent::Notification(Notification::SummaryRequest)
+                ) {
+                    control.abort();
+                }
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(
+            *trace.0.lock().unwrap(),
+            ["before compaction", "settle unconfirmed summary"]
+        );
+        let journal = sdk.journal().unwrap();
+        assert_eq!(journal.pending_before_agent_start_run(), None);
+        assert!(matches!(
+            journal.records().last().unwrap().event,
+            Event::Run {
+                state: RunState::Cancelled,
+                ..
+            }
+        ));
+        assert!(
+            !journal
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+    }
+
+    fn seed_interrupted_summary(
+        journal: &mut Session,
+        run_id: Uuid,
+        summary_id: Uuid,
+        max_output_tokens: u32,
+    ) -> (u64, u64, u64) {
+        seed_compaction_history(journal, false);
+        journal.set_run_id(Some(run_id));
+        let running = journal
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: Some("new question".into()),
+            })
+            .unwrap()
+            .id;
+        let marker = journal
+            .append(Event::SourceEntry {
+                format: COMPACTION_FORMAT.into(),
+                entry: Value::Null,
+            })
+            .unwrap()
+            .id;
+        let requested = journal
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 2,
+                tools: 0,
+                max_output_tokens,
+                request_id: Some(summary_id),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+                tool_decision: None,
+            })
+            .unwrap()
+            .id;
+        (running, marker, requested)
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_resume_skips_interrupted_summary_and_starts_original_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let run_id = Uuid::new_v4();
+        let summary_id = Uuid::new_v4();
+        let (running, marker, requested) = {
+            let mut journal = Session::open(&path).unwrap();
+            seed_interrupted_summary(&mut journal, run_id, summary_id, 32)
+        };
+        let trace = Arc::new(CompactionTrace::default());
+        let mut sdk = compaction_builder(&trace)
+            .extension(trace.clone())
+            .unwrap()
+            .open(path)
+            .unwrap();
+        assert_eq!(
+            sdk.journal().unwrap().pending_before_agent_start_run(),
+            Some(run_id)
+        );
+        assert!(matches!(
+            sdk.prompt("different question").await,
+            Err(Error::Session(_))
+        ));
+        for target in [running, marker] {
+            sdk.checkout(target).unwrap();
+            assert!(matches!(
+                sdk.run(None, run_id, &mut |_| {}).await,
+                Err(Error::Session(message)) if message.contains("branch that recorded its attempt")
+            ));
+            assert!(trace.0.lock().unwrap().is_empty());
+        }
+        sdk.checkout(requested).unwrap();
+        assert_eq!(sdk.resume().await.unwrap(), "answer");
+        assert_eq!(
+            *trace.0.lock().unwrap(),
+            [
+                "settle unconfirmed summary",
+                "before_agent_start",
+                "turn request",
+            ]
+        );
+        let journal = sdk.journal().unwrap();
+        assert_eq!(journal.pending_before_agent_start_run(), None);
+        assert_eq!(
+            journal
+                .records()
+                .iter()
+                .filter(|record| {
+                    record.run_id == Some(run_id)
+                        && matches!(record.event, Event::ModelRequested { .. })
+                })
+                .count(),
+            2
+        );
+        assert!(
+            journal
+                .records()
+                .iter()
+                .any(|record| matches!(&record.event, Event::User {
+            content, input_id: Some(id),
+        } if *id == run_id && content == "new question"))
+        );
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_resumes_once_after_interrupted_stream_cancellation_settlement() {
+        struct PausedSettlement {
+            trace: Arc<CompactionTrace>,
+            entered: tokio::sync::Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl Model for PausedSettlement {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                self.trace.stream(request).await
+            }
+
+            async fn record_usage_with_metadata(
+                &self,
+                _: Uuid,
+                usage: &crate::UsageReport,
+                _: &crate::ModelMetadata,
+            ) -> Result<()> {
+                assert_eq!(*usage, crate::UsageReport::Unconfirmed);
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+        let trace = Arc::new(CompactionTrace(
+            Mutex::default(),
+            SummaryOutcome::StreamCancelled,
+        ));
+        let model = Arc::new(PausedSettlement {
+            trace: trace.clone(),
+            entered: tokio::sync::Notify::new(),
+        });
+        let run_id = Uuid::new_v4();
+        let mut sdk = SessionBuilder::new(model.clone(), "fixture")
+            .system_prompt("base prompt")
+            .limits(compaction_limits())
+            .extension(trace.clone())
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        let mut observe = |_: Notification<'_>| {};
+        let mut run = Box::pin(sdk.run(Some("new question".into()), run_id, &mut observe));
+        tokio::select! {
+            _ = model.entered.notified() => {}
+            result = &mut run => panic!("run finished before settlement paused: {result:?}"),
+        }
+        drop(run);
+        assert_eq!(
+            *trace.0.lock().unwrap(),
+            ["before compaction", "summary request"]
+        );
+        drop(sdk);
+
+        let mut sdk = compaction_builder(&trace)
+            .extension(trace.clone())
+            .unwrap()
+            .open(path)
+            .unwrap();
+        {
+            let journal = sdk.journal().unwrap();
+            assert_eq!(journal.pending_before_agent_start_run(), Some(run_id));
+            assert!(matches!(
+                &journal.records().last().unwrap().event,
+                Event::ModelFinished {
+                    usage: crate::UsageReport::Unconfirmed,
+                    failure: Some(crate::ModelFailure::Cancelled),
+                    partial,
+                    ..
+                } if partial == PARTIAL_SUMMARY
+            ));
+        }
+        assert_eq!(sdk.resume().await.unwrap(), "answer");
+        assert_eq!(sdk.run(None, run_id, &mut |_| {}).await.unwrap(), "answer");
+        assert_eq!(
+            *trace.0.lock().unwrap(),
+            [
+                "before compaction",
+                "summary request",
+                "settle unconfirmed summary",
+                "before_agent_start",
+                "turn request",
+            ]
+        );
+        let journal = sdk.journal().unwrap();
+        assert_eq!(journal.pending_before_agent_start_run(), None);
+        assert_eq!(
+            journal
+                .records()
+                .iter()
+                .filter(|record| {
+                    record.run_id == Some(run_id)
+                        && matches!(record.event, Event::ModelRequested { .. })
+                })
+                .count(),
+            2
+        );
+        assert_eq!(
+            journal.records().iter().filter(|record| matches!(
+                &record.event,
+                Event::User { content, input_id: Some(id) } if *id == run_id && content == "new question"
+            )).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_resume_settles_then_enforces_the_recorded_summary_allowance() {
+        for output_tokens in [8, 9] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            let run_id = Uuid::new_v4();
+            let summary_id = Uuid::new_v4();
+            {
+                let mut journal = Session::open(&path).unwrap();
+                seed_interrupted_summary(&mut journal, run_id, summary_id, 8);
+                journal
+                    .append(Event::ModelFinished {
+                        request_id: summary_id,
+                        metadata: Default::default(),
+                        usage: crate::UsageReport::Measured {
+                            usage: crate::Usage {
+                                input_tokens: 24,
+                                output_tokens,
+                            },
+                        },
+                        failure: None,
+                        partial: String::new(),
+                        reply: None,
+                    })
+                    .unwrap();
+            }
+            let trace = Arc::new(CompactionTrace(
+                Mutex::default(),
+                SummaryOutcome::RecoveredSummary {
+                    id: summary_id,
+                    output_tokens,
+                },
+            ));
+            let mut sdk = compaction_builder(&trace)
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+            assert_eq!(
+                sdk.journal().unwrap().pending_before_agent_start_run(),
+                Some(run_id)
+            );
+            let result = sdk.resume().await;
+            let journal = sdk.journal().unwrap();
+            assert_eq!(journal.pending_before_agent_start_run(), None);
+            let seen = trace.0.lock().unwrap();
+            if output_tokens > 8 {
+                assert!(matches!(result, Err(Error::Budget)), "{result:?}");
+                assert_eq!(*seen, ["settle measured summary"]);
+                assert!(matches!(
+                    journal.records().last().unwrap().event,
+                    Event::Run {
+                        state: RunState::Failed,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(result.unwrap(), "answer");
+                assert_eq!(
+                    *seen,
+                    [
+                        "settle measured summary",
+                        "before_agent_start",
+                        "turn request"
+                    ]
+                );
+            }
+        }
     }
 
     #[tokio::test]
