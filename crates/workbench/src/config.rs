@@ -1218,7 +1218,7 @@ pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
     read_object_with_format(
         path,
         settings,
-        settings || name.is_some_and(|name| name == "mcp.json"),
+        settings || name.is_some_and(|name| name == "mcp.json" || name == "models.json"),
     )
 }
 
@@ -1243,11 +1243,18 @@ fn read_json_object(
             if bytes.is_empty() && empty_is_object {
                 return Ok(Value::Object(Map::new()));
             }
-            // Pi accepts a UTF-8 BOM in settings and MCP configuration when loading and editing them.
+            // Pi accepts a UTF-8 BOM in these configuration files.
             let input = if allow_bom {
                 bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes)
             } else {
                 &bytes
+            };
+            let normalized;
+            let input = if path.file_name().is_some_and(|name| name == "models.json") {
+                normalized = super::models_json::normalize(input);
+                normalized.as_slice()
+            } else {
+                input
             };
             let value: Value = serde_json::from_slice(input).map_err(|error| {
                 let reason = if path.file_name().is_some_and(|name| name == "settings.json")
@@ -1937,16 +1944,18 @@ mod tests {
         }
     }
     #[test]
-    fn bom_handling_is_limited_to_settings_and_mcp_configuration() {
+    fn bom_handling_is_limited_to_supported_configuration_files() {
         let directory = tempfile::tempdir().unwrap();
         let mcp = directory.path().join("mcp.json");
         let settings = directory.path().join("settings.json");
         let other = directory.path().join("other.json");
-        for path in [&mcp, &settings, &other] {
+        let models = directory.path().join("models.json");
+        for path in [&mcp, &settings, &models, &other] {
             std::fs::write(path, "\u{feff}{\"keep\":true}").unwrap();
         }
         assert_eq!(super::read_object(&mcp).unwrap()["keep"], true);
         assert_eq!(super::read_object(&settings).unwrap()["keep"], true);
+        assert_eq!(super::read_object(&models).unwrap()["keep"], true);
         assert!(super::read_object(&other).is_err());
     }
 

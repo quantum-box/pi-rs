@@ -1544,6 +1544,55 @@ impl View {
             self.picker = None;
         }
     }
+    fn reload_model_profiles(&mut self, args: &mut Cli) -> Result<()> {
+        let previous = args.clone();
+        args.reload_model_profiles()?;
+        if previous.model_profiles.revision() == args.model_profiles.revision() {
+            return Ok(());
+        }
+        let mut models = std::mem::take(&mut self.available_models);
+        self.invalidate_model_catalog();
+        if models.is_empty() {
+            return Ok(());
+        }
+        models.retain(|reference| {
+            let Some((provider, model)) =
+                super::model_selection::qualified_model(reference, &previous.model_profiles)
+            else {
+                return false;
+            };
+            args.model_profiles.provider(provider.id()).as_ref() == Some(&provider)
+                && !previous
+                    .model_profiles
+                    .has_model_definition(&provider, model)
+                && previous.model_profiles.model_adapter(&provider, model)
+                    == args.model_profiles.model_adapter(&provider, model)
+                && [None, Some(model)].into_iter().all(|model| {
+                    let endpoint = previous.model_endpoint_for(&provider, model);
+                    endpoint == args.model_endpoint_for(&provider, model)
+                        && previous.model_request_authorization(
+                            &previous.model_profiles,
+                            &provider,
+                            endpoint,
+                            model,
+                        ) == args.model_request_authorization(
+                            &args.model_profiles,
+                            &provider,
+                            endpoint,
+                            model,
+                        )
+                })
+        });
+        // Configured IDs come from the new profiles. Keep discovery-only IDs
+        // on their revalidated routes and include newly configured providers.
+        for reference in super::model_selection::configured_model_references(args) {
+            if !models.contains(&reference) {
+                models.push(reference);
+            }
+        }
+        self.available_models = models;
+        Ok(())
+    }
     fn streaming_tool_entries(&self) -> impl Iterator<Item = Entry> + '_ {
         self.streaming_tools.values().filter_map(|tool| {
             if tool.name == super::operation_models::TOOL {
@@ -5593,20 +5642,41 @@ fn slash(
                 .and_then(|slot| slot.as_mut())
                 .filter(|worker| worker.busy);
             if active.is_none() {
-                args.reload_model_profiles()?;
+                view.reload_model_profiles(args)?;
+                if let Some(warning) = args.model_profiles.warning() {
+                    view.append(warning);
+                }
             }
-            if super::model_selection::qualified_model(rest, &args.model_profiles).is_some()
-                || super::model_selection::thinking_suffix(rest).is_some()
-            {
+            if super::model_selection::qualified_model(rest, &args.model_profiles).is_some() {
                 select_model_input(args, view, active, rest, false)?;
-            } else if let Some(model) = exact_model_query(args, rest, &view.available_models) {
-                select_model_input(args, view, active, &model, false)?;
+            } else if let Some((provider, model)) =
+                exact_model_query(args, rest, &view.available_models)?
+            {
+                select_model(
+                    args,
+                    view,
+                    active,
+                    provider,
+                    super::model_selection::Choice {
+                        model,
+                        thinking: None,
+                    },
+                    false,
+                )?;
             } else {
-                start_model_picker(args, view, ModelListIntent::Select { query: rest.into() });
+                args.model_profiles.ensure_model_reference_available(rest)?;
+                if super::model_selection::thinking_suffix(rest).is_some() {
+                    select_model_input(args, view, active, rest, false)?;
+                } else {
+                    start_model_picker(args, view, ModelListIntent::Select { query: rest.into() });
+                }
             }
         }
         "/scoped-models" => {
-            args.reload_model_profiles()?;
+            view.reload_model_profiles(args)?;
+            if let Some(warning) = args.model_profiles.warning() {
+                view.append(warning);
+            }
             start_model_picker(args, view, ModelListIntent::Scope);
         }
         "/login" if rest.eq_ignore_ascii_case("anthropic") => show_anthropic_methods(view),
@@ -6610,8 +6680,13 @@ pub(super) async fn run(
             match task.receiver.try_recv() {
                 Ok(Ok(keys)) => {
                     if args.model_keys.revision() == task.revision {
+                        let credentials_changed = keys.revision() != task.revision;
+                        let profile_revision = args.model_profiles.revision().to_owned();
                         let result = args.replace_model_keys(keys);
-                        view.invalidate_model_catalog();
+                        if credentials_changed || args.model_profiles.revision() != profile_revision
+                        {
+                            view.invalidate_model_catalog();
+                        }
                         match result {
                             Ok(()) => view.append("Provider credentials reloaded"),
                             Err(error) => view.append(&format!("Model profile reload: {error}")),
@@ -6832,19 +6907,30 @@ pub(super) async fn run(
                             }
                             ModelListIntent::Select { query } => {
                                 view.available_models = models.clone();
-                                let selection = exact_model_query(&args, &query, &models);
-                                if let Some(model) = selection {
-                                    if let Err(error) = select_model_input(
-                                        &mut args,
-                                        &mut view,
-                                        worker.as_mut(),
-                                        &model,
-                                        false,
-                                    ) {
-                                        view.append(&error.to_string());
+                                match exact_model_query(&args, &query, &models) {
+                                    Ok(Some((provider, model))) => {
+                                        if let Err(error) = select_model(
+                                            &mut args,
+                                            &mut view,
+                                            worker.as_mut(),
+                                            provider,
+                                            super::model_selection::Choice {
+                                                model,
+                                                thinking: None,
+                                            },
+                                            false,
+                                        ) {
+                                            view.append(&error.to_string());
+                                        }
+                                        dirty = true;
+                                        continue;
                                     }
-                                    dirty = true;
-                                    continue;
+                                    Err(error) => {
+                                        view.append(&error.to_string());
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    Ok(None) => {}
                                 }
                                 let mut picker = Picker::new(
                                     "Select model",
@@ -8750,7 +8836,10 @@ pub(super) async fn run(
                             auth_reload =
                                 Some(AuthReload::start(args.model_keys.revision().to_owned()));
                             view.append("Reloading provider credentials (Esc to cancel)");
-                            args.reload_model_profiles()?;
+                            view.reload_model_profiles(&mut args)?;
+                            if let Some(warning) = args.model_profiles.warning() {
+                                view.append(warning);
+                            }
                             {
                                 let preparation = super::packages::prepare(&args);
                                 tokio::pin!(preparation);
@@ -9208,29 +9297,45 @@ fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut Vie
     result
 }
 
-fn exact_model_query(args: &Cli, query: &str, catalog: &[String]) -> Option<String> {
+fn exact_model_query(
+    args: &Cli,
+    query: &str,
+    catalog: &[String],
+) -> Result<Option<(super::Provider, String)>> {
     if query.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let scoped;
-    let models = if args.model_scope.is_empty() {
-        catalog
-    } else {
-        scoped = args
+    let local;
+    let models = if !args.model_scope.is_empty() {
+        local = args
             .model_scope
             .iter()
             .map(super::model_selection::ScopedChoice::qualified)
             .collect::<Vec<_>>();
-        &scoped
+        &local
+    } else if catalog.is_empty() && super::model_selection::thinking_suffix(query).is_some() {
+        // A cold picker still knows configured literal IDs before suffix parsing.
+        local = super::model_selection::configured_model_references(args);
+        &local
+    } else {
+        catalog
     };
-    let mut matches = models.iter().filter(|reference| {
-        super::model_selection::qualified_model(reference, &args.model_profiles)
-            .is_some_and(|(_, id)| id.eq_ignore_ascii_case(query))
+    let mut matches = models.iter().filter_map(|reference| {
+        let (provider, model) =
+            super::model_selection::qualified_model(reference, &args.model_profiles)?;
+        model
+            .eq_ignore_ascii_case(query)
+            .then_some((provider, model))
     });
-    let first = matches.next()?;
-    matches
-        .all(|reference| reference == first)
-        .then(|| first.clone())
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.any(|candidate| candidate != first) {
+        return Err(Error::Config(format!(
+            "Model {query:?} is ambiguous. Use provider/model to choose one."
+        )));
+    }
+    Ok(Some((first.0, first.1.to_owned())))
 }
 
 fn select_model_input(
@@ -9256,6 +9361,17 @@ fn select_model_input(
         &provider,
         &current.model_profiles,
     )?;
+    select_model(args, view, worker, provider, selection, save_default)
+}
+
+fn select_model(
+    args: &mut Cli,
+    view: &mut View,
+    worker: Option<&mut Worker>,
+    provider: super::Provider,
+    selection: super::model_selection::Choice,
+    save_default: bool,
+) -> Result<()> {
     let status = if save_default {
         format!("Default model: {}/{}", provider.id(), selection.model)
     } else {
@@ -12064,14 +12180,23 @@ mod tests {
             "ollama/chat-model",
             "openai/chat-model",
             "openai/other-model",
+            "ollama/company/literal:high",
+            "openai/company/literal:high",
         ]
         .map(str::to_owned);
-        assert_eq!(super::exact_model_query(&args, "chat", &models), None);
-        assert_eq!(super::exact_model_query(&args, "chat-model", &models), None);
         assert_eq!(
-            super::exact_model_query(&args, "OTHER-MODEL", &models).as_deref(),
-            Some("openai/other-model")
+            super::exact_model_query(&args, "chat", &models).unwrap(),
+            None
         );
+        assert!(super::exact_model_query(&args, "chat-model", &models).is_err());
+        assert_eq!(
+            super::exact_model_query(&args, "OTHER-MODEL", &models).unwrap(),
+            Some((
+                super::super::Provider::named("openai").unwrap(),
+                "other-model".into()
+            ))
+        );
+        assert!(super::exact_model_query(&args, "company/literal:high", &models).is_err());
         args.model_scope
             .push(super::super::model_selection::ScopedChoice {
                 provider: super::super::Provider::Ollama,
@@ -12079,8 +12204,8 @@ mod tests {
                 thinking: Some("low".into()),
             });
         assert_eq!(
-            super::exact_model_query(&args, "chat-model", &models).as_deref(),
-            Some("ollama/chat-model")
+            super::exact_model_query(&args, "chat-model", &models).unwrap(),
+            Some((super::super::Provider::Ollama, "chat-model".into()))
         );
     }
 

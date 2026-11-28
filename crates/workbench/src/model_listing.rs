@@ -8,8 +8,14 @@ use super::{Cli, OutputMode, model_selection, output};
 pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
     let mut catalogs = if args.connection_explicit {
         vec![
-            model_selection::catalog(args, args.provider.clone(), args.allow_model_probes())
-                .await?,
+            model_selection::catalog(
+                args,
+                args.provider.clone(),
+                args.allow_model_probes()
+                    || (args.model_profiles.warning().is_some()
+                        && args.allow_endpoint_probes(args.endpoint_for(&args.provider))),
+            )
+            .await?,
         ]
     } else {
         model_selection::catalogs(args, true)

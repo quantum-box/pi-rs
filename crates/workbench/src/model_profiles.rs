@@ -16,6 +16,7 @@ use super::{Provider, builtin_chat, config, model_auth::Credential, providers::A
 #[derive(Clone, Default)]
 pub(super) struct Profiles {
     entries: BTreeMap<String, Profile>,
+    warning: Option<String>,
     revision: String,
     cloudflare_saved_account: Option<String>,
     cloudflare_gateway_route: Option<super::cloudflare_gateway::Route>,
@@ -42,7 +43,7 @@ struct Profile {
     overrides: BTreeMap<String, ModelMetadata>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(super) struct RequestHeaders {
     values: BTreeMap<String, String>,
     auth_header: bool,
@@ -815,10 +816,42 @@ pub(super) fn cloudflare_workers_chat_account(endpoint: &str) -> Option<&str> {
 impl Profiles {
     pub fn load(keys: &super::model_auth::Keys) -> Result<Self> {
         let path = config::agent_dir().join("models.json");
-        let data = config::read_object(&path)?;
+        Self::load_data(keys, &config::read_object(&path)?)
+    }
+
+    pub fn load_for_cli(keys: &super::model_auth::Keys) -> Result<Self> {
+        let path = config::agent_dir().join("models.json");
+        let reason = match config::read_object(&path) {
+            Ok(data) => match Self::load_data(keys, &data) {
+                Ok(profiles) => return Ok(profiles),
+                // Only discard errors attributable to the file. Environment and
+                // credential-derived route configuration still fails closed.
+                Err(Error::Config(_))
+                    if Self::parse_routes(&data, None, None, |_| None).is_err() =>
+                {
+                    "invalid model configuration".into()
+                }
+                Err(error) => return Err(error),
+            },
+            Err(Error::Config(_)) => "expected a JSON object".into(),
+            Err(Error::Io(error)) => format!("could not read the file ({})", error.kind()),
+            Err(error) => return Err(error),
+        };
+        let mut profiles = Self::load_data(keys, &serde_json::json!({}))?;
+        // Fallback disables auxiliary model probes. A worker must agree on
+        // that policy even when it loaded the same built-in profiles.
+        profiles.revision.push_str(":fallback");
+        profiles.warning = Some(format!(
+            "Warning: models.json error: {}: {reason}. Ignoring the file.",
+            path.display()
+        ));
+        Ok(profiles)
+    }
+
+    fn load_data(keys: &super::model_auth::Keys, data: &Value) -> Result<Self> {
         let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").ok();
         let mut profiles = Self::parse_with_provider_environment(
-            &data,
+            data,
             keys.cloudflare_chat_account().or(account.as_deref()),
             keys.cloudflare_gateway_route(),
             |name| std::env::var(name).ok(),
@@ -1202,6 +1235,7 @@ impl Profiles {
         let revision = format!("{:x}", revision.finalize());
         Ok(Self {
             entries,
+            warning: None,
             revision,
             cloudflare_saved_account: None,
             cloudflare_gateway_route,
@@ -1230,6 +1264,28 @@ impl Profiles {
 
     pub fn revision(&self) -> &str {
         &self.revision
+    }
+
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
+    }
+
+    pub fn ensure_model_reference_available(&self, reference: &str) -> Result<()> {
+        if self.warning.is_some()
+            && let Some((name, _)) = reference.split_once('/')
+            && self.provider(name).is_none()
+        {
+            let model = super::model_selection::thinking_suffix(reference)
+                .map_or(reference, |(model, _)| model);
+            if !self.providers().any(|provider| {
+                self.model_ids(&provider)
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(reference) || id.eq_ignore_ascii_case(model))
+            }) {
+                return Err(Error::Config(format!("unknown model provider {name:?}")));
+            }
+        }
+        Ok(())
     }
 
     pub fn provider(&self, name: &str) -> Option<Provider> {
@@ -1318,10 +1374,11 @@ impl Profiles {
 
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<Credential> {
         let profile = self.entries.get(provider.id())?;
-        if !profile.provider_endpoints.contains(endpoint) {
-            return None;
-        }
-        Credential::configured(profile.api_key.as_deref()?)
+        let key = profile
+            .api_key
+            .as_deref()
+            .filter(|_| profile.provider_endpoints.contains(endpoint))?;
+        Credential::configured(key)
     }
 
     pub fn has_provider_endpoint(&self, provider: &Provider, endpoint: &str) -> bool {
@@ -2263,6 +2320,189 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn catalog_fallback_verifies_saved_model_on_its_loopback_route() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            let body = r#"{"data":[{"id":"fixture-custom:7b"}]}"#;
+            socket.get_mut().write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+        });
+        let mut args = super::super::Cli::parse_from(["pi", "--offline"]);
+        args.provider = Provider::Ollama;
+        args.model_keys = crate::model_auth::Keys::parse(&json!({
+            "ollama":{"type":"api_key","key":"synthetic-recovery-token","endpoint":endpoint}
+        }));
+        args.endpoint = endpoint;
+        args.model = "fixture-custom:7b".into();
+        args.model_profiles.warning = Some("fixture invalid file".into());
+        assert_eq!(
+            args.configured_model_credential(&args.provider, &args.endpoint)
+                .as_ref()
+                .and_then(crate::model_auth::Credential::literal),
+            Some("synthetic-recovery-token")
+        );
+        assert!(args.model_scope.is_empty());
+        assert!(!args.saved_model_route_available(&args.provider, &args.model));
+        args.verify_saved_model_route().await.unwrap();
+        assert!(args.saved_model_route_available(&args.provider, &args.model));
+        let catalog = args.fallback_scope_catalog(&args.provider, None);
+        let (scope, _) = crate::model_selection::scoped_choices(
+            ["openai/gpt-4.1", "ollama/fixture-custom:7b"],
+            &[catalog],
+        );
+        assert_eq!(scope.len(), 1);
+        assert_eq!(scope[0].provider, Provider::Ollama);
+        assert_eq!(scope[0].model, args.model);
+        let mut available = scope;
+        available.push(crate::model_selection::ScopedChoice {
+            provider: Provider::named("openai").unwrap(),
+            model: "gpt-4.1".into(),
+            thinking: None,
+        });
+        assert!(crate::model_selection::next_model(&args, &available, false).is_none());
+
+        args.model = "fixture-custom".into();
+        assert!(args.verify_saved_model_route().await.is_err());
+        server.await.unwrap();
+
+        args.model = "fixture-custom:7b".into();
+        args.endpoint = "http://127.0.0.1:1/v1/chat/completions".into();
+        assert!(!args.saved_model_route_available(&args.provider, &args.model));
+        assert!(
+            args.fallback_scope_catalog(&args.provider, None)
+                .models
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_models_json_does_not_replace_authorized_routes() {
+        let fallback = Profiles {
+            warning: Some("fixture invalid file".into()),
+            ..Profiles::default()
+        };
+        let provider = Provider::Anthropic;
+        for profile in [
+            json!({"baseUrl": "https://relay.example.test"}),
+            json!({"apiKey": "fixture-key"}),
+            json!({"headers": {"x-api-key": "fixture-header"}}),
+        ] {
+            let previous = Profiles::parse(&json!({"providers": {"anthropic": profile}})).unwrap();
+            let mut args = super::super::Cli::parse_from(["pi", "--offline"]);
+            args.provider = provider.clone();
+            args.model = "claude-opus-4-6".into();
+            args.endpoint = previous.endpoint(&provider).to_owned();
+            args.model_profiles = previous.clone();
+
+            let error = args.apply_model_profiles(fallback.clone()).unwrap_err();
+            assert!(error.to_string().contains("cannot replace model route"));
+            assert_eq!(args.model_profiles.revision(), previous.revision());
+
+            args.model_scope
+                .push(super::super::model_selection::ScopedChoice {
+                    provider: provider.clone(),
+                    model: args.model.clone(),
+                    thinking: None,
+                });
+            args.provider = Provider::Ollama;
+            args.endpoint = previous.endpoint(&args.provider).to_owned();
+            let error = args.apply_model_profiles(fallback.clone()).unwrap_err();
+            assert!(error.to_string().contains("cannot replace model route"));
+            assert_eq!(args.model_profiles.revision(), previous.revision());
+        }
+    }
+
+    #[test]
+    fn malformed_models_json_preserves_saved_authorization_on_an_explicit_endpoint() {
+        let previous =
+            Profiles::parse(&json!({"providers":{"azure":{"baseUrl":"http://127.0.0.1:1"}}}))
+                .unwrap();
+        let provider = previous.provider("azure").unwrap();
+        let endpoint = previous.endpoint(&provider);
+        let fallback = Profiles {
+            warning: Some("fixture invalid file".into()),
+            ..Profiles::default()
+        };
+        assert_eq!(fallback.provider("azure").as_ref(), Some(&provider));
+        assert_eq!(
+            fallback.model_adapter(&provider, "fixture"),
+            previous.model_adapter(&provider, "fixture")
+        );
+        for saved in [
+            json!({"type":"api_key", "key":"fixture-key"}),
+            json!({"type":"api_key", "env":{"FIXTURE_ACCOUNT":"fixture"}}),
+        ] {
+            let mut args = super::super::Cli::parse_from(["pi", "--offline"]);
+            args.provider = provider.clone();
+            args.model = "fixture".into();
+            args.model_profiles = previous.clone();
+            args.model_keys = super::super::model_auth::Keys::parse(&json!({"azure":saved}));
+            args.endpoint_explicit = true;
+            args.initial_connection = Some((provider.clone(), endpoint.into()));
+            args.endpoint = endpoint.into();
+
+            let error = args.apply_model_profiles(fallback.clone()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot replace model route azure/fixture")
+            );
+            assert_eq!(args.model_profiles.revision(), previous.revision());
+        }
+    }
+
+    #[test]
+    fn malformed_models_json_preserves_an_inactive_explicit_model_route() {
+        let previous = Profiles::parse(&json!({
+            "providers":{"anthropic":{"models":[{"id":"fixture","baseUrl":"http://127.0.0.1:1"}]}}
+        }))
+        .unwrap();
+        let provider = Provider::Anthropic;
+        let mut args = super::super::Cli::parse_from(["pi", "--offline"]);
+        args.model_profiles = previous.clone();
+        args.provider = provider.clone();
+        args.endpoint = previous.endpoint(&provider).into();
+        args.model = "claude-opus-4-6".into();
+        args.cli_selection = Some(super::super::InitialSelection {
+            provider,
+            endpoint: args.endpoint.clone(),
+            model: "fixture".into(),
+        });
+        let fallback = Profiles {
+            warning: Some("fixture invalid file".into()),
+            ..Profiles::default()
+        };
+        let error = args.apply_model_profiles(fallback).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot replace model route anthropic/fixture")
+        );
+        assert_eq!(args.model_profiles.revision(), previous.revision());
+    }
 
     #[test]
     fn google_catalogs_and_vertex_model_endpoints_match_upstream() {

@@ -876,6 +876,214 @@ fn reload_applies_saved_theme_changes_without_overriding_cli_selection() {
 }
 
 #[test]
+fn malformed_models_json_warns_at_terminal_startup_and_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let models = home.join("models.json");
+    std::fs::write(&models, "{,}").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        prepare_gate(&socket);
+        let mut request = String::new();
+        let mut reader = BufReader::new(&socket);
+        reader.read_line(&mut request).unwrap();
+        assert!(request.starts_with("GET /v1/models "), "{request}");
+        loop {
+            request.clear();
+            if reader.read_line(&mut request).unwrap() == 0 || request == "\r\n" {
+                break;
+            }
+        }
+        let body = r#"{"data":[
+            {"id":"qwen2.5:7b"},
+            {"id":"company/private-model"},
+            {"id":"company/private-model:high"},
+            {"id":"company/ambiguous:high"},
+            {"id":"company/shared"}
+        ]}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 180,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env("ANTHROPIC_API_KEY", "fixture-builtin-key")
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-session",
+                "--tui-mode",
+                "regular",
+                "--provider",
+                "ollama",
+                "--model",
+                "qwen2.5:7b",
+                "--endpoint",
+                &endpoint,
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| {
+        text.contains("models.json error:") && text.contains("Enter to send")
+    });
+
+    let mut profiles = serde_json::json!({
+        "providers": {
+            "ollama": {"models": [{"id": "company/cold:high"}]},
+            "anthropic": {
+                "baseUrl": "http://127.0.0.1:1",
+                "apiKey": "fixture-key",
+                "models": [
+                    {"id": "company/literal:high"},
+                    {"id": "company/ambiguous:high"},
+                    {"id": "company/cold:high"},
+                    {"id": "inactive/stale-model"},
+                    {"id": "ollama/qwen2.5:7b"}
+                ]
+            }
+        }
+    });
+    std::fs::write(&models, profiles.to_string()).unwrap();
+    master.write_all(b"/model company/cold:high\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains(r#"Model "company/cold:high" is ambiguous"#)
+    });
+
+    master.write_all(b"/model qwen2.5:7b\r").unwrap();
+    output_until(&mut master, |text| text.contains("Model: qwen2.5:7b"));
+    server.join().unwrap();
+
+    master
+        .write_all(b"/model company/ambiguous:high\r")
+        .unwrap();
+    output_until(&mut master, |text| {
+        text.contains(r#"Model "company/ambiguous:high" is ambiguous"#)
+    });
+    master
+        .write_all(b"/model ollama/company/ambiguous:high\r")
+        .unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Model: company/ambiguous:high")
+    });
+
+    master.write_all(b"/model company/shared\r").unwrap();
+    output_until(&mut master, |text| text.contains("Model: company/shared"));
+    profiles["providers"]["anthropic"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"id": "company/shared"}));
+    std::fs::write(&models, profiles.to_string()).unwrap();
+    master.write_all(b"/model company/shared\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains(r#"Model "company/shared" is ambiguous"#)
+    });
+
+    master.write_all(b"/model inactive/stale-model\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Model: inactive/stale-model")
+    });
+    // The exact literal belongs to Anthropic even when Ollama is active.
+    master.write_all(b"/model ollama/qwen2.5:7b\r").unwrap();
+    output_until(&mut master, |text| text.contains("Model: qwen2.5:7b"));
+    master.write_all(b"/model COMPANY/LITERAL:HIGH\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Model: company/literal:high")
+    });
+    master.write_all(b"/model ollama/qwen2.5:7b\r").unwrap();
+    output_until(&mut master, |text| text.contains("Model: qwen2.5:7b"));
+
+    std::fs::write(&models, "{,}").unwrap();
+    master.write_all(b"/model inactive/stale-model\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains(r#"unknown model provider "inactive""#)
+    });
+    master.write_all(b"/model company/private-model\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Model: company/private-model")
+    });
+    master
+        .write_all(b"/model anthropic/claude-opus-4-6\r")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("Model: claude-opus-4-6"));
+    master
+        .write_all(b"/model company/private-model:high\r")
+        .unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Model: company/private-model:high")
+    });
+    master.write_all(b"/model company/private\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains(r#"unknown model provider "company""#)
+    });
+
+    std::fs::write(&models, r#"{"providers":[]}"#).unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("invalid model configuration") && text.contains("Reloaded settings")
+    });
+
+    std::fs::remove_file(&models).unwrap();
+    std::fs::create_dir(&models).unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("could not read the file") && text.contains("Reloaded settings")
+    });
+
+    std::fs::remove_dir(&models).unwrap();
+    std::fs::write(&models, "{}").unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| text.contains("Reloaded settings"));
+    master.write_all(b"prompt-still-usable").unwrap();
+    output_until(&mut master, |text| text.contains("prompt-still-usable"));
+}
+
+#[test]
 fn terminal_color_and_hyperlink_capabilities_apply_at_startup_and_reload_in_both_modes() {
     const RGB: &str = "\x1b[38;2;255;0;0m";
     const INDEXED: &str = "\x1b[38;5;196m";
@@ -956,15 +1164,23 @@ fn terminal_color_and_hyperlink_capabilities_apply_at_startup_and_reload_in_both
             master.write_all(b"/reload\r").unwrap();
             output_until(&mut master, |text| {
                 let background = if configured { INDEXED_BG } else { RGB_BG };
-                let ready = text.contains("Reloaded settings")
-                    && text.contains(TRANSCRIPT)
-                    && text.contains(after)
-                    && text.contains(background)
-                    && text.contains(URL);
-                if ready {
-                    assert_eq!(text.contains(&osc_link), !configured, "{mode}");
-                }
-                ready
+                // Typing /reload can redraw the transcript using the old settings.
+                // Match the transcript and its link in the completed reload frame.
+                text.split("\x1b[?2026h")
+                    .skip(1)
+                    .filter_map(|frame| frame.split_once("\x1b[?2026l"))
+                    .map(|(frame, _)| frame)
+                    .any(|frame| {
+                        let ready = frame.contains("Reloaded settings")
+                            && frame.contains(TRANSCRIPT)
+                            && frame.contains(after)
+                            && frame.contains(background)
+                            && frame.contains(URL);
+                        if ready {
+                            assert_eq!(frame.contains(&osc_link), !configured, "{mode}");
+                        }
+                        ready
+                    })
             });
         }
     }

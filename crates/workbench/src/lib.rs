@@ -45,6 +45,7 @@ mod mcp_resource_compat;
 pub mod model_factory;
 pub mod model_file;
 mod model_thinking_levels;
+mod models_json;
 #[doc(hidden)]
 pub mod native_pi_messages;
 #[doc(hidden)]

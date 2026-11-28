@@ -13,6 +13,7 @@ pub(super) const REFRESH_BARRIER_ENV: &str = "PI_RS_WORKER_REFRESH_BARRIER";
 pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
+pub(super) const MODEL_PROFILE_REVISION_ENV: &str = "PI_RS_WORKER_MODEL_PROFILE_REVISION";
 const MAX_SETTINGS_BOOTSTRAP: usize = 16 * 1024 * 1024;
 
 pub(super) fn read_settings_bootstrap() -> Result<super::config::Settings> {
@@ -249,6 +250,7 @@ impl Worker {
             }
         }
         command.env(REFRESH_BARRIER_ENV, refresh_barrier.path());
+        command.env(MODEL_PROFILE_REVISION_ENV, args.model_profiles.revision());
         command.env_remove("PI_RS_MODEL_TOKEN");
         command.env_remove(SESSION_TRANSITION_ENV);
         command.env(

@@ -5198,6 +5198,46 @@ original provider and endpoint. A profile key is used only for that profile's
 endpoint. Named custom providers, per-model overrides and credential
 commands remain in progress.
 
+Native `models.json` accepts the same optional UTF-8 BOM, `//` line comments,
+and trailing commas as Pi. Quoted strings retain their contents. Unlike Pi’s
+normalizer, native rejects bare or repeated commas in empty containers instead of
+repairing malformed JSON; strict credential and granted SDK reads reject them too.
+
+If the CLI's user-level `models.json` is malformed or unreadable, model listing
+and session startup warn and use the built-in catalog. Reload uses that fallback
+only when active, scoped, and original selection routes retain their endpoints,
+adapters, and effective authorization. Workers check the parent profile revision
+and fallback status before using its selection or inline key. Unscoped listing
+ignores saved model and provider selections during fallback, while explicit
+provider routes still require validation. An explicit built-in model can
+override an unavailable saved provider and scope. Saved defaults and
+enabled-model scopes require a confirmed route during fallback because the
+discarded profile may have overridden a bundled ID. Retired saved defaults
+follow the same confirmation rules.
+Use `--model` to select a built-in route, or `--endpoint` to
+confirm a route for a saved model even when the server has no catalog. An
+unauthenticated catalog request to the selected loopback Chat Completions
+endpoint can also confirm an exact ID outside the bundled catalog. Repeating a
+saved provider with `--provider` alone leaves its route unconfirmed. An explicit
+`--models` scope takes precedence over the saved default. Listing on an explicit
+endpoint and discovery needed to resolve its scope use the ordinary endpoint-bound
+credentials and offline rules. A scope already resolved against confirmed choices
+skips discovery, including literal model IDs with bracket characters. Fallback
+suppresses auxiliary model probes. With both
+`--provider` and `--endpoint`, fallback preserves the full model namespace.
+In the TUI, `/model` accepts an exact discovered or scoped model ID such as
+`company/private-model` on its confirmed route. When profiles change, the TUI
+rebuilds its configured catalog and retains discovered IDs whose catalog and
+model routes are unchanged. Explicit provider qualification takes precedence,
+followed by unambiguous literal IDs, including IDs that end in a thinking
+suffix. Before parsing a thinking suffix, `/model` checks configured IDs even
+with an empty picker cache. A literal ID shared by multiple providers requires
+qualification.
+An unmatched ID with an unknown provider prefix still triggers an error.
+Credential-management commands and the host-granted SDK model file loader retain
+strict file handling.
+[Pi's model file loader](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/model-config.ts#L169-L199)
+
 Loopback RPC and PTY checks switched providers in one session, verified
 conversation continuity and credential isolation between the endpoints,
 and reopened a session with its saved provider.
