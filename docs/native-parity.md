@@ -6485,6 +6485,15 @@ the configured payload. Live verification on compatible servers remains open.
 The native catalog includes Pi AI v1.6.0's 35 Copilot chat models across
 Chat Completions, Anthropic Messages, and OpenAI Responses. Models that
 advertise thinking effort on Chat Completions use its reasoning-effort field.
+
+Native Copilot Chat Completions retain the latest nonempty opaque reasoning
+value for replay, including turns with no reasoning text. Valid structured
+reasoning details take precedence. The value is stored in private journal
+metadata and replayed only for the same provider, model, and resolved Chat
+Completions endpoint. The displayed transcript omits the opaque value and shows
+reasoning text when present. Loopback tests cover the wire format and replay
+after reopening a session, following the [pinned Pi opaque reasoning fixtures](https://github.com/earendil-works/pi/blob/2126569de40d5595dd3f41f7af126001f04c1de0/packages/ai/test/openai-completions-reasoning-opaque.test.ts).
+
 Copilot Messages and Responses expose strict sampling for supported tools.
 Ordinary Responses function declarations explicitly send `strict: false` to
 prevent Copilot from imposing strict sampling and filling optional fields.

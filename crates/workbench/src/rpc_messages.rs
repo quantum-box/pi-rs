@@ -1039,6 +1039,67 @@ mod tests {
     }
 
     #[test]
+    fn copilot_opaque_replay_is_absent_from_rendered_messages() {
+        for reasoning in [None, Some("Plan.".to_owned())] {
+            let initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            let mut records = initial.records().to_vec();
+            let request_id = Uuid::new_v4();
+            for event in [
+                Event::ModelFinished {
+                    request_id,
+                    metadata: ModelMetadata {
+                        finish_reason: Some("stop".into()),
+                        reasoning: reasoning.clone(),
+                        provider_api: Some(pi_rs::ModelApi::OpenaiCompletions),
+                        replay: Some(Box::new(pi_rs::ProviderReplay {
+                            identity: pi_rs::ResolvedModelIdentity {
+                                provider: "github-copilot".into(),
+                                model: "fixture".into(),
+                            },
+                            blocks: vec![json!({
+                                "type":"reasoning.copilot",
+                                "field":reasoning.as_ref().map(|_| "reasoning_text"),
+                                "text":reasoning,
+                                "opaque":"private-replay-value",
+                            })],
+                        })),
+                        ..Default::default()
+                    },
+                    usage: UsageReport::Unconfirmed,
+                    failure: None,
+                    partial: String::new(),
+                    reply: None,
+                },
+                Event::Assistant {
+                    content: "Answer.".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: Some(request_id),
+                },
+            ] {
+                let parent = records.last().unwrap();
+                records.push(Record {
+                    id: parent.id + 1,
+                    parent: Some(parent.id),
+                    version: parent.version,
+                    timestamp: None,
+                    run_id: None,
+                    event,
+                });
+            }
+            let session = Session::from_records(records).unwrap();
+            let (messages, _) = snapshot(&session);
+            let mut expected = Vec::new();
+            if let Some(reasoning) = reasoning {
+                expected.push(json!({"type":"thinking","thinking":reasoning}));
+            }
+            expected.push(json!({"type":"text","text":"Answer."}));
+            assert_eq!(messages[0]["content"], json!(expected));
+            assert!(!messages[0].to_string().contains("private-replay-value"));
+        }
+    }
+
+    #[test]
     fn native_assistant_stop_is_preserved_when_an_edit_empties_the_reply() {
         for (has_calls, stop, selected) in [(false, "stop", None), (true, "toolUse", Some("older"))]
         {
