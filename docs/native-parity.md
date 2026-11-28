@@ -877,6 +877,10 @@ independently of its extension and can replace a previous export. The
 destination is written atomically, and the active session file is protected
 from being replaced by its own export. The export uses the native renderer.
 
+Native SDK HTML export requires a host-selected destination and atomically
+creates a new file. Both the owned SDK session and shared journal exporters
+return `AlreadyExists` if the destination exists at publication.
+
 Cancelled model turns with streamed text remain visible in RPC `get_messages`
 after settlement and session reopen. Marked partials have stable entries in
 `get_entries` and `get_tree`; `edit_context` can replace or omit their displayed

@@ -66,6 +66,7 @@ mod rpc_entries;
 mod rpc_events;
 mod rpc_messages;
 mod runtime;
+mod session_html_output;
 mod session_import;
 mod sessions;
 mod share_refresh;
@@ -1898,7 +1899,7 @@ fn export_from_file(paths: &[PathBuf], protected_inputs: &[PathBuf]) -> Result<(
             let path = std::path::absolute(normalize(path)?)?;
             match path.canonicalize() {
                 Ok(input) => {
-                    if same_export_file(&input, &output)? {
+                    if sessions::same_export_file(&input, &output)? {
                         return Err(Error::Config(
                             "Cannot export HTML over an input session file".into(),
                         ));
@@ -1922,21 +1923,6 @@ fn export_from_file(paths: &[PathBuf], protected_inputs: &[PathBuf]) -> Result<(
         output_path.display()
     );
     Ok(())
-}
-
-fn same_export_file(input: &Path, output: &Path) -> std::io::Result<bool> {
-    if input == output {
-        return Ok(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let input = input.metadata()?;
-        let output = output.metadata()?;
-        Ok(input.dev() == output.dev() && input.ino() == output.ino())
-    }
-    #[cfg(not(unix))]
-    Ok(false)
 }
 
 async fn read_piped_stdin() -> Result<Vec<u8>> {

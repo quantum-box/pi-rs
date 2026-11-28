@@ -393,6 +393,31 @@ The JavaScript browser SDK uses a separate `wasm-bindgen` wrapper around the cor
 session. Its prompt and resume methods return promises for completed answers,
 and its current bindings do not expose this subscription.
 
+## Native HTML export
+
+Use `pi_rs_workbench::session_html::export_agent_session(&session, &path)`
+from the native host to export the selected branch. The host chooses the
+destination, for example through a native save dialog in a Tauri command.
+Both disk-backed and in-memory sessions use the CLI and RPC renderer. Export
+is synchronous and reports a busy journal through the usual SDK error.
+
+For a shared `Session`, `session_html::render(&journal)` returns the document
+without filesystem access. Use `session_html::export(&journal, &path)` to
+write it to a file.
+
+Both file exporters atomically create a new destination whose parent
+directory already exists. If the destination exists at publication, the
+exporter returns an I/O error with kind `AlreadyExists`. On Unix, a directory
+sync error after publication can leave the HTML in place.
+
+Pi's SDK chooses a default output filename, supports a theme override, and
+uses extension tool HTML renderers. The native SDK export requires an explicit
+path and uses the Workbench's fixed style and built-in tool formatting. It
+exports the journal's selected branch, with escaped Markdown and a restrictive
+content security policy. Browser WASM hosts can request export from a native
+backend. The HTML export API lives in native Workbench.
+[Pinned Pi SDK export](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L4462-L4486)
+
 ## Browser WASM status
 
 The standalone `pi-rs-tool-arguments` crate isolates complete tool-argument
