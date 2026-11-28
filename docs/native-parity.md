@@ -3409,7 +3409,9 @@ when another program takes over the terminal.
 Suspension can interrupt the terminal's wait during `/reload`. Package
 preparation resumes with the foreground job.
 Windows and WSL use Pi's Ctrl+Q follow-up, Alt+P reverse-model and Alt+V paste
-bindings. Unix suspension remains available on WSL.
+bindings. On Linux, WSL detection uses nonempty WSL environment markers and
+falls back to the kernel signature in `/proc/version` for service-launched
+terminals. Unix suspension remains available on WSL.
 Windows uses Ctrl+Z for undo; WSL uses Alt+Z so Ctrl+Z remains suspend.
 Both use Ctrl+F for fullscreen transcript search and their prompt-jump
 defaults omit the redundant Ctrl+Shift variants, matching Pi.
