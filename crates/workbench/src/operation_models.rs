@@ -3099,7 +3099,8 @@ mod tests {
             }
             let body = json!({"id":"fixture-response", "choices":[], "usage":{
                 "prompt_tokens":100, "completion_tokens":10,
-                "prompt_tokens_details":{"cached_tokens":120,"cache_write_tokens":20}
+                "prompt_tokens_details":{"cached_tokens":120,"cache_write_tokens":20},
+                "completion_tokens_details":{"reasoning_tokens":2,"image_tokens":7}
             }})
             .to_string();
             stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -3137,6 +3138,8 @@ mod tests {
         assert_eq!(data["usage"]["output"], 10);
         assert_eq!(data["usage"]["cacheRead"], 100);
         assert_eq!(data["usage"]["cacheWrite"], 20);
+        assert_eq!(data["usage"]["reasoning"], 2);
+        assert_eq!(data["usage"]["imageOutput"], 7);
         assert_eq!(data["usage"]["totalTokens"], 130);
         assert!((data["usage"]["cost"]["total"].as_f64().unwrap() - 0.0004).abs() < 1e-12);
         let request = server.await.unwrap();
