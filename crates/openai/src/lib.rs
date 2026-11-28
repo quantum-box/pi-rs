@@ -10,8 +10,9 @@ use base64::Engine;
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::{StreamExt, stream::BoxStream};
 use pi_rs_core::{
-    CacheRetention, Error, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest,
-    ModelStream, ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
+    AssistantDiagnostic, CacheRetention, Error, Message, Model, ModelApi, ModelEvent,
+    ModelMetadata, ModelRequest, ModelStream, OpenAiInputTransformations, ProviderReplay,
+    ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
@@ -963,7 +964,7 @@ impl OpenAiResponses {
     }
 }
 
-fn response_usage_metadata(
+fn response_metadata(
     api: ModelApi,
     model: &str,
     requested_tier: Option<&str>,
@@ -986,12 +987,24 @@ fn response_usage_metadata(
         _ => None,
     };
     let counts = &response["usage"]["input_tokens_details"];
+    let diagnostics = OpenAiInputTransformations::from_value(&response["input_transformations"])
+        .map(|details| {
+            let millis = std::time::UNIX_EPOCH
+                .elapsed()
+                .unwrap_or_default()
+                .as_millis();
+            AssistantDiagnostic::OpenAiInputTransformations {
+                timestamp: i64::try_from(millis).unwrap_or(i64::MAX),
+                details,
+            }
+        });
     ModelMetadata {
         cached_input_tokens: counts["cached_tokens"].as_u64(),
         cache_creation_input_tokens: counts["cache_write_tokens"].as_u64(),
         reasoning_output_tokens: response["usage"]["output_tokens_details"]["reasoning_tokens"]
             .as_u64(),
         catalog_cost_multiplier: multiplier.and_then(serde_json::Number::from_f64),
+        diagnostics: diagnostics.into_iter().collect(),
         ..Default::default()
     }
 }
@@ -2585,7 +2598,7 @@ impl OpenAiResponses {
                             }
                             Box::new(replay)
                         });
-                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay, ..response_usage_metadata(api, &model, requested_service_tier.as_deref(), response) }));
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay, ..response_metadata(api, &model, requested_service_tier.as_deref(), response) }));
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls:calls.into_values().collect(), usage });
                         return;
                     }
@@ -5882,6 +5895,76 @@ mod tests {
                 configuration_update("high")
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn responses_reasoning_removals_come_from_successful_terminal_response() {
+        let removal = json!({
+            "type":"reasoning", "id":"rs_edited", "action":"removed", "reason":"prefix_mismatch"
+        });
+        let report = json!([
+            removal,
+            {"type":"reasoning","id":"rs_old","action":"removed","reason":"turn_boundary"},
+            {"type":"reasoning","id":"rs_changed","action":"changed"},
+            null,
+        ]);
+        for (kind, status, expected) in [
+            ("response.completed", "completed", Some("stop")),
+            ("response.incomplete", "incomplete", Some("length")),
+            ("response.done", "completed", Some("stop")),
+            ("response.failed", "failed", None),
+        ] {
+            let early = json!({"type":"response.created","response":{"input_transformations":[
+                {"type":"reasoning","id":"rs_early","action":"removed","reason":"model_mismatch"}
+            ]}});
+            let terminal = json!({"type":kind, "response":{
+                "status":status, "output":[], "input_transformations":report,
+                "incomplete_details":{"reason":"max_output_tokens"},
+            }});
+            let (mut client, server) =
+                fixture(&format!("data: {early}\n\ndata: {terminal}\n\n")).await;
+            if kind == "response.done" {
+                client.codex_account = Some("fixture-account".into());
+                client.codex_transport = CodexTransport::Sse;
+            }
+            let events = client
+                .stream(ModelRequest {
+                    model: "fixture".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            server.await.unwrap();
+            if let Some(finish_reason) = expected {
+                let metadata = events
+                    .iter()
+                    .find_map(|event| match event {
+                        Ok(ModelEvent::Metadata(metadata)) => Some(metadata),
+                        _ => None,
+                    })
+                    .expect("terminal metadata");
+                assert_eq!(metadata.finish_reason.as_deref(), Some(finish_reason));
+                assert!(metadata.reasoning.is_none());
+                let diagnostics = json!(metadata.diagnostics);
+                assert_eq!(diagnostics[0]["type"], "openai_input_transformations");
+                assert!(diagnostics[0]["timestamp"].as_i64().unwrap() > 0);
+                assert_eq!(
+                    diagnostics[0]["details"]["transformations"],
+                    json!([removal])
+                );
+            } else {
+                assert!(events.iter().any(Result::is_err));
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, Ok(ModelEvent::Metadata(_))))
+                );
+            }
+        }
     }
 
     #[tokio::test]

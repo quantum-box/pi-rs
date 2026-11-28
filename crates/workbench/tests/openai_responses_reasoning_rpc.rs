@@ -62,7 +62,10 @@ fn responses_reasoning_item_survives_rpc_stream_and_finalization() {
             json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"thought"}),
             json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Final summary"}]}}),
             json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Answer"}]}}),
-            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Final summary"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Answer"}]}]}}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Final summary"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Answer"}]}],"input_transformations":[
+                {"type":"reasoning","id":"rs_edited","action":"removed","reason":"prefix_mismatch","encrypted_content":"fixture-private"},
+                {"type":"reasoning","id":"rs_old_turn","action":"removed","reason":"turn_boundary"}
+            ]}}),
         ];
         let sse: String = events
             .iter()
@@ -245,4 +248,12 @@ fn responses_reasoning_item_survives_rpc_stream_and_finalization() {
         message["message"]["content"],
         json!([{"type":"thinking","thinking":"Final summary"},{"type":"text","text":"Answer"}])
     );
+    let diagnostic = &message["message"]["diagnostics"][0];
+    assert_eq!(diagnostic["type"], "openai_input_transformations");
+    assert!(diagnostic["timestamp"].as_i64().unwrap() > 0);
+    assert_eq!(
+        diagnostic["details"]["transformations"],
+        json!([{"type":"reasoning","id":"rs_edited","action":"removed","reason":"prefix_mismatch"}])
+    );
+    assert!(!json!(events).to_string().contains("fixture-private"));
 }
