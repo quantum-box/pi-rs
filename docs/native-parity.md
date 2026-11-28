@@ -932,6 +932,14 @@ changes rerender the active presentation with the host theme. Live tool
 calls render progressively parsed arguments and execution updates render
 partial content before the committed result.
 
+Rust SDK hosts can opt in to live `tool_execution_update` payloads with
+`AgentSession::subscribe_tool_progress()`. Direct and control-triggered runs
+forward the scheduler's partial results, including parent call IDs for nested
+tools. The bounded stream reports lag and closes with the session. Final tool
+results stay on the existing record stream. The JavaScript browser wrapper
+continues to return completed prompt and resume results.
+[Pinned Pi event dispatch](https://github.com/earendil-works/pi/blob/bf3f6a2228710cf457604f74b0aceb7bcc8a6b9e/packages/coding-agent/src/core/agent-session.ts#L1209-L1213)
+
 ### Executable cross-tool renderers
 
 Executable extensions advertise ordered exact and prefix matches for tool
