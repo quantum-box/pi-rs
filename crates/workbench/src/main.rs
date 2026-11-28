@@ -28,6 +28,8 @@ mod changelog;
 mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+mod clipboard_wsl;
 mod cloudflare_gateway;
 mod codex_auth;
 mod config;
@@ -57,6 +59,7 @@ mod vertex_auth;
 mod windows_file_identity;
 mod xai_auth;
 use providers::Provider;
+mod platform;
 mod radius_auth;
 mod radius_catalog;
 mod resource_paths;
