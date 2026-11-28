@@ -5977,9 +5977,10 @@ The new starting message and the hook's prompt override are excluded from the
 summary. The saved prior-history token estimate also excludes the incoming
 image prompt when the SDK has already journaled it. A prior assistant older than the latest
 compaction cannot trigger this check. Provider failures, extension vetoes,
-and an insufficient local summary allowance leave preflight runnable. A model
-adapter's explicit budget failure or a summary that exceeds its allowance
-stops the run. Journal failures, including
+and an insufficient local summary allowance leave preflight runnable. Adapter
+cancellation, an explicit adapter budget failure, or a summary that exceeds
+its allowance stops the run. If the cancelled summary was dispatched, usage
+settlement runs before preflight returns cancellation. Journal failures, including
 writes requested by the failed-compaction hook, and usage settlement failures
 also stop it. Cancelling preflight or the native agent-start hook stops the run
 before RPC emits `agent_start`. RPC reports a started prompt after compaction

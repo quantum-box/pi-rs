@@ -5943,7 +5943,6 @@ impl Agent<'_> {
                             | Error::Extension { .. }
                             | Error::Config(_)
                             | Error::AuthorizationRequired { .. }
-                            | Error::Cancelled
                     ),
                 });
         let event = match &result {
@@ -6102,7 +6101,10 @@ impl Agent<'_> {
             )
             .await?;
             match result {
-                Ok(Some(result)) if result.cancel => return Err(Error::Cancelled),
+                Ok(Some(result)) if result.cancel => {
+                    progress.failure = SummaryFailure::Optional;
+                    return Err(Error::Cancelled);
+                }
                 Ok(Some(result)) => supplied = result.compaction,
                 Ok(None) => {}
                 Err(message) => observer(Notification::ExtensionLifecycleError {
@@ -7181,9 +7183,9 @@ enum SummaryFailure {
 
 impl SummaryFailure {
     fn from_model_error(error: &Error) -> Self {
-        // A model's explicit budget error applies to the run. Local summary
-        // allowance checks decide separately whether to skip compaction.
-        if matches!(error, Error::Budget) {
+        // An adapter can cancel independently of the caller's token. Its
+        // cancellation and explicit budget errors apply to the whole run.
+        if matches!(error, Error::Budget | Error::Cancelled) {
             Self::Fatal
         } else {
             Self::Optional

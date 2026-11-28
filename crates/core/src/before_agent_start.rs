@@ -565,7 +565,9 @@ mod tests {
         #[default]
         Success,
         PreparationBudget,
+        PreparationCancelled,
         PreparationUnavailable,
+        ProviderCancelled,
         ProviderFailure,
         ProviderIo,
         ProviderJson,
@@ -604,6 +606,7 @@ mod tests {
             if is_summary_request(request) {
                 let error = match self.1 {
                     SummaryOutcome::PreparationBudget => Error::Budget,
+                    SummaryOutcome::PreparationCancelled => Error::Cancelled,
                     SummaryOutcome::PreparationUnavailable => {
                         std::io::Error::other("summary adapter unavailable").into()
                     }
@@ -631,6 +634,7 @@ mod tests {
                 );
                 self.0.lock().unwrap().push("summary request");
                 match self.1 {
+                    SummaryOutcome::ProviderCancelled => return Err(Error::Cancelled),
                     SummaryOutcome::ProviderFailure | SummaryOutcome::SettlementIo => {
                         return Err(Error::RetryableModel("summary provider unavailable".into()));
                     }
@@ -1311,6 +1315,78 @@ mod tests {
                     .any(|(_, input)| input.id == queued_id),
                 queued_after_turn
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_adapter_cancellation_stops_preflight_and_settles_dispatch() {
+        for (summary, expected_trace, dispatched) in [
+            (
+                SummaryOutcome::PreparationCancelled,
+                &["before compaction", "prepare summary"][..],
+                false,
+            ),
+            (
+                SummaryOutcome::ProviderCancelled,
+                &[
+                    "before compaction",
+                    "summary request",
+                    "settle unconfirmed summary",
+                ][..],
+                true,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            seed_compaction_history(&mut Session::open(&path).unwrap(), false);
+            let trace = Arc::new(CompactionTrace(Mutex::default(), summary));
+            let mut sdk = compaction_builder(&trace)
+                .extension(trace.clone())
+                .unwrap()
+                .open(path)
+                .unwrap();
+
+            let result = sdk.prompt("new question").await;
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert_eq!(*trace.0.lock().unwrap(), expected_trace);
+            let journal = sdk.journal().unwrap();
+            assert_eq!(journal.pending_before_agent_start_run(), None);
+            assert!(matches!(
+                journal.records().last().unwrap().event,
+                Event::Run {
+                    state: RunState::Cancelled,
+                    ..
+                }
+            ));
+            assert!(!journal.records().iter().any(|record| matches!(
+                &record.event,
+                Event::SourceEntry { format, .. } if format == PLAN_FORMAT
+            ) || matches!(
+                record.event,
+                Event::Compacted { .. }
+            )));
+            let requests: Vec<_> = journal
+                .records()
+                .iter()
+                .filter_map(|record| match record.event {
+                    Event::ModelRequested { request_id, .. } => Some(request_id),
+                    _ => None,
+                })
+                .collect();
+            let finished: Vec<_> = journal
+                .records()
+                .iter()
+                .filter_map(|record| match record.event {
+                    Event::ModelFinished {
+                        request_id,
+                        usage: crate::UsageReport::Unconfirmed,
+                        ..
+                    } => Some(Some(request_id)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(requests.len(), usize::from(dispatched));
+            assert_eq!(requests, finished);
         }
     }
 
