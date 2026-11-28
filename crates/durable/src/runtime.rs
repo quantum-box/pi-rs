@@ -9597,6 +9597,30 @@ impl Harness {
         )
     }
 
+    fn append_documents_unchanged(
+        &self,
+        previous_key: &[u8],
+        append_key: &[u8],
+        revision: u64,
+    ) -> Result<bool, Error> {
+        let store = self.owner.store();
+        let Some(previous_revision) = store.document_cut(previous_key)? else {
+            return Ok(false);
+        };
+        if previous_revision >= revision {
+            return Ok(previous_revision == revision);
+        }
+        // A newer cut can include writes made between the two conversation
+        // commits. The latest document revision must predate the append itself.
+        let previous = store.first_commit_for_key(previous_key)?;
+        let documents = store.document_commit_sequence(revision)?;
+        let append = store.first_commit_for_key(append_key)?;
+        Ok(matches!((previous, documents, append),
+            (Some(previous), Some(documents), Some(append))
+                if previous < documents && documents < append
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn fork_at_selected(
         &mut self,
@@ -9641,7 +9665,12 @@ impl Harness {
                 .checked_sub(1)
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
             let previous_key = format!("runtime/fork/{}/{:020}", id, previous);
-            if self.owner.store().document_cut(previous_key.as_bytes())? != Some(revision) {
+            let unchanged = if reset_cut.is_none() {
+                self.append_documents_unchanged(previous_key.as_bytes(), key.as_bytes(), revision)?
+            } else {
+                self.owner.store().document_cut(previous_key.as_bytes())? == Some(revision)
+            };
+            if !unchanged {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             }
         }
@@ -11472,7 +11501,7 @@ impl Harness {
             return Err(InvalidSnapshot.into());
         }
         let prefix_histories = if let Some((_, Some(count))) = position {
-            let (retain, batch_len) =
+            let (retain, batch_len, append_cut) =
                 self.checkout_prefix_len(&source, observation.0, count, &mut checks)?;
             if batch_len != messages.len()
                 || occurrences[..retain]
@@ -11483,8 +11512,13 @@ impl Harness {
             }
             let previous = observation.0.checked_sub(1).ok_or(InvalidSnapshot)?;
             let previous_anchor = self.fork_anchor_checks(origin, previous)?;
-            let revision = store.document_cut(&anchor[1].key)?;
-            if revision.is_none() || store.document_cut(&previous_anchor[1].key)? != revision {
+            let revision = store.document_cut(&anchor[1].key)?.ok_or(InvalidSnapshot)?;
+            let unchanged = if append_cut {
+                self.append_documents_unchanged(&previous_anchor[1].key, &anchor[1].key, revision)?
+            } else {
+                store.document_cut(&previous_anchor[1].key)? == Some(revision)
+            };
+            if !unchanged {
                 return Err(InvalidSnapshot.into());
             }
             checks.extend(previous_anchor);
@@ -11591,14 +11625,14 @@ impl Harness {
         observation: u64,
         count: usize,
         checks: &mut Vec<Check>,
-    ) -> Result<(usize, usize), Error> {
+    ) -> Result<(usize, usize, bool), Error> {
         use crate::fork::Error::InvalidSnapshot;
 
         let transcript =
             crate::transcript::Transcript::new(self.owner.store(), source.transcript_id());
         let page = transcript.read_with_blocks(source, std::num::NonZeroUsize::MIN)?;
         let entry = page.records.into_iter().next().ok_or(InvalidSnapshot)?;
-        let (stable_prefix, appended) = match serde_json::from_value(entry.value)? {
+        let (stable_prefix, appended, append_cut) = match serde_json::from_value(entry.value)? {
             TranscriptChange::AppendV3 {
                 stable_prefix,
                 messages,
@@ -11608,13 +11642,13 @@ impl Harness {
                 stable_prefix,
                 messages,
                 ..
-            } => (stable_prefix, messages.len()),
+            } => (stable_prefix, messages.len(), true),
             TranscriptChange::ReplaceV2 { messages, .. } => {
                 let (_, evidence) = self
                     .anchored_block_reset(source.transcript_id(), observation, source)?
                     .ok_or(InvalidSnapshot)?;
                 checks.extend(evidence);
-                (0, messages.len())
+                (0, messages.len(), false)
             }
             _ => return Err(InvalidSnapshot.into()),
         };
@@ -11624,6 +11658,7 @@ impl Harness {
         Ok((
             stable_prefix.checked_add(count).ok_or(InvalidSnapshot)?,
             stable_prefix.checked_add(appended).ok_or(InvalidSnapshot)?,
+            append_cut,
         ))
     }
 
@@ -13125,6 +13160,10 @@ impl Harness {
                         .value
                         .clone(),
                 )?;
+                let append_cut = matches!(
+                    source,
+                    TranscriptChange::AppendV3 { .. } | TranscriptChange::AppendV4 { .. }
+                );
                 let (stable_prefix, source_commit, source_origin, batch_len) = match source {
                     TranscriptChange::AppendV3 {
                         stable_prefix,
@@ -13175,7 +13214,16 @@ impl Harness {
                     .store()
                     .document_cut(current_key.as_bytes())?
                     .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                if self.owner.store().document_cut(previous_key.as_bytes())? != Some(revision)
+                let unchanged = if append_cut {
+                    self.append_documents_unchanged(
+                        previous_key.as_bytes(),
+                        current_key.as_bytes(),
+                        revision,
+                    )?
+                } else {
+                    self.owner.store().document_cut(previous_key.as_bytes())? == Some(revision)
+                };
+                if !unchanged
                     || stable_prefix.checked_add(batch_len) != Some(active.len())
                     || messages.len() <= stable_prefix
                     || messages.len() >= active.len()
