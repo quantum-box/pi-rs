@@ -48,6 +48,8 @@ pub fn extension_flag(name: &str) -> Option<ExtensionFlagValue> {
 #[derive(Clone)]
 struct Endpoint {
     path: PathBuf,
+    #[cfg(target_os = "macos")]
+    admitted_bytes: Option<Arc<[u8]>>,
     flags: Option<Arc<str>>,
     pi_lifecycle_fields: bool,
     compaction_overflow_reason_v1: bool,
@@ -89,8 +91,17 @@ impl Endpoint {
             outcome.legacy_text_result()
         }
     }
-    fn command(&self, protocol: &str) -> Command {
-        let mut command = Command::new(&self.path);
+    fn command(&self, protocol: &str) -> ExtensionResult<(Command, Option<tempfile::TempDir>)> {
+        #[cfg(target_os = "macos")]
+        let (mut command, staging) = if let Some(bytes) = &self.admitted_bytes {
+            let (staging, executable) =
+                project_trust::stage(bytes).map_err(|error| error.to_string())?;
+            (Command::new(executable), Some(staging))
+        } else {
+            (Command::new(&self.path), None)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (mut command, staging) = (Command::new(&self.path), None);
         if let Some(flags) = &self.flags {
             command.env(FLAGS_ENV, flags.as_ref());
         } else {
@@ -106,7 +117,7 @@ impl Endpoint {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        command
+        Ok((command, staging))
     }
 }
 
@@ -889,6 +900,8 @@ impl ExecutableExtension {
         }
         Ok(Endpoint {
             path: executable,
+            #[cfg(target_os = "macos")]
+            admitted_bytes: None,
             flags: None,
             pi_lifecycle_fields: false,
             compaction_overflow_reason_v1: false,
@@ -3224,8 +3237,8 @@ fn call_bash_stream(
     cancel: &CancellationToken,
     output: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> ExtensionResult<Option<i32>> {
-    let mut child = ChildGuard::spawn(endpoint.command("--pi-rs-extension-bash-v1"))
-        .map_err(|error| error.to_string())?;
+    let (command, _staging) = endpoint.command("--pi-rs-extension-bash-v1")?;
+    let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
     let (written, writes) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -3336,7 +3349,7 @@ fn call_duplex_inner<T: serde::de::DeserializeOwned>(
             ..
         }
     );
-    let command = endpoint.command("--pi-rs-extension-v2");
+    let (command, _staging) = endpoint.command("--pi-rs-extension-v2")?;
     if cancellation.is_cancelled() {
         return Err("native extension operation cancelled".into());
     }
@@ -4058,11 +4071,29 @@ fn call<T: serde::de::DeserializeOwned>(
                 .map_err(|error| error.to_string())?;
         }
     }
-    let bytes = serde_json::to_vec(&wire).map_err(|error| error.to_string())?;
+    let (command, _staging) = endpoint.command("--pi-rs-extension-v1")?;
+    call_wire(
+        command,
+        &wire,
+        response_limit,
+        presence_response.then_some(legacy_response_limit),
+        Duration::from_secs(30),
+        cancel,
+    )
+}
+
+fn call_wire<T: serde::de::DeserializeOwned>(
+    command: Command,
+    wire: &Value,
+    response_limit: u64,
+    presence_limit: Option<u64>,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> ExtensionResult<T> {
+    let bytes = serde_json::to_vec(wire).map_err(|error| error.to_string())?;
     if bytes.len() as u64 > MAX_REQUEST {
         return Err("extension request exceeds 64 MiB".into());
     }
-    let command = endpoint.command("--pi-rs-extension-v1");
     if cancel.is_some_and(CancellationToken::is_cancelled) {
         return Err("native extension operation cancelled".into());
     }
@@ -4085,7 +4116,7 @@ fn call<T: serde::de::DeserializeOwned>(
             .map(|_| bytes);
         let _ = reader.send(result);
     });
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
     let mut completed_write = false;
     let mut completed_read = None;
     let status = loop {
@@ -4095,9 +4126,10 @@ fn call<T: serde::de::DeserializeOwned>(
             );
         }
         if Instant::now() >= deadline {
-            return Err(
-                "native extension exceeded 30 seconds; outcome requires reconciliation".into(),
-            );
+            return Err(format!(
+                "native extension exceeded {} seconds; outcome requires reconciliation",
+                timeout.as_secs()
+            ));
         }
         if completed_read.is_none()
             && let Ok(result) = read.try_recv()
@@ -4139,16 +4171,145 @@ fn call<T: serde::de::DeserializeOwned>(
     if envelope.version != PROTOCOL {
         return Err("unsupported native extension protocol version".into());
     }
-    if presence_response {
+    if let Some(presence_limit) = presence_limit {
         check_presence_response(
             &envelope.response,
-            legacy_response_limit,
+            presence_limit,
             false,
             bytes.ends_with(b"\n"),
         )?;
     }
     serde_json::from_value(envelope.response?)
         .map_err(|error| format!("invalid native extension result: {error}"))
+}
+
+/// Startup trust hook for explicitly admitted native executables.
+pub mod project_trust {
+    use super::*;
+
+    #[derive(Deserialize)]
+    pub struct Event {
+        pub cwd: PathBuf,
+        pub mode: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Decision {
+        Yes,
+        No,
+        Undecided,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Vote {
+        pub trusted: Decision,
+        #[serde(default)]
+        pub remember: bool,
+    }
+
+    /// Serve the normal native protocol and optionally vote during Describe.
+    /// The hook receives no session or tool host.
+    pub fn serve(
+        extension: Arc<dyn Extension>,
+        hook: impl Fn(&Event) -> ExtensionResult<Vote>,
+    ) -> Result<()> {
+        super::serve_extension_inner(extension, Some(&hook))
+    }
+
+    /// Reconstitute the normal v1 registration from an earlier Describe.
+    #[doc(hidden)]
+    #[cfg(target_os = "macos")]
+    pub fn load_described(
+        path: &Path,
+        description: &Value,
+        verified_bytes: Vec<u8>,
+    ) -> Result<ExecutableExtension> {
+        ExecutableExtension::from_description(
+            Endpoint {
+                // The source path is provenance only. Every invocation uses
+                // a fresh private copy of the bytes this registration checked.
+                path: path.into(),
+                admitted_bytes: Some(verified_bytes.into()),
+                flags: None,
+                pi_lifecycle_fields: false,
+                compaction_overflow_reason_v1: false,
+                text_result_v2: false,
+                structured_text_result: false,
+            },
+            serde_json::from_value(description.clone())?,
+        )
+    }
+
+    #[doc(hidden)]
+    #[cfg(target_os = "macos")]
+    pub fn stage(verified_bytes: &[u8]) -> Result<(tempfile::TempDir, PathBuf)> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let root = Path::new("/private/tmp");
+        let metadata = root.symlink_metadata()?;
+        if root.canonicalize()? != root
+            || !metadata.is_dir()
+            || metadata.uid() != 0
+            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
+        {
+            return Err(Error::Config(
+                "native voter scratch root is not protected".into(),
+            ));
+        }
+        let staging = tempfile::Builder::new()
+            .prefix("pi-trust-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(root)?;
+        let metadata = staging.path().symlink_metadata()?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o700
+        {
+            return Err(Error::Config(
+                "native voter scratch is not owner-only".into(),
+            ));
+        }
+        let executable = staging.path().join("voter");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o500)
+            .open(&executable)?;
+        file.write_all(verified_bytes)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o500))?;
+        Ok((staging, executable))
+    }
+
+    /// The command is already sandboxed and can see only the preflight request.
+    #[doc(hidden)]
+    #[cfg(target_os = "macos")]
+    pub fn describe(
+        mut command: Command,
+        cwd: &Path,
+        cancel: &CancellationToken,
+    ) -> ExtensionResult<Value> {
+        use std::os::unix::process::CommandExt;
+        let cwd = cwd
+            .to_str()
+            .ok_or("project_trust requires a UTF-8 workspace path")?;
+        command
+            .arg("--pi-rs-extension-v1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0);
+        call_wire(
+            command,
+            &serde_json::json!({"type":"describe", "project_trust":{
+                "type":"project_trust", "cwd":cwd, "mode":"interactive"
+            }}),
+            1024 * 1024,
+            None,
+            Duration::from_secs(3),
+            Some(cancel),
+        )
+    }
 }
 #[cfg(windows)]
 type NativeChild = Box<dyn process_wrap::std::ChildWrapper>;
@@ -4217,6 +4378,16 @@ impl Drop for ChildGuard {
 /// Entry point for a native extension binary. Its stdout is reserved for the
 /// protocol response. Diagnostic output belongs on stderr.
 pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
+    serve_extension_inner(extension, None)
+}
+
+type ProjectTrustHook<'a> =
+    dyn Fn(&project_trust::Event) -> ExtensionResult<project_trust::Vote> + 'a;
+
+fn serve_extension_inner(
+    extension: Arc<dyn Extension>,
+    trust_hook: Option<&ProjectTrustHook<'_>>,
+) -> Result<()> {
     if std::env::args().any(|argument| argument == "--pi-rs-extension-bash-v1") {
         return serve_bash_stream(extension);
     }
@@ -4234,6 +4405,10 @@ pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
             Ok(raw) => {
                 let legacy_tree_response =
                     raw["type"] == "before_tree" && raw["lifecycleFieldNames"] != "camelCase";
+                let trust_event = trust_hook
+                    .zip(raw.get("project_trust"))
+                    .filter(|_| raw["type"] == "describe")
+                    .map(|(hook, event)| (hook, event.clone()));
                 match serde_json::from_value(raw) {
                     Ok(request) => {
                         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4242,6 +4417,19 @@ pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
                         runtime
                             .block_on(dispatch(extension, request))
                             .map(|mut response| {
+                                if let Some((hook, event)) = trust_event {
+                                    let vote = serde_json::from_value(event)
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|event| hook(&event));
+                                    match vote {
+                                        Ok(vote) => {
+                                            response["project_trust"] = serde_json::json!(vote)
+                                        }
+                                        Err(error) => {
+                                            response["project_trust_error"] = Value::String(error)
+                                        }
+                                    }
+                                }
                                 if legacy_tree_response {
                                     legacy_tree_decision(&mut response);
                                 }
@@ -5123,6 +5311,38 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn admitted_registration_stages_verified_bytes_for_callbacks() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let verified = b"approved fixture bytes";
+        std::fs::write(&source, verified).unwrap();
+        let extension = project_trust::load_described(
+            &source,
+            &serde_json::json!({"id":"fixture", "dependencies":[], "commands":[], "tools":[]}),
+            verified.to_vec(),
+        )
+        .unwrap();
+        std::fs::write(&source, b"updated fixture bytes").unwrap();
+        for protocol in [
+            "--pi-rs-extension-v1",
+            "--pi-rs-extension-v2",
+            "--pi-rs-extension-bash-v1",
+        ] {
+            let (command, staging) = extension.endpoint.command(protocol).unwrap();
+            let staging = staging.unwrap();
+            let executable = Path::new(command.get_program());
+            assert_eq!(executable.parent(), Some(staging.path()));
+            assert_eq!(std::fs::read(executable).unwrap(), verified);
+            assert_eq!(
+                staging.path().metadata().unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
     #[test]
     fn cancelled_extension_write_returns_with_a_full_queue() {
         let (writer, _reader) = std::sync::mpsc::sync_channel(1);
@@ -5137,6 +5357,8 @@ mod tests {
     fn cancelled_extension_request_does_not_spawn_process() {
         let endpoint = Endpoint {
             path: std::env::temp_dir().join("pi-cancelled-extension-does-not-exist"),
+            #[cfg(target_os = "macos")]
+            admitted_bytes: None,
             flags: None,
             pi_lifecycle_fields: false,
             compaction_overflow_reason_v1: false,
@@ -5663,6 +5885,8 @@ mod tests {
             description,
             endpoint: Endpoint {
                 path: PathBuf::from("nonexistent-pre-summary-executable"),
+                #[cfg(target_os = "macos")]
+                admitted_bytes: None,
                 flags: None,
                 pi_lifecycle_fields: false,
                 compaction_overflow_reason_v1: false,

@@ -127,6 +127,129 @@ pub fn builtin_enabled(args: &Cli, name: &str) -> Result<bool> {
     }
     Ok(enabled)
 }
+
+fn configured_entries(kind: Kind, entries: Vec<String>) -> Result<(Vec<String>, Vec<String>)> {
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| {
+            kind != Kind::Extension || !named_extension(entry.trim_start_matches(['+', '-', '!']))
+        })
+        .collect();
+    packages::validate_patterns(&entries)?;
+    Ok(entries
+        .into_iter()
+        .partition(|entry| !entry.starts_with(['+', '-', '!'])))
+}
+
+// This type is produced only by the user layer of the configured extension
+// resolver. No CLI, package, automatic walk, or project layer is visited.
+#[cfg(target_os = "macos")]
+pub(super) struct UserTrustExtension {
+    pub path: PathBuf,
+    pub id: String,
+    pub sha256: String,
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn user_trust_root(agent: &Path, workspace: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let agent = agent.canonicalize().ok()?;
+    let metadata = agent.metadata().ok()?;
+    if !metadata.is_dir()
+        || metadata.mode() & 0o022 != 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return None;
+    }
+    let agent_handle = same_file::Handle::from_path(&agent).ok()?;
+    let workspace_handle = same_file::Handle::from_path(workspace).ok()?;
+    let contains = |path: &Path, target: &same_file::Handle| {
+        path.ancestors().any(|ancestor| {
+            same_file::Handle::from_path(ancestor)
+                .as_ref()
+                .is_ok_and(|handle| handle == target)
+        })
+    };
+    (!contains(workspace, &agent_handle) && !contains(&agent, &workspace_handle)).then_some(agent)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn user_trust_extensions(
+    agent: &Path,
+    settings: &serde_json::Value,
+    disabled: &[String],
+) -> Result<Vec<UserTrustExtension>> {
+    #[derive(serde::Deserialize)]
+    struct Admission {
+        path: String,
+        id: String,
+        sha256: String,
+    }
+    let Some(admissions) = settings.get("projectTrustExtensions") else {
+        return Ok(Vec::new());
+    };
+    use std::os::unix::fs::MetadataExt;
+    let extension_dir = agent.join("extensions");
+    if !extension_dir.symlink_metadata().is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.mode() & 0o022 == 0
+            && metadata.uid() == unsafe { libc::geteuid() }
+    }) {
+        return Ok(Vec::new());
+    }
+    let admissions: Vec<Admission> = serde_json::from_value(admissions.clone())?;
+    if admissions.len() > 8 {
+        return Err(Error::Config(
+            "projectTrustExtensions allows at most eight voters".into(),
+        ));
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    let mut ids = std::collections::BTreeSet::new();
+    if admissions
+        .iter()
+        .any(|admission| !paths.insert(&admission.path) || !ids.insert(&admission.id))
+    {
+        return Err(Error::Config(
+            "duplicate projectTrustExtensions path or ID".into(),
+        ));
+    }
+    let extensions = settings
+        .get("extensions")
+        .map(|entries| serde_json::from_value(entries.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let (entries, patterns) = configured_entries(Kind::Extension, extensions)?;
+    let mut candidates: Vec<UserTrustExtension> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.strip_prefix("extensions/") else {
+            continue;
+        };
+        if name.is_empty()
+            || name.starts_with('.')
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        {
+            continue;
+        }
+        let path = extension_dir.join(name);
+        if !patterns.is_empty() && !packages::selected(&path, agent, &patterns) {
+            continue;
+        }
+        if let Some(admission) = admissions.iter().find(|admission| admission.path == entry)
+            && !disabled.contains(&admission.id)
+            && !candidates.iter().any(|candidate| candidate.path == path)
+        {
+            candidates.push(UserTrustExtension {
+                path,
+                id: admission.id.clone(),
+                sha256: admission.sha256.clone(),
+            });
+        }
+    }
+    Ok(candidates)
+}
 pub fn resolve(
     args: &Cli,
     kind: Kind,
@@ -205,25 +328,10 @@ pub fn resolve(
     let mut seen_prompts = Vec::new();
     for (layer_index, (base, entries)) in layers.into_iter().enumerate().rev() {
         let base = base.canonicalize().unwrap_or(base);
-        let entries: Vec<_> = entries
-            .into_iter()
-            .filter(|entry| {
-                kind != Kind::Extension
-                    || !named_extension(entry.trim_start_matches(['+', '-', '!']))
-            })
-            .collect();
-        packages::validate_patterns(&entries)?;
-        let patterns: Vec<_> = entries
-            .iter()
-            .filter(|entry| entry.starts_with(['+', '-', '!']))
-            .cloned()
-            .collect();
+        let (entries, patterns) = configured_entries(kind, entries)?;
         let mut configured = Vec::new();
-        for entry in entries
-            .iter()
-            .filter(|entry| !entry.starts_with(['+', '-', '!']))
-        {
-            let path = absolute(&base, entry);
+        for entry in entries {
+            let path = absolute(&base, &entry);
             if !skill_file_is_markdown(kind, &path, warnings) {
                 continue;
             }
@@ -242,6 +350,9 @@ pub fn resolve(
             });
         } else if !patterns.is_empty() {
             configured.retain(|path| packages::selected(path, &base, &patterns));
+        }
+        if kind == Kind::Extension && !args.trusted {
+            configured = outside_workspace(args, configured)?;
         }
         append(&mut paths, configured);
         let mut roots = vec![(base.join(kind.key()), base.clone())];
@@ -269,17 +380,15 @@ pub fn resolve(
             }
         }
         let mut overrides = vec!["**".to_owned()];
-        overrides.extend(
-            entries
-                .iter()
-                .filter(|entry| entry.starts_with(['+', '-', '!']))
-                .cloned(),
-        );
+        overrides.extend(patterns);
         for (root, scope) in roots {
             let mut discovered = match kind {
                 Kind::Prompt | Kind::Theme => auto_resources(&root, kind, warnings)?,
                 _ => collect(&root, kind, false, warnings)?,
             };
+            if kind == Kind::Extension && !args.trusted {
+                discovered = outside_workspace(args, discovered)?;
+            }
             discovered.retain(|path| {
                 if kind == Kind::Prompt {
                     let previous = seen_prompts.len();
@@ -293,16 +402,28 @@ pub fn resolve(
             append(&mut paths, discovered);
         }
     }
-    append(
-        &mut paths,
-        packaged
-            .iter()
-            .filter(|path| path.is_file())
-            .cloned()
-            .collect(),
-    );
+    let mut packaged: Vec<_> = packaged
+        .iter()
+        .filter(|path| path.is_file())
+        .cloned()
+        .collect();
+    if kind == Kind::Extension && !args.trusted {
+        packaged = outside_workspace(args, packaged)?;
+    }
+    append(&mut paths, packaged);
     append(&mut paths, additional_prompts);
+    args.verify_project_workspace()?;
     Ok(paths)
+}
+
+fn outside_workspace(args: &Cli, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut allowed = Vec::new();
+    for path in paths {
+        if super::project_trust::outside_untrusted_workspace(args, &path)? {
+            allowed.push(path);
+        }
+    }
+    Ok(allowed)
 }
 fn skill_file_is_markdown(kind: Kind, path: &Path, warnings: &mut Vec<String>) -> bool {
     if kind != Kind::Skill {

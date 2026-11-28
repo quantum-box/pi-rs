@@ -316,6 +316,7 @@ impl Settings {
             migrate_legacy_settings(&mut project);
             let user_only = project.as_object_mut().expect("object");
             user_only.remove("defaultProjectTrust");
+            user_only.remove("projectTrustExtensions");
             user_only.remove("cacheWarming");
             validate_settings(&project, &project_path)?;
             resource_layers.push((workspace.join(".pi"), project.clone()));
@@ -945,28 +946,148 @@ fn migrate_legacy_notices(settings: &mut Map<String, Value>) {
 }
 
 pub fn project_trust(workspace: &Path, explicit: Option<bool>) -> Result<Option<bool>> {
+    resolve_project_trust(workspace, explicit, &agent_dir(), |_| [], |_| {})
+}
+
+pub(super) struct ProjectTrustVote {
+    pub trusted: bool,
+    pub remember: bool,
+}
+
+// The host must authorize the source of each vote before invoking it. Keep
+// this iterator lazy so skipped callbacks cannot start executable processes.
+pub(super) fn resolve_project_trust<I>(
+    workspace: &Path,
+    explicit: Option<bool>,
+    agent: &Path,
+    preflight: impl FnOnce(&Path) -> I,
+    warn: impl FnMut(String),
+) -> Result<Option<bool>>
+where
+    I: IntoIterator<Item = std::result::Result<Option<ProjectTrustVote>, String>>,
+{
+    resolve_project_trust_guarded(workspace, explicit, agent, None, preflight, warn, || Ok(()))
+}
+
+pub(super) fn resolve_project_trust_guarded<I>(
+    workspace: &Path,
+    explicit: Option<bool>,
+    agent: &Path,
+    identity: Option<&super::project_trust::WorkspaceIdentity>,
+    preflight: impl FnOnce(&Path) -> I,
+    mut warn: impl FnMut(String),
+    check: impl Fn() -> Result<()>,
+) -> Result<Option<bool>>
+where
+    I: IntoIterator<Item = std::result::Result<Option<ProjectTrustVote>, String>>,
+{
+    check()?;
     if explicit.is_some() {
         return Ok(explicit);
     }
     let workspace = workspace.canonicalize()?;
-    let decisions = read_object(&agent_dir().join("trust.json"))?;
-    for directory in workspace.ancestors() {
-        if let Some(decision) = decisions
-            .get(directory.to_string_lossy().as_ref())
-            .and_then(Value::as_bool)
-        {
+    if let Some(decision) = existing_project_trust(&workspace, agent)? {
+        return Ok(Some(decision));
+    }
+    if !has_trust_requiring_project_resources(&workspace) {
+        return Ok(Some(true));
+    }
+    for vote in preflight(&workspace) {
+        check()?;
+        if let Some(decision) = existing_project_trust(&workspace, agent)? {
             return Ok(Some(decision));
         }
+        match vote {
+            Ok(Some(vote)) => {
+                if !vote.remember {
+                    check()?;
+                    return Ok(Some(vote.trusted));
+                }
+                return match record_canonical_trust(
+                    agent,
+                    &workspace,
+                    vote.trusted,
+                    true,
+                    identity,
+                    &check,
+                ) {
+                    Ok(decision) => Ok(Some(decision)),
+                    Err(TrustWriteError::MalformedNativeStore(error)) => {
+                        check()?;
+                        warn(format!(
+                            "Cannot remember native project trust vote: {error}"
+                        ));
+                        Ok(None)
+                    }
+                    Err(TrustWriteError::Other(error)) => Err(error),
+                };
+            }
+            Ok(None) => {}
+            Err(error) => warn(error),
+        }
     }
+    check()?;
+    Ok(None)
+}
+
+const NATIVE_TRUST_FILE: &str = "native-project-trust.json";
+
+fn stored_project_trust(
+    workspace: &Path,
+    decisions: &Value,
+    native_votes: Option<&Value>,
+) -> Option<bool> {
+    workspace.ancestors().find_map(|directory| {
+        let key = directory.to_string_lossy();
+        if let Some(value) = legacy_project_trust(directory, decisions) {
+            return Some(value);
+        }
+        let vote: SavedVote =
+            serde_json::from_value(native_votes?.get(key.as_ref())?.clone()).ok()?;
+        vote.workspace.verify(directory).ok()?;
+        Some(vote.trusted)
+    })
+}
+
+fn legacy_project_trust(directory: &Path, decisions: &Value) -> Option<bool> {
+    decisions
+        .get(directory.to_string_lossy().as_ref())
+        .and_then(Value::as_bool)
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct SavedVote {
+    trusted: bool,
+    workspace: super::project_trust::WorkspaceIdentity,
+}
+
+fn existing_project_trust(workspace: &Path, agent: &Path) -> Result<Option<bool>> {
+    let decisions = read_object(&agent.join("trust.json"))?;
+    if let Some(decision) = legacy_project_trust(workspace, &decisions) {
+        return Ok(Some(decision));
+    }
+    let native_votes = match read_object(&agent.join(NATIVE_TRUST_FILE)) {
+        Ok(votes) => Some(votes),
+        // A malformed native store supplies no votes. Legacy ancestor
+        // decisions and host policy still resolve trust normally.
+        Err(Error::Config(_)) => None,
+        Err(error) => return Err(error),
+    };
+    Ok(
+        stored_project_trust(workspace, &decisions, native_votes.as_ref())
+            .or_else(|| default_project_trust(agent)),
+    )
+}
+
+fn default_project_trust(agent: &Path) -> Option<bool> {
     // Settings::load reports a broken file. The trust gate must still choose
     // the conservative default instead of failing before that diagnostic.
-    let settings = read_object(&agent_dir().join("settings.json"))
-        .unwrap_or_else(|_| Value::Object(Map::new()));
+    let settings =
+        read_object(&agent.join("settings.json")).unwrap_or_else(|_| Value::Object(Map::new()));
     match settings["defaultProjectTrust"].as_str() {
-        Some("always") => Ok(Some(true)),
-        Some("never") => Ok(Some(false)),
-        _ if !has_trust_requiring_project_resources(&workspace) => Ok(Some(true)),
-        _ => Ok(None),
+        Some("always") => Some(true),
+        Some("never") => Some(false),
+        _ => None,
     }
 }
 
@@ -1012,22 +1133,122 @@ fn has_trust_requiring_project_resources(workspace: &Path) -> bool {
     false
 }
 
-pub fn save_trust(workspace: &Path, decision: bool) -> Result<()> {
-    let path = agent_dir().join("trust.json");
-    std::fs::create_dir_all(agent_dir())?;
+pub(super) fn save_trust_guarded(
+    workspace: &Path,
+    decision: bool,
+    check: impl Fn() -> Result<()>,
+) -> Result<()> {
+    check()?;
+    record_canonical_trust(
+        &agent_dir(),
+        &workspace.canonicalize()?,
+        decision,
+        false,
+        None,
+        &check,
+    )
+    .map(drop)
+    .map_err(Error::from)
+}
+
+#[cfg(test)]
+fn save_canonical_trust(agent: &Path, workspace: &Path, decision: bool) -> Result<()> {
+    record_canonical_trust(agent, workspace, decision, false, None, &|| Ok(()))
+        .map(drop)
+        .map_err(Error::from)
+}
+
+#[derive(Debug)]
+enum TrustWriteError {
+    MalformedNativeStore(Error),
+    Other(Error),
+}
+
+impl From<Error> for TrustWriteError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<TrustWriteError> for Error {
+    fn from(error: TrustWriteError) -> Self {
+        match error {
+            TrustWriteError::MalformedNativeStore(error) | TrustWriteError::Other(error) => error,
+        }
+    }
+}
+
+fn record_canonical_trust(
+    agent: &Path,
+    workspace: &Path,
+    decision: bool,
+    preserve_saved: bool,
+    identity: Option<&super::project_trust::WorkspaceIdentity>,
+    check: &impl Fn() -> Result<()>,
+) -> std::result::Result<bool, TrustWriteError> {
+    check()?;
+    let path = agent.join("trust.json");
+    std::fs::create_dir_all(agent).map_err(Error::from)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path.with_extension("lock"))?;
-    lock.lock()?;
-    let mut value = read_object(&path)?;
-    value.as_object_mut().expect("object").insert(
-        workspace.canonicalize()?.to_string_lossy().into_owned(),
-        Value::Bool(decision),
-    );
-    write_json(&path, &value)
+        .open(path.with_extension("lock"))
+        .map_err(Error::from)?;
+    loop {
+        check()?;
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(Error::from(error).into()),
+        }
+    }
+    check()?;
+    let mut decisions = read_object(&path)?;
+    if preserve_saved && let Some(saved) = legacy_project_trust(workspace, &decisions) {
+        return Ok(saved);
+    }
+    let native_path = agent.join(NATIVE_TRUST_FILE);
+    let native_votes = if preserve_saved || identity.is_some() {
+        read_object(&native_path)
+    } else {
+        Ok(Value::Null)
+    };
+    if preserve_saved
+        && matches!(&native_votes, Ok(_) | Err(Error::Config(_)))
+        && let Some(saved) = stored_project_trust(workspace, &decisions, native_votes.as_ref().ok())
+            .or_else(|| default_project_trust(agent))
+    {
+        return Ok(saved);
+    }
+    // The read fallback must never turn a malformed store into a writable one.
+    let mut native_votes = native_votes.map_err(|error| match error {
+        Error::Config(_) if identity.is_some() => TrustWriteError::MalformedNativeStore(error),
+        error => TrustWriteError::Other(error),
+    })?;
+    let key = workspace.to_string_lossy().into_owned();
+    if let Some(identity) = identity {
+        identity.verify(workspace)?;
+        native_votes.as_object_mut().expect("object").insert(
+            key,
+            serde_json::to_value(SavedVote {
+                trusted: decision,
+                workspace: identity.clone(),
+            })
+            .map_err(Error::from)?,
+        );
+        write_json_guarded(&native_path, &native_votes, check)?;
+    } else {
+        decisions
+            .as_object_mut()
+            .expect("object")
+            .insert(key, Value::Bool(decision));
+        write_json_guarded(&path, &decisions, check)?;
+    }
+    Ok(decision)
 }
 
 pub fn update_object(
@@ -1299,13 +1520,26 @@ fn injected_json_write_failure(path: &Path, value: &Value, stage: &'static str) 
 }
 
 pub fn write_json(path: &Path, value: &Value) -> Result<()> {
-    write_json_with_guard(path, value, None)
+    write_json_inner(path, value, None, &|| Ok(()))
+}
+
+fn write_json_guarded(path: &Path, value: &Value, check: &impl Fn() -> Result<()>) -> Result<()> {
+    write_json_inner(path, value, None, check)
 }
 
 fn write_json_with_guard(
     path: &Path,
     value: &Value,
     guard: Option<&super::auth_lock::Guard>,
+) -> Result<()> {
+    write_json_inner(path, value, guard, &|| Ok(()))
+}
+
+fn write_json_inner(
+    path: &Path,
+    value: &Value,
+    guard: Option<&super::auth_lock::Guard>,
+    check: &impl Fn() -> Result<()>,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -1320,6 +1554,7 @@ fn write_json_with_guard(
     file.as_file().sync_all()?;
     #[cfg(test)]
     injected_json_write_failure(path, value, "rename")?;
+    check()?;
     #[cfg(windows)]
     if let Some(guard) = guard {
         persist_locked_auth(file, path, guard)?;
@@ -1822,6 +2057,399 @@ mod tests {
     }
 
     #[test]
+    fn project_trust_guarded_write_checks_before_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("trust.json");
+        std::fs::write(&path, b"{\"prior\":true}").unwrap();
+        let rejected = super::write_json_guarded(&path, &serde_json::json!({"new": true}), &|| {
+            Err(super::Error::Cancelled)
+        });
+        assert!(matches!(rejected, Err(super::Error::Cancelled)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"prior\":true}");
+        super::write_json_guarded(&path, &serde_json::json!({"new": true}), &|| Ok(())).unwrap();
+        assert_eq!(super::read_object_unlocked(&path).unwrap()["new"], true);
+    }
+
+    #[test]
+    fn project_trust_preflight_runs_only_for_pending_host_decisions() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        std::fs::create_dir(&agent).unwrap();
+        let parent = root.path().join("repo");
+        let workspace = parent.join("subdir");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let resolve = |workspace: &std::path::Path, explicit| {
+            let called = std::cell::Cell::new(false);
+            let result = super::resolve_project_trust(
+                workspace,
+                explicit,
+                &agent,
+                |_| {
+                    called.set(true);
+                    []
+                },
+                |_| unreachable!(),
+            )
+            .unwrap();
+            assert!(!called.get(), "preflight ran for a resolved host decision");
+            result
+        };
+        assert_eq!(resolve(&workspace, None), Some(true));
+        std::fs::create_dir(workspace.join(".pi")).unwrap();
+        std::fs::write(
+            workspace.join(".pi/settings.json"),
+            r#"{"defaultProjectTrust":"always"}"#,
+        )
+        .unwrap();
+        for (default, expected) in [("always", true), ("never", false)] {
+            std::fs::write(
+                agent.join("settings.json"),
+                serde_json::json!({"defaultProjectTrust": default}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(resolve(&workspace, None), Some(expected));
+        }
+        let parent = parent.canonicalize().unwrap();
+        super::save_canonical_trust(&agent, &parent, false).unwrap();
+        assert_eq!(resolve(&workspace, None), Some(false));
+        assert_eq!(resolve(&workspace, Some(true)), Some(true));
+        super::save_canonical_trust(&agent, &parent, true).unwrap();
+        assert_eq!(resolve(&workspace, None), Some(true));
+        assert_eq!(resolve(&workspace, Some(false)), Some(false));
+        std::fs::write(agent.join("trust.json"), "{").unwrap();
+        assert_eq!(
+            resolve(&workspace.join("missing"), Some(false)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn project_trust_exact_and_inherited_legacy_decisions_survive_invalid_native_store() {
+        use serde_json::json;
+
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("project");
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let child = workspace.join("child");
+        std::fs::create_dir(&child).unwrap();
+        let native_path = agent.join(super::NATIVE_TRUST_FILE);
+        let resolve = |workspace: &std::path::Path| {
+            super::resolve_project_trust(
+                workspace,
+                None,
+                &agent,
+                |_| -> [std::result::Result<Option<super::ProjectTrustVote>, String>; 0] {
+                    panic!("preflight must not run")
+                },
+                |_| unreachable!(),
+            )
+        };
+
+        for contents in [b"{".as_slice(), b"[]"] {
+            std::fs::write(&native_path, contents).unwrap();
+            for decision in [true, false] {
+                std::fs::write(
+                    agent.join("trust.json"),
+                    json!({(workspace.to_str().unwrap()): decision}).to_string(),
+                )
+                .unwrap();
+                for target in [&workspace, &child] {
+                    assert_eq!(resolve(target).unwrap(), Some(decision));
+                    // The locked publish path must also preserve a newly saved decision.
+                    assert_eq!(
+                        super::record_canonical_trust(
+                            &agent,
+                            target,
+                            !decision,
+                            true,
+                            None,
+                            &|| Ok(()),
+                        )
+                        .unwrap(),
+                        decision
+                    );
+                }
+                assert_eq!(std::fs::read(&native_path).unwrap(), contents);
+            }
+        }
+    }
+
+    #[test]
+    fn project_trust_malformed_native_store_uses_host_policy_without_repairing_stores() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let legacy_path = agent.join("trust.json");
+        let native_path = agent.join(super::NATIVE_TRUST_FILE);
+        let settings_path = agent.join("settings.json");
+        let resolve =
+            || super::resolve_project_trust(&workspace, None, &agent, |_| [], |_| unreachable!());
+        std::fs::write(&native_path, b"{").unwrap();
+        for (policy, decision) in [
+            ("ask", None),
+            ("always", Some(true)),
+            ("never", Some(false)),
+        ] {
+            std::fs::write(
+                &settings_path,
+                serde_json::json!({"defaultProjectTrust":policy}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(resolve().unwrap(), decision);
+        }
+        std::fs::remove_file(settings_path).unwrap();
+        #[cfg(unix)]
+        {
+            let identity = crate::project_trust::WorkspaceIdentity::capture(&workspace).unwrap();
+            assert!(matches!(
+                super::record_canonical_trust(
+                    &agent,
+                    &workspace,
+                    true,
+                    true,
+                    Some(&identity),
+                    &|| Ok(()),
+                ),
+                Err(super::TrustWriteError::MalformedNativeStore(_))
+            ));
+        }
+        assert!(!legacy_path.exists());
+        assert_eq!(std::fs::read(&native_path).unwrap(), b"{");
+
+        super::save_canonical_trust(&agent, &workspace, false).unwrap();
+        assert_eq!(resolve().unwrap(), Some(false));
+        assert_eq!(std::fs::read(&native_path).unwrap(), b"{");
+        std::fs::write(&legacy_path, b"[]").unwrap();
+        assert!(resolve().is_err());
+        assert!(super::save_canonical_trust(&agent, &workspace, true).is_err());
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), b"[]");
+        assert_eq!(std::fs::read(&native_path).unwrap(), b"{");
+    }
+
+    #[test]
+    fn project_trust_preflight_resolves_in_order_and_remembers_only_decisive_votes() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        std::fs::write(
+            workspace.join(".pi/settings.json"),
+            r#"{"defaultProjectTrust":"always"}"#,
+        )
+        .unwrap();
+        let canonical = workspace.canonicalize().unwrap();
+        for (decision, remember) in [(None, false), (Some(true), false), (Some(false), true)] {
+            let mut calls = Vec::new();
+            let mut warnings = Vec::new();
+            let result = super::resolve_project_trust(
+                &workspace,
+                None,
+                &agent,
+                |cwd| {
+                    assert_eq!(cwd, canonical);
+                    let calls = &mut calls;
+                    ["failed", "undecided", "policy", "last"]
+                        .into_iter()
+                        .map(move |id| {
+                            calls.push(id);
+                            match id {
+                                "failed" => Err("failed: fixture runtime error".into()),
+                                "policy" => Ok(decision
+                                    .map(|trusted| super::ProjectTrustVote { trusted, remember })),
+                                _ => Ok(None),
+                            }
+                        })
+                },
+                |warning| warnings.push(warning),
+            )
+            .unwrap();
+            assert_eq!(result, decision);
+            assert_eq!(warnings, ["failed: fixture runtime error"]);
+            if decision.is_some() {
+                assert_eq!(calls, ["failed", "undecided", "policy"]);
+            } else {
+                assert_eq!(calls, ["failed", "undecided", "policy", "last"]);
+            }
+            assert_eq!(agent.join("trust.json").exists(), remember);
+        }
+        let saved = super::read_object(&agent.join("trust.json")).unwrap();
+        assert_eq!(saved[canonical.to_string_lossy().as_ref()], false);
+        assert_eq!(
+            super::resolve_project_trust(&workspace, None, &agent, |_| [], |_| unreachable!())
+                .unwrap(),
+            Some(false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_trust_preflight_propagates_native_write_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let agent = agent.canonicalize().unwrap();
+        let identity = crate::project_trust::WorkspaceIdentity::capture(&workspace).unwrap();
+        let native_path = agent.join(super::NATIVE_TRUST_FILE);
+        std::fs::write(&native_path, b"{}").unwrap();
+        super::fail_json_write_for_test(&native_path, false, "rename");
+
+        let result = super::resolve_project_trust_guarded(
+            &workspace,
+            None,
+            &agent,
+            Some(&identity),
+            |_| {
+                [Ok(Some(super::ProjectTrustVote {
+                    trusted: true,
+                    remember: true,
+                }))]
+            },
+            |_| panic!("a native write I/O failure must propagate"),
+            || Ok(()),
+        );
+        assert!(matches!(result, Err(super::Error::Io(error))
+            if error.to_string() == "injected JSON write failure"));
+        assert_eq!(std::fs::read(&native_path).unwrap(), b"{}");
+        assert!(!agent.join("trust.json").exists());
+    }
+
+    #[test]
+    fn project_trust_preflight_preserves_a_denial_saved_while_the_vote_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        for remember in [false, true] {
+            let decision = super::resolve_project_trust(
+                &workspace,
+                None,
+                &agent,
+                |canonical| {
+                    super::save_canonical_trust(&agent, canonical, false).unwrap();
+                    [Ok(Some(super::ProjectTrustVote {
+                        trusted: true,
+                        remember,
+                    }))]
+                },
+                |_| unreachable!(),
+            )
+            .unwrap();
+            assert_eq!(decision, Some(false));
+            std::fs::remove_file(agent.join("trust.json")).unwrap();
+        }
+    }
+
+    #[test]
+    fn project_trust_cancellation_discards_a_completed_vote() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let cancelled = pi_rs::CancellationToken::new();
+        let result = super::resolve_project_trust_guarded(
+            &workspace,
+            None,
+            &agent,
+            None,
+            |_| {
+                cancelled.cancel();
+                [Ok(Some(super::ProjectTrustVote {
+                    trusted: true,
+                    remember: true,
+                }))]
+            },
+            |_| unreachable!(),
+            || {
+                if cancelled.is_cancelled() {
+                    Err(pi_rs::Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(pi_rs::Error::Cancelled)));
+        assert!(!agent.join("trust.json").exists());
+        assert!(!agent.join(super::NATIVE_TRUST_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_trust_does_not_save_a_vote_for_a_replaced_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let identity = crate::project_trust::WorkspaceIdentity::capture(&workspace).unwrap();
+        let worker: crate::project_trust::WorkspaceIdentity =
+            serde_json::from_value(serde_json::to_value(&identity).unwrap()).unwrap();
+        worker.verify(&workspace).unwrap();
+        let result = super::resolve_project_trust_guarded(
+            identity.path(),
+            None,
+            &agent,
+            Some(&identity),
+            |_| {
+                std::fs::rename(&workspace, root.path().join("previous")).unwrap();
+                std::fs::create_dir(&workspace).unwrap();
+                [Ok(Some(super::ProjectTrustVote {
+                    trusted: true,
+                    remember: true,
+                }))]
+            },
+            |_| unreachable!(),
+            || identity.verify(&workspace),
+        );
+        assert!(result.is_err());
+        assert!(worker.verify(&workspace).is_err());
+        assert!(!agent.join("trust.json").exists());
+        assert!(!agent.join(super::NATIVE_TRUST_FILE).exists());
+
+        let current = crate::project_trust::WorkspaceIdentity::capture(&workspace).unwrap();
+        assert!(
+            super::record_canonical_trust(
+                &agent,
+                current.path(),
+                true,
+                true,
+                Some(&current),
+                &|| current.verify(&workspace)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            super::existing_project_trust(current.path(), &agent).unwrap(),
+            Some(true)
+        );
+        super::save_canonical_trust(&agent, current.path().parent().unwrap(), false).unwrap();
+        let child = current.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        assert_eq!(
+            super::existing_project_trust(&child, &agent).unwrap(),
+            Some(true)
+        );
+        super::save_canonical_trust(&agent, current.path(), false).unwrap();
+        assert_eq!(
+            super::existing_project_trust(&child, &agent).unwrap(),
+            Some(false)
+        );
+        std::fs::remove_file(agent.join("trust.json")).unwrap();
+        std::fs::rename(&workspace, root.path().join("remembered")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        assert_eq!(
+            super::existing_project_trust(current.path(), &agent).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn ancestor_agents_skills_require_project_trust_without_blocking_user_skills() {
         const CHILD: &str = "PI_RS_TEST_AGENTS_TRUST_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -1919,9 +2547,9 @@ mod tests {
         assert!(resources.skills.contains_key("global-example"));
         assert!(resources.skills.contains_key("project-example"));
         assert!(!resources.skills.contains_key("outside-example"));
-        super::save_trust(&repo, false).unwrap();
+        super::save_trust_guarded(&repo, false, || Ok(())).unwrap();
         assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(false));
-        super::save_trust(&repo, true).unwrap();
+        super::save_trust_guarded(&repo, true, || Ok(())).unwrap();
         assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(true));
         std::fs::remove_file(super::agent_dir().join("trust.json")).unwrap();
         for (value, expected) in [("always", true), ("never", false)] {

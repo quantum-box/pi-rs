@@ -1254,6 +1254,100 @@ Project configuration follows a stored trust decision, with an interactive
 trust selector and explicit `--trust` / `--no-trust` overrides. Context files
 remain readable independently of project trust. `/skills`, `/prompts`,
 `/skill:name`, prompt argument expansion and `/reload` are available.
+
+On macOS, the initial terminal startup can dispatch `project_trust` to
+explicitly admitted native extensions. The closest saved decision, including an
+ancestor's denial, is a host decision. Explicit host overrides take precedence
+over saved decisions, followed by user-level `defaultProjectTrust`. Upstream
+commit `b882d08f` dispatches its handlers before reading stored decisions. pi-rs
+reserves the event for an unresolved `ask` in a workspace with trust-requiring
+resources. CLI help and model listing, print and RPC, package commands, terminal
+session switches, and managed workers use their existing trust paths. Initial
+terminal launches with extension CLI flags also skip preflight because flag
+discovery may already have started a registration.
+
+Add the executable's literal relative path to `extensions` in the user
+`settings.json` and admit the same path, registered ID, and lowercase SHA-256
+under `projectTrustExtensions`. For example, a voter at
+`$PI_RS_HOME/extensions/company-policy` uses this settings shape:
+
+```json
+{
+  "extensions": ["extensions/company-policy"],
+  "projectTrustExtensions": [
+    {
+      "path": "extensions/company-policy",
+      "id": "company-policy",
+      "sha256": "<64 lowercase hex digits of the executable>"
+    }
+  ]
+}
+```
+
+Replace the placeholder with the digest from `shasum -a 256` for that file.
+Each admitted executable is a regular, user-owned file directly in the user
+extension directory. The source must be executable, match the pin, and pass
+the normal configured extension filters. Admission rejects linked files and
+overlapping workspace and agent roots. It never searches project, package,
+transient CLI, or extension-discovered sources. `--no-extensions` and the
+matching `--disable-extension` ID suppress the hook. Enabled candidates run in
+user `extensions` order. Automatic user-layer extension and package discovery
+excludes targets that resolve into an unresolved or denied workspace. Cached
+package roots and candidate executables are checked too. Automatic user-package
+Cargo preparation and uncached remote installs wait for project trust, since
+their dependency graphs and ambient configuration are outside that path check.
+Explicit CLI extension and package requests retain their separate authorization.
+
+Voter errors and undecided votes fall through to the next voter. If all abstain
+or fail, the existing trust selector appears. The first yes or no wins, and
+only a decisive vote with `remember: true` is saved. Native remembered votes
+are stored with the directory identity in `native-project-trust.json`. The
+shared `trust.json` keeps its path-based boolean format and takes precedence on
+an identical path. A malformed native vote file contributes no votes. Legacy
+ancestor decisions and the normal host default or selector still apply. A
+malformed legacy file remains an error. If an admitted extension asks to
+remember its vote and the native store is malformed, the host reports the
+problem and shows the manual selector without applying the vote. Manual choices
+are saved separately in `trust.json`.
+A stale native vote is ignored after directory replacement. A host decision
+recorded during preflight takes precedence. The terminal uses the canonical
+workspace and carries its identity into settings, package and resource
+resolution, and worker bootstrap.
+
+The macOS host invokes a verified copy inside the system sandbox with owner-only
+scratch and a cleared environment. The child receives the canonical workspace
+path and terminal mode. The profile denies workspace reads and grants no
+general network or filesystem writes. Its execution allowlist contains the
+copied executable and Bash for script voters. The launch closes inherited
+descriptors on exec and rejects launch when descriptor coverage or scratch
+ownership cannot be established. Startup waits for voter cleanup after
+cancellation. Cancellation is checked under the trust-file lock and again
+before publishing a remembered vote. Platforms without this sandbox use the
+existing selector.
+
+An admitted v1 executable receives its ordinary `describe` request augmented
+with `"project_trust":{"type":"project_trust","cwd":"…","mode":"interactive"}`.
+Rust extensions can use `pi_rs_extensions::project_trust::serve` to register
+the callback and keep the regular native protocol.
+Its ordinary `Describe` result may include
+`"project_trust":{"trusted":"yes","remember":true}`. Supported votes are
+`"yes"`, `"no"`, and `"undecided"`. Omitting the field also abstains.
+`"project_trust_error":"…"` reports a hook error alongside a valid registration.
+A process or protocol failure preserves the trust fallback and skips the failed
+registration for that terminal launch. No second `Describe` is sent. The host
+defers preparation of an explicit local package that includes a failed voter
+for that launch, so the terminal can still offer the trust selector. The host
+reuses valid registrations during package validation and forwards them to the
+terminal worker with the existing settings snapshot and resolved trust flag.
+The worker rechecks the pin on the opened source file and retains those verified
+bytes with the registration. Each ordinary callback launches a fresh private
+copy, while the configured path serves as provenance. Voters must be able to run
+from a relocated executable. Ordinary callbacks have the existing native
+extension privileges. The startup guards rely on the OS filesystem and process
+boundary, including trusted ownership of the agent and scratch roots. They
+provide no containment against an actor that can already act as the terminal
+user. Restart the terminal after changing a voter's executable or admission.
+
 As in Pi v1.5.0, the project `.agents/skills` trust check scans ancestors to
 the filesystem root, excluding the global home directory. Discovery stops at the
 first `.git` boundary, so an undiscovered skill above it can still prompt trust.

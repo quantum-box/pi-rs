@@ -8733,6 +8733,7 @@ pub(super) async fn run(
                             view.append("Wait for the shell command to finish");
                             view.editor.replace(input);
                         } else if input.trim() == "/reload" {
+                            args.verify_project_workspace()?;
                             view.cache_warming_status = None;
                             view.dialogs.clear();
                             view.ui_status.clear();
@@ -11040,7 +11041,9 @@ fn select(
             }
         }
         Selection::Trust(decision) => {
-            crate::config::save_trust(&args.workspace, decision)?;
+            crate::config::save_trust_guarded(&args.workspace, decision, || {
+                args.verify_project_workspace()
+            })?;
             args.trusted = decision;
             args.trust_pending = false;
             args.settings = args.settings.reload_latest(&args.workspace, decision)?;
@@ -11180,15 +11183,14 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
 }
 
 async fn prepare_initial_session_async(args: Cli) -> Result<Cli> {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
+    // Runtime shutdown joins started blocking tasks even when the startup
+    // future is dropped after a signal.
+    let mut args = tokio::task::spawn_blocking(move || {
         let mut args = args;
-        let result = restore_workspace(&mut args).map(|()| args);
-        let _ = sender.send(result);
-    });
-    let mut args = receiver
-        .await
-        .map_err(|_| Error::Config("workspace discovery stopped".into()))??;
+        restore_workspace_with_trust(&mut args, true).map(|()| args)
+    })
+    .await
+    .map_err(|_| Error::Config("workspace discovery stopped".into()))??;
     initialize_session(&mut args)?;
     Ok(args)
 }
@@ -11246,6 +11248,10 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     Ok(())
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
+    restore_workspace_with_trust(args, false)
+}
+
+fn restore_workspace_with_trust(args: &mut Cli, initial_terminal: bool) -> Result<()> {
     let session = Session::open(&args.session)?;
     if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);
@@ -11256,19 +11262,21 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
         }
         args.workspace = path;
     }
-    let decision = crate::config::project_trust(
-        &args.workspace,
-        if args.no_trust {
-            Some(false)
-        } else if args.trust || args.project.is_some() {
-            Some(true)
-        } else {
-            None
-        },
-    )?;
+    if cfg!(target_os = "macos") && (initial_terminal || args.project_workspace.is_some()) {
+        let identity = super::project_trust::WorkspaceIdentity::capture(&args.workspace)?;
+        args.workspace = identity.path().into();
+        args.project_workspace = Some(identity);
+    }
+    let decision = if initial_terminal {
+        crate::project_trust::resolve_initial(args)?
+    } else {
+        crate::config::project_trust(&args.workspace, args.explicit_project_trust())?
+    };
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
+    args.verify_project_workspace()?;
     args.settings = args.settings.reload_latest(&args.workspace, args.trusted)?;
+    args.verify_project_workspace()?;
     args.refresh_workspace_selection();
     args.restore_session_model(&session)?;
     drop(session);
@@ -16604,6 +16612,7 @@ exit {exit}
             "package-theme"
         );
         args.trusted = false;
+        std::fs::remove_file(project.join("settings.json")).unwrap();
 
         // Cargo metadata is parsed as data: even a build script is never run.
         let cargo_source = home.join("cargo-package");
@@ -17254,7 +17263,7 @@ exit {exit}
             }
         }
 
-        // A regular Cargo manifest still follows the normal offline build path.
+        // The picker can read Cargo theme metadata without granting permission to build.
         let valid_cargo = home.join("valid-cargo");
         std::fs::create_dir_all(valid_cargo.join("src")).unwrap();
         std::fs::create_dir_all(valid_cargo.join("palette")).unwrap();
@@ -17269,10 +17278,23 @@ exit {exit}
         .unwrap();
         args.offline = true;
         args.use_theme = Some("prepared-cargo-theme".into());
-        tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap()
+            .unwrap();
+        let before = std::fs::read(&index).unwrap();
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "prepared-cargo-theme"
+        );
+        runtime
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+
+        // The same package follows the offline build path after the fixture grants trust.
+        args.trusted = true;
+        runtime
             .block_on(super::super::packages::prepare(&args))
             .unwrap();
         assert!(

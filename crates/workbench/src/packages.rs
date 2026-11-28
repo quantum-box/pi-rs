@@ -229,10 +229,12 @@ pub async fn prepare(args: &Cli) -> Result<()> {
 }
 
 pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>) -> Result<()> {
+    args.verify_project_workspace()?;
     let mut installed = index()?;
     let mut plan = resource_declarations(args, false)?;
     plan.extend(resource_declarations(args, true)?);
     for declaration in plan {
+        args.verify_project_workspace()?;
         let is_remote = remote(&declaration.source);
         let cached = if is_remote {
             installed.contains_key(&key(&declaration.source))
@@ -262,13 +264,34 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
             continue;
         }
         if declaration.transient || !cached {
+            let restricted = declaration.scope_order == 1 && !args.trusted;
+            // Cargo can read ambient workspace config and transitively build
+            // local dependencies. No automatic remote build is scoped here.
+            if is_remote && restricted {
+                continue;
+            }
             eprintln!(
                 "Preparing native package {}",
                 display_source(&declaration.source)
             );
-            match install(&declaration.source, args.offline, cleanup).await {
-                Ok(package) => {
+            match install_with_registrations(
+                &declaration.source,
+                args.offline,
+                cleanup,
+                Some(args),
+                restricted,
+            )
+            .await
+            {
+                Ok(Some(package)) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
+                }
+                Ok(None) => {
+                    let error = deferred_preflight_package();
+                    if cleanup.is_some() {
+                        return Err(error);
+                    }
+                    eprintln!("Package {}: {error}", display_source(&declaration.source));
                 }
                 // Standalone share requires a complete runtime. Keep strict
                 // validation for explicitly requested native files and directories.
@@ -281,6 +304,7 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
             }
         }
     }
+    args.verify_project_workspace()?;
     Ok(())
 }
 
@@ -353,6 +377,15 @@ fn resolve_package_resources(
     let mut prompts = ResourceSelections::default();
     let mut themes = ResourceSelections::default();
     for declaration in resource_declarations(args, transient)? {
+        if declaration.scope_order == 1
+            && !args.trusted
+            && let Some(value) = installed.get(&key(&declaration.source))
+        {
+            let package: Installed = serde_json::from_value(value.clone())?;
+            if !super::project_trust::outside_untrusted_workspace(args, &package.root)? {
+                continue;
+            }
+        }
         let package = if startup {
             startup_package(&declaration, &installed)?
         } else {
@@ -1195,10 +1228,19 @@ fn resource_declarations(args: &Cli, transient: bool) -> Result<Vec<Declaration>
         .filter(|entry| entry.transient)
         .map(|entry| source_identity(&entry.source))
         .collect();
-    let users: Vec<_> = read(&agent)?
-        .into_iter()
-        .filter(|entry| !transient_identities.contains(&source_identity(&entry.source)))
-        .collect();
+    let mut users = Vec::new();
+    for entry in read(&agent)? {
+        if !transient_identities.contains(&source_identity(&entry.source))
+            && (remote(&entry.source)
+                || args.trusted
+                || super::project_trust::outside_untrusted_workspace(
+                    args,
+                    Path::new(&entry.source),
+                )?)
+        {
+            users.push(entry);
+        }
+    }
     let projects = if args.trusted {
         read(&project)?
             .into_iter()
@@ -1475,6 +1517,74 @@ fn remote(source: &str) -> bool {
 }
 
 async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Result<Installed> {
+    install_with_registrations(source, offline, cleanup, None, false)
+        .await?
+        .ok_or_else(deferred_preflight_package)
+}
+
+fn deferred_preflight_package() -> Error {
+    Error::Config(
+        "native package deferred for this launch after project_trust preflight failed".into(),
+    )
+}
+
+async fn validate_package_executable(
+    executable: &Path,
+    activation: Option<&Cli>,
+    restricted: bool,
+) -> Result<bool> {
+    if let Some(args) = activation {
+        args.verify_project_workspace()?;
+        if restricted && !super::project_trust::outside_untrusted_workspace(args, executable)? {
+            return Err(Error::Config(
+                "package executable is inside the untrusted workspace".into(),
+            ));
+        }
+    }
+    if let Some(registration) = activation.and_then(|args| {
+        args.trust_registrations
+            .load(executable, args.trusted.then_some(args.workspace.as_path()))
+    }) {
+        Ok(registration?.is_some())
+    } else {
+        pi_rs_extensions::ExecutableExtension::load_async(executable).await?;
+        Ok(true)
+    }
+}
+
+fn admit_user_package_preparation(args: &Cli, source: &str) -> Result<()> {
+    let path = Path::new(source);
+    if remote(source) || !super::project_trust::outside_untrusted_workspace(args, path)? {
+        return Err(Error::Config(
+            "package preparation requires a trusted source".into(),
+        ));
+    }
+    if path.is_dir() {
+        match path.join("Cargo.toml").symlink_metadata() {
+            Ok(_) => {
+                return Err(Error::Config(
+                    "automatic Cargo preparation requires project trust".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+async fn install_with_registrations(
+    source: &str,
+    offline: bool,
+    cleanup: Option<&Children>,
+    activation: Option<&Cli>,
+    restricted: bool,
+) -> Result<Option<Installed>> {
+    let check_workspace = || activation.map_or(Ok(()), Cli::verify_project_workspace);
+    check_workspace()?;
+    if restricted {
+        admit_user_package_preparation(activation.expect("automatic preparation"), source)?;
+    }
     if offline && remote(source) {
         return Err(Error::Config(format!(
             "cannot install package in offline mode: {}",
@@ -1504,9 +1614,12 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
         }
     }
     let _lock = lock;
+    check_workspace()?;
     if !remote(source) && Path::new(source).is_file() {
         let executable = PathBuf::from(source);
-        pi_rs_extensions::ExecutableExtension::load_async(&executable).await?;
+        if !validate_package_executable(&executable, activation, restricted).await? {
+            return Ok(None);
+        }
         let root = executable.parent().unwrap_or(Path::new(".")).to_path_buf();
         let package = Installed {
             source: source.into(),
@@ -1521,7 +1634,7 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
             index.insert(key(source), serde_json::to_value(&package)?);
             Ok(())
         })?;
-        return Ok(package);
+        return Ok(Some(package));
     }
     let generation = tempfile::Builder::new()
         .prefix("install-")
@@ -1529,12 +1642,16 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
     let mut root = PathBuf::from(source);
     let mut installed_binaries = Vec::new();
     if let Some(specification) = source.strip_prefix("cargo:") {
+        check_workspace()?;
         let (name, version) = specification
             .rsplit_once('@')
             .map_or((specification, None), |(name, version)| {
                 (name, Some(version))
             });
         let mut command = tokio::process::Command::new("cargo");
+        if let Some(args) = activation {
+            command.current_dir(&args.workspace);
+        }
         command
             .args([
                 "install",
@@ -1567,6 +1684,7 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
             })?;
         installed_binaries = executable_files(&generation.path().join("cargo/bin"))?;
     } else if let Some(specification) = source.strip_prefix("git:") {
+        check_workspace()?;
         if ambiguous_git_reference(specification) {
             eprintln!(
                 "Ambiguous Git package source: using the last @ as the ref separator for compatibility; use #ref to disambiguate"
@@ -1620,6 +1738,13 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
         installed_binaries.push(root.clone());
         root = root.parent().unwrap_or(Path::new(".")).into();
     }
+    if restricted {
+        admit_user_package_preparation(
+            activation.expect("automatic preparation"),
+            root.to_str()
+                .ok_or_else(|| Error::Config("invalid package directory".into()))?,
+        )?;
+    }
     // Check both files before executable discovery or local/Git Cargo builds.
     // Registry `cargo install` above has already built the crate in order to
     // locate its source; it cannot be prevalidated through this path.
@@ -1635,7 +1760,16 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
         .and_then(Value::as_str)
         .map(str::to_owned);
     if has_cargo_manifest {
+        if restricted {
+            return Err(Error::Config(
+                "automatic Cargo preparation requires project trust".into(),
+            ));
+        }
+        check_workspace()?;
         let mut metadata = tokio::process::Command::new("cargo");
+        if let Some(args) = activation {
+            metadata.current_dir(&args.workspace);
+        }
         metadata
             .args([
                 "metadata",
@@ -1667,7 +1801,11 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
             version = package["version"].as_str().map(str::to_owned);
         }
         if !source.starts_with("cargo:") {
+            check_workspace()?;
             let mut build = tokio::process::Command::new("cargo");
+            if let Some(args) = activation {
+                build.current_dir(&args.workspace);
+            }
             build
                 .args([
                     "build",
@@ -1706,8 +1844,12 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
     let pi = manifest_pi(&manifest)?;
     let resources = collect_package_resources(&root, pi, installed_binaries)?;
     for executable in &resources.extensions {
-        pi_rs_extensions::ExecutableExtension::load_async(executable).await?;
+        if !validate_package_executable(executable, activation, restricted).await? {
+            // Every executable must pass validation before this package is cached.
+            return Ok(None);
+        }
     }
+    check_workspace()?;
     let retain_generation = root.starts_with(generation.path())
         || resources
             .extensions
@@ -1726,7 +1868,7 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
         index.insert(key(source), serde_json::to_value(&package)?);
         Ok(())
     })?;
-    Ok(package)
+    Ok(Some(package))
 }
 
 fn collect_package_resources(
@@ -2455,6 +2597,33 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn project_trust_rejects_workspace_package_aliases_before_preparation() {
+        use clap::Parser;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let user_packages = root.path().join("user-packages");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&user_packages).unwrap();
+        let manifest = workspace.join("package");
+        std::fs::create_dir(&manifest).unwrap();
+        let alias = user_packages.join("alias");
+        std::os::unix::fs::symlink(&manifest, &alias).unwrap();
+        let mut args = Cli::parse_from(["pi", "--no-trust"]);
+        args.workspace = workspace;
+        args.project_workspace =
+            Some(super::super::project_trust::WorkspaceIdentity::capture(&args.workspace).unwrap());
+        assert!(admit_user_package_preparation(&args, alias.to_str().unwrap()).is_err());
+        assert!(admit_user_package_preparation(&args, user_packages.to_str().unwrap()).is_ok());
+        std::fs::write(
+            user_packages.join("Cargo.toml"),
+            "[package]\nname = 'fixture'\n",
+        )
+        .unwrap();
+        assert!(admit_user_package_preparation(&args, user_packages.to_str().unwrap()).is_err());
+    }
+
     #[test]
     fn worker_package_discovery_keeps_recovered_scope_after_disk_repair() {
         use clap::Parser;
@@ -2564,7 +2733,10 @@ mod tests {
         ]});
         std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
         let mut args = Cli::parse_from(["pi", "--no-trust"]);
-        args.workspace = directory.clone();
+        // Exercise user-package filters with eligible sources outside the workspace.
+        args.workspace = directory.join("workspace");
+        std::fs::create_dir(&args.workspace).unwrap();
+        let project_settings = args.workspace.join(".pi/settings.json");
         // Before package preparation, theme discovery still honors earlier failures.
         let themes = startup_themes(&args, false).unwrap();
         assert_eq!(themes.len(), 1);
@@ -2704,9 +2876,9 @@ mod tests {
         assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
         // Project deltas run before separate user declarations and reserve
         // explicitly disabled paths while leaving others to user defaults.
-        std::fs::create_dir_all(directory.join(".pi")).unwrap();
+        std::fs::create_dir_all(project_settings.parent().unwrap()).unwrap();
         std::fs::write(
-            directory.join(".pi/settings.json"),
+            &project_settings,
             json!({"packages":[
                 {"source":sources[0],"autoload":false,"prompts":["-prompts/demo.md"]}
             ]})
@@ -2726,7 +2898,7 @@ mod tests {
         assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
         // An error stops only the project declaration. The user declaration
         // still contributes prompts and themes, after prior project skills.
-        std::fs::write(directory.join(".pi/settings.json"), json!({"packages":[
+        std::fs::write(&project_settings, json!({"packages":[
             {"source":sources[0],"autoload":false,"skills":["+skills/demo"],"prompts":["file:///bad%2Fpath"]}
         ]}).to_string()).unwrap();
         let resources = resources_for(&args, false).unwrap();
@@ -2737,7 +2909,7 @@ mod tests {
         // Both user declarations survive a project delta. The first user
         // decision, including an explicit disable, takes precedence.
         std::fs::write(
-            directory.join(".pi/settings.json"),
+            &project_settings,
             json!({"packages":[
                 {"source":sources[0],"autoload":false}
             ]})
@@ -2769,7 +2941,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            directory.join(".pi/settings.json"),
+            &project_settings,
             json!({"packages":[{
                 "source":ordered,
                 "autoload":false,
@@ -2789,7 +2961,7 @@ mod tests {
         // A project delta resolves against the first user source even when
         // its own revision differs.
         std::fs::write(
-            directory.join(".pi/settings.json"),
+            &project_settings,
             json!({"packages":[
                 {"source":"git:https://example.com/org/repo#project","autoload":false}
             ]})
@@ -2837,7 +3009,7 @@ mod tests {
             Value::Object(revision_index).to_string(),
         )
         .unwrap();
-        std::fs::write(directory.join(".pi/settings.json"), json!({"packages":[
+        std::fs::write(&project_settings, json!({"packages":[
             {"source":"git:https://example.com/org/repo#project","autoload":false,"prompts":["-prompts/demo.md"]}
         ]}).to_string()).unwrap();
         assert!(resources_for(&args, false).unwrap().prompts.is_empty());
@@ -3027,6 +3199,86 @@ mod tests {
         assert!(!local_source_matches_cache(&package));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn project_trust_failed_voter_defers_explicit_local_package() {
+        const CHILD: &str = "PI_RS_TEST_DEFERRED_PREFLIGHT_PACKAGE";
+        let Some(directory) = std::env::var_os(CHILD) else {
+            let temporary = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "packages::tests::project_trust_failed_voter_defers_explicit_local_package",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, temporary.path())
+                .env("HOME", temporary.path())
+                .env("PI_RS_HOME", temporary.path().join("agent"))
+                .env("TMPDIR", temporary.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("native package deferred for this launch")
+            );
+            return;
+        };
+
+        use clap::Parser;
+        let directory = PathBuf::from(directory).canonicalize().unwrap();
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let package = config::agent_dir();
+        let voter = package.join("extensions/voter");
+        std::fs::create_dir_all(voter.parent().unwrap()).unwrap();
+        // A manifest can select a regular file. This fixture has no executable code.
+        std::fs::write(&voter, "inert fixture").unwrap();
+        std::fs::write(
+            package.join("pi-package.json"),
+            json!({"pi":{"extensions":["extensions/voter"]}}).to_string(),
+        )
+        .unwrap();
+
+        let mut args = Cli::parse_from([
+            "pi",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--extension",
+            package.to_str().unwrap(),
+            "--offline",
+        ]);
+        args.trust_pending = config::project_trust(&workspace, None).unwrap().is_none();
+        assert!(args.trust_pending);
+        args.trust_registrations = serde_json::from_value(json!({
+            (voter.to_str().unwrap()): {
+                "sha256": "0".repeat(64),
+                "identity": null,
+                "description": null
+            }
+        }))
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(prepare(&args)).unwrap();
+        assert!(args.trust_pending);
+        assert!(matches!(
+            args.trust_registrations.load(&voter, None),
+            Some(Ok(None))
+        ));
+        assert!(index().unwrap().is_empty());
+        assert!(transient_resources(&args).unwrap().extensions.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn single_file_install_ignores_parent_manifests_and_resources() {
@@ -3092,7 +3344,9 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         )
         .unwrap();
         let mut args = Cli::parse_from(["pi", "--no-trust"]);
-        args.workspace = directory.clone();
+        // Keep the user package outside the untrusted project workspace.
+        args.workspace = directory.join("workspace");
+        std::fs::create_dir(&args.workspace).unwrap();
         std::fs::remove_file(config::agent_dir().join("validated")).unwrap();
         config::update_object(&config::agent_dir().join("packages/index.json"), |index| {
             index.insert(key(&source), serde_json::to_value(old_cache).unwrap());

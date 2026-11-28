@@ -1315,6 +1315,112 @@ fn malformed_settings_warn_without_blocking_offline_model_listing() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid settings file"));
 }
 
+#[cfg(unix)]
+#[test]
+fn project_trust_preflight_keeps_denied_rpc_workspaces_isolated() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = tempfile::tempdir().unwrap();
+    let agent = root.path().join("agent");
+    let project = root.path().join("project");
+    let local = project.join(".pi");
+    let log = root.path().join("launches");
+    let fixture = |path: &std::path::Path, id: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let response = json!({"version": 1, "response": {"Ok": {
+            "id": id, "dependencies": [], "commands": [], "tools": [],
+            "project_trust_hook": true
+        }}});
+        let body = if id == "project-mcp" {
+            format!("printf '%s\\n' '{id}' >> \"$PI_TEST_LAUNCH_LOG\"\n")
+        } else {
+            format!(
+                "request=$(cat)\nprintf '%s %s\\n' '{id}' \"$request\" >> \"$PI_TEST_LAUNCH_LOG\"\nprintf '%s\\n' '{response}'\n"
+            )
+        };
+        std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    fixture(&agent.join("extensions/global"), "global");
+    fixture(&local.join("extensions/automatic"), "project-auto");
+    fixture(&local.join("configured"), "project-configured");
+    fixture(&local.join("packaged"), "project-package");
+    symlink(local.join("packaged"), agent.join("package-alias")).unwrap();
+    std::fs::write(
+        agent.join("settings.json"),
+        json!({"packages":["./package-alias"]}).to_string(),
+    )
+    .unwrap();
+    let mcp = local.join("mcp");
+    fixture(&mcp, "project-mcp");
+    std::fs::write(
+        local.join("settings.json"),
+        json!({"defaultProjectTrust":"always", "extensions":["configured"], "packages":["./packaged"]}).to_string(),
+    ).unwrap();
+    std::fs::write(
+        local.join("mcp.json"),
+        json!({"mcpServers":{"fixture":{"command":mcp}}}).to_string(),
+    )
+    .unwrap();
+
+    let saved = agent.join("trust.json");
+    let canonical = project.canonicalize().unwrap();
+    for (stored, explicit, trusted) in [
+        (None, None, false),
+        (Some(false), None, false),
+        (Some(true), Some("--no-trust"), false),
+        (Some(false), Some("--trust"), true),
+    ] {
+        let stored =
+            stored.map(|decision| json!({(canonical.to_string_lossy()): decision}).to_string());
+        if let Some(value) = &stored {
+            std::fs::write(&saved, value).unwrap();
+        }
+        std::fs::write(&log, "").unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("HOME", root.path())
+            .env("PI_RS_HOME", &agent)
+            .env("PI_TEST_LAUNCH_LOG", &log)
+            .args(["--offline", "--no-session", "--mode", "rpc"])
+            .args(explicit)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            r#"{{"id":"trust-fixture","type":"get_commands"}}"#
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.lines().any(|line| {
+                let value: Value = serde_json::from_str(line).unwrap();
+                value["id"] == "trust-fixture" && value["success"] == true
+            }),
+            "{stdout}\n{stderr}"
+        );
+        let launches = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(launches.matches("global ").count(), 1, "{launches}");
+        assert!(!launches.contains("project_trust"), "{launches}");
+        for id in [
+            "project-auto",
+            "project-configured",
+            "project-package",
+            "project-mcp",
+        ] {
+            assert_eq!(launches.contains(id), trusted, "{id}: {launches}\n{stderr}");
+        }
+        assert_eq!(agent.join("packages/index.json").exists(), trusted);
+        assert_eq!(std::fs::read_to_string(&saved).ok(), stored);
+    }
+}
+
 #[test]
 fn malformed_settings_keep_other_scope_in_package_listing() {
     for (bad_global, trusted) in [(true, true), (false, true), (false, false)] {
