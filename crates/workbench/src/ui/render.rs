@@ -255,7 +255,7 @@ pub enum ToolPart {
     Text(String),
     Warning(String),
     TruncationNotice(String),
-    Image(std::sync::Arc<super::images::InlineImage>),
+    Image(std::sync::Arc<super::images::InlineAttachment>),
 }
 
 #[derive(Clone)]
@@ -341,6 +341,7 @@ pub enum Entry {
         id: u64,
         custom_type: String,
         text: String,
+        images: Vec<std::sync::Arc<super::images::InlineAttachment>>,
         rendered: Option<pi_rs::RenderedCustomMessage>,
     },
     CustomRecord {
@@ -355,7 +356,7 @@ pub enum Entry {
         text: String,
         expanded: Option<bool>,
     },
-    Image(std::sync::Arc<super::images::InlineImage>),
+    Image(std::sync::Arc<super::images::InlineAttachment>),
     Tool {
         id: String,
         call_id: Option<String>,
@@ -374,7 +375,7 @@ pub enum Entry {
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranscriptOptions<'a> {
     pub notices: crate::config::NoticeSettings,
-    pub image_width: Option<usize>,
+    pub inline_images: Option<(super::images::Protocol, usize)>,
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
     pub code_block_indent: Option<&'a str>,
@@ -384,6 +385,26 @@ pub struct TranscriptOptions<'a> {
 }
 
 impl Entry {
+    pub fn has_inline_images(&self, expand_tools: bool) -> bool {
+        match self {
+            Self::Image(image) => image.is_renderable(),
+            Self::CustomMessage { images, .. } => images.iter().any(|image| image.is_renderable()),
+            Self::Tool {
+                parts,
+                numbered_diff,
+                rendered,
+                ..
+            } if rendered.as_ref().is_some_and(|tool| tool.result.is_some())
+                || (expand_tools && !numbered_diff) =>
+            {
+                parts
+                    .iter()
+                    .any(|part| matches!(part, ToolPart::Image(image) if image.is_renderable()))
+            }
+            _ => false,
+        }
+    }
+
     pub fn user(text: String) -> Self {
         Self::user_markdown(text.into())
     }
@@ -565,11 +586,7 @@ impl Entry {
                 lines
             }
             Self::CustomRecord { rendered: None, .. } => return Vec::new(),
-            Self::CustomMessage {
-                rendered: Some(rendered),
-                ..
-            }
-            | Self::CustomRecord {
+            Self::CustomRecord {
                 rendered: Some(rendered),
                 ..
             } => {
@@ -578,22 +595,41 @@ impl Entry {
                 return lines;
             }
             Self::CustomMessage {
-                custom_type, text, ..
+                custom_type,
+                text,
+                images,
+                rendered,
+                ..
             } => {
-                let mut label =
-                    Span::themed(format!("[{custom_type}]"), theme, "customMessageLabel");
-                label.bold = true;
                 let mut lines = vec![Line::default()];
-                lines.extend(wrap(&[label], inner));
-                lines.push(Line::default());
-                let mut body = transcript_markdown(text, theme, inner, options, false);
-                custom_message_base_style(&mut body, theme);
-                lines.extend(body);
-                lines.push(Line::default());
-                for line in &mut lines {
-                    line.background = Some(theme.color("customMessageBg"));
+                if let Some(rendered) = rendered {
+                    lines.extend(extension_rows(rendered, theme, width));
+                } else {
+                    let mut label =
+                        Span::themed(format!("[{custom_type}]"), theme, "customMessageLabel");
+                    label.bold = true;
+                    lines.extend(wrap(&[label], inner));
+                    lines.push(Line::default());
+                    let mut body = transcript_markdown(text, theme, inner, options, false);
+                    custom_message_base_style(&mut body, theme);
+                    lines.extend(body);
+                    lines.push(Line::default());
+                    for line in &mut lines {
+                        line.background = Some(theme.color("customMessageBg"));
+                    }
+                    lines.push(Line::default());
                 }
-                lines.push(Line::default());
+                if let Some((protocol, limit)) = options.inline_images {
+                    lines.extend(
+                        images
+                            .iter()
+                            .filter_map(|image| image.lines(width, limit, padding, protocol))
+                            .flatten(),
+                    );
+                }
+                if rendered.is_some() {
+                    return lines;
+                }
                 lines
             }
             Self::Summary {
@@ -654,8 +690,9 @@ impl Entry {
             }
             Self::Image(image) => {
                 return options
-                    .image_width
-                    .map_or_else(Vec::new, |limit| image.lines(width, limit, padding));
+                    .inline_images
+                    .and_then(|(protocol, limit)| image.lines(width, limit, padding, protocol))
+                    .unwrap_or_default();
             }
             Self::Thinking { text, expanded } => {
                 if text
@@ -773,10 +810,12 @@ impl Entry {
                     .and_then(|rendered| rendered.result.as_ref())
                 {
                     lines.extend(extension_rows(result, theme, inner));
-                    if let Some(limit) = options.image_width {
+                    if let Some((protocol, limit)) = options.inline_images {
                         for part in parts {
-                            if let ToolPart::Image(image) = part {
-                                lines.extend(image.lines(width, limit, padding));
+                            if let ToolPart::Image(image) = part
+                                && let Some(rows) = image.lines(width, limit, padding, protocol)
+                            {
+                                lines.extend(rows);
                             }
                         }
                     }
@@ -811,14 +850,19 @@ impl Entry {
                         && parts
                             .iter()
                             .any(|part| matches!(part, ToolPart::Text(_) | ToolPart::Image(_)))
-                        && let Some(limit) = options.image_width
+                        && let Some((protocol, limit)) = options.inline_images
                     {
                         for part in parts {
                             match part {
                                 ToolPart::Text(text) => render_text(text, &mut lines),
                                 ToolPart::Warning(_) | ToolPart::TruncationNotice(_) => {}
                                 ToolPart::Image(image) => {
-                                    lines.extend(image.lines(width, limit, padding))
+                                    if let Some(rows) = image.lines(width, limit, padding, protocol)
+                                    {
+                                        lines.extend(rows);
+                                    } else {
+                                        render_text("[image unavailable]", &mut lines);
+                                    }
                                 }
                             }
                         }
@@ -880,11 +924,20 @@ fn extension_rows(
     theme: &Theme,
     width: usize,
 ) -> Vec<Line> {
+    extension_rows_bounded(rendered, theme, width, usize::MAX)
+}
+
+pub(crate) fn extension_rows_bounded(
+    rendered: &pi_rs::RenderedExtensionRows,
+    theme: &Theme,
+    width: usize,
+    limit: usize,
+) -> Vec<Line> {
     let pad = rendered.padding.min(width.saturating_sub(1) / 2);
     let inner = width.saturating_sub(2 * pad).max(1);
     let padding = " ".repeat(pad);
     let background = rendered.background.as_deref().map(|role| theme.color(role));
-    let mut rows = component_lines(&rendered.lines, theme, inner);
+    let mut rows = component_lines_bounded(&rendered.lines, theme, inner, limit);
     for row in &mut rows {
         if pad != 0 && !row.spans.is_empty() {
             row.spans.insert(0, Span::new(&padding, Color::Reset));
@@ -5338,6 +5391,7 @@ mod tests {
             id: 1,
             custom_type: "card".into(),
             text: "fallback".into(),
+            images: vec![],
             rendered: Some(pi_rs::RenderedCustomMessage {
                 lines: vec![vec![pi_rs::UiComponentSpan {
                     text: "status\u{7}".into(),
@@ -5367,6 +5421,7 @@ mod tests {
             rendered: None,
             custom_type: "fixture\x1b]bad".into(),
             text: "**bold**\n\nplain \x1b]0;bad\x07text".into(),
+            images: vec![],
         };
         for width in [12, 80] {
             let lines = entry.render(
@@ -5423,6 +5478,7 @@ mod tests {
             rendered: None,
             custom_type: "x".into(),
             text: "plain `code`".into(),
+            images: vec![],
         };
         let lines = entry.render(&theme, 80, false, false, TranscriptOptions::default());
         let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
@@ -5754,11 +5810,10 @@ mod tests {
         image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
-        let image = super::super::images::InlineImage::decode(&pi_rs::ImageContent {
+        let image = super::super::images::InlineAttachment::new(pi_rs::ImageContent {
             data: base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()),
             mime_type: "image/png".into(),
-        })
-        .unwrap();
+        });
         let entry = Entry::Tool {
             id: "test".into(),
             call_id: None,
@@ -5783,7 +5838,7 @@ mod tests {
             true,
             true,
             TranscriptOptions {
-                image_width: Some(60),
+                inline_images: Some((super::super::images::Protocol::Kitty, 60)),
                 padding: 1,
                 ..Default::default()
             },
@@ -5806,7 +5861,7 @@ mod tests {
                     false,
                     true,
                     TranscriptOptions {
-                        image_width: Some(60),
+                        inline_images: Some((super::super::images::Protocol::Kitty, 60)),
                         padding: 1,
                         ..Default::default()
                     }

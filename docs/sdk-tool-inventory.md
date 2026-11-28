@@ -7,6 +7,13 @@ selected for model advertisement. Request hooks can alter a particular request.
 Results are ordered by tool name and include inactive tools. Inactive tools remain registered for nested calls, which are still
 subject to host policy; the `active` flag is not an authorization decision.
 
+Use `Registry::registered_tool(name)` or `AgentSession::registered_tool(name)`
+to inspect a single entry. These methods match the exact registered name,
+include inactive tools, and return `None` for unknown names. This is the Rust
+SDK equivalent of [Pi's `getToolDefinition`][pi-tool-definition]. The returned
+`spec` holds the definition alongside the same provenance and activity fields
+as the full inventory.
+
 The path is the value the extension reports through `command_source`; it may be
 absent and does not by itself identify package, origin, or scope. This is a
 bounded subset of pinned Pi's `getAllTools` source metadata. The session method
@@ -21,3 +28,5 @@ host policies, so neither event is an authorization decision. Events are
 transient, have the usual broadcast lag behavior, and can contain private source
 paths. They are not an idle or current-state query. Existing `tools()` callers
 continue to receive bare schemas.
+
+[pi-tool-definition]: https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/agent-session.ts#L1597-L1599

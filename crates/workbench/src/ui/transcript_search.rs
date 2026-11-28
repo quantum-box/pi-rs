@@ -27,6 +27,8 @@ pub struct Search {
 }
 
 impl Search {
+    pub const OVERLAY_HEIGHT: usize = 3;
+
     pub fn input(&mut self, key: KeyEvent, keys: &Keys) {
         let action = keys.action(key, false).unwrap_or("");
         if action == "tui.input.newLine" || self.editor.search_action(action) {
