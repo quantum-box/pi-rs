@@ -15634,7 +15634,7 @@ exit {exit}
             ..Default::default()
         };
         let now = Instant::now();
-        let interrupt = Some(crate::ui::keys::parse("ctrl+g").unwrap());
+        let interrupt = Some(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
         for fullscreen in [false, true] {
             let status = view.working_status(true, fullscreen, now, 80, interrupt);
             assert!(status.contains("Ctrl+Gで取消"), "{status}");
