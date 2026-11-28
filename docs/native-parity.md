@@ -5191,6 +5191,9 @@ credentials and offline rules. A scope already resolved against confirmed choice
 skips discovery, including literal model IDs with bracket characters. Fallback
 suppresses auxiliary model probes. With both
 `--provider` and `--endpoint`, fallback preserves the full model namespace.
+In the TUI, `/model` accepts an exact discovered or scoped model ID such as
+`company/private-model` on its confirmed route. An unmatched ID with an
+unknown provider prefix still triggers an error.
 Credential-management commands and the host-granted SDK model file loader retain
 strict file handling.
 [Pi's model file loader](https://github.com/earendil-works/pi/blob/db79712854e5154f48f10564c3f235abadfcefdc/packages/coding-agent/src/core/model-config.ts#L169-L199)

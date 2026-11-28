@@ -882,6 +882,32 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
     std::fs::create_dir(&home).unwrap();
     let models = home.join("models.json");
     std::fs::write(&models, "{,}").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        prepare_gate(&socket);
+        let mut request = String::new();
+        let mut reader = BufReader::new(&socket);
+        reader.read_line(&mut request).unwrap();
+        assert!(request.starts_with("GET /v1/models "), "{request}");
+        loop {
+            request.clear();
+            if reader.read_line(&mut request).unwrap() == 0 || request == "\r\n" {
+                break;
+            }
+        }
+        let body = r#"{"data":[{"id":"qwen2.5:7b"},{"id":"company/private-model"}]}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let mut size = libc::winsize {
@@ -928,7 +954,7 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
                 "--model",
                 "qwen2.5:7b",
                 "--endpoint",
-                "http://127.0.0.1:1/v1/chat/completions",
+                &endpoint,
             ])
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -938,6 +964,18 @@ fn malformed_models_json_warns_at_terminal_startup_and_reload() {
     );
     output_until(&mut master, |text| {
         text.contains("models.json error:") && text.contains("Enter to send")
+    });
+
+    master.write_all(b"/model qwen2.5:7b\r").unwrap();
+    output_until(&mut master, |text| text.contains("Model: qwen2.5:7b"));
+    server.join().unwrap();
+    master.write_all(b"/model company/private-model\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Model: company/private-model")
+    });
+    master.write_all(b"/model company/private\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains(r#"unknown model provider "company""#)
     });
 
     std::fs::write(&models, r#"{"providers":[]}"#).unwrap();

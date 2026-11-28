@@ -5598,12 +5598,15 @@ fn slash(
                     view.append(warning);
                 }
             }
-            args.model_profiles.ensure_model_reference_available(rest)?;
+            let exact = exact_model_query(args, rest, &view.available_models);
+            if exact.is_none() {
+                args.model_profiles.ensure_model_reference_available(rest)?;
+            }
             if super::model_selection::qualified_model(rest, &args.model_profiles).is_some()
                 || super::model_selection::thinking_suffix(rest).is_some()
             {
                 select_model_input(args, view, active, rest, false)?;
-            } else if let Some(model) = exact_model_query(args, rest, &view.available_models) {
+            } else if let Some(model) = exact {
                 select_model_input(args, view, active, &model, false)?;
             } else {
                 start_model_picker(args, view, ModelListIntent::Select { query: rest.into() });
