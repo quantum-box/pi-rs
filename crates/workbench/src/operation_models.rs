@@ -1333,7 +1333,11 @@ impl Tool for Operations {
                 "action":{"enum":["list","resolve","classify","generateImages"]},
                 "type":{"enum":["chat","classifier","image"]},
                 "provider":{"type":"string"},"id":{"type":"string"},
-                "available":{"type":"boolean"},"context":{"type":"object"}
+                "available":{"type":"boolean"},"context":{"type":"object"},
+                "options":{"type":"object","properties":{
+                    "aspectRatio":{"type":"string","minLength":1},
+                    "size":{"type":"string","minLength":1}
+                },"additionalProperties":false}
             },"required":["action"],"additionalProperties":false}),
         }
     }
@@ -1523,7 +1527,8 @@ impl Tool for Operations {
         } else {
             let operation = self.perform_authenticated(
                 model,
-                &args["context"],
+                inputs,
+                &args["options"],
                 &keys,
                 radius
                     .as_ref()
@@ -1654,7 +1659,7 @@ impl Operations {
         keys: &Keys,
         data: &mut Value,
     ) -> Result<()> {
-        self.perform_authenticated(entry, context, keys, None, data)
+        self.perform_authenticated(entry, context, &Value::Null, keys, None, data)
             .await
     }
 
@@ -1662,6 +1667,7 @@ impl Operations {
         &self,
         entry: &Entry,
         context: &Value,
+        options: &Value,
         keys: &Keys,
         radius_auth: Option<(&str, &HeaderMap)>,
         data: &mut Value,
@@ -1685,7 +1691,7 @@ impl Operations {
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
             Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
             Api::PiClassifier | Api::PiDecision => (pi_classifier::payload(entry, context)?, false),
-            Api::OpenRouterImages => (image_payload(entry, context)?, false),
+            Api::OpenRouterImages => (image_payload(entry, context, options)?, false),
         };
         let (endpoint, mut headers) = if let Some((token, configured)) = radius_auth {
             let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))

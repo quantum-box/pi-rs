@@ -466,7 +466,7 @@ impl Tool for ScriptTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ID.into(),
-            description: "Run JavaScript in a QuickJS sandbox. Use await tools.<name>(args), models.getAvailableOfType(type), models.classify(model, context), models.generateImages(model, context), text(value), image(value), console.log, return, exit(), store(key,value), load(key), ALL_TOOLS, searchTools(query), describeTool(name), and describeNamespace(name). The sandbox has no filesystem, network, Node APIs or timers. Only emitted output reaches the model. A first-line // @options: JSON object may set max_output_tokens and timeout_ms. Store writes commit only after success.".into(),
+            description: "Run JavaScript in a QuickJS sandbox. Use await tools.<name>(args), models.getAvailableOfType(type), models.classify(model, context), models.generateImages(model, context, options?), text(value), image(value), console.log, return, exit(), store(key,value), load(key), ALL_TOOLS, searchTools(query), describeTool(name), and describeNamespace(name). The sandbox has no filesystem, network, Node APIs or timers. Only emitted output reaches the model. A first-line // @options: JSON object may set max_output_tokens and timeout_ms. Store writes commit only after success.".into(),
             parameters: json!({"type":"object","properties":{"code":{"type":"string","minLength":1}},"required":["code"],"additionalProperties":false}),
         }
     }
@@ -2785,9 +2785,21 @@ mod tests {
                 try { await call(); throw new Error('missing model succeeded'); }
                 catch (error) { if (!String(error).includes('unknown model')) throw error; }
             }
+            const imageContext = {input:[{type:'text', text:'draw'}]};
+            const generate = options => models.generateImages(model, imageContext, options);
             for (const [call, message] of [
                 [() => models.classify(model, null), 'expects a context object'],
                 [() => models.generateImages(model, {input:[]}), 'context.input'],
+                [() => generate("16:9"), 'expects an options object as its third argument'],
+                [() => generate([]), 'got an empty array'],
+                [() => generate({aspectRatio:"   "}), 'options.aspectRatio must be a non-empty string'],
+                [() => generate({size:1024}), 'options.size must be a non-empty string'],
+                [() => generate({size:null}), 'options.size must be a non-empty string'],
+                [() => generate({apiKey:"ignored", size:1024}), 'does not accept options.apiKey'],
+                [() => generate({aspect_ratio:"16:9"}), 'does not accept options.aspect_ratio'],
+                [() => models.generateImages(null, {input:[]}, []), 'expects a model'],
+                [() => models.generateImages({provider:'fixture', id:'missing'}, {input:[]}, []), 'unknown model'],
+                [() => models.generateImages(model, {input:[]}, []), 'context.input'],
             ]) {
                 try { await call(); throw new Error('invalid context succeeded'); }
                 catch (error) { if (!String(error).includes(message)) throw error; }
