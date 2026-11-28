@@ -489,6 +489,14 @@ so do omitted recorded calls in a replayed scope, unlike upstream. Calls are
 serialized, bounded in depth, and cannot update extension state. A safe replay
 still requires destination-level idempotency for external effects.
 
+Register a replay-safe ordinary tool through
+`checkpointable_tool_with_foreground_subagent` to expose `foreground_subagent`
+on its invocation's `ToolHost`. Call it with a stable `key` and a `prompt`.
+The host configures the child model and tool allowlist at registration. The
+calling task owns the child and reopening reuses the same conversation and
+submission. A successful result includes the answer and `conversationId`.
+The call uses the registered wait timeout and parent abort drains the child.
+
 Ordinary nested calls support `ToolHost::call_with_cancellation`. Cancelling a
 new call during preparation records a skipped result at its original position.
 Replay reuses that result and the positions of later siblings. Cancellation

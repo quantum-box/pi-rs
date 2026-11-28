@@ -25,7 +25,7 @@ use pi_rs_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{
         Arc,
@@ -2218,11 +2218,10 @@ fn stop_at_unsafe_park_boundary(stage: &str, state: &Conversation) {
     let Some(root) = std::env::var_os("PI_UNSAFE_BOUNDARY_DIR") else {
         return;
     };
-    std::fs::write(
+    crate::publish_ready_marker(
         std::path::PathBuf::from(root).join("boundary"),
         serde_json::to_vec(&state.tool_attempt()).unwrap(),
-    )
-    .unwrap();
+    );
     loop {
         std::thread::park();
     }
@@ -2509,6 +2508,16 @@ impl Conversation {
     /// predate answer IDs and return None.
     pub fn answer_id(&self, submission: Uuid) -> Option<Uuid> {
         self.answer_ids.get(&submission).copied()
+    }
+
+    /// Whether ordinary input would be queued behind an active run.
+    pub fn input_run_active(&self) -> bool {
+        self.active.is_some()
+            || pending_failure_continuation(self)
+            || matches!(
+                self.phase,
+                Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
+            )
     }
 
     /// Current model request identity for a submission placed in this run.
@@ -3275,6 +3284,32 @@ pub struct ProgressHistoryFrame {
     pub commit_sequence: u64,
     pub changes: Vec<ProgressHistoryChange>,
 }
+
+fn decode_progress_history_frame(
+    record: serde_json::Value,
+    conversation: Uuid,
+    position: u64,
+    commit_sequence: u64,
+) -> Result<ProgressHistoryFrame, Error> {
+    let event: ProgressHistoryRecord = serde_json::from_value(record)?;
+    if event.version != 1
+        || event.conversation != conversation
+        || event.changes.is_empty()
+        || event.changes.len() > 2
+        || position == 0
+    {
+        return Err(Error::Invalid("invalid progress history record".into()));
+    }
+    Ok(ProgressHistoryFrame {
+        cursor: ProgressHistoryCursor {
+            version: 1,
+            conversation,
+            position,
+        },
+        commit_sequence,
+        changes: event.changes,
+    })
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProgressHistoryPage {
     pub records: Vec<ProgressHistoryFrame>,
@@ -3725,6 +3760,13 @@ pub struct UnifiedHistoryCommit {
     pub snapshots: Vec<crate::observer::Record>,
     /// Full application log at this commit, including inherited fork entries.
     pub applications: Option<Vec<crate::application_entry::ApplicationEntry>>,
+    /// Generation and tool progress committed alongside any other records.
+    pub progress: Vec<ProgressHistoryFrame>,
+    /// Document changes in the conversation's explicit address scope.
+    pub documents: Vec<(
+        crate::document::Address,
+        crate::document::DocumentOperationFrame,
+    )>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3732,6 +3774,16 @@ pub struct UnifiedHistoryPage {
     pub commits: Vec<UnifiedHistoryCommit>,
     pub next: UnifiedHistoryCursor,
     pub has_more: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DisplayForkOrigin {
+    source: Uuid,
+    observation: u64,
+}
+
+fn display_fork_origin_key(child: Uuid) -> Vec<u8> {
+    format!("runtime/display-fork-origin/{child}").into_bytes()
 }
 
 pub struct Harness {
@@ -8894,11 +8946,12 @@ impl Harness {
         mut after_load: F,
     ) -> Result<Uuid, Error> {
         let mut attempts = 0;
-        let (mut state, revision, membership) = loop {
+        let (mut state, revision, membership, observation) = loop {
             let membership = self.fork_membership_proof(id)?;
             let (state, version) = self.load(id)?;
             after_load();
             let revision = self.owner.store().document_snapshot()?;
+            let observation = crate::observer::Observer::new(self.owner.store(), id).head()?;
             // The parent must remain unchanged through the document snapshot.
             // Otherwise the two reads may straddle an atomic admission commit.
             if self
@@ -8907,7 +8960,7 @@ impl Harness {
                 .get(&Self::key(id))?
                 .is_some_and(|entry| entry.version == version)
             {
-                break (state, revision, membership);
+                break (state, revision, membership, observation);
             }
             attempts += 1;
             if attempts == FORK_DOCUMENT_ATTEMPTS {
@@ -8950,12 +9003,63 @@ impl Harness {
         retry_document_fork(|| {
             let mut batch = crate::document::Documents::new(self.owner.store())
                 .fork_scope(id, state.id, revision)?;
+            self.record_display_fork_origin(&state, id, observation, &mut batch)?;
             membership
                 .append_to(state.id, &mut batch)
                 .map_err(|error| Error::Invalid(format!("fork session membership: {error}")))?;
             self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))
         })?;
         Ok(state.id)
+    }
+
+    fn record_display_fork_origin(
+        &self,
+        child: &Conversation,
+        source: Uuid,
+        cursor: crate::observer::Cursor,
+        batch: &mut crate::task_store::OwnedBatch,
+    ) -> Result<(), Error> {
+        if child.application_writes.is_empty() || cursor.0 == 0 {
+            return Ok(());
+        }
+        let snapshot_key = format!("runtime/fork/{source}/{:020}", cursor.0).into_bytes();
+        let store = self.owner.store();
+        let Some(snapshot) = store.get(&snapshot_key)? else {
+            return Ok(());
+        };
+        let source_snapshot: serde_json::Value = serde_json::from_slice(&snapshot.value)?;
+        let Some(writes) = source_snapshot.pointer("/documents/pi-rs~1runtime~1application-writes")
+        else {
+            return Ok(());
+        };
+        let mut writes: Vec<ApplicationWrite> = serde::Deserialize::deserialize(writes)?;
+        writes.retain(|write| write.placed);
+        for write in &mut writes {
+            write.request_id = None;
+        }
+        if !writes.starts_with(&child.application_writes) {
+            return Ok(());
+        }
+        let lineage = display_fork_origin_key(child.id);
+        let check = Check {
+            key: snapshot_key,
+            expected: Expected::Version(snapshot.version),
+        };
+        if !batch.checks.contains(&check) {
+            batch.checks.push(check);
+        }
+        batch.checks.push(Check {
+            key: lineage.clone(),
+            expected: Expected::Missing,
+        });
+        batch.mutations.push(Mutation::Put {
+            key: lineage,
+            value: serde_json::to_vec(&DisplayForkOrigin {
+                source,
+                observation: cursor.0,
+            })?,
+        });
+        Ok(())
     }
     /// Fork a committed observation cut, including cuts during active work.
     /// Incomplete tool batches and snapshots without historical state fail closed.
@@ -8981,7 +9085,7 @@ impl Harness {
         prefix: Option<(usize, usize)>,
         application_cut: Option<(u64, Uuid, Vec<crate::application_entry::ApplicationEntry>)>,
         reset_cut: Option<(Conversation, crate::transcript::Cursor, u64, Vec<Check>)>,
-        display_len: Option<usize>,
+        display_cut: Option<(usize, Uuid)>,
         evidence: &[Check],
         membership: &crate::session_membership::ForkMembershipProof,
     ) -> Result<Uuid, Error> {
@@ -9015,7 +9119,7 @@ impl Harness {
             }
         }
         let mut value: serde_json::Value = serde_json::from_slice(&entry.value)?;
-        if let Some(len) = display_len {
+        if let Some((len, _)) = display_cut {
             let writes = value
                 .pointer_mut("/documents/pi-rs~1runtime~1application-writes")
                 .and_then(serde_json::Value::as_array_mut)
@@ -9093,7 +9197,7 @@ impl Harness {
             .transpose()?;
         // Capture source versions before expanding or validating the seed, so
         // a rewrite during either read cannot authorize a different child.
-        let source_checks = if display_len.is_some() {
+        let source_checks = if display_cut.is_some() {
             let source = transcript
                 .as_ref()
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
@@ -9162,7 +9266,7 @@ impl Harness {
             Vec::new()
         };
         self.expand_event(id, &mut value)?;
-        if display_len.is_some() {
+        if display_cut.is_some() {
             let source = transcript
                 .as_ref()
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
@@ -9329,7 +9433,9 @@ impl Harness {
         retry_document_fork(|| {
             let current_parent = application_cut
                 .as_ref()
-                .map_or(id, |(_, parent, _)| *parent);
+                .map(|(_, parent, _)| *parent)
+                .or_else(|| display_cut.map(|(_, parent)| parent))
+                .unwrap_or(id);
             let mut batch = crate::document::Documents::new(self.owner.store()).fork_scope_from(
                 id,
                 current_parent,
@@ -9343,6 +9449,8 @@ impl Harness {
                 .map_err(|error| Error::Invalid(format!("fork session membership: {error}")))?;
             if let Some((_, _, _, checks)) = &reset_cut {
                 batch.checks.extend(checks.clone());
+            } else {
+                self.record_display_fork_origin(&state, id, cursor, &mut batch)?;
             }
             if let Some((_, _, entries)) = &application_cut {
                 let target = crate::application_entry::key(state.id);
@@ -9633,15 +9741,15 @@ impl Harness {
         )
     }
 
-    /// Fork a locally placed display write in an append-only batch that is the
-    /// sole visible change in its tracked runtime commit. Inherited and
-    /// ambiguous cuts are rejected until their placement can be authenticated.
+    /// Fork a display write whose placement and visible ancestry can be
+    /// authenticated. Ambiguous and untracked cuts are rejected.
     pub fn fork_by_display_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
         let _bounded_reads = crate::transcript::BoundedForkReads::enter();
         let _bounded_runtime_reads = durable_store::BoundedReadScope::enter(
             &[
                 b"runtime/conversation/",
                 b"runtime/fork/",
+                b"runtime/display-fork-origin/",
                 b"durable/observer/",
                 b"runtime/tool-result-pending/",
                 b"durable/application-entries/",
@@ -9652,6 +9760,31 @@ impl Harness {
         );
         let membership = self.fork_membership_proof(id)?;
         let _proof_scope = ResetProofScope::enter();
+        self.fork_by_display_entry_with_origin(
+            id,
+            id,
+            entry_id,
+            None,
+            Vec::new(),
+            &mut HashSet::new(),
+            &membership,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fork_by_display_entry_with_origin(
+        &mut self,
+        id: Uuid,
+        requested: Uuid,
+        entry_id: Uuid,
+        through: Option<crate::observer::Cursor>,
+        mut checks: Vec<Check>,
+        visited: &mut HashSet<Uuid>,
+        membership: &crate::session_membership::ForkMembershipProof,
+    ) -> Result<Uuid, Error> {
+        if visited.len() >= 32 || !visited.insert(id) {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
         let (_, root_version) = self.load(id)?;
         let store = self.owner.store();
         if entry_id.is_nil() || store.legacy_version_boundary()? != 0 {
@@ -9661,10 +9794,10 @@ impl Harness {
         let prefix = format!("runtime/fork/{id}/");
         let observer = crate::observer::Observer::new(store, id);
         let mut cursor = crate::observer::Cursor(0);
-        let mut checks = vec![Check {
+        checks.push(Check {
             key: root.clone(),
             expected: Expected::Version(root_version),
-        }];
+        });
         let mut prior: Option<(
             serde_json::Value,
             serde_json::Value,
@@ -9676,6 +9809,9 @@ impl Harness {
         loop {
             let page = observer.read(cursor, std::num::NonZeroUsize::new(64).unwrap())?;
             for record in &page.records {
+                if through.is_some_and(|end| record.cursor.0 > end.0) {
+                    return Err(crate::fork::Error::InvalidCursor.into());
+                }
                 count += 1;
                 if count > 256 || record.cursor.0 != count as u64 {
                     return Err(crate::fork::Error::InvalidSnapshot.into());
@@ -9736,10 +9872,81 @@ impl Harness {
                     .filter(|w| w.placed && !w.withdrawn)
                     .cloned()
                     .collect();
+                checks.push(Check {
+                    key: event_key,
+                    expected: Expected::Version(event.version),
+                });
+                let fork_check = Check {
+                    key: fork_key,
+                    expected: Expected::Version(fork.version),
+                };
+                if !checks.contains(&fork_check) {
+                    checks.push(fork_check);
+                }
                 if prior.is_none() && writes.iter().any(|write| write.id == entry_id) {
-                    // A copied prefix is evidence of the local baseline, not
-                    // of the original placement of any entry inside that prefix.
-                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                    let lineage_key = display_fork_origin_key(id);
+                    let lineage = store
+                        .get(&lineage_key)?
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    if store.commit_for_version(&lineage_key, lineage.version)? != Some(sequence) {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    let origin: DisplayForkOrigin = serde_json::from_slice(&lineage.value)?;
+                    let source_fork =
+                        format!("runtime/fork/{}/{:020}", origin.source, origin.observation)
+                            .into_bytes();
+                    let source_root = Self::key(origin.source);
+                    let source_prefix = format!("runtime/fork/{}/", origin.source);
+                    let source = store
+                        .get(&source_fork)?
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    let source_sequence = store
+                        .commit_for_version(&source_fork, source.version)?
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    if origin.source.is_nil()
+                        || origin.observation == 0
+                        || source_sequence >= sequence
+                        || !store.runtime_snapshot_exact_at(
+                            &source_root,
+                            source_prefix.as_bytes(),
+                            &source_fork,
+                            source_sequence,
+                        )?
+                    {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    let source_snapshot: serde_json::Value = serde_json::from_slice(&source.value)?;
+                    let mut source_writes: Vec<ApplicationWrite> = serde::Deserialize::deserialize(
+                        source_snapshot
+                            .pointer("/documents/pi-rs~1runtime~1application-writes")
+                            .ok_or(crate::fork::Error::InvalidSnapshot)?,
+                    )?;
+                    source_writes.retain(|write| write.placed);
+                    for write in &mut source_writes {
+                        write.request_id = None;
+                    }
+                    if placed.len() != writes.len() || !source_writes.starts_with(&placed) {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    checks.extend([
+                        Check {
+                            key: lineage_key,
+                            expected: Expected::Version(lineage.version),
+                        },
+                        Check {
+                            key: source_fork,
+                            expected: Expected::Version(source.version),
+                        },
+                    ]);
+                    return self.fork_by_display_entry_with_origin(
+                        origin.source,
+                        requested,
+                        entry_id,
+                        Some(crate::observer::Cursor(origin.observation)),
+                        checks,
+                        visited,
+                        membership,
+                    );
                 }
                 snapshot
                     .pointer_mut("/documents")
@@ -9750,14 +9957,6 @@ impl Harness {
                     .as_object_mut()
                     .ok_or(crate::fork::Error::InvalidSnapshot)?
                     .remove("application_writes");
-                checks.push(Check {
-                    key: event_key,
-                    expected: Expected::Version(event.version),
-                });
-                checks.push(Check {
-                    key: fork_key,
-                    expected: Expected::Version(fork.version),
-                });
                 if let Some((before_snapshot, before_event, before_writes, before_revision)) =
                     &prior
                 {
@@ -9800,9 +9999,9 @@ impl Harness {
                             None,
                             None,
                             None,
-                            Some(index + 1),
+                            Some((index + 1, requested)),
                             &checks,
-                            &membership,
+                            membership,
                         );
                     }
                 }
@@ -13431,9 +13630,9 @@ impl Harness {
         })
     }
 
-    /// Read at most `limit` complete commits in the captured range. Each model
-    /// record is an expanded observation snapshot; application records are full
-    /// log snapshots, not individually ordered transcript events.
+    /// Read at most `limit` complete commits in the captured range. Observation
+    /// and application records are snapshots. Document operation and progress
+    /// frames advance the same cursor, including commits without a snapshot.
     pub fn unified_history(
         &self,
         cursor: &UnifiedHistoryCursor,
@@ -13443,29 +13642,65 @@ impl Harness {
             return Err(Error::Invalid("history page limit exceeds 255".into()));
         }
         self.load(cursor.conversation)?;
-        let mut prefix = b"durable/observer/".to_vec();
-        prefix.extend_from_slice(cursor.conversation.as_bytes());
-        prefix.extend_from_slice(b"/r");
+        let store = self.owner.store();
+        let prefix = crate::observer::Observer::new(store, cursor.conversation).record_prefix();
+        let progress_prefix =
+            crate::observer::Observer::progress_history(store, cursor.conversation).record_prefix();
         let app_key = crate::application_entry::key(cursor.conversation);
-        let mut frames = self.owner.store().conversation_commits(
+        let records = store.conversation_commits_including_progress(
             &prefix,
+            Some(&progress_prefix),
             &app_key,
             cursor.after,
             cursor.through,
             limit.get() + 1,
         )?;
+        let scope = crate::document::Address::conversation_scope_prefix(cursor.conversation);
+        let document_commits = store.scoped_document_commit_positions(
+            &scope,
+            cursor.after,
+            cursor.through,
+            limit.get() + 1,
+        )?;
+        // Both sources read the same immutable range. If a sequence is in the
+        // first N merged frames, it must be in the first N of each component
+        // where it occurs, so the merged page cannot split a commit.
+        let mut frames: std::collections::BTreeMap<_, _> = records
+            .into_iter()
+            .map(|(sequence, records)| (sequence, (records, None)))
+            .collect();
+        for (sequence, revision) in document_commits {
+            frames.entry(sequence).or_default().1 = Some(revision);
+        }
         let has_more = frames.len() > limit.get();
-        frames.truncate(limit.get());
-        let mut commits = Vec::with_capacity(frames.len());
-        for (sequence, records) in frames {
+        let mut commits = Vec::with_capacity(frames.len().min(limit.get()));
+        for (sequence, (records, document_commit)) in frames.into_iter().take(limit.get()) {
             let mut snapshots = Vec::new();
             let mut applications = None;
+            let mut progress = Vec::new();
             for (key, entry) in records {
                 if key == app_key {
                     if applications.is_some() {
                         return Err(Error::Invalid("duplicate application snapshot".into()));
                     }
                     applications = Some(serde_json::from_slice(&entry.value)?);
+                } else if let Some(suffix) = key.strip_prefix(progress_prefix.as_slice()) {
+                    if entry.value.len() > MAX_PROGRESS_HISTORY_BYTES {
+                        return Err(Error::Invalid(
+                            "progress history event exceeds size limit".into(),
+                        ));
+                    }
+                    let position = u64::from_be_bytes(
+                        suffix
+                            .try_into()
+                            .map_err(|_| Error::Invalid("invalid progress history key".into()))?,
+                    );
+                    progress.push(decode_progress_history_frame(
+                        serde_json::from_slice(&entry.value)?,
+                        cursor.conversation,
+                        position,
+                        sequence,
+                    )?);
                 } else {
                     let suffix = key
                         .strip_prefix(prefix.as_slice())
@@ -13483,10 +13718,24 @@ impl Harness {
                     });
                 }
             }
+            let documents = if let Some(revision) = document_commit {
+                let changes =
+                    store.scoped_document_changes_at_commit(&scope, revision, sequence)?;
+                crate::document::scoped_document_operations(
+                    store,
+                    cursor.conversation,
+                    revision,
+                    changes,
+                )?
+            } else {
+                Vec::new()
+            };
             commits.push(UnifiedHistoryCommit {
                 sequence,
                 snapshots,
                 applications,
+                progress,
+                documents,
             });
         }
         let mut next = cursor.clone();
@@ -13578,14 +13827,7 @@ impl Harness {
         conversation: Uuid,
         after: u64,
     ) -> Result<Option<(u64, u64, Vec<MergedDocumentChange>)>, Error> {
-        let scope = conversation.to_string();
-        let mut encoded = serde_json::to_vec(&[scope])?;
-        if encoded.pop() != Some(b']') {
-            return Err(Error::Invalid("invalid document scope".into()));
-        }
-        encoded.push(b',');
-        let mut prefix = b"durable/document/".to_vec();
-        prefix.extend(encoded);
+        let prefix = crate::document::Address::conversation_scope_prefix(conversation);
         let Some((revision, sequence, changes)) = self
             .owner
             .store()
@@ -14149,17 +14391,14 @@ impl Harness {
             ));
         }
         self.load(cursor.conversation)?;
-        let page =
-            crate::observer::Observer::progress_history(self.owner.store(), cursor.conversation)
-                .read(crate::observer::Cursor(cursor.position), limit)?;
+        let observer =
+            crate::observer::Observer::progress_history(self.owner.store(), cursor.conversation);
+        let page = observer.read(crate::observer::Cursor(cursor.position), limit)?;
         let records = page
             .records
             .into_iter()
             .map(|record| -> Result<_, Error> {
-                let mut key = b"durable/progress-history/".to_vec();
-                key.extend_from_slice(cursor.conversation.as_bytes());
-                key.extend_from_slice(b"/r");
-                key.extend_from_slice(&record.cursor.0.to_be_bytes());
+                let key = observer.record_key(record.cursor);
                 let entry = self
                     .owner
                     .store()
@@ -14179,23 +14418,12 @@ impl Harness {
                     .store()
                     .commit_for_version(&key, entry.version)?
                     .ok_or_else(|| Error::Invalid("untracked progress history record".into()))?;
-                let event: ProgressHistoryRecord = serde_json::from_value(persisted)?;
-                if event.version != 1
-                    || event.conversation != cursor.conversation
-                    || event.changes.is_empty()
-                    || event.changes.len() > 2
-                {
-                    return Err(Error::Invalid("invalid progress history record".into()));
-                }
-                Ok(ProgressHistoryFrame {
-                    cursor: ProgressHistoryCursor {
-                        version: 1,
-                        conversation: cursor.conversation,
-                        position: record.cursor.0,
-                    },
+                decode_progress_history_frame(
+                    persisted,
+                    cursor.conversation,
+                    record.cursor.0,
                     commit_sequence,
-                    changes: event.changes,
-                })
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ProgressHistoryPage {
@@ -15845,6 +16073,47 @@ impl Harness {
             }
         }
     }
+    /// Withdraw all queued inputs in one commit and return them in admission order.
+    /// Inputs that have already entered a run remain part of that run.
+    pub fn clear_input_queue(&mut self, id: Uuid) -> Result<Vec<WithdrawnInput>, Error> {
+        self.load(id)?;
+        let gate = self.owner.conversation_controls().get(id).callback_start;
+        let _start_lease = gate.try_enter().ok_or(Error::TaskPublicationBusy)?;
+        loop {
+            let (mut state, version) = self.load(id)?;
+            let mut withdrawn = Vec::new();
+            for input in &mut state.submissions {
+                if input.status == Status::Queued {
+                    let mode = state
+                        .input_modes
+                        .get(&input.id)
+                        .copied()
+                        .unwrap_or(InputMode::FollowUp);
+                    withdrawn.push(WithdrawnInput {
+                        conversation_id: id,
+                        mode,
+                        submission: input.clone(),
+                    });
+                    input.status = Status::Unanswered {
+                        reason: "aborted".into(),
+                    };
+                }
+            }
+            if withdrawn.is_empty() {
+                return Ok(withdrawn);
+            }
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&state, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
+                Ok(()) => return Ok(withdrawn),
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Persist the abort mark and withdraw the inputs queued at this commit.
     /// The caller must stop any executing worker before driving the mark.
     pub fn request_abort(&mut self, id: Uuid) -> Result<(), Error> {
@@ -24527,6 +24796,11 @@ impl Scheduler {
     ) -> Result<WithdrawResult, Error> {
         self.harness.withdraw_submission(id, submission)
     }
+    /// Withdraw all queued inputs, keeping the currently running input.
+    pub fn clear_input_queue(&mut self, id: Uuid) -> Result<Vec<WithdrawnInput>, Error> {
+        self.harness.clear_input_queue(id)
+    }
+
     pub fn blocked(&self, id: Uuid) -> Result<Option<(Uuid, String)>, Error> {
         self.harness.blocked(id)
     }
@@ -37556,6 +37830,57 @@ mod scheduler_tests {
         );
         scheduler.shutdown().await.unwrap();
     }
+    #[tokio::test]
+    async fn clears_both_input_queues_without_aborting_the_active_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let active = scheduler.submit(id, None, "first".into()).unwrap();
+        model.started.acquire().await.unwrap().forget();
+        let follow_up = scheduler.submit(id, None, "follow-up".into()).unwrap();
+        let steer = scheduler
+            .submit_with_mode(id, None, "steer".into(), InputMode::Steer)
+            .unwrap();
+        let cleared = scheduler.clear_input_queue(id).unwrap();
+        assert_eq!(
+            cleared
+                .iter()
+                .map(|entry| (entry.submission.id, entry.mode))
+                .collect::<Vec<_>>(),
+            [(follow_up, InputMode::FollowUp), (steer, InputMode::Steer)]
+        );
+        assert!(scheduler.clear_input_queue(id).unwrap().is_empty());
+        model.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        let state = scheduler.conversation(id).unwrap();
+        assert!(matches!(state.submissions[0].status, Status::Done { .. }));
+        assert_eq!(state.submissions[0].id, active);
+        assert!(state.submissions[1..].iter().all(|input| {
+            matches!(&input.status, Status::Unanswered { reason } if reason == "aborted")
+        }));
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
+        scheduler.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn restart_processes_abort_mark_before_recovery_can_redispatch() {
         let dir = tempfile::tempdir().unwrap();

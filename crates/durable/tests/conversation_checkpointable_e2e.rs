@@ -934,6 +934,7 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
             .watch_view(id, NonZeroUsize::MIN, Duration::from_millis(5))
             .unwrap();
         let progress_cursor = scheduler.progress_history_from_now(id).unwrap();
+        let unified_cursor = scheduler.unified_history_from_now(id).unwrap();
         scheduler.submit(id, None, "work".into()).unwrap();
         let first = wait_for_stream_text(&mut watch, |p| p.text == "first").await;
         let store = durable_store::Store::open(&path).unwrap();
@@ -1113,6 +1114,31 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
             assert_eq!(recorded.last().unwrap().2.text, "second attempt");
         }
         assert_eq!(scheduler.conversation(id).unwrap().messages, published);
+        let history = scheduler
+            .watch_unified_history(
+                &unified_cursor,
+                NonZeroUsize::new(255).unwrap(),
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap();
+        assert!(history.commits.iter().any(|commit| {
+            commit.snapshots.is_empty() && commit.applications.is_none()
+                && commit.progress.iter().any(|frame| {
+                    assert_eq!(frame.commit_sequence, commit.sequence);
+                    frame.changes.iter().any(|change| matches!(
+                        change,
+                        pi_rs_durable::runtime::ProgressHistoryChange::CheckpointableTool { task: reported, progress, .. }
+                            if *reported == task && progress.text == "first"
+                    ))
+                })
+        }));
+        assert!(
+            history
+                .commits
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
         watch.close();
         driver.shutdown().unwrap();
         scheduler.shutdown().await.unwrap();
@@ -1132,20 +1158,39 @@ struct ModelStub {
 #[tokio::test]
 async fn checkpointable_tool_starts_and_reattaches_to_a_foreground_subagent() {
     let directory = tempfile::tempdir().unwrap();
-    exercise_foreground_delegation(directory.path(), false, None).await;
+    exercise_foreground_delegation(directory.path(), false, None, false).await;
 }
 
 #[tokio::test]
 async fn checkpointable_foreground_subagent_crash_fixture() {
     if let Some(directory) = std::env::var_os("PI_FOREGROUND_CHILD_RESTART_DIR") {
-        exercise_foreground_delegation(std::path::Path::new(&directory), true, None).await;
+        exercise_foreground_delegation(
+            std::path::Path::new(&directory),
+            true,
+            None,
+            std::env::var_os("PI_FOREGROUND_ORDINARY_TOOL").is_some(),
+        )
+        .await;
     }
 }
 
 #[tokio::test]
 async fn checkpointable_foreground_subagent_reuses_answer_after_process_loss() {
+    exercise_foreground_process_loss(false).await;
+}
+
+#[tokio::test]
+async fn ordinary_tool_foreground_subagent_reuses_answer_after_process_loss() {
+    exercise_foreground_process_loss(true).await;
+}
+
+async fn exercise_foreground_process_loss(ordinary: bool) {
     let directory = tempfile::tempdir().unwrap();
-    let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    if ordinary {
+        command.env("PI_FOREGROUND_ORDINARY_TOOL", "1");
+    }
+    let mut process = command
         .args([
             "--exact",
             "checkpointable_foreground_subagent_crash_fixture",
@@ -1168,15 +1213,21 @@ async fn checkpointable_foreground_subagent_reuses_answer_after_process_loss() {
         .unwrap()
         .parse()
         .unwrap();
-    exercise_foreground_delegation(directory.path(), false, Some(root)).await;
+    exercise_foreground_delegation(directory.path(), false, Some(root), ordinary).await;
 }
 
 async fn exercise_foreground_delegation(
     directory: &std::path::Path,
     hold_after_answer: bool,
     resume: Option<uuid::Uuid>,
+    ordinary: bool,
 ) {
-    use pi_rs_durable::{async_task_tool::ForegroundSubagentRequest, runtime::Status};
+    use pi_rs_durable::{
+        async_task_tool::{
+            ForegroundSubagentRequest, checkpointable_tool_with_foreground_subagent,
+        },
+        runtime::Status,
+    };
 
     struct Delegate(Option<std::path::PathBuf>);
     #[async_trait]
@@ -1191,6 +1242,43 @@ async fn exercise_foreground_delegation(
 
         async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
             unreachable!()
+        }
+
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: Arc<dyn pi_rs_core::ToolHost>,
+        ) -> Outcome {
+            assert_eq!(
+                host.tools()
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["foreground_subagent"]
+            );
+            let input = json!({"key": "delegate", "prompt": "child input"});
+            let outcome = host.call("foreground_subagent", input.clone()).await;
+            assert!(matches!(outcome, Outcome::SucceededWithDetails { .. }));
+            assert_eq!(host.call("foreground_subagent", input).await, outcome);
+            assert!(matches!(
+                host.call(
+                    "foreground_subagent",
+                    json!({"key": "delegate", "prompt": "different input"})
+                )
+                .await,
+                Outcome::Failed(_)
+            ));
+            assert!(matches!(
+                host.call("foreground_subagent", json!({"key": "forbidden", "prompt": "another input", "allowed_tools": ["shell"]})).await,
+                Outcome::Failed(_)
+            ));
+            if let Some(dir) = &self.0 {
+                std::fs::write(dir.join("child-answered"), b"ready").unwrap();
+                std::future::pending::<()>().await;
+            }
+            outcome
         }
     }
 
@@ -1274,9 +1362,24 @@ async fn exercise_foreground_delegation(
     }
 
     let mut registry = Registry::default();
+    let delegate = Arc::new(Delegate(hold_after_answer.then(|| directory.to_owned())));
+    let delegate: Arc<dyn DurableAsyncTool> = if ordinary {
+        checkpointable_tool_with_foreground_subagent(
+            delegate,
+            Duration::from_secs(15),
+            Config {
+                model: "child".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            },
+            vec![],
+        )
+    } else {
+        delegate
+    };
     let tool = register_conversation_replay_safe_durable_tool(
         &mut registry,
-        Arc::new(Delegate(hold_after_answer.then(|| directory.to_owned()))),
+        delegate,
         "delegate-v1",
         1,
         vec![],
