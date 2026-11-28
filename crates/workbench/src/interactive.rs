@@ -110,12 +110,13 @@ pub(super) fn latest_session(
                 .is_some_and(|value| value == "jsonl")
         })
         .filter(|entry| {
-            super::session_import::read(&entry.path()).is_ok_and(|session| {
-                session.working_directory().is_some_and(|cwd| {
-                    std::path::Path::new(cwd)
-                        .canonicalize()
-                        .is_ok_and(|cwd| cwd == workspace)
-                })
+            Session::snapshot(entry.path()).is_ok_and(|session| {
+                session.host_binding().is_none()
+                    && session.working_directory().is_some_and(|cwd| {
+                        std::path::Path::new(cwd)
+                            .canonicalize()
+                            .is_ok_and(|cwd| cwd == workspace)
+                    })
             })
         })
         .filter_map(|entry| {
@@ -17853,8 +17854,21 @@ exit {exit}
         drop(session);
         let invalid = directory.path().join("invalid.jsonl");
         std::fs::write(&invalid, "invalid").unwrap();
+        let falsy_native = directory.path().join("falsy-native.jsonl");
+        let mut invalid_native = std::fs::read(&valid).unwrap();
+        invalid_native.extend_from_slice(b"false\n");
+        std::fs::write(&falsy_native, invalid_native).unwrap();
         let late = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
-        for path in [&foreign, &invalid] {
+        let pi_source = directory.path().join("external.jsonl");
+        let header = json!({"type":"session","version":3,"id":"external","cwd":workspace});
+        std::fs::write(&pi_source, format!("null\n{header}\nfalse\n{{")).unwrap();
+        assert!(crate::session_import::read(&pi_source).is_ok());
+        let managed = directory.path().join("managed.jsonl");
+        let mut session = pi_rs::Session::open(&managed).unwrap();
+        session.bind_host("test-scope").unwrap();
+        session.set_working_directory(&workspace).unwrap();
+        drop(session);
+        for path in [&foreign, &invalid, &falsy_native, &pi_source, &managed] {
             std::fs::File::options()
                 .write(true)
                 .open(path)
