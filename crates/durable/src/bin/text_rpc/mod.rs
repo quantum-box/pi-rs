@@ -1,13 +1,15 @@
-//! Text-only subset of the line-delimited Pi RPC protocol.
+//! Companion implementation of the line-delimited Pi RPC protocol.
 use std::collections::HashSet;
 use std::io::{self, BufRead, Read};
-use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
-use pi_rs_core::Message;
+use pi_rs_core::{CancellationToken, Message};
+use pi_rs_durable::images::{BuiltinImageProcessor, UserImageAdmission};
 use pi_rs_durable::progress;
 use pi_rs_durable::runtime::{
-    AdmissionOptions, Conversation, InputMode, OnAbort, QueueMode, Scheduler, Status,
+    AdmissionError, AdmissionOptions, Conversation, Error, InputMode, OnAbort, QueueMode,
+    Scheduler, Status, Submission,
 };
 use pi_rs_durable::worker_activity::WorkerKind;
 use serde_json::{Value, json};
@@ -15,7 +17,7 @@ use uuid::Uuid;
 
 use super::{RoutedModel, emit};
 
-const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+const MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 
 struct Turn {
     submission: Uuid,
@@ -27,22 +29,25 @@ struct Turn {
 }
 
 impl Turn {
-    fn start(submission: Uuid, content: &str) -> io::Result<Self> {
+    fn start(input: &Submission) -> io::Result<Self> {
         emit(&json!({"type":"agent_start"}))?;
         let mut turn = Self {
-            submission,
+            submission: input.id,
             users: Vec::new(),
             partial: String::new(),
             attempt: None,
             assistant_open: false,
             emitted_failures: HashSet::new(),
         };
-        turn.emit_user(content)?;
+        turn.emit_user(input)?;
         Ok(turn)
     }
 
-    fn emit_user(&mut self, content: &str) -> io::Result<()> {
-        let user = text_message("user", content);
+    fn emit_user(&mut self, input: &Submission) -> io::Result<()> {
+        let user = input.input_blocks.as_ref().map_or_else(
+            || text_message("user", &input.content),
+            |value| user_message(&value.blocks),
+        );
         emit(&json!({"type":"message_start","message":user}))?;
         emit(&json!({"type":"message_end","message":user}))?;
         self.users.push(user);
@@ -66,7 +71,7 @@ impl Turn {
                 Status::Queued => false,
             };
             if same_run && seen.insert(input.id) {
-                self.emit_user(&input.content)?;
+                self.emit_user(input)?;
             }
         }
         Ok(())
@@ -201,7 +206,7 @@ pub(super) async fn run(
     id: Uuid,
     model: &RoutedModel,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = scheduler.conversation(id)?;
+    let state = prepare_input_adapter(scheduler, id, model.has_image_adapter)?;
     let provider_model = model.provider_model(&state.config.model)?.to_owned();
     let mut seen = state
         .submissions
@@ -232,7 +237,7 @@ pub(super) async fn run(
             received = input.recv(), if input_open => {
                 match received {
                     Some(request) => {
-                        watching |= respond(scheduler, id, &provider_model, &mut active, &mut seen, request).await?;
+                        watching |= respond(scheduler, id, &provider_model, model.has_image_adapter, &mut active, &mut seen, request).await?;
                     }
                     None => input_open = false,
                 }
@@ -281,6 +286,7 @@ async fn respond(
     scheduler: &mut Scheduler,
     id: Uuid,
     model: &str,
+    has_image_adapter: bool,
     active: &mut Option<Turn>,
     seen: &mut HashSet<Uuid>,
     request: Result<Value, String>,
@@ -296,11 +302,23 @@ async fn respond(
     let mut admitted = false;
     let result = match command {
         "prompt" | "steer" | "follow_up" => {
-            let state = scheduler.conversation(id).map_err(io::Error::other)?;
-            // Admit against the same observation used to deliver an earlier failure.
-            // A concurrent transition must not let a queued request start an idle run.
+            let state = prepare_input_adapter(scheduler, id, has_image_adapter)
+                .map_err(io::Error::other)?;
             publish_turns(&state, active, seen, None, true, None)?;
-            submit_input(scheduler, &state, command, &request).map(|started| {
+            let mut result = submit_input(scheduler, &state, command, &request, false).await;
+            if matches!(result, Err(Error::Admission(AdmissionError::Idle)))
+                && state.input_run_active()
+                && request["images"].as_array().is_some_and(|images| !images.is_empty())
+            {
+                // The previous run settled during fitting. Publish its result
+                // before admission can clear its persisted failure record.
+                let settled = prepare_input_adapter(scheduler, id, has_image_adapter)
+                    .map_err(io::Error::other)?;
+                publish_turns(&settled, active, seen, None, true, None)?;
+                result = submit_input(scheduler, &settled, command, &request, true)
+                    .await.map(|_| false);
+            }
+            result.map_err(|error| error.to_string()).map(|started| {
                 admitted = true;
                 Some(json!({"disposition": if started { "started" } else { "queued" }}))
             })
@@ -313,7 +331,12 @@ async fn respond(
                     InputMode::Steer => &mut steering,
                     InputMode::FollowUp => &mut follow_up,
                 };
-                queue.push(input.submission.content);
+                let text = input.submission.input_blocks.as_ref()
+                    .and_then(|value| value.blocks.first())
+                    .and_then(|block| block["text"].as_str())
+                    .map(str::to_owned)
+                    .unwrap_or(input.submission.content);
+                queue.push(text);
             }
             Some(json!({"steering": steering, "followUp": follow_up}))
         }).map_err(|error| error.to_string()),
@@ -357,44 +380,87 @@ async fn respond(
     Ok(admitted)
 }
 
-fn submit_input(
+fn prepare_input_adapter(
+    scheduler: &mut Scheduler,
+    id: Uuid,
+    has_image_adapter: bool,
+) -> Result<Conversation, Error> {
+    let state = scheduler.conversation(id)?;
+    if has_image_adapter && state.provider_adapter.is_none() && !state.input_run_active() {
+        scheduler.select_provider_adapter(id, true)?;
+        return scheduler.conversation(id);
+    }
+    Ok(state)
+}
+
+async fn submit_input(
     scheduler: &mut Scheduler,
     state: &Conversation,
     command: &str,
     request: &Value,
-) -> Result<bool, String> {
-    if request
-        .get("images")
-        .is_some_and(|value| value.as_array().is_none_or(|images| !images.is_empty()))
-    {
-        return Err("durable text RPC accepts text input".into());
-    }
+    continue_after_settlement: bool,
+) -> Result<bool, Error> {
+    let attachments = match request.get("images") {
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| Error::Invalid("images must be an array".into()))?
+            .as_slice(),
+        None => &[],
+    };
     let message = request["message"]
         .as_str()
-        .ok_or("input message must be text")?;
+        .ok_or_else(|| Error::Invalid("input message must be text".into()))?;
     let behavior = match (command, request.get("streamingBehavior")) {
         ("steer", _) => Some(InputMode::Steer),
         ("follow_up", _) => Some(InputMode::FollowUp),
         (_, None) => None,
         (_, Some(value)) if value == "steer" => Some(InputMode::Steer),
         (_, Some(value)) if value == "followUp" => Some(InputMode::FollowUp),
-        _ => return Err("streamingBehavior must be steer or followUp".into()),
+        _ => {
+            return Err(Error::Invalid(
+                "streamingBehavior must be steer or followUp".into(),
+            ));
+        }
     };
     let running = state.input_run_active();
     let queued = command != "prompt" || running;
     if queued && behavior.is_none() {
-        return Err("a running prompt needs streamingBehavior".into());
+        return Err(Error::Invalid(
+            "a running prompt needs streamingBehavior".into(),
+        ));
     }
     let options = AdmissionOptions {
         mode: behavior.unwrap_or(InputMode::FollowUp),
         reject_when_busy: !queued,
-        reject_when_idle: queued,
+        reject_when_idle: queued && !continue_after_settlement,
         on_abort: OnAbort::Keep,
     };
-    scheduler
-        .submit_with_options(state.id, None, message.to_owned(), options)
-        .map(|_| !queued)
-        .map_err(|error| error.to_string())
+    let submission = if attachments.is_empty() {
+        scheduler.submit_with_options(state.id, None, message.to_owned(), options)
+    } else {
+        if attachments.iter().any(|image| {
+            image["type"] != "image" || !image["data"].is_string() || !image["mimeType"].is_string()
+        }) {
+            return Err(Error::Invalid(
+                "images must contain image blocks with data and mimeType".into(),
+            ));
+        }
+        let mut blocks = vec![json!({"type": "text", "text": message})];
+        blocks.extend_from_slice(attachments);
+        let admission = UserImageAdmission::new(Arc::new(BuiltinImageProcessor));
+        scheduler
+            .submit_fitted_user_blocks_with_options(
+                state.id,
+                None,
+                blocks,
+                &admission,
+                options,
+                &CancellationToken::default(),
+            )
+            .await
+            .map(|input| input.submission_id)
+    };
+    submission.map(|_| !queued)
 }
 
 fn set_queue_mode(
@@ -459,7 +525,7 @@ async fn advance(
             .err()
             .map(|error| error.to_string())
     };
-    let view = scheduler.view(id, NonZeroUsize::MIN)?;
+    let view = scheduler.view_status(id)?;
     publish_turns(
         &view.state,
         active,
@@ -495,7 +561,7 @@ fn publish_turns(
                 return Ok(());
             };
             seen.insert(input.id);
-            *active = Some(Turn::start(input.id, &input.content)?);
+            *active = Some(Turn::start(input)?);
         }
         let turn = active.as_mut().unwrap();
         let status = &state
@@ -533,12 +599,20 @@ fn messages(state: &Conversation) -> Vec<Value> {
     state
         .messages
         .iter()
-        .filter_map(|message| match message {
-            Message::User { content } => Some(text_message("user", content)),
+        .enumerate()
+        .filter_map(|(index, message)| match message {
+            Message::User { content } => Some(state.content_blocks.get(&index).map_or_else(
+                || text_message("user", content),
+                |value| user_message(&value.blocks),
+            )),
             Message::Assistant { content, .. } => Some(text_message("assistant", content)),
             _ => None,
         })
         .collect()
+}
+
+fn user_message(blocks: &[Value]) -> Value {
+    json!({"role": "user", "content": blocks, "timestamp": 0})
 }
 
 fn text_message(role: &str, text: &str) -> Value {

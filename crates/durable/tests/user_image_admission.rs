@@ -116,6 +116,63 @@ fn config(model: &str) -> Config {
         max_output_tokens: 100,
     }
 }
+
+#[cfg(all(feature = "builtin-images", feature = "openai-responses"))]
+#[tokio::test]
+async fn responses_rejects_aggregate_image_overflow_before_admission() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use pi_rs_durable::{images::BuiltinImageProcessor, openai_responses::OpenAiResponsesAdapter};
+
+    let mut seed = 1u32;
+    let mut image_block = |size| {
+        let pixels = image::RgbImage::from_fn(size, size, |_, _| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            image::Rgb([seed as u8, (seed >> 8) as u8, (seed >> 16) as u8])
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        json!({"type":"image","mimeType":"image/png","data":STANDARD.encode(bytes.into_inner())})
+    };
+    let big = image_block(800);
+    let small = image_block(2);
+    let fit = UserImageAdmission::new(Arc::new(BuiltinImageProcessor));
+    let adapter = Arc::new(
+        OpenAiResponsesAdapter::new("http://127.0.0.1:1/v1/responses", "fixture".into()).unwrap(),
+    );
+    let cancel = CancellationToken::new();
+    for queued in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        h.install_provider_adapter(adapter.clone()).unwrap();
+        let id = h.create_conversation(config("gpt-4.1")).unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        if queued {
+            h.submit(id, None, "keep this turn active".into()).unwrap();
+        }
+        h.submit_fitted_user_blocks(id, None, vec![big.clone()], &fit, &cancel)
+            .await
+            .unwrap();
+        let before = h.conversation(id).unwrap();
+        let error = h
+            .submit_fitted_user_blocks(id, Some("retry".into()), vec![big.clone()], &fit, &cancel)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Responses request size limit"),
+            "{error}"
+        );
+        let after = h.conversation(id).unwrap();
+        assert_eq!(after.submissions.len(), before.submissions.len());
+        assert_eq!(after.messages, before.messages);
+        h.submit_fitted_user_blocks(id, Some("retry".into()), vec![small.clone()], &fit, &cancel)
+            .await
+            .unwrap();
+    }
+}
 struct Switch;
 impl pi_rs_durable::task::scheduler::Handler for Switch {
     fn run(
@@ -528,6 +585,72 @@ async fn busy_fitted_inputs_queue_dedupe_and_survive_reopen() {
     s.shutdown().await.unwrap();
     let h = Harness::open_paused(&path, options()).unwrap();
     assert_eq!(h.conversation(id).unwrap().content_blocks, expected);
+}
+
+#[tokio::test]
+async fn fitted_input_is_admitted_after_the_previous_run_advances() {
+    use pi_rs_durable::runtime::{AdmissionOptions, Scheduler, Status};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(GatedAdapter::new());
+    let mut scheduler = Scheduler::open_with_provider_adapter(
+        &path,
+        options(),
+        Default::default(),
+        adapter.clone(),
+    )
+    .unwrap();
+    let id = scheduler.create_conversation(config("first")).unwrap();
+    scheduler.select_provider_adapter(id, true).unwrap();
+    scheduler.submit(id, None, "first run".into()).unwrap();
+    adapter.started.acquire().await.unwrap().forget();
+
+    let (ready, started) = std::sync::mpsc::channel();
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let fit = UserImageAdmission::new(Arc::new(GateProcessor {
+        ready: Mutex::new(Some(ready)),
+        wake: wake.clone(),
+    }));
+    let store = durable_store::Store::open(&path).unwrap();
+    let conversation_key = format!("runtime/conversation/{id}");
+    let cancel = CancellationToken::new();
+    let (admitted, ()) = tokio::join!(
+        scheduler.submit_fitted_user_blocks_with_options(
+            id,
+            None,
+            vec![image_block()],
+            &fit,
+            AdmissionOptions::default(),
+            &cancel,
+        ),
+        async {
+            tokio::task::spawn_blocking(move || started.recv().unwrap())
+                .await
+                .unwrap();
+            adapter.release.add_permits(1);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let entry = store.get(conversation_key.as_bytes()).unwrap().unwrap();
+                    let state: Value = serde_json::from_slice(&entry.value).unwrap();
+                    if state["phase"] == "Idle" {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            wake.notify_one();
+        },
+    );
+    let admitted = admitted.unwrap().submission_id;
+    scheduler.wait(id).await.unwrap();
+    let state = scheduler.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 2);
+    assert_eq!(state.submissions[1].id, admitted);
+    assert!(matches!(state.submissions[1].status, Status::Done { .. }));
+    assert_eq!(state.content_blocks.len(), 1);
+    scheduler.shutdown().await.unwrap();
 }
 
 struct ContinueFit {

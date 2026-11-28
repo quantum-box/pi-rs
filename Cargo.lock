@@ -2924,17 +2924,20 @@ dependencies = [
 name = "pi-rs-durable"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "base64 0.22.1",
  "clap",
  "durable-store",
  "durable-task-schema",
+ "eventsource-stream",
  "futures-util",
  "image",
  "jsonschema",
  "pi-rs-core",
  "pi-rs-workbench",
  "regex",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",
