@@ -6344,6 +6344,8 @@ from that catalog can become the new workspace default even when the launch
 workspace used another provider. Advertised, explicitly configured, and bundled
 models whose effective route matches that endpoint are eligible for its fallback;
 configured and advertised models retain preference over other bundled entries. The
+configured model ID owns case variants when choosing the effective route, so a
+separately routed model cannot reappear through the relay under another spelling. The
 automatic workspace refresh connects directly to a loopback relay in offline
 mode. Ordinary inference and user-requested discovery honor proxy settings in
 both modes. The fallback applies to

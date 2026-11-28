@@ -982,6 +982,20 @@ impl Cli {
             .chain(advertised.iter().map(String::as_str))
             .chain(bundled.iter().map(String::as_str))
         {
+            // A configured spelling owns every case variant for fallback.
+            // Resolve ownership before filtering so a rejected configured ID
+            // cannot reappear from discovery or the bundled catalog.
+            let mut owners = self
+                .model_profiles
+                .configured_model_ids(provider)
+                .filter(|configured| configured.eq_ignore_ascii_case(id));
+            let owner = owners.next();
+            if owner.is_some_and(|owner| self.model_endpoint_for(provider, Some(owner)) != endpoint)
+                || owners.any(|owner| self.model_endpoint_for(provider, Some(owner)) != endpoint)
+            {
+                continue;
+            }
+            let id = owner.unwrap_or(id);
             if self.model_endpoint_for(provider, Some(id)) == endpoint
                 && !models.iter().any(|model| model.eq_ignore_ascii_case(id))
             {

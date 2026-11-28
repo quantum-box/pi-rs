@@ -9221,6 +9221,60 @@ fn together_retired_fallback_uses_the_relay_catalog_across_workspace_restore() {
 }
 
 #[test]
+fn together_relay_fallback_respects_case_insensitive_model_route_ownership() {
+    for advertised in [vec![], vec!["moonshotai/Kimi-K3", "relay-model"]] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(
+            root.path().join("models.json"),
+            json!({"providers":{"together":{
+                "baseUrl":base,"apiKey":"relay-fixture",
+                "models":[{"id":"MOONSHOTAI/KIMI-K3","baseUrl":"https://other.example/v1"}]
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({
+                "defaultProvider":"together","defaultModel":"thinkingmachines/Inkling"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let expected = if advertised.is_empty() {
+            None
+        } else {
+            Some("relay-model")
+        };
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("GET /v1/models "), "{first}");
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+            }
+            let body = json!({"data":advertised.into_iter().map(|id| json!({"id":id})).collect::<Vec<_>>()}).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let output = together_saved_model_rpc(root.path(), &["--provider", "together"], &[]);
+        server.join().unwrap();
+        for model in together_saved_model_states(output) {
+            assert_eq!(model["provider"], "together");
+            let id = model["id"].as_str().unwrap();
+            assert!(!id.eq_ignore_ascii_case("moonshotai/Kimi-K3"), "{id}");
+            if let Some(expected) = expected {
+                assert_eq!(id, expected);
+            }
+        }
+    }
+}
+
+#[test]
 fn together_retired_default_discovers_again_after_rpc_workspace_switch() {
     let root = tempfile::tempdir().unwrap();
     let launch = root.path().join("launch");

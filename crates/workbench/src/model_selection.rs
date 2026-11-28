@@ -1427,7 +1427,9 @@ mod tests {
                 "baseUrl":"https://relay.example/v1",
                 "models":[
                     {"id":"separate", "baseUrl":"https://other.example/v1"},
-                    {"id":"Qwen/Qwen4-Max", "baseUrl":"https://other.example/v1"}
+                    {"id":"Qwen/Qwen4-Max", "baseUrl":"https://other.example/v1"},
+                    {"id":"MOONSHOTAI/KIMI-K3", "baseUrl":"https://other.example/v1"},
+                    {"id":"Relay-Configured"}
                 ]
             }}
         }))
@@ -1440,6 +1442,8 @@ mod tests {
                 "relay-only".into(),
                 "separate".into(),
                 "Qwen/Qwen4-Max".into(),
+                "moonshotai/Kimi-K3".into(),
+                "relay-configured".into(),
             ],
         ] {
             args.complete_catalogs =
@@ -1447,7 +1451,20 @@ mod tests {
             let models = args
                 .custom_together_fallback_models(&args.provider, true)
                 .unwrap();
-            assert!(models.iter().any(|id| id == "moonshotai/Kimi-K3"));
+            assert!(
+                !models
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case("moonshotai/Kimi-K3"))
+            );
+            assert!(models.iter().any(|id| id == "Relay-Configured"));
+            assert_eq!(
+                models
+                    .iter()
+                    .filter(|id| id.eq_ignore_ascii_case("Relay-Configured"))
+                    .count(),
+                1
+            );
+            assert!(models.iter().any(|id| id == "moonshotai/Kimi-K3.1-Pro"));
             assert_eq!(
                 models.iter().any(|id| id == "relay-only"),
                 !advertised.is_empty()
@@ -1456,6 +1473,14 @@ mod tests {
                 !models
                     .iter()
                     .any(|id| id == "separate" || id == "Qwen/Qwen4-Max")
+            );
+            let preferred = args
+                .custom_together_fallback_models(&args.provider, false)
+                .unwrap();
+            assert!(
+                !preferred
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case("moonshotai/Kimi-K3"))
             );
         }
         args.complete_catalogs.clear();
