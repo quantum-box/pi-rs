@@ -38,6 +38,7 @@ pub mod owned_subagent;
 pub mod ownership_edge;
 pub mod poll;
 pub mod progress;
+mod progress_retention;
 pub mod recovery;
 pub mod report;
 pub mod reset;

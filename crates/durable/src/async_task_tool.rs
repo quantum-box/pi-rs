@@ -861,8 +861,10 @@ pub struct DurableToolProgress {
 
 pub(crate) const MAX_CHECKPOINTABLE_PROGRESS_BYTES: usize = 32 * 1024;
 
+pub(crate) const CHECKPOINTABLE_PROGRESS_PREFIX: &str = "durable/checkpointable-progress/";
+
 pub(crate) fn durable_progress_prefix(task: uuid::Uuid) -> String {
-    format!("durable/checkpointable-progress/{task}/")
+    format!("{CHECKPOINTABLE_PROGRESS_PREFIX}{task}/")
 }
 
 pub(crate) fn durable_progress_key(task: uuid::Uuid, attempt: uuid::Uuid) -> Vec<u8> {
