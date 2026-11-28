@@ -13855,6 +13855,30 @@ impl Harness {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some((revision, sequence, changes)))
     }
+    /// Watch the current scoped value without creating a missing document.
+    pub fn watch_session_document<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        conversation: Uuid,
+        definition: &crate::document::SessionDocument<T>,
+        key: &str,
+        interval: Duration,
+        cancel: CancellationToken,
+    ) -> Result<Option<crate::document::SessionDocumentWatch<T>>, Error> {
+        let source = self
+            .merged_source
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("session document watch source already closed".into()))?;
+        Ok(crate::document::SessionDocumentWatch::attach(
+            &self.owner,
+            source.signal.closed.clone(),
+            conversation,
+            definition,
+            key,
+            interval,
+            cancel,
+        )?)
+    }
+
     /// Attach a lifecycle-aware merged watch from now or after a consumed cursor.
     /// Older cursors keep their original document selection on resume.
     pub fn watch_merged_progress_handle(
@@ -24199,6 +24223,19 @@ impl Scheduler {
     ) -> Result<crate::task_driver::Driver, Error> {
         self.harness.start_tasks(registry)
     }
+    /// Watch one shared session document without retaining the runtime.
+    pub fn watch_session_document<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        conversation: Uuid,
+        definition: &crate::document::SessionDocument<T>,
+        key: &str,
+        interval: Duration,
+        cancel: CancellationToken,
+    ) -> Result<Option<crate::document::SessionDocumentWatch<T>>, Error> {
+        self.harness
+            .watch_session_document(conversation, definition, key, interval, cancel)
+    }
+
     pub fn watch_merged_progress_handle(
         &self,
         conversation: Uuid,

@@ -480,7 +480,11 @@ membership changes reject the enclosing commit. Forks share the current value
 with the parent through the inherited membership. A migration keeps the
 incarnation ID, and recreating after retirement assigns a new ID. The store
 replaces the current payload and retains no historical document snapshots for
-these addresses.
+these addresses. Use `watch_session_document` from a member conversation to
+observe the current value without creating it. The pull watch follows the
+address through retirement and recreation, and coalesces commits between reads.
+Membership revocation, runtime shutdown, cancellation, or a definition change
+ends the watch. Acquire a watch with the new definition after migration.
 
 
 Nested tool calls are journaled by parent operation and call order. The standalone
