@@ -1574,6 +1574,41 @@ mod tests {
     }
 
     #[test]
+    fn imported_copilot_edit_preserves_opaque_signature_without_authorizing_replay() {
+        let signature = json!({"reasoning_opaque":"imported-fixture"}).to_string();
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{
+                "role":"assistant","provider":"github-copilot","api":"openai-completions",
+                "model":"fixture","content":[{"type":"text","text":"old"}],"stopReason":"stop"
+            }}),
+            json!({"type":"context_edit","id":"e","parentId":"a","targetId":"a","replacement":{
+                "content":[{"type":"text","text":"updated"},{"type":"thinking","thinking":"","thinkingSignature":signature}]
+            }}),
+        ]).unwrap();
+
+        assert!(matches!(
+            &session.current_messages()[0],
+            Message::Assistant { content, replay: None, .. } if content == "updated"
+        ));
+        let replacement = session
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::ContextEdited {
+                    replacement: Some(content),
+                    ..
+                } => Some(content),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(replacement).unwrap()[1]["thinkingSignature"],
+            signature
+        );
+    }
+
+    #[test]
     fn imported_assistant_edit_counts_replacement_thinking() {
         let session = import_pi(vec![
             json!({"type":"session","version":3}),

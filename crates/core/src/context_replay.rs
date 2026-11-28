@@ -133,12 +133,57 @@ pub(crate) fn replacement_replay(
             .or_else(|| metadata.replay.as_ref().map(|r| r.identity.clone()))
             .or_else(|| metadata.resolved_model.clone())?
     };
+    let copilot = api == ModelApi::OpenaiCompletions
+        && identity
+            .provider
+            .strip_prefix("github-copilot+endpoint-sha256:")
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+            });
     let mut result = Vec::new();
     if api == ModelApi::PiMessages {
         // The gateway binds replay to its endpoint as well as provider and model.
         result.push(metadata.replay.as_ref()?.blocks.first()?.clone());
     }
     for block in blocks {
+        let unsigned;
+        let block = if let ContentBlock::Thinking {
+            thinking,
+            thinking_signature: Some(signature),
+            redacted,
+        } = block
+            && signature.trim_start().starts_with('{')
+            && let Ok(signature) = serde_json::from_str::<Value>(signature)
+            && let Some(opaque) = signature.get("reasoning_opaque")
+        {
+            let field = signature.get("field");
+            if copilot
+                && let Some(opaque) = opaque.as_str().filter(|opaque| !opaque.is_empty())
+                && field.is_none_or(|field| {
+                    matches!(
+                        field.as_str(),
+                        Some("reasoning_content" | "reasoning" | "reasoning_text")
+                    )
+                })
+            {
+                result.push(json!({
+                    "type":"context_edit_reasoning",
+                    "text":thinking,
+                    "field":field,
+                    "opaque":opaque,
+                }));
+                continue;
+            }
+            // An opaque Copilot signature cannot serve as another provider's signature.
+            unsigned = ContentBlock::Thinking {
+                thinking: thinking.clone(),
+                thinking_signature: None,
+                redacted: *redacted,
+            };
+            &unsigned
+        } else {
+            block
+        };
         let value = match (api, block) {
             (ModelApi::PiMessages, ContentBlock::ToolCall { id, .. })
                 if !calls.iter().any(|call| call.id == *id) =>
@@ -827,6 +872,57 @@ mod tests {
         );
         assert_eq!(replay.blocks[1]["details"][0]["text"], "signed");
         assert_eq!(replay.blocks[3]["text"], "ordinary");
+    }
+
+    #[test]
+    fn replacement_decodes_only_valid_copilot_signatures_with_endpoint_provenance() {
+        let endpoint = "https://api.individual.githubcopilot.com/chat/completions";
+        let scope = endpoint_replay_scope("github-copilot", endpoint);
+        let replacement: ContextContent = serde_json::from_value(json!([
+            {"type":"thinking","thinking":"Plan.","thinkingSignature":r#"{"field":"reasoning_text","reasoning_opaque":"first"}"#},
+            {"type":"thinking","thinking":"","thinkingSignature":r#"{"reasoning_opaque":"latest"}"#},
+            {"type":"thinking","thinking":"Keep text.","thinkingSignature":r#"{"field":null,"reasoning_opaque":"invalid-field"}"#},
+            {"type":"thinking","thinking":"","thinkingSignature":r#"{"reasoning_opaque":""}"#},
+            {"type":"thinking","thinking":"","thinkingSignature":r#"{"reasoning_opaque":42}"#},
+            {"type":"text","text":"answer"}
+        ])).unwrap();
+        let metadata = |api, provider: String| ModelMetadata {
+            provider_api: Some(api),
+            replay_identity: Some(ResolvedModelIdentity {
+                provider,
+                model: "fixture".into(),
+            }),
+            ..Default::default()
+        };
+        let chat = ModelApi::OpenaiCompletions;
+        let replay = replacement_replay(&replacement, &metadata(chat, scope.clone()), &[]).unwrap();
+        assert_eq!(
+            replay.blocks[..2],
+            [
+                json!({"type":"context_edit_reasoning","text":"Plan.","field":"reasoning_text","opaque":"first"}),
+                json!({"type":"context_edit_reasoning","text":"","field":null,"opaque":"latest"}),
+            ]
+        );
+        assert_eq!(replay.blocks.len(), 5);
+        assert_eq!(replay.blocks[2]["text"], "Keep text.");
+        assert!(replay.blocks[2].get("opaque").is_none());
+
+        for (api, provider) in [
+            (chat, endpoint_replay_scope("other", endpoint)),
+            (chat, "github-copilot+endpoint-sha256:invalid".into()),
+            (ModelApi::AnthropicMessages, scope),
+        ] {
+            let replay = replacement_replay(&replacement, &metadata(api, provider), &[]).unwrap();
+            assert!(
+                !serde_json::to_string(&replay.blocks)
+                    .unwrap()
+                    .contains("opaque")
+            );
+        }
+        assert!(
+            replacement_replay(&replacement, &metadata(chat, "github-copilot".into()), &[],)
+                .is_none()
+        );
     }
 
     #[test]

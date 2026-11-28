@@ -1662,6 +1662,382 @@ async fn read_model_json_request(
     (head, body)
 }
 
+async fn serve_chat_deltas(
+    listener: &tokio::net::TcpListener,
+    deltas: &[serde_json::Value],
+    finish_reason: Option<&str>,
+) -> serde_json::Value {
+    use serde_json::json;
+    use tokio::io::AsyncWriteExt;
+
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let (_, body) = read_model_json_request(&mut socket).await;
+    let mut events = String::new();
+    for delta in deltas {
+        let chunk = json!({"choices":[{"index":0,"delta":delta}]});
+        events.push_str(&format!("data: {chunk}\n\n"));
+    }
+    if let Some(finish_reason) = finish_reason {
+        let chunk = json!({"choices":[{"index":0,"delta":{},"finish_reason":finish_reason}]});
+        events.push_str(&format!("data: {chunk}\n\ndata: [DONE]\n\n"));
+    }
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",
+        events.len()
+    );
+    socket.write_all(response.as_bytes()).await.unwrap();
+    body
+}
+
+#[tokio::test]
+async fn copilot_opaque_reasoning_survives_reopen_and_stays_on_its_route() {
+    use pi_rs::{Message, Model, ModelRequest, Notification, SessionBuilder};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+    let other_endpoint = format!(
+        "http://{}/other/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let factory = ModelClientFactory::new(HostAuthBuilder::new().build());
+    let client = |provider: &str, endpoint: &str| {
+        Arc::new(factory.anonymous_chat(provider, endpoint).unwrap()) as Arc<dyn Model>
+    };
+    let copilot = client("github-copilot", &endpoint);
+    let model = "fixture";
+    let directory = tempfile::tempdir().unwrap();
+    let detail = json!({"type":"reasoning.encrypted","id":"fixture","data":"signed"});
+    for (name, deltas, reasoning, expected) in [
+        (
+            "with-text",
+            vec![
+                json!({"reasoning_text":"First.", "reasoning_opaque":"discarded", "content":"Check"}),
+                json!({"reasoning_content":" Second.", "reasoning":"duplicate", "reasoning_opaque":"private-value"}),
+                json!({"reasoning_opaque":17}),
+                json!({"content":"ing.", "reasoning_opaque":""}),
+            ],
+            vec!["First.", " Second."],
+            json!({"role":"assistant","content":"Checking.","reasoning_content":"First. Second.","reasoning_opaque":"private-value"}),
+        ),
+        (
+            "without-text",
+            vec![json!({"content":"Checking.","reasoning_opaque":"private-value"})],
+            vec![],
+            json!({"role":"assistant","content":"Checking.","reasoning_opaque":"private-value"}),
+        ),
+        (
+            "structured",
+            vec![json!({
+                "content":"Checking.","reasoning_text":"Plan.",
+                "reasoning_opaque":"discarded","reasoning_details":[detail]
+            })],
+            vec!["Plan."],
+            json!({"role":"assistant","content":"Checking.","reasoning_details":[detail]}),
+        ),
+    ] {
+        let path = directory.path().join(format!("{name}.jsonl"));
+        let open = || {
+            SessionBuilder::new(copilot.clone(), model)
+                .provider("github-copilot")
+                .unwrap()
+                .open(&path)
+                .unwrap()
+        };
+        let mut session = open();
+        let mut visible = Vec::new();
+        let mut observer = |event: Notification<'_>| match event {
+            Notification::Reasoning(text) => visible.push(("reasoning", text.to_owned())),
+            Notification::Text(text) => visible.push(("text", text.to_owned())),
+            _ => {}
+        };
+        let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                serve_chat_deltas(&listener, &deltas, Some("stop")),
+                session.prompt_with_observer("start", &mut observer)
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), "Checking.");
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|(kind, _)| *kind == "reasoning")
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            reasoning
+        );
+        if name == "with-text" {
+            assert_eq!(
+                visible
+                    .iter()
+                    .map(|(kind, text)| (*kind, text.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    ("reasoning", "First."),
+                    ("text", "Check"),
+                    ("reasoning", " Second."),
+                    ("text", "ing.")
+                ]
+            );
+        }
+        session.close().await.unwrap();
+        drop(session);
+
+        let mut session = open();
+        assert_eq!(
+            session.get_last_assistant_text().unwrap().as_deref(),
+            Some("Checking.")
+        );
+        let history = {
+            let journal = session.journal().unwrap();
+            journal.model_conversation_at(journal.head()).unwrap()
+        };
+        assert!(history.iter().any(|message| matches!(
+            message,
+            Message::Assistant {
+                replay: Some(_),
+                ..
+            }
+        )));
+        let reply = [json!({"content":"Done."})];
+        let (body, result) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                serve_chat_deltas(&listener, &reply, Some("stop")),
+                session.prompt("continue")
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), "Done.");
+        let assistant = |body: &Value| {
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "assistant")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(assistant(&body), expected, "{name}");
+
+        for (provider, endpoint, model) in [
+            ("github-copilot", endpoint.as_str(), "different-model"),
+            ("github-copilot", other_endpoint.as_str(), model),
+            ("other-provider", endpoint.as_str(), model),
+        ] {
+            let client = client(provider, endpoint);
+            let request = ModelRequest {
+                model: model.into(),
+                messages: history.clone(),
+                tools: vec![],
+                max_output_tokens: 32,
+            };
+            let (body, stream) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    serve_chat_deltas(&listener, &reply, Some("stop")),
+                    client.stream(request)
+                )
+            })
+            .await
+            .unwrap();
+            drop(stream.unwrap());
+            assert_eq!(
+                assistant(&body),
+                json!({"role":"assistant","content":"Checking."})
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn copilot_context_replacement_replays_legacy_opaque_signatures_only_on_the_origin_route() {
+    use pi_rs::{Event, Model, ModelRequest, SessionBuilder};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+    let other_endpoint = format!(
+        "http://{}/other/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let factory = ModelClientFactory::new(HostAuthBuilder::new().build());
+    let copilot = Arc::new(factory.anonymous_chat("github-copilot", &endpoint).unwrap());
+    let mut session = SessionBuilder::new(copilot, "fixture")
+        .provider("github-copilot")
+        .unwrap()
+        .in_memory()
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let reply = [json!({"content":"Original."})];
+        let (_, result) = tokio::join!(
+            serve_chat_deltas(&listener, &reply, Some("stop")),
+            session.prompt("start")
+        );
+        assert_eq!(result.unwrap(), "Original.");
+        let target = session
+            .journal()
+            .unwrap()
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Assistant { .. }))
+            .unwrap()
+            .id;
+
+        for (thinking, signature, expected) in [
+            (
+                "Plan.",
+                r#"{"field":"reasoning_text","reasoning_opaque":"edited-state"}"#,
+                json!({"role":"assistant","content":"Edited.","reasoning_text":"Plan.","reasoning_opaque":"edited-state"}),
+            ),
+            (
+                "",
+                r#"{"reasoning_opaque":"edited-state"}"#,
+                json!({"role":"assistant","content":"Edited.","reasoning_opaque":"edited-state"}),
+            ),
+        ] {
+            let replacement = serde_json::from_value(json!([
+                {"type":"thinking","thinking":thinking,"thinkingSignature":signature},
+                {"type":"text","text":"Edited."}
+            ])).unwrap();
+            session.edit_context(target, Some(replacement)).unwrap();
+            let history = {
+                let journal = session.journal().unwrap();
+                journal.model_conversation_at(journal.head()).unwrap()
+            };
+            for (provider, route, model) in [
+                ("github-copilot", endpoint.as_str(), "fixture"),
+                ("github-copilot", other_endpoint.as_str(), "fixture"),
+                ("github-copilot", endpoint.as_str(), "other-model"),
+                ("other-provider", endpoint.as_str(), "fixture"),
+            ] {
+                let client = factory.anonymous_chat(provider, route).unwrap();
+                let request = ModelRequest {
+                    model: model.into(),
+                    messages: history.clone(),
+                    tools: vec![],
+                    max_output_tokens: 32,
+                };
+                let (body, stream) = tokio::join!(
+                    serve_chat_deltas(&listener, &reply, Some("stop")),
+                    client.stream(request)
+                );
+                drop(stream.unwrap());
+                let assistant = body["messages"].as_array().unwrap().iter()
+                    .find(|message| message["role"] == "assistant").unwrap();
+                if provider == "github-copilot" && route == endpoint && model == "fixture" {
+                    assert_eq!(assistant, &expected);
+                } else {
+                    assert_eq!(assistant, &json!({"role":"assistant","content":"Edited."}));
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn copilot_replays_opaque_reasoning_on_a_tool_only_assistant_turn() {
+    use futures_util::StreamExt;
+    use pi_rs::{Message, Model, ModelEvent, ModelRequest};
+    use serde_json::json;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+    let factory = ModelClientFactory::new(HostAuthBuilder::new().build());
+    let client = factory.anonymous_chat("github-copilot", &endpoint).unwrap();
+    let call = json!({"id":"call_fixture","type":"function","function":{"name":"lookup","arguments":"{}"}});
+    let deltas = [
+        json!({"reasoning_opaque":"private-tool-state"}),
+        json!({"tool_calls":[{"index":0,"id":call["id"],"type":call["type"],"function":call["function"]}]}),
+    ];
+    let mut request = ModelRequest {
+        model: "fixture".into(),
+        messages: vec![],
+        tools: vec![],
+        max_output_tokens: 32,
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (_, stream) = tokio::join!(
+            serve_chat_deltas(&listener, &deltas, Some("tool_calls")),
+            client.stream(request.clone())
+        );
+        let mut stream = stream.unwrap();
+        let mut replay = None;
+        let mut calls = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ModelEvent::Metadata(metadata) => replay = metadata.replay,
+                ModelEvent::Complete { calls: completed, .. } => calls = completed,
+                ModelEvent::Reasoning(_) | ModelEvent::Text(_) => panic!("unexpected visible delta"),
+                _ => {}
+            }
+        }
+        request.messages.push(Message::Assistant { content: String::new(), calls, replay });
+        let reply = [json!({"content":"Done."})];
+        let (body, stream) = tokio::join!(
+            serve_chat_deltas(&listener, &reply, Some("stop")),
+            client.stream(request)
+        );
+        drop(stream.unwrap());
+        assert_eq!(
+            body["messages"][0],
+            json!({"role":"assistant","content":null,"tool_calls":[call],"reasoning_opaque":"private-tool-state"})
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn copilot_incomplete_stream_keeps_opaque_metadata_private() {
+    use futures_util::StreamExt;
+    use pi_rs::{Model, ModelEvent, ModelRequest};
+    use serde_json::json;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client =
+        pi_rs::ollama::Ollama::new(&format!("http://{}", listener.local_addr().unwrap()), None)
+            .unwrap()
+            .with_provider("github-copilot");
+    let deltas = [json!({"reasoning_text":"Plan.","reasoning_opaque":"private-value"})];
+    let request = ModelRequest {
+        model: "fixture".into(),
+        messages: vec![],
+        tools: vec![],
+        max_output_tokens: 32,
+    };
+    let (_, stream) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            serve_chat_deltas(&listener, &deltas, None),
+            client.stream(request)
+        )
+    })
+    .await
+    .unwrap();
+    let events = stream.unwrap().collect::<Vec<_>>().await;
+    assert!(events.last().unwrap().is_err());
+    assert!(events.iter().any(|event| matches!(event,
+        Ok(ModelEvent::Metadata(metadata)) if metadata.replay.as_ref().is_some_and(|replay|
+            replay.blocks.iter().any(|block| block["opaque"] == "private-value")))));
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(ModelEvent::Reasoning(text) | ModelEvent::Text(text)) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ["Plan."]
+    );
+}
+
 #[tokio::test]
 async fn pi_messages_does_not_follow_redirects_from_the_granted_endpoint() {
     use pi_rs::ModelRequest;

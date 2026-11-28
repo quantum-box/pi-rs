@@ -502,7 +502,10 @@ impl Ollama {
     }
 
     fn compatible_message(&self, message: Message, identity: &ResolvedModelIdentity) -> Vec<Value> {
+        let copilot = self.provider == "github-copilot";
+        let preserve_details = copilot || self.compatibility.preserves_reasoning_details();
         let mut reasoning = None;
+        let mut copilot_reasoning = None;
         let mut details = Vec::new();
         let mut edited_reasoning = Vec::new();
         let mut edited_order = Vec::new();
@@ -517,9 +520,7 @@ impl Ollama {
                 if block["type"] == "context_edit_reasoning" {
                     edited_reasoning.push(block.clone());
                     edited_order.push(block.clone());
-                    if self.compatibility.preserves_reasoning_details()
-                        && let Some(items) = block["details"].as_array()
-                    {
+                    if preserve_details && let Some(items) = block["details"].as_array() {
                         details.extend(
                             items
                                 .iter()
@@ -531,9 +532,9 @@ impl Ollama {
                     edited_order.push(block.clone());
                 } else if block["type"] == "reasoning_content" {
                     reasoning = block["text"].as_str().map(str::to_owned);
-                } else if self.compatibility.preserves_reasoning_details()
-                    && reasoning_details::is_valid(block)
-                {
+                } else if copilot && block["type"] == "reasoning.copilot" {
+                    copilot_reasoning = Some(block.clone());
+                } else if preserve_details && reasoning_details::is_valid(block) {
                     details.push(block.clone());
                 }
             }
@@ -563,8 +564,48 @@ impl Ollama {
                 reasoning.as_deref().unwrap_or_default()
             });
         }
+        let edited_opaque = copilot
+            .then(|| {
+                edited_reasoning.iter().rev().find(|block| {
+                    block["opaque"]
+                        .as_str()
+                        .is_some_and(|opaque| !opaque.is_empty())
+                })
+            })
+            .flatten();
+        let has_details = !details.is_empty();
+        if let Some(block) = edited_opaque
+            && !has_details
+        {
+            first["reasoning_opaque"] = block["opaque"].clone();
+        }
         if !details.is_empty() {
             first["reasoning_details"] = Value::Array(details);
+        } else if let Some(block) = &copilot_reasoning {
+            // Replay state cannot make an otherwise empty assistant turn valid.
+            if first["content"]
+                .as_str()
+                .is_none_or(|text| text.trim().is_empty())
+                && first.get("tool_calls").is_none()
+            {
+                return Vec::new();
+            }
+            if let Some(opaque) = block["opaque"].as_str().filter(|opaque| !opaque.is_empty()) {
+                first["reasoning_opaque"] = json!(opaque);
+            }
+            if self.supports_reasoning != Some(false)
+                && let Some(text) = block["text"]
+                    .as_str()
+                    .filter(|text| !text.trim().is_empty())
+            {
+                if self.compatibility.requires_thinking_as_text == Some(true) {
+                    reasoning = Some(text.to_owned());
+                } else if let Some(field @ ("reasoning_content" | "reasoning" | "reasoning_text")) =
+                    block["field"].as_str()
+                {
+                    first[field] = json!(text);
+                }
+            }
         }
         if edited_reasoning.is_empty()
             && self.supports_reasoning != Some(false)
@@ -608,28 +649,42 @@ impl Ollama {
                 let ordinary: Vec<_> = edited_reasoning
                     .iter()
                     .filter(|b| {
-                        !self.compatibility.preserves_reasoning_details()
+                        !preserve_details
                             || !b["details"]
                                 .as_array()
                                 .is_some_and(|items| items.iter().any(reasoning_details::is_valid))
                     })
                     .collect();
-                let text = ordinary
-                    .iter()
-                    .filter_map(|b| b["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let field = ordinary
-                    .first()
-                    .and_then(|b| b["field"].as_str())
-                    .or(self.compatibility.reasoning_field.as_deref())
-                    .unwrap_or("reasoning_content");
-                if !text.is_empty()
-                    && matches!(field, "reasoning_content" | "reasoning" | "reasoning_text")
+                let field = if let Some(block) = edited_opaque {
+                    (!has_details).then(|| block["field"].as_str()).flatten()
+                } else {
+                    ordinary
+                        .first()
+                        .and_then(|b| b["field"].as_str())
+                        .or(self.compatibility.reasoning_field.as_deref())
+                        .or(Some("reasoning_content"))
+                };
+                if let Some(field @ ("reasoning_content" | "reasoning" | "reasoning_text")) = field
                 {
-                    first[field] = json!(text);
+                    let text = ordinary
+                        .iter()
+                        .filter_map(|b| b["text"].as_str())
+                        .filter(|text| edited_opaque.is_none() || !text.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        first[field] = json!(text);
+                    }
                 }
             }
+        }
+        if edited_opaque.is_some()
+            && first["content"]
+                .as_str()
+                .is_some_and(|text| text.trim().is_empty())
+            && first.get("tool_calls").is_none()
+        {
+            return Vec::new();
         }
         if first["role"] == "assistant"
             && first["content"].as_str().is_some_and(str::is_empty)
@@ -1093,6 +1148,7 @@ impl Model for Ollama {
                     "reasoning",
                     "reasoning_text",
                     "reasoning_details",
+                    "reasoning_opaque",
                 ]
                 .iter()
                 .filter_map(|key| item.get(*key))
@@ -1134,7 +1190,11 @@ impl Model for Ollama {
                                 .blocks
                                 .iter()
                                 .rev()
-                                .find(|b| b["type"] == "reasoning_content")
+                                .find(|b| {
+                                    b["type"] == "reasoning_content"
+                                        || (self.provider == "github-copilot"
+                                            && b["type"] == "reasoning.copilot")
+                                })
                                 .and_then(|b| b["text"].as_str())
                                 .filter(|text| !text.trim().is_empty())
                                 .map_or(0, |text| {
@@ -1370,7 +1430,8 @@ impl Ollama {
         let requested_model = request.model.clone();
         let identity = self.replay_identity(&requested_model);
         let infer_finish = self.compatibility.supports_finish_reason == Some(false);
-        let preserve_details = self.compatibility.preserves_reasoning_details();
+        let preserve_copilot = copilot.is_some() && self.mistral.is_none();
+        let preserve_details = preserve_copilot || self.compatibility.preserves_reasoning_details();
         let preserve_reasoning = self.supports_reasoning != Some(false)
             && (self
                 .compatibility
@@ -1618,10 +1679,13 @@ impl Ollama {
                 ..ModelMetadata::default()
             };
             let mut reasoning_text = String::new();
+            let mut copilot_first_field = None;
+            let mut copilot_last_field = None;
+            let mut copilot_opaque = None;
             let mut replay_blocks = Vec::new();
             let mut mistral_segments = Vec::new();
             let mut mistral_after_tool = false;
-            loop {
+            let stream_error = 'stream: loop {
                 let event = tokio::select! {
                     event = events.next() => event,
                     _ = poll.tick(), if monitor_loading && matches!(last_progress, Some(ModelProgress::WaitingForModel | ModelProgress::LoadingModel)) => {
@@ -1636,18 +1700,19 @@ impl Ollama {
                     }
                 };
                 let Some(event) = event else {
-                    if mistral && metadata.finish_reason.is_some() {
-                        break;
-                    }
-                    Err(Error::RetryableModel("SSE closed before the end marker".into()))?;
-                    unreachable!();
+                    break if mistral && metadata.finish_reason.is_some() {
+                        None
+                    } else {
+                        Some(Error::RetryableModel("SSE closed before the end marker".into()))
+                    };
                 };
-                let event = event.map_err(|error| match error {
-                    eventsource_stream::EventStreamError::Transport(error) => error,
-                    _ => Error::RetryableModel("broken SSE stream".into()),
-                })?;
+                let event = match event {
+                    Ok(event) => event,
+                    Err(eventsource_stream::EventStreamError::Transport(error)) => break Some(error),
+                    Err(_) => break Some(Error::RetryableModel("broken SSE stream".into())),
+                };
                 if event.data == "[DONE]" {
-                    break;
+                    break None;
                 }
                 if observe_stream && let Ok(raw) = serde_json::from_str::<Value>(&event.data) {
                     pi_rs_core::observe_provider_stream(
@@ -1655,10 +1720,11 @@ impl Ollama {
                         &raw, &error_secrets, &loading_probe.headers,
                     ).await;
                 }
-                let chunk: Chunk = serde_json::from_str(&event.data)
-                    .map_err(|_| Error::Model("malformed SSE chunk".into()))?;
+                let Ok(chunk) = serde_json::from_str::<Chunk>(&event.data) else {
+                    break Some(Error::Model("malformed SSE chunk".into()));
+                };
                 if let Some(error) = &chunk.error {
-                    Err(if pi_rs_core::permanent_provider_error(error, &error_secrets) {
+                    break Some(if pi_rs_core::permanent_provider_error(error, &error_secrets) {
                         Error::Model("Chat Completions account quota or billing limit reached".into())
                     } else if pi_rs_core::retryable_provider_error(error, &error_secrets) {
                         Error::RetryableModel("provider returned a transient stream error".into())
@@ -1666,7 +1732,7 @@ impl Ollama {
                         Error::Model("context window exceeded".into())
                     } else {
                         Error::Model("provider returned a stream error".into())
-                    })?;
+                    });
                 }
                 let previous = metadata.clone();
                 if let Some(id) = chunk.id
@@ -1704,13 +1770,29 @@ impl Ollama {
                 }
                 for choice in chunk.choices {
                     if choice.index != 0 || metadata.finish_reason.is_some() {
-                        Err(Error::Model("unexpected choice in model stream".into()))?;
+                        break 'stream Some(Error::Model("unexpected choice in model stream".into()));
                     }
-                    if let Some(text) = [
-                        choice.delta.reasoning,
-                        choice.delta.reasoning_content,
-                        choice.delta.reasoning_text,
-                    ].into_iter().flatten().find(|text| !text.is_empty()) {
+                    let mut fields = [
+                        ("reasoning", choice.delta.reasoning),
+                        ("reasoning_content", choice.delta.reasoning_content),
+                        ("reasoning_text", choice.delta.reasoning_text),
+                    ];
+                    if preserve_copilot {
+                        // Pi prefers reasoning_content over reasoning when both are present.
+                        fields.swap(0, 1);
+                        if let Some(Value::String(opaque)) = choice.delta.reasoning_opaque
+                            && !opaque.is_empty()
+                        {
+                            copilot_opaque = Some(opaque);
+                        }
+                    }
+                    if let Some((field, Some(text))) = fields.into_iter()
+                        .find(|(_, text)| text.as_ref().is_some_and(|text| !text.is_empty()))
+                    {
+                        if preserve_copilot {
+                            copilot_first_field.get_or_insert(field);
+                            copilot_last_field = Some(field);
+                        }
                         report_progress(&progress, &mut last_progress, ModelProgress::Thinking);
                         reasoning_text.push_str(&text);
                         if let Some(observer) = &reasoning { observer(&text); }
@@ -1808,10 +1890,10 @@ impl Ollama {
                     }
                     match choice.finish_reason.as_deref() {
                         Some("error") if mistral => {
-                            Err(Error::RetryableModel("Mistral reported a server error".into()))?;
+                            break 'stream Some(Error::RetryableModel("Mistral reported a server error".into()));
                         }
                         Some("error" | "network_error") => {
-                            Err(Error::RetryableModel("provider returned a transient finish reason".into()))?;
+                            break 'stream Some(Error::RetryableModel("provider returned a transient finish reason".into()));
                         }
                         _ => {}
                     }
@@ -1830,6 +1912,34 @@ impl Ollama {
                 if metadata != previous {
                     yield ModelEvent::Metadata(metadata.clone());
                 }
+            };
+            if preserve_copilot {
+                // Structured details take precedence over the opaque value and its raw reasoning field.
+                if replay_blocks.is_empty() && (copilot_opaque.is_some() || copilot_first_field.is_some()) {
+                    let field = if copilot_opaque.is_some() { copilot_last_field } else { copilot_first_field };
+                    replay_blocks.push(json!({
+                        "type":"reasoning.copilot",
+                        "field":field,
+                        "text":reasoning_text,
+                        "opaque":copilot_opaque,
+                    }));
+                }
+                if !replay_blocks.is_empty() {
+                    metadata.replay = Some(Box::new(ProviderReplay {
+                        identity: identity.clone(),
+                        blocks: std::mem::take(&mut replay_blocks),
+                    }));
+                }
+                if !reasoning_text.is_empty() {
+                    metadata.reasoning = Some(std::mem::take(&mut reasoning_text));
+                }
+            }
+            if let Some(error) = stream_error {
+                if preserve_copilot && metadata.replay.is_some() {
+                    yield ModelEvent::Metadata(metadata);
+                }
+                Err(error)?;
+                unreachable!();
             }
             if infer_finish && !matches!(metadata.finish_reason.as_deref(), Some("length" | "content_filter")) {
                 metadata.finish_reason = Some(if calls.is_empty() { "stop" } else { "tool_calls" }.into());
@@ -1838,7 +1948,13 @@ impl Ollama {
             match metadata.finish_reason.as_deref() {
                 Some("stop" | "length") if calls.is_empty() => {},
                 Some("tool_calls") if !calls.is_empty() => {},
-                _ => Err(Error::Model("model response did not finish successfully".into()))?,
+                _ => {
+                    if preserve_copilot && metadata.replay.is_some() {
+                        yield ModelEvent::Metadata(metadata);
+                    }
+                    Err(Error::Model("model response did not finish successfully".into()))?;
+                    unreachable!();
+                }
             }
             if !mistral_segments.is_empty() {
                 replay_blocks.push(mistral::replay_block(mistral_segments));
@@ -2173,6 +2289,7 @@ struct Delta {
     reasoning_content: Option<String>,
     reasoning_text: Option<String>,
     reasoning_details: Option<Value>,
+    reasoning_opaque: Option<Value>,
     tool_calls: Option<Vec<WireCall>>,
 }
 
