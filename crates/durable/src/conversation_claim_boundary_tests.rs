@@ -1,4 +1,5 @@
 // Real driver tests with a deterministic competing writer at claim commit.
+use crate::publish_ready_marker;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use pi_rs_core::{
@@ -23,11 +24,6 @@ struct ModelStub {
     arguments: String,
 }
 struct ClaimPassHook(Option<Arc<std::sync::atomic::AtomicUsize>>, bool);
-fn publish_ready_marker(path: std::path::PathBuf, data: impl AsRef<[u8]>) {
-    let staging = path.with_extension("tmp");
-    std::fs::write(&staging, data).unwrap();
-    std::fs::rename(staging, path).unwrap();
-}
 
 #[async_trait]
 impl crate::extension::Hook for ClaimPassHook {
