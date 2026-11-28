@@ -305,6 +305,30 @@ mod tests {
         assert_eq!(estimated["cost"]["output"].as_f64(), Some(2.6));
     }
 
+    #[test]
+    fn usage_prices_duplicate_tiers_and_large_input_like_pi() {
+        let cost = serde_json::from_value(json!({
+            "tiers": [
+                {"inputTokensAbove":100, "input":1.0},
+                {"inputTokensAbove":100, "input":3.0},
+                {"inputTokensAbove":50, "input":4.0}
+            ]
+        }))
+        .unwrap();
+        let priced = usage(&cost, &json!({"input":200})).unwrap();
+        let total = priced["cost"]["total"].as_f64().unwrap();
+        assert!((total - 0.0002).abs() < 1e-12, "{total}");
+
+        let cost = Cost {
+            input: 10.0,
+            cache_read: 10.0,
+            ..Cost::default()
+        };
+        let priced = usage(&cost, &json!({"input":1e308,"cacheRead":1e307})).unwrap();
+        assert!(priced["cost"]["input"].as_f64().unwrap().is_finite());
+        assert!(priced["cost"]["cacheRead"].as_f64().unwrap().is_finite());
+    }
+
     async fn request(socket: &mut TcpStream) -> (String, BTreeMap<String, String>, Value) {
         let mut reader = BufReader::new(socket);
         let mut route = String::new();

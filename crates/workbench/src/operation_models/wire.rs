@@ -383,14 +383,16 @@ pub(super) fn token_cost(cost: &super::Cost, counts: [f64; 4], image_tokens: f64
     let tier = cost
         .tiers
         .iter()
+        .rev() // max_by_key keeps the last match; Pi keeps the first configured tier.
         .filter(|tier| input + cache_read + cache_write > tier.input_tokens_above as f64)
         .max_by_key(|tier| tier.input_tokens_above);
-    let input_cost = tier.map_or(cost.input, |tier| tier.input) * input / 1_000_000.0;
+    let input_cost = (tier.map_or(cost.input, |tier| tier.input) / 1_000_000.0) * input;
     let output_rate = tier.map_or(cost.output, |tier| tier.output);
     let output_cost = (output_rate * (output - image_tokens)
         + cost.image_output.unwrap_or_default() * image_tokens)
         / 1_000_000.0;
-    let read_cost = tier.map_or(cost.cache_read, |tier| tier.cache_read) * cache_read / 1_000_000.0;
+    let read_cost =
+        (tier.map_or(cost.cache_read, |tier| tier.cache_read) / 1_000_000.0) * cache_read;
     let write_cost =
         tier.map_or(cost.cache_write, |tier| tier.cache_write) * cache_write / 1_000_000.0;
     json!({
