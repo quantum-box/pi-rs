@@ -49,6 +49,11 @@ pub mod native_pi_messages;
 #[doc(hidden)]
 pub mod oauth_callback;
 #[doc(hidden)]
+pub mod package_manifest;
+#[doc(hidden)]
+pub mod package_pattern;
+pub mod package_resources;
+#[doc(hidden)]
 pub mod process_cleanup;
 pub mod prompt_resources;
 pub mod prompt_template_arguments;

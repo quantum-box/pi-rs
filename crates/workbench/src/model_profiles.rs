@@ -275,6 +275,7 @@ struct ModelCompatibility {
     session_affinity_format: Option<AffinityFormat>,
     prompt_cache_key_mode: Option<PromptCacheKeyMode>,
     supports_long_cache_retention: Option<bool>,
+    supports_reasoning_replay: Option<bool>,
     supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
     supports_eager_tool_input_streaming: Option<bool>,
@@ -319,6 +320,9 @@ impl ModelCompatibility {
             supports_long_cache_retention: newer
                 .supports_long_cache_retention
                 .or(self.supports_long_cache_retention),
+            supports_reasoning_replay: newer
+                .supports_reasoning_replay
+                .or(self.supports_reasoning_replay),
             supports_explicit_prompt_cache_mode: newer
                 .supports_explicit_prompt_cache_mode
                 .or(self.supports_explicit_prompt_cache_mode),
@@ -695,15 +699,13 @@ static BUILTIN_MODELS: LazyLock<BTreeMap<String, Vec<ConfiguredModel>>> = LazyLo
     models
 });
 
-fn configure_azure(data: &mut Value, env: impl Fn(&str) -> Option<String>) -> Result<()> {
-    let configured_base = data
-        .get("providers")
-        .and_then(Value::as_object)
-        .and_then(|providers| {
-            providers
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("azure"))
-        })
+fn configure_azure(
+    providers: &mut serde_json::Map<String, Value>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
+    let configured_base = providers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("azure"))
         .is_some_and(|(_, provider)| provider.get("baseUrl").is_some());
     if configured_base {
         return Ok(());
@@ -727,14 +729,6 @@ fn configure_azure(data: &mut Value, env: impl Fn(&str) -> Option<String>) -> Re
     } else {
         return Ok(());
     };
-    let providers = data
-        .as_object_mut()
-        .and_then(|data| {
-            data.entry("providers")
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-        })
-        .ok_or_else(|| Error::Config("models.json providers must be an object".into()))?;
     let name = providers
         .keys()
         .find(|key| key.eq_ignore_ascii_case("azure"))
@@ -830,10 +824,10 @@ pub(super) fn cloudflare_workers_chat_account(endpoint: &str) -> Option<&str> {
 impl Profiles {
     pub fn load(keys: &super::model_auth::Keys) -> Result<Self> {
         let path = config::agent_dir().join("models.json");
-        let mut data = config::read_object(&path)?;
+        let data = config::read_object(&path)?;
         let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").ok();
         let mut profiles = Self::parse_with_provider_environment(
-            &mut data,
+            &data,
             keys.cloudflare_chat_account().or(account.as_deref()),
             keys.cloudflare_gateway_route(),
             |name| std::env::var(name).ok(),
@@ -845,11 +839,7 @@ impl Profiles {
             )
             .to_string();
             if let Some(profile) = profiles.entries.get_mut("radius")
-                && data["providers"].as_object().is_some_and(|providers| {
-                    providers.iter().any(|(name, entry)| {
-                        name.eq_ignore_ascii_case("radius") && entry["baseUrl"].is_null()
-                    })
-                })
+                && profile.base_url.is_none()
             {
                 profile.provider_endpoints.remove(&profile.endpoint);
                 profile.endpoint.clone_from(&endpoint);
@@ -862,20 +852,19 @@ impl Profiles {
 
     #[cfg(test)]
     pub(super) fn parse_with_azure_env(
-        data: &mut Value,
+        data: &Value,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
         Self::parse_with_provider_environment(data, None, None, env)
     }
 
     fn parse_with_provider_environment(
-        data: &mut Value,
+        data: &Value,
         account: Option<&str>,
         gateway: Option<super::cloudflare_gateway::Route>,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
-        configure_azure(data, &env)?;
-        let mut profiles = Self::parse_with_cloudflare_routes(data, account, gateway)?;
+        let mut profiles = Self::parse_routes(data, account, gateway, &env)?;
         profiles.azure_api_version =
             env("AZURE_OPENAI_API_VERSION").filter(|value| !value.is_empty());
         if let Some(mapping) = env("AZURE_OPENAI_DEPLOYMENT_NAME_MAP") {
@@ -923,11 +912,23 @@ impl Profiles {
         self.cloudflare_gateway_route.as_ref()
     }
 
+    #[cfg(test)]
     pub(super) fn parse_with_cloudflare_routes(
         data: &Value,
         account: Option<&str>,
         cloudflare_gateway_route: Option<super::cloudflare_gateway::Route>,
     ) -> Result<Self> {
+        Self::parse_routes(data, account, cloudflare_gateway_route, |_| None)
+    }
+
+    fn parse_routes(
+        data: &Value,
+        account: Option<&str>,
+        cloudflare_gateway_route: Option<super::cloudflare_gateway::Route>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        use super::operation_models::{Catalogue, decision_operation_defaults};
+
         let empty = serde_json::Map::new();
         let providers = match data.get("providers") {
             Some(providers) => providers
@@ -936,8 +937,40 @@ impl Profiles {
             None => &empty,
         };
         let configured_providers = providers;
-        let operations = super::operation_models::Catalogue::parse(configured_providers)?;
+        let operations = Catalogue::parse(configured_providers)?;
         let mut providers = configured_providers.clone();
+        for (name, entry) in configured_providers
+            .iter()
+            .filter(|(_, entry)| decision_operation_defaults(entry))
+        {
+            // Retain explicitly routed chat definitions without inheriting the
+            // operation default, its credentials, or its base URL.
+            let models: Vec<_> = entry["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|model| model["type"].as_str().is_none_or(|kind| kind == "chat"))
+                .collect();
+            for model in &models {
+                let id = model["id"].as_str().unwrap_or_default();
+                if model["api"].as_str().and_then(Adapter::named).is_none() {
+                    return Err(Error::Config(format!(
+                        "chat model {name}/{id} requires its own supported chat api in a pi-decision profile (for example, openai-completions)"
+                    )));
+                }
+                if model["baseUrl"].as_str().is_none() {
+                    return Err(Error::Config(format!(
+                        "chat model {name}/{id} requires its own baseUrl in a pi-decision profile"
+                    )));
+                }
+            }
+            if models.is_empty() {
+                providers.remove(name);
+            } else {
+                providers.insert(name.clone(), serde_json::json!({"models": models}));
+            }
+        }
+        configure_azure(&mut providers, env)?;
         configure_cloudflare_workers(&mut providers, account)?;
         if let Some(route) = &cloudflare_gateway_route {
             let name = providers
@@ -990,7 +1023,11 @@ impl Profiles {
                 {
                     return Err(Error::Config("invalid custom model provider name".into()));
                 }
-                if entry["baseUrl"].as_str().is_none() {
+                if entry["baseUrl"].as_str().is_none()
+                    && !configured_providers
+                        .get(name)
+                        .is_some_and(decision_operation_defaults)
+                {
                     return Err(Error::Config(format!(
                         "custom model provider {name} requires baseUrl"
                     )));
@@ -1137,6 +1174,7 @@ impl Profiles {
                         provider.id(),
                         "cloudflare-workers-ai" | "cloudflare-ai-gateway"
                     ) && configured["api"] != "cloudflare-workers-ai-system-one"
+                        && !decision_operation_defaults(configured)
                 })
                 .and_then(|configured| configured["baseUrl"].as_str())
                 .map(str::to_owned);
@@ -1420,6 +1458,15 @@ impl Profiles {
             Some(model) => base.overlay(model.compat.clone()),
             None => base,
         }
+    }
+
+    pub fn bedrock_reasoning_replay_override(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> Option<bool> {
+        self.cache_compatibility(provider, model)
+            .supports_reasoning_replay
     }
 
     pub fn bedrock_long_cache_override(
@@ -2963,6 +3010,25 @@ mod tests {
         let cost = sol.cost.unwrap().value();
         assert_eq!(cost["tiers"][0]["inputTokensAbove"], 272_000);
         assert_eq!(cost["tiers"][0]["output"], 15.0);
+
+        for (id, off, replay) in [
+            ("global.moonshotai.kimi-k3", Some("none"), Some(false)),
+            ("us.moonshotai.kimi-k3.1", Some("none"), Some(false)),
+            ("global.zai.glm-5.3", None, None),
+        ] {
+            let model = profiles.model(&provider, id).unwrap();
+            assert_eq!(model.mapped_effort("off"), Some(off), "{id}");
+            assert_eq!(model.mapped_effort("minimal"), Some(None), "{id}");
+            assert_eq!(model.mapped_effort("xhigh"), Some(Some("xhigh")), "{id}");
+            assert_eq!(
+                profiles.bedrock_reasoning_replay_override(&provider, Some(&model)),
+                replay,
+                "{id}"
+            );
+            let levels = model.levels(Adapter::Bedrock).unwrap();
+            assert_eq!(levels.iter().any(|level| level == "off"), off.is_some());
+            assert!(!levels.iter().any(|level| level == "minimal"));
+        }
     }
 
     #[test]
@@ -3288,20 +3354,17 @@ mod tests {
             builtin_chat::find("ant-ling").unwrap().env(),
             "ANT_LING_API_KEY"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 3);
-        let ring = profiles.model(&provider, "Ring-2.6-1T").unwrap();
+        assert_eq!(profiles.model_ids(&provider).len(), 5);
+        let model = profiles.model(&provider, "Ling-3.1-flash").unwrap();
         assert_eq!(
-            ring.levels(Adapter::ChatCompletions).unwrap(),
-            ["high", "xhigh"]
+            model.levels(Adapter::ChatCompletions).unwrap(),
+            ["off", "high"]
         );
-        assert_eq!(ring.mapped_effort("high"), Some(Some("high")));
-        assert_eq!(
-            profiles
-                .model(&provider, "Ling-2.6-flash")
-                .unwrap()
-                .reasoning,
-            Some(false)
-        );
+        assert_eq!(model.mapped_effort("off"), Some(Some("off")));
+        assert_eq!(model.mapped_effort("high"), Some(Some("high")));
+        assert_eq!(model.mapped_effort("medium"), Some(None));
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert!(profiles.model(&provider, "Ring-2.6-1T").is_none());
     }
 
     #[test]
@@ -3912,8 +3975,8 @@ mod tests {
 
     #[test]
     fn azure_profiles_scope_credentials_to_configured_resource_routes() {
-        let mut data = json!({});
-        let profiles = Profiles::parse_with_azure_env(&mut data, |key| match key {
+        let data = json!({});
+        let profiles = Profiles::parse_with_azure_env(&data, |key| match key {
             "AZURE_OPENAI_RESOURCE_NAME" => Some("configured-account".into()),
             "AZURE_OPENAI_API_VERSION" => Some("preview".into()),
             "AZURE_OPENAI_DEPLOYMENT_NAME_MAP" => Some("o4-mini = deployment,invalid".into()),
@@ -3984,15 +4047,15 @@ mod tests {
             .is_none()
         );
         assert!(
-            Profiles::parse_with_azure_env(&mut json!({}), |key| {
+            Profiles::parse_with_azure_env(&json!({}), |key| {
                 (key == "AZURE_OPENAI_RESOURCE_NAME").then(|| "other.example/path".into())
             })
             .is_err()
         );
-        let mut configured = json!({
+        let configured = json!({
             "providers":{"Azure":{"baseUrl":"https://configured.openai.azure.com"}}
         });
-        let profiles = Profiles::parse_with_azure_env(&mut configured, |key| {
+        let profiles = Profiles::parse_with_azure_env(&configured, |key| {
             (key == "AZURE_OPENAI_RESOURCE_NAME").then(|| "other.example/path".into())
         })
         .unwrap();

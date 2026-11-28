@@ -38,7 +38,7 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         id: "ant-ling",
         endpoint: "https://api.ant-ling.com/v1/chat/completions",
         env: "ANT_LING_API_KEY",
-        compatibility: || json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","thinkingFormat":"ant-ling","supportsStrictMode":true}),
+        compatibility: || json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","thinkingFormat":"deepseek","supportsStrictMode":true}),
     },
     Builtin {
         id: "azure",
