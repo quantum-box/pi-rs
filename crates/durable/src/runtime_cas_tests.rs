@@ -1223,6 +1223,76 @@ fn session_navigation_reedits_user_input_and_keeps_the_original_path() {
 }
 
 #[test]
+fn session_checkout_projects_an_interior_append_and_keeps_the_old_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    let blocks = ["retained", "draft"].map(|text| crate::transcript::MessageContentBlocks {
+        message_id: Uuid::new_v4(),
+        blocks: vec![serde_json::json!({"type":"text","text":text})],
+    });
+    for block in &blocks {
+        state
+            .content_blocks
+            .insert(state.messages.len(), block.clone());
+        state.messages.push(Message::User {
+            content: String::new(),
+        });
+    }
+    h.save(&state, Expected::Version(version)).unwrap();
+
+    let [retained, original] = blocks.map(|block| block.message_id);
+    let draft = h.navigate_session_entry(id, original).unwrap().unwrap();
+    assert_eq!(
+        draft.blocks,
+        Some(vec![serde_json::json!({"type":"text","text":"draft"})])
+    );
+    drop(h);
+
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let current = h.conversation(id).unwrap();
+    assert_eq!(current.messages.len(), 1);
+    assert_eq!(current.content_blocks[&0].message_id, retained);
+    let tree = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap();
+    assert_eq!(tree.leaf_id, Some(retained));
+    assert_eq!(tree.entries.len(), 2);
+
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.push(Message::User {
+        content: "edited".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let tree = h
+        .session_tree(&h.session_entries_start(id).unwrap())
+        .unwrap();
+    assert_eq!(tree.entries.last().unwrap().parent_id, Some(retained));
+    assert_eq!(tree.entries[1].entry.id(), original);
+    let edited = tree.leaf_id.unwrap();
+    h.checkout_session_entry(id, original).unwrap();
+    assert_eq!(
+        h.conversation(id).unwrap().content_blocks[&1].message_id,
+        original
+    );
+    h.checkout_session_entry(id, edited).unwrap();
+    assert_eq!(h.conversation(id).unwrap().content_blocks.len(), 1);
+    let fork = h.fork_by_entry_id(id, edited).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().content_blocks[&0].message_id,
+        retained
+    );
+}
+
+#[test]
 fn interrupted_recovery_retries_racing_stream_append() {
     for initial in [None, Some("first")] {
         let dir = tempfile::tempdir().unwrap();
@@ -5248,6 +5318,12 @@ fn config_change_does_not_authorize_interior_tool_batch_cut() {
             .is_err()
     );
     assert!(h.fork_at_position(id, entries[1].position.clone()).is_err());
+    let before = h.session_entries_start(id).unwrap();
+    assert!(matches!(
+        h.checkout_session_entry(id, entries[2].history.as_ref().unwrap().id),
+        Err(Error::Fork(crate::fork::Error::InvalidSnapshot))
+    ));
+    assert_eq!(h.session_entries_start(id).unwrap(), before);
     assert!(
         h.fork_by_entry_id(id, entries[0].history.as_ref().unwrap().id)
             .is_ok()

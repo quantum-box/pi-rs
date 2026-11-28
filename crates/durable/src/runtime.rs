@@ -2909,7 +2909,11 @@ enum SessionTreeEvent {
 #[derive(Clone, Debug)]
 enum SessionCheckout {
     Root,
-    Entry(Uuid, crate::transcript::Cursor),
+    Entry {
+        id: Uuid,
+        source: crate::transcript::Cursor,
+        prefix_histories: Option<Vec<Option<MessageHistory>>>,
+    },
 }
 
 struct SessionMessageBatch {
@@ -8341,12 +8345,32 @@ impl Harness {
             atomic_evidence = Some((revision, checks, mutations));
             state.transcript = Some(anchor_cursor);
             Some(batch)
-        } else if let Some(SessionCheckout::Entry(_, source)) = &checkout {
+        } else if let Some(SessionCheckout::Entry {
+            source,
+            prefix_histories,
+            ..
+        }) = &checkout
+        {
             let previous = old
                 .and_then(|prior| prior.transcript.as_ref())
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
-            let (batch, cursor) = crate::transcript::Transcript::new(self.owner.store(), state.id)
-                .prepare_checkout(previous, source)?;
+            let transcript = crate::transcript::Transcript::new(self.owner.store(), state.id);
+            let (batch, cursor) = if let Some(histories) = prefix_histories {
+                let cut = TranscriptChange::ForkCut {
+                    messages: state.messages.clone(),
+                    histories: histories.clone(),
+                    commit,
+                    origin: state.id,
+                };
+                transcript.prepare_checkout_projection(
+                    previous,
+                    source,
+                    &serde_json::to_value(cut)?,
+                    state.content_blocks.values().cloned().collect(),
+                )?
+            } else {
+                transcript.prepare_checkout(previous, source)?
+            };
             state.transcript = Some(cursor);
             Some(batch)
         } else if expected == Expected::Missing
@@ -8451,7 +8475,7 @@ impl Harness {
         if let Some(checkout) = checkout {
             event["session_checkout"] = match checkout {
                 SessionCheckout::Root => serde_json::Value::Null,
-                SessionCheckout::Entry(entry, _) => serde_json::to_value(entry)?,
+                SessionCheckout::Entry { id, .. } => serde_json::to_value(id)?,
             };
         } else if let Some(info) = state.session_info.as_ref()
             && old.is_some_and(|old| old.session_info.as_ref() != Some(info))
@@ -11000,16 +11024,14 @@ impl Harness {
         use crate::fork::Error::InvalidSnapshot;
 
         let (origin, observation, position) = match entry {
-            SessionEntry::Message(message)
-                if message.history.commit_boundary || message.compaction.is_some() =>
-            {
+            SessionEntry::Message(message) => {
+                let ViewCursor { cursor, remaining } =
+                    self.original_occurrence_position(&message.history, &message.message)?;
+                let interior = !message.history.commit_boundary && message.compaction.is_none();
                 (
                     message.history.origin,
                     crate::observer::Cursor(message.history.commit),
-                    Some(
-                        self.original_occurrence_position(&message.history, &message.message)?
-                            .cursor,
-                    ),
+                    Some((cursor, remaining.filter(|_| interior))),
                 )
             }
             SessionEntry::SessionInfo {
@@ -11032,7 +11054,10 @@ impl Harness {
         let source = self
             .session_observation_transcript(origin, observation.0)?
             .ok_or(InvalidSnapshot)?;
-        if position.is_some_and(|position| position != source) {
+        if position
+            .as_ref()
+            .is_some_and(|(cursor, _)| *cursor != source)
+        {
             return Err(Error::Invalid(
                 "checkout requires the final context of a commit".into(),
             ));
@@ -11045,16 +11070,44 @@ impl Harness {
         }
         let mut checks =
             crate::transcript::Transcript::new(store, origin).fork_source_checks(&source)?;
-        checks.extend(anchor);
-        let (messages, blocks) = self.read_transcript_blocks(origin, source.clone())?;
-        if self
-            .resolved_occurrences(origin, source.clone())?
+        let (mut messages, mut blocks) = self.read_transcript_blocks(origin, source.clone())?;
+        let mut occurrences = self.resolved_occurrences(origin, source.clone())?;
+        if occurrences
             .iter()
             .map(|(message, _)| message)
             .ne(messages.iter())
         {
             return Err(InvalidSnapshot.into());
         }
+        let prefix_histories = if let Some((_, Some(count))) = position {
+            let (retain, batch_len) = self.checkout_prefix_len(&source, count)?;
+            if batch_len != messages.len()
+                || occurrences[..retain]
+                    .iter()
+                    .any(|(_, history)| history.is_none())
+            {
+                return Err(InvalidSnapshot.into());
+            }
+            let previous = observation.0.checked_sub(1).ok_or(InvalidSnapshot)?;
+            let previous_anchor = self.fork_anchor_checks(origin, previous)?;
+            let revision = store.document_cut(&anchor[1].key)?;
+            if revision.is_none() || store.document_cut(&previous_anchor[1].key)? != revision {
+                return Err(InvalidSnapshot.into());
+            }
+            checks.extend(previous_anchor);
+            messages.truncate(retain);
+            blocks.retain(|index, _| *index < retain);
+            occurrences.truncate(retain);
+            Some(
+                occurrences
+                    .into_iter()
+                    .map(|(_, history)| history)
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        checks.extend(anchor);
         crate::fork::validate_context(&messages)?;
         state.messages = messages;
         state.content_blocks = blocks;
@@ -11073,8 +11126,45 @@ impl Harness {
             .pointer("/documents/pi-rs~1runtime~1occurrence-epoch-proven")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        state.session_checkout = Some(SessionCheckout::Entry(entry.id(), source));
+        state.session_checkout = Some(SessionCheckout::Entry {
+            id: entry.id(),
+            source,
+            prefix_histories,
+        });
         Ok(checks)
+    }
+
+    fn checkout_prefix_len(
+        &self,
+        source: &crate::transcript::Cursor,
+        count: usize,
+    ) -> Result<(usize, usize), Error> {
+        use crate::fork::Error::InvalidSnapshot;
+
+        let transcript =
+            crate::transcript::Transcript::new(self.owner.store(), source.transcript_id());
+        let page = transcript.read_with_blocks(source, std::num::NonZeroUsize::MIN)?;
+        let entry = page.records.into_iter().next().ok_or(InvalidSnapshot)?;
+        let (stable_prefix, appended) = match serde_json::from_value(entry.value)? {
+            TranscriptChange::AppendV3 {
+                stable_prefix,
+                messages,
+                ..
+            }
+            | TranscriptChange::AppendV4 {
+                stable_prefix,
+                messages,
+                ..
+            } => (stable_prefix, messages.len()),
+            _ => return Err(InvalidSnapshot.into()),
+        };
+        if count == 0 || count >= appended {
+            return Err(InvalidSnapshot.into());
+        }
+        Ok((
+            stable_prefix.checked_add(count).ok_or(InvalidSnapshot)?,
+            stable_prefix.checked_add(appended).ok_or(InvalidSnapshot)?,
+        ))
     }
 
     /// Resolve the active bookmarks in this captured session history.
