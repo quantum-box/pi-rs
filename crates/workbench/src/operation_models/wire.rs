@@ -241,6 +241,65 @@ pub(super) fn image_payload(entry: &Entry, context: &Value, options: &Value) -> 
     Ok(payload)
 }
 
+pub(super) fn pi_image_payload(entry: &Entry, context: &Value, options: &Value) -> Result<Value> {
+    let input = context["input"]
+        .as_array()
+        .filter(|blocks| !blocks.is_empty() && blocks.len() <= 64)
+        .ok_or_else(|| Error::Config("image generation requires 1–64 input blocks".into()))?;
+    let blocks = input
+        .iter()
+        .map(|block| match block["type"].as_str() {
+            Some("text") if block["text"].is_string() => {
+                Ok(json!({"type":"text","text":block["text"]}))
+            }
+            Some("image") if entry.accepts_images() => {
+                let image = parse_image(block)?;
+                Ok(json!({"type":"image","mimeType":image.mime_type,"data":image.data}))
+            }
+            Some("image") => Err(Error::Config(
+                "image model does not support image input".into(),
+            )),
+            _ => Err(Error::Config("invalid image generation input block".into())),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut payload = json!({"model":entry.model.id,"context":{"input":blocks}});
+    let selected: Map<_, _> = ["aspectRatio", "size", "sessionId", "metadata"]
+        .into_iter()
+        .filter_map(|key| {
+            options
+                .get(key)
+                .map(|value| (key.to_owned(), value.clone()))
+        })
+        .collect();
+    if !selected.is_empty() {
+        payload["options"] = Value::Object(selected);
+    }
+    Ok(payload)
+}
+
+pub(super) fn pi_image_output(output: &Value) -> Result<Value> {
+    let blocks = output
+        .as_array()
+        .ok_or_else(|| Error::Model("Pi Image response is missing its output".into()))?;
+    let blocks = blocks
+        .iter()
+        .map(|block| match block["type"].as_str() {
+            Some("text") if block["text"].is_string() => {
+                Ok(json!({"type":"text","text":block["text"]}))
+            }
+            Some("image") => {
+                let image = parse_image(block)
+                    .map_err(|_| Error::Model("Pi Image returned an invalid image block".into()))?;
+                Ok(json!({"type":"image","mimeType":image.mime_type,"data":image.data}))
+            }
+            _ => Err(Error::Model(
+                "Pi Image returned an invalid output block".into(),
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Value::Array(blocks))
+}
+
 pub(super) fn image_output(body: &Value, blocks: &mut Vec<Value>) -> Result<()> {
     let choices = body["choices"]
         .as_array()
@@ -305,7 +364,7 @@ pub(super) fn usage(entry: &Entry, raw: &Value) -> Option<Value> {
     };
     let (input, output, cache_read, cache_write) = match entry.api {
         Api::LlamaCppClassifier => return None,
-        Api::PiClassifier | Api::PiDecision => {
+        Api::PiClassifier | Api::PiDecision | Api::PiImage => {
             return super::pi_classifier::usage(&entry.model.cost, raw);
         }
         Api::SystemOne | Api::WorkersAiSystemOne | Api::OpenAiDecisions => {

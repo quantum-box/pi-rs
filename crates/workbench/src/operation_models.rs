@@ -57,6 +57,8 @@ enum Api {
     WorkersAiSystemOne,
     #[serde(rename = "openrouter-images")]
     OpenRouterImages,
+    #[serde(rename = "pi-image")]
+    PiImage,
     #[serde(rename = "llama-cpp-classify")]
     LlamaCppClassifier,
 }
@@ -70,7 +72,7 @@ impl Api {
             | Self::PiClassifier
             | Self::PiDecision
             | Self::LlamaCppClassifier => Kind::Classifier,
-            Self::OpenRouterImages => Kind::Image,
+            Self::OpenRouterImages | Self::PiImage => Kind::Image,
         }
     }
 
@@ -82,6 +84,7 @@ impl Api {
             Self::SystemOne => "systemone",
             Self::WorkersAiSystemOne => "run",
             Self::OpenRouterImages => "chat/completions",
+            Self::PiImage => "image",
             Self::LlamaCppClassifier => "completion",
         }
     }
@@ -631,7 +634,7 @@ impl Catalogue {
                 // Pi Decision is an explicitly configured route. A known
                 // provider name does not establish an official decision endpoint.
                 let default_base = match api {
-                    Api::PiDecision => None,
+                    Api::PiDecision | Api::PiImage => None,
                     _ => official_base(&name),
                 };
                 let base = configured
@@ -950,7 +953,7 @@ impl Entry {
     }
 
     fn is_official(&self) -> bool {
-        if matches!(self.api, Api::PiDecision) {
+        if matches!(self.api, Api::PiDecision | Api::PiImage) {
             return false;
         }
         if self.provider == "github-copilot" {
@@ -1341,7 +1344,9 @@ impl Tool for Operations {
                 "available":{"type":"boolean"},"context":{"type":"object"},
                 "options":{"type":"object","properties":{
                     "aspectRatio":{"type":"string","minLength":1},
-                    "size":{"type":"string","minLength":1}
+                    "size":{"type":"string","minLength":1},
+                    "sessionId":{"type":"string"},
+                    "metadata":{"type":"object"}
                 },"additionalProperties":false}
             },"required":["action"],"additionalProperties":false}),
         }
@@ -1697,6 +1702,7 @@ impl Operations {
             Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
             Api::PiClassifier | Api::PiDecision => (pi_classifier::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context, options)?, false),
+            Api::PiImage => (wire::pi_image_payload(entry, context, options)?, false),
         };
         let (endpoint, mut headers) = if let Some((token, configured)) = radius_auth {
             let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
@@ -1764,6 +1770,12 @@ impl Operations {
                     .as_array_mut()
                     .expect("image operation output is initialized as an array");
                 image_output(&body, output)?;
+            }
+            Api::PiImage => {
+                if let Some(id) = body["responseId"].as_str() {
+                    data["responseId"] = json!(id);
+                }
+                data["output"] = wire::pi_image_output(&body["output"])?;
             }
             Api::LlamaCppClassifier => unreachable!("handled before the single request"),
         }
@@ -3554,6 +3566,34 @@ mod tests {
         assert_eq!(data["api"], "typesafe-system-one");
         assert!(data["timestamp"].as_u64().unwrap() > 0);
         assert_eq!(data["answers"], json!({}));
+    }
+
+    #[test]
+    fn pi_image_wire_preserves_blocks_and_optional_options() {
+        let provider = json!({"fixture":{"baseUrl":"http://127.0.0.1:9/v1/",
+            "models":[{"id":"paint","type":"image","api":"pi-image","input":["text","image"]}]}});
+        let catalogue = Catalogue::parse(provider.as_object().unwrap()).unwrap();
+        let entry = &catalogue.0[0];
+        assert_eq!(entry.endpoint.path(), "/v1/image");
+        let input = json!([{"type":"text","text":"draw"},
+            {"type":"image","mimeType":"image/png","data":"YQ=="}]);
+        let context = json!({"input":input});
+        assert_eq!(
+            wire::pi_image_payload(entry, &context, &Value::Null).unwrap(),
+            json!({"model":"paint","context":{"input":input}})
+        );
+        let options =
+            json!({"aspectRatio":"1:1","size":"1K","sessionId":"fixture","metadata":{"key":1}});
+        assert_eq!(
+            wire::pi_image_payload(entry, &context, &options).unwrap()["options"],
+            options
+        );
+        assert_eq!(wire::pi_image_output(&input).unwrap(), input);
+        assert!(
+            wire::pi_image_output(&json!([{"type":"image","data":"","mimeType":"image/png"}]))
+                .is_err()
+        );
+        assert!(wire::pi_image_output(&json!([{"type":"unknown"}])).is_err());
     }
 
     #[test]
