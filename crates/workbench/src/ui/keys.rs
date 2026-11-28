@@ -7,8 +7,23 @@ use std::collections::BTreeMap;
 pub fn windows_keybindings() -> bool {
     cfg!(windows)
         || (cfg!(target_os = "linux")
-            && (std::env::var_os("WSL_DISTRO_NAME").is_some()
-                || std::env::var_os("WSL_INTEROP").is_some()))
+            && detect_wsl(
+                |name| std::env::var_os(name).is_some_and(|value| !value.is_empty()),
+                || std::fs::read_to_string("/proc/version").ok(),
+            ))
+}
+
+fn detect_wsl(
+    has_env: impl Fn(&str) -> bool,
+    read_version: impl FnOnce() -> Option<String>,
+) -> bool {
+    ["WSL_DISTRO_NAME", "WSL_INTEROP", "WSLENV"]
+        .into_iter()
+        .any(has_env)
+        || read_version().is_some_and(|version| {
+            let version = version.to_ascii_lowercase();
+            version.contains("microsoft") || version.contains("wsl")
+        })
 }
 
 pub struct Keys {
@@ -151,8 +166,10 @@ impl Keys {
             ("app.message.copy", &["ctrl+x"]),
             (
                 "app.clipboard.pasteImage",
-                if windows_keys {
+                if windows {
                     &["alt+v"]
+                } else if windows_keys {
+                    &["alt+v", "ctrl+v"]
                 } else {
                     &["ctrl+v"]
                 },
@@ -506,6 +523,21 @@ pub(super) fn parse(text: &str) -> Result<KeyEvent> {
 mod tests {
     use super::*;
     #[test]
+    fn wsl_detection_uses_environment_or_kernel_release() {
+        for marker in ["WSL_DISTRO_NAME", "WSL_INTEROP", "WSLENV"] {
+            assert!(detect_wsl(
+                |name| name == marker,
+                || panic!("kernel fallback")
+            ));
+        }
+        for release in ["Linux version 4.4.0-Microsoft", "Linux version 6.6.87-WSL2"] {
+            assert!(detect_wsl(|_| false, || Some(release.into())));
+        }
+        assert!(!detect_wsl(|_| false, || Some("Linux version 6.12".into())));
+        assert!(!detect_wsl(|_| false, || None));
+    }
+
+    #[test]
     fn parses_combined_modifiers_and_literal_plus() {
         assert_eq!(
             parse("alt+ctrl+x").unwrap(),
@@ -528,6 +560,13 @@ mod tests {
             let keys = Keys {
                 bindings: Keys::defaults_for(windows, windows_keys).unwrap(),
             };
+            let paste_keys: &[&str] = match (windows, windows_keys) {
+                (true, _) => &["alt+v"],
+                (false, true) => &["alt+v", "ctrl+v"],
+                (false, false) => &["ctrl+v"],
+            };
+            let expected: Vec<_> = paste_keys.iter().map(|key| parse(key).unwrap()).collect();
+            assert_eq!(keys.bindings["app.clipboard.pasteImage"], expected);
             assert!(keys.matches("tui.editor.undo", parse(undo).unwrap()));
             assert!(keys.matches("tui.altScreen.search", parse(search).unwrap()));
             assert_eq!(
