@@ -339,13 +339,19 @@ mod tests {
         let scheduler = harness.attach_tasks(Registry::default()).unwrap();
         let publication = scheduler.failure_publication();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let handler = Foreground {
-            harness: Mutex::new(harness.worker()),
-            parent,
-            config: config(),
-            allowed_tools: Some(vec![]),
-            schedule: sender,
-        };
+        let handler = handler(
+            harness.worker(),
+            HashMap::from([(
+                parent,
+                Binding {
+                    parent,
+                    config: config(),
+                    allowed_tools: Some(vec![]),
+                },
+            )]),
+            Some(parent),
+            sender,
+        );
         publication.test_set_published(task.id(), true);
         assert!(matches!(
             handler.run(&task).unwrap(),
