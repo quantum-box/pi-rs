@@ -1,4 +1,5 @@
 // Real driver tests with a deterministic competing writer at claim commit.
+use crate::publish_ready_marker;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use pi_rs_core::{
@@ -23,11 +24,6 @@ struct ModelStub {
     arguments: String,
 }
 struct ClaimPassHook(Option<Arc<std::sync::atomic::AtomicUsize>>, bool);
-fn publish_ready_marker(path: std::path::PathBuf, data: impl AsRef<[u8]>) {
-    let staging = path.with_extension("tmp");
-    std::fs::write(&staging, data).unwrap();
-    std::fs::rename(staging, path).unwrap();
-}
 
 #[async_trait]
 impl crate::extension::Hook for ClaimPassHook {
@@ -10949,11 +10945,10 @@ async fn nested_woken_evidence_worker() {
                 name: "policy".into(),
                 ..Default::default()
             });
-            std::fs::write(
+            publish_ready_marker(
                 control.join("pending-held"),
                 format!("{identity_result:?};{selection_result:?}"),
-            )
-            .unwrap();
+            );
             while !control.join("release-pending").exists() {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -10971,7 +10966,7 @@ async fn nested_woken_evidence_worker() {
                 name: "policy".into(),
                 ..Default::default()
             });
-            std::fs::write(control.join("selection-replaced"), format!("{result:?}")).unwrap();
+            publish_ready_marker(control.join("selection-replaced"), format!("{result:?}"));
         });
     }
 
