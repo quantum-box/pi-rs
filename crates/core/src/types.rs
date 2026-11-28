@@ -1143,6 +1143,11 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// Whether the previous measured input and output can anchor this request's budget.
+    fn can_reuse_measured_context(&self, _request: &ModelRequest) -> bool {
+        true
+    }
+
     /// Estimate a message in the form this adapter sends to its provider.
     fn estimate_message_tokens(&self, _request: &ModelRequest, message: &Message) -> u64 {
         crate::estimate_message_tokens(message)
@@ -1750,6 +1755,20 @@ impl BashExecution {
                     |path| format!("Output truncated. Full output: {path}"),
                 )
         })
+    }
+
+    /// Keep save failure detail only when output is missing and no complete file exists.
+    #[doc(hidden)]
+    pub fn output_save_error<'a>(&self, error: Option<&'a str>) -> Option<&'a str> {
+        if !self.truncated || self.full_output_path.is_some() {
+            return None;
+        }
+        let error = error.filter(|error| !error.is_empty())?;
+        let mut end = error.len().min(4096);
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        Some(&error[..end])
     }
 
     pub fn context_text(&self) -> String {

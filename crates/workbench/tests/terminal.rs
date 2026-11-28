@@ -854,6 +854,246 @@ fn terminal_project_trust_routes_around_a_malformed_native_store() {
     }
 }
 
+fn fullscreen_widget_terminal(
+    widgets: &[(&str, Vec<String>)],
+) -> (tempfile::TempDir, File, Process) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        r#"{"fullscreenScrollbar":"always","showHardwareCursor":true}"#,
+    )
+    .unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let mut session = pi_rs::Session::open(&session_path).unwrap();
+    for index in 0..80 {
+        session
+            .append_user_with_images(format!("history-row-{index:02}"), vec![], None)
+            .unwrap();
+    }
+    drop(session);
+
+    let extension = root.path().join("widgets.py");
+    std::fs::write(
+        &extension,
+        r#"#!/usr/bin/env python3
+import json, os, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request = json.load(sys.stdin)
+    result = {'id':'widgets-fixture','dependencies':[],'commands':[],'tools':[],
+              'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True} if request['type'] == 'describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    event = json.loads(sys.stdin.readline())['request']['event']
+    if event['type'] == 'session_start':
+        for key, (placement, lines) in enumerate(json.loads(os.environ['PI_TEST_WIDGETS'])):
+            print(json.dumps({'type':'ui','request':{'method':'setWidget','widgetKey':str(key),
+                  'widgetPlacement':placement,'widgetLines':lines}}), flush=True)
+            assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (master, process) = spawn_capability_test_terminal(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("PI_TEST_WIDGETS", serde_json::to_string(widgets).unwrap())
+            .env("TERM", "xterm-256color")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--tui-mode",
+                "fullscreen",
+                "--model",
+                "fixture",
+                "--session",
+            ])
+            .arg(&session_path)
+            .arg("--extension")
+            .arg(&extension),
+    );
+    (root, master, process)
+}
+
+fn wait_for_widget_frame(master: &mut File, predicate: impl Fn(&str) -> bool) {
+    output_until(master, |text| {
+        text.split("\x1b[?2026h")
+            .skip(1)
+            .filter_map(|frame| frame.split_once("\x1b[?2026l").map(|(body, _)| body))
+            .any(&predicate)
+    });
+}
+
+fn resize_widget_terminal(master: &File, process: &Process, rows: u16, columns: u16) {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGWINCH) },
+        0
+    );
+}
+
+fn tall_widget(label: &str) -> Vec<String> {
+    std::iter::once(label.to_owned())
+        .chain((0..9).map(|i| format!("{label}-filler-{i}")))
+        .collect()
+}
+
+#[test]
+fn fullscreen_extension_widgets_stay_with_editor_when_scrolling_and_resizing() {
+    let (_root, mut master, process) = fullscreen_widget_terminal(&[
+        ("aboveEditor", tall_widget("dock-above")),
+        ("belowEditor", vec!["dock-below".into()]),
+    ]);
+    let assert_dock = |frame: &str, draft: &str| {
+        let above = frame.find("dock-above").expect("above-editor widget");
+        let editor = frame.find(draft).expect("editor draft");
+        let below = frame.find("dock-below").expect("below-editor widget");
+        assert!(
+            above < editor && editor < below,
+            "unexpected dock: {frame:?}"
+        );
+    };
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("dock-below") && frame.contains("history-row-79")
+    });
+
+    master.write_all(b"dock-draft").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        if !frame.contains("history-row-79") || !frame.contains("dock-draft") {
+            return false;
+        }
+        assert_dock(frame, "dock-draft");
+        true
+    });
+    master.write_all(b"\x1b[5~").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        if !frame.contains("history-row-")
+            || frame.contains("history-row-79")
+            || !frame.contains("dock-draft")
+        {
+            return false;
+        }
+        assert_dock(frame, "dock-draft");
+        true
+    });
+
+    // Ctrl+Shift+F, followed by text that exists only in the fixed widget.
+    master.write_all(b"\x1b[102;6udock-above").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("dock-above-filler-0") && frame.contains("No matches")
+    });
+    master.write_all(b"\x1b").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("dock-draft") && !frame.contains("No matches")
+    });
+
+    resize_widget_terminal(&master, &process, 9, 72);
+    master.write_all(b"-short").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        if !frame.contains("dock-draft-short") || frame.contains("dock-above-filler-8") {
+            return false;
+        }
+        assert_dock(frame, "dock-draft-short");
+        // The scroll thumb occupies the one remaining transcript row.
+        assert!(frame.contains("┃") && !frame.contains("│"), "{frame:?}");
+        true
+    });
+}
+
+#[test]
+fn fullscreen_extension_widgets_yield_to_search_on_a_short_terminal() {
+    let (_root, mut master, process) = fullscreen_widget_terminal(&[
+        ("aboveEditor", tall_widget("dock-above")),
+        ("belowEditor", tall_widget("dock-below")),
+    ]);
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("dock-above") && frame.contains("dock-below")
+    });
+    resize_widget_terminal(&master, &process, 9, 72);
+    master.write_all(b"preserved-draft").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("\x1b[9;1H")
+            && !frame.contains("\x1b[10;1H")
+            && frame.contains("preserved-draft")
+            && frame.contains("dock-below")
+    });
+
+    master.write_all(b"\x1b[102;6u").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("Find in transcript")
+            && frame.contains("preserved-draft")
+            && frame.contains("\x1b[?25h")
+    });
+    master.write_all(b"history-row-79").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains(" 1/1 ")
+            && frame.contains("history-row-79")
+            && frame.contains("preserved-draft")
+    });
+    master.write_all(b"x").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("history-row-79x") && frame.contains("No matches")
+    });
+    master.write_all(b"\x1b").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("preserved-draft")
+            && frame.contains("dock-below")
+            && !frame.contains("No matches")
+    });
+}
+
+#[test]
+fn fullscreen_extension_widgets_yield_to_settings_pagination() {
+    let (_root, mut master, _process) = fullscreen_widget_terminal(&[
+        ("aboveEditor", tall_widget("above-first")),
+        ("aboveEditor", tall_widget("above-second")),
+        ("belowEditor", tall_widget("below-first")),
+        ("belowEditor", tall_widget("below-second")),
+    ]);
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("above-first") && frame.contains("below-second-filler-8")
+    });
+    master.write_all(b"/settings\r").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        if !frame.contains("Settings") || !frame.contains("(1/") {
+            return false;
+        }
+        assert!(
+            frame.contains("Auto-compact") && frame.contains("Editor padding"),
+            "{frame:?}"
+        );
+        true
+    });
+    master.write_all(b"\x1b[6~").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("Settings") && frame.contains("(11/")
+    });
+    master.write_all(b"\x1b[5~").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("Settings") && frame.contains("(1/")
+    });
+    master.write_all(b"\x1b").unwrap();
+    wait_for_widget_frame(&mut master, |frame| {
+        frame.contains("above-first") && frame.contains("below-second-filler-8")
+    });
+}
+
 #[test]
 fn terminal_appearance_notifications_follow_the_saved_theme_selection() {
     let root = tempfile::tempdir().unwrap();
@@ -1012,12 +1252,14 @@ fn reload_applies_saved_theme_changes_without_overriding_cli_selection() {
 }
 
 #[test]
-fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
+fn terminal_color_and_hyperlink_capabilities_apply_at_startup_and_reload_in_both_modes() {
     const RGB: &str = "\x1b[38;2;255;0;0m";
     const INDEXED: &str = "\x1b[38;5;196m";
     const RGB_BG: &str = "\x1b[48;2;128;128;128m";
     const INDEXED_BG: &str = "\x1b[48;5;244m";
-    const TRANSCRIPT: &str = "committed color fixture";
+    const TRANSCRIPT: &str = "committed terminal fixture";
+    const URL: &str = "https://example.com/terminal";
+    let osc_link = format!("\x1b]8;;{URL}\x1b\\");
     for mode in ["regular", "fullscreen"] {
         for (configured, env, before, after) in
             [(false, "1", INDEXED, RGB), (true, "0", RGB, INDEXED)]
@@ -1028,12 +1270,12 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
             let session_path = root.path().join("session.jsonl");
             pi_rs::Session::open(&session_path)
                 .unwrap()
-                .append_user_with_images(TRANSCRIPT.into(), vec![], None)
+                .append_user_with_images(format!("{TRANSCRIPT} {URL}"), vec![], None)
                 .unwrap();
             let settings = home.join("settings.json");
             std::fs::write(
                 &settings,
-                serde_json::json!({"theme":"color-fixture","terminal":{"trueColor":configured}})
+                serde_json::json!({"theme":"color-fixture","terminal":{"trueColor":configured,"hyperlinks":configured}})
                     .to_string(),
             )
             .unwrap();
@@ -1044,39 +1286,13 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
             theme["colors"]["userMessageBg"] = serde_json::json!("#808080");
             std::fs::write(home.join("themes/color-fixture.json"), theme.to_string()).unwrap();
 
-            let mut master_fd = -1;
-            let mut slave_fd = -1;
-            let mut size = libc::winsize {
-                ws_row: 32,
-                ws_col: 110,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            assert_eq!(
-                unsafe {
-                    libc::openpty(
-                        &mut master_fd,
-                        &mut slave_fd,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::addr_of_mut!(size),
-                    )
-                },
-                0
-            );
-            let mut master = unsafe { File::from_raw_fd(master_fd) };
-            let slave = unsafe { File::from_raw_fd(slave_fd) };
-            let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
-            assert_eq!(
-                unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
-                0
-            );
-            let _process = Process(
+            let (mut master, _process) = spawn_capability_test_terminal(
                 Command::new(env!("CARGO_BIN_EXE_pi"))
                     .current_dir(root.path())
                     .env("PI_RS_HOME", &home)
                     .env("TERM", "xterm-256color")
                     .env("PI_TRUE_COLOR", env)
+                    .env("PI_HYPERLINKS", env)
                     .env_remove("NO_COLOR")
                     .args([
                         "--offline",
@@ -1087,12 +1303,7 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
                         mode,
                         "--session",
                     ])
-                    .arg(&session_path)
-                    .stdin(Stdio::from(slave.try_clone().unwrap()))
-                    .stdout(Stdio::from(slave.try_clone().unwrap()))
-                    .stderr(Stdio::from(slave))
-                    .spawn()
-                    .unwrap(),
+                    .arg(&session_path),
             );
             output_until(&mut master, |text| {
                 assert!(
@@ -1103,22 +1314,540 @@ fn terminal_color_capability_applies_at_startup_and_reload_in_both_modes() {
                     assert!(!text.contains("\x1b[38;2;") && !text.contains("\x1b[48;2;"));
                 }
                 let background = if configured { RGB_BG } else { INDEXED_BG };
-                text.contains("Enter to send")
+                let ready = text.contains("Enter to send")
                     && text.contains(TRANSCRIPT)
                     && text.contains(before)
                     && text.contains(background)
+                    && text.contains(URL);
+                if ready {
+                    assert_eq!(text.contains(&osc_link), configured, "{mode}");
+                }
+                ready
             });
-            std::fs::write(&settings, br#"{"theme":"color-fixture"}"#).unwrap();
+            std::fs::write(
+                &settings,
+                br#"{"theme":"color-fixture","terminal":{"trueColor":"auto","hyperlinks":"auto"}}"#,
+            )
+            .unwrap();
             master.write_all(b"/reload\r").unwrap();
             output_until(&mut master, |text| {
                 let background = if configured { INDEXED_BG } else { RGB_BG };
-                text.contains("Reloaded settings")
+                let ready = text.contains("Reloaded settings")
                     && text.contains(TRANSCRIPT)
                     && text.contains(after)
                     && text.contains(background)
+                    && text.contains(URL);
+                if ready {
+                    assert_eq!(text.contains(&osc_link), !configured, "{mode}");
+                }
+                ready
             });
         }
     }
+}
+
+fn spawn_capability_test_terminal(command: &mut Command) -> (File, Process) {
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let process = Process(
+        command
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    (master, process)
+}
+
+#[test]
+fn terminal_hyperlink_capabilities_reprobe_tmux_after_override() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const LABEL: &str = "tmux link fixture";
+    const URL: &str = "https://example.com/tmux-link";
+    let osc_link = format!("\x1b]8;;{URL}\x1b\\");
+    let fallback = format!(" ({URL})");
+
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let settings = home.join("settings.json");
+        let features = root.path().join("features");
+        let probe_log = root.path().join("probe-log");
+        let tmux = root.path().join("tmux");
+        std::fs::write(&probe_log, "").unwrap();
+        std::fs::write(
+            &tmux,
+            "#!/bin/sh\nprintf 'probe\\n' >> \"$PI_TEST_TMUX_PROBE_LOG\"\nIFS= read -r features < \"$PI_TEST_TMUX_FEATURES\"\nprintf '%s\\n' \"$features\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&features, "RGB\n").unwrap();
+        std::fs::write(
+            &settings,
+            br#"{"terminal":{"hyperlinks":null,"trueColor":null}}"#,
+        )
+        .unwrap();
+        let session_path = root.path().join("session.jsonl");
+        pi_rs::Session::open(&session_path)
+            .unwrap()
+            .append_user_with_images(format!("[{LABEL}]({URL})"), vec![], None)
+            .unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(root.path().to_owned()).chain(
+                std::env::var_os("PATH")
+                    .iter()
+                    .flat_map(std::env::split_paths),
+            ),
+        )
+        .unwrap();
+        let (mut master, _process) = spawn_capability_test_terminal(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(root.path())
+                .env("PI_RS_HOME", &home)
+                .env("TERM", "xterm-256color")
+                .env("TMUX", "fixture")
+                .env("PATH", path)
+                .env("PI_TEST_TMUX_FEATURES", &features)
+                .env("PI_TEST_TMUX_PROBE_LOG", &probe_log)
+                .env_remove("PI_HYPERLINKS")
+                .args([
+                    "--offline",
+                    "--no-trust",
+                    "--no-mcp",
+                    "--no-extensions",
+                    "--tui-mode",
+                    mode,
+                    "--session",
+                ])
+                .arg(&session_path),
+        );
+        let probes = || std::fs::read_to_string(&probe_log).unwrap().lines().count();
+        output_until(&mut master, |text| {
+            text.contains("Enter to send") && text.contains(LABEL) && text.contains(&fallback)
+        });
+        assert_eq!(probes(), 1, "{mode}");
+
+        std::fs::write(&settings, br#"{"terminal":{"hyperlinks":true}}"#).unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Reloaded settings") && text.contains(&osc_link)
+        });
+        assert_eq!(probes(), 1, "{mode}");
+
+        // Force a visual change on the next automatic probe. Regular mode
+        // retains the existing link when explicit and detected support agree.
+        std::fs::write(&settings, br#"{"terminal":{"hyperlinks":false}}"#).unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.split("\x1b[?2026h").skip(1).any(|frame| {
+                frame.split_once("\x1b[?2026l").is_some_and(|(body, _)| {
+                    body.contains("Reloaded settings")
+                        && body.contains(&fallback)
+                        && !body.contains(&osc_link)
+                })
+            })
+        });
+        assert_eq!(probes(), 1, "{mode}");
+
+        std::fs::write(&features, "RGB,hyperlinks\n").unwrap();
+        std::fs::write(&settings, br#"{"terminal":{"hyperlinks":"auto"}}"#).unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Reloaded settings") && text.contains(&osc_link) && probes() == 2
+        });
+        master.write_all(b"cached probe fixture").unwrap();
+        output_until(&mut master, |text| text.contains("cached probe fixture"));
+        assert_eq!(probes(), 2, "{mode}");
+    }
+}
+
+const KITTY_IMAGE: &str = "\x1b_Ga=t,";
+const ITERM_IMAGE: &str = "\x1b]1337;File=inline=1;";
+const IMAGE_TRANSCRIPT: &str = "saved image fixture";
+
+fn completed_frame(text: &str, check: impl Fn(&str) -> bool) -> bool {
+    text.split("\x1b[?2026h")
+        .skip(1)
+        .filter_map(|frame| frame.split_once("\x1b[?2026l"))
+        .any(|(frame, _)| check(frame))
+}
+
+fn write_image_settings(root: &std::path::Path, images: serde_json::Value, show_images: bool) {
+    let value = serde_json::json!({
+        "theme": "dark",
+        "terminal": {"images": images, "showImages": show_images},
+    });
+    std::fs::write(root.join("home/settings.json"), value.to_string()).unwrap();
+}
+
+fn spawn_image_terminal(
+    root: &std::path::Path,
+    mode: &str,
+    protocol: &str,
+    attach_image: bool,
+) -> (File, File, Process, libc::winsize) {
+    use base64::Engine;
+
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    write_image_settings(root, serde_json::json!(protocol), true);
+    let path = root.join("session.jsonl");
+    let mut attachments = Vec::new();
+    if attach_image {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(201, 101)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        attachments.push(pi_rs::ImageContent {
+            data: base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+            mime_type: "image/png".into(),
+        });
+    }
+    pi_rs::Session::open(&path)
+        .unwrap()
+        .append_user_with_images(IMAGE_TRANSCRIPT.into(), attachments, None)
+        .unwrap();
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 42,
+        ws_col: 110,
+        ws_xpixel: 990,
+        ws_ypixel: 756,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root)
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env("PI_IMAGE_PROTOCOL", "iterm2")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--tui-mode",
+                mode,
+                "--session",
+            ])
+            .arg(path)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    (master, slave, process, size)
+}
+
+#[test]
+fn terminal_image_protocol_applies_at_startup_reload_and_resize_in_both_modes() {
+    const DELETE_KITTY: &str = "\x1b_Ga=d,d=I,";
+    const QUERY_CELL: &str = "\x1b[16t";
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let (mut master, slave, process, mut size) =
+            spawn_image_terminal(root.path(), mode, "kitty", true);
+        output_until(&mut master, |text| {
+            assert!(!text.contains(ITERM_IMAGE), "{mode}");
+            text.contains(IMAGE_TRANSCRIPT)
+                && text.contains(KITTY_IMAGE)
+                && text.contains(",c=60,r=15,")
+                && text.contains("Enter to send")
+        });
+
+        write_image_settings(root.path(), serde_json::json!("iterm2"), true);
+        master.write_all(b"\x1b[?1;2c/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            let Some((before, after)) = text.split_once(ITERM_IMAGE) else {
+                return false;
+            };
+            assert!(before.contains(DELETE_KITTY), "{mode}");
+            after.contains(";width=60;height=16;") && text.contains("Reloaded settings")
+        });
+
+        size.ws_col = 100;
+        size.ws_xpixel = 900;
+        assert_eq!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGWINCH) },
+            0
+        );
+        output_until(&mut master, |text| {
+            text.split_once(QUERY_CELL)
+                .is_some_and(|(_, frame)| frame.contains(ITERM_IMAGE))
+        });
+
+        write_image_settings(root.path(), serde_json::json!(false), true);
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains(if mode == "regular" {
+                "\x1b[3J"
+            } else {
+                "\x1b[2J"
+            }) && completed_frame(text, |frame| {
+                frame.contains("Reloaded settings")
+                    && frame.contains(IMAGE_TRANSCRIPT)
+                    && (mode != "regular" || frame.contains("\x1b[3J"))
+                    && !frame.contains(ITERM_IMAGE)
+                    && !frame.contains(KITTY_IMAGE)
+            })
+        });
+
+        write_image_settings(root.path(), serde_json::json!("auto"), false);
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            let Some((_, frame)) = text.split_once(QUERY_CELL) else {
+                return false;
+            };
+            completed_frame(frame, |frame| {
+                frame.contains("Reloaded settings")
+                    && !frame.contains(ITERM_IMAGE)
+                    && !frame.contains(KITTY_IMAGE)
+            })
+        });
+
+        write_image_settings(root.path(), serde_json::json!("auto"), true);
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains(ITERM_IMAGE) && text.contains("Reloaded settings")
+        });
+    }
+}
+
+#[test]
+fn terminal_image_protocol_switch_preserves_regular_scrollback_without_images() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _slave, _process, _) =
+        spawn_image_terminal(root.path(), "regular", "iterm2", false);
+    output_until(&mut master, |text| {
+        text.contains(IMAGE_TRANSCRIPT) && text.contains("Enter to send")
+    });
+    write_image_settings(root.path(), serde_json::json!("kitty"), true);
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b[3J"), "{text}");
+        completed_frame(text, |frame| frame.contains("Reloaded settings"))
+    });
+}
+
+fn switch_image_terminal_mode(master: &mut File, mode: &str, check: impl Fn(&str) -> bool) {
+    let (previous, control) = if mode == "regular" {
+        ("fullscreen", "\x1b[?1049l")
+    } else {
+        ("regular", "\x1b[?1049h")
+    };
+    master.write_all(b"/settings\r").unwrap();
+    output_until(master, |text| text.contains("Settings"));
+    master.write_all(b"TUI mode").unwrap();
+    output_until(master, |text| {
+        settings_row_shows(text, "TUI mode", previous)
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(master, |text| {
+        text.split_once(control).is_some_and(|(_, restored)| {
+            settings_row_shows(restored, "TUI mode", mode) && check(restored)
+        })
+    });
+    master.write_all(b"\x03").unwrap();
+    output_until(master, |text| {
+        completed_frame(text, |frame| {
+            frame.contains("0 tokens") && !settings_row_shows(frame, "TUI mode", mode)
+        })
+    });
+}
+
+#[test]
+fn terminal_image_visibility_reflows_the_regular_screen_after_fullscreen_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _slave, _process, _) =
+        spawn_image_terminal(root.path(), "regular", "iterm2", true);
+    output_until(&mut master, |text| {
+        text.contains(ITERM_IMAGE) && text.contains("Enter to send")
+    });
+
+    for show_images in [false, true] {
+        switch_image_terminal_mode(&mut master, "fullscreen", |_| true);
+        write_image_settings(root.path(), serde_json::json!("iterm2"), show_images);
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            completed_frame(text, |frame| {
+                frame.contains("Reloaded settings") && frame.contains(ITERM_IMAGE) == show_images
+            })
+        });
+        switch_image_terminal_mode(&mut master, "regular", |text| {
+            completed_frame(text, |frame| {
+                frame.contains("\x1b[3J")
+                    && frame.contains(IMAGE_TRANSCRIPT)
+                    && frame.contains(ITERM_IMAGE) == show_images
+            })
+        });
+    }
+}
+
+fn start_blocked_image_reload(root: &std::path::Path, master: &mut File) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let package = root.join("reload-package.sh");
+    std::fs::write(
+        &package,
+        r#"#!/bin/sh
+: > "$PI_RS_HOME/probe-started"
+for i in $(seq 1 100); do
+    if [ -f "$PI_RS_HOME/probe-release" ]; then
+        printf '%s\n' '{"version":1,"response":{"Ok":{"id":"probe","dependencies":[],"commands":[],"tools":[]}}}'
+        exit 0
+    fi
+    sleep .1
+done
+exit 1
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = root.join("home");
+    std::fs::write(
+        home.join("settings.json"),
+        serde_json::json!({"theme":"dark","terminal":{"images":"kitty"},"packages":[package]})
+            .to_string(),
+    )
+    .unwrap();
+    master.write_all(b"/reload\r").unwrap();
+}
+
+#[test]
+fn terminal_image_exit_replay_uses_settings_from_an_interrupted_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, _slave, process, _) =
+        spawn_image_terminal(root.path(), "fullscreen", "iterm2", true);
+    output_until(&mut master, |text| {
+        text.contains(ITERM_IMAGE) && text.contains("Enter to send")
+    });
+    start_blocked_image_reload(root.path(), &mut master);
+    let home = root.path().join("home");
+    output_until(&mut master, |_| home.join("probe-started").exists());
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    output_until(&mut master, |text| {
+        let Some((_, replay)) = text.split_once("\x1b[?1049l") else {
+            return false;
+        };
+        assert!(!replay.contains(ITERM_IMAGE), "{replay}");
+        replay.contains(IMAGE_TRANSCRIPT) && replay.contains(KITTY_IMAGE)
+    });
+    std::fs::File::create(home.join("probe-release")).unwrap();
+}
+
+#[test]
+fn terminal_image_interrupt_during_reload_keeps_regular_transcript() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master, slave, mut process, _) =
+        spawn_image_terminal(root.path(), "regular", "iterm2", true);
+    output_until(&mut master, |text| {
+        completed_frame(text, |frame| {
+            frame.contains(IMAGE_TRANSCRIPT) && frame.contains(ITERM_IMAGE)
+        })
+    });
+    let terminal_flags = || {
+        let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), settings.as_mut_ptr()) },
+            0
+        );
+        unsafe { settings.assume_init().c_lflag }
+    };
+    let cooked_flags = libc::ICANON | libc::ECHO;
+    assert_eq!(terminal_flags() & cooked_flags, 0);
+
+    start_blocked_image_reload(root.path(), &mut master);
+    let home = root.path().join("home");
+    let erased = std::cell::Cell::new(false);
+    let record_erase = |text: &str| {
+        erased.set(erased.get() || text.contains("\x1b[2J") || text.contains("\x1b[3J"));
+    };
+    output_until(&mut master, |text| {
+        record_erase(text);
+        home.join("probe-started").exists()
+    });
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    output_until(&mut master, |text| {
+        record_erase(text);
+        text.contains("Resume this session with pi --session")
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pi did not exit during package preparation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    std::fs::File::create(home.join("probe-release")).unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(terminal_flags() & cooked_flags, cooked_flags);
+    assert!(
+        !erased.get(),
+        "interrupted reload erased the regular transcript"
+    );
 }
 
 #[test]
@@ -1452,6 +2181,116 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
     output_until(&mut master, |text| {
         text.contains("automatic compaction is disabled")
     });
+}
+
+#[test]
+fn editor_component_edits_then_restores_native_keys_in_both_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in ["regular", "fullscreen"] {
+        let directory = tempfile::tempdir().unwrap();
+        let session_path = directory.path().join("session.jsonl");
+        let extension = directory.path().join("editor-component.py");
+        std::fs::write(&extension, r#"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    descriptor = {'id':'editor-component','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True}
+    print(json.dumps({'version':1,'response':{'Ok':descriptor}}))
+else:
+    event = json.loads(sys.stdin.readline())['request']['event']
+    def ui(method, **fields):
+        print(json.dumps({'type':'ui','request':{'method':method,**fields}}), flush=True)
+        assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    if event['type'] == 'session_start':
+        ui('setEditorComponent', component={'placeholder':'Editor component ready','keybindings':[{'key':'f6','action':'deleteCharBackward'}]})
+    if event['type'] == 'session_info_changed':
+        ui('setEditorComponent', component=None)
+        ui('notify', message='Default editor restored after ' + event['name'])
+    print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
+"#).unwrap();
+        std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (mut master, mut slave) = (-1, -1);
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 110,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(size),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let mut process = Process(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(directory.path())
+                .env("PI_RS_HOME", directory.path().join("home"))
+                .env("TERM", "xterm-256color")
+                .args(["--no-trust", "--no-mcp", "--offline", "--tui-mode", mode])
+                .arg("--session")
+                .arg(&session_path)
+                .arg("--extension")
+                .arg(&extension)
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+        output_until(&mut master, |text| text.contains("component ready"));
+        master
+            .write_all(b"\x1b[?1;2c/name custom-keptX\x1b[17~\r")
+            .unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Default editor restored after custom-kept")
+        });
+        assert_eq!(
+            pi_rs::Session::snapshot(&session_path).unwrap().name(),
+            Some("custom-kept"),
+            "{mode}"
+        );
+        master.write_all(b"/name plain-keptX\x1b[17~\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Default editor restored after plain-keptX")
+        });
+        assert_eq!(
+            pi_rs::Session::snapshot(&session_path).unwrap().name(),
+            Some("plain-keptX"),
+            "{mode}"
+        );
+        master.write_all(b"/qui\t").unwrap();
+        output_until(&mut master, |text| text.contains("/quit"));
+        master.write_all(b"\r").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = process.0.try_wait().unwrap() {
+                assert!(status.success(), "{mode}: {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{mode}: completed quit command did not exit"
+            );
+            let mut output = [0; 8192];
+            let _ = master.read(&mut output);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 #[test]
@@ -1800,6 +2639,9 @@ import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     request = json.load(sys.stdin)
     result = {'id':'theme-extension','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'lifecycle_host_calls':True,'session_lifecycle_hook':True,'model_selection_hook':True} if request['type'] == 'describe' else None
+    if request['type'] == 'render_header':
+        context = request['context']
+        result = {'lines': [[{'text': f"Mounted header {context['width']} {context['theme']['name']}"}]]}
     print(json.dumps({'version':1,'response':{'Ok':result}}))
     sys.exit(0)
 event = json.loads(sys.stdin.readline())['request']['event']
@@ -1912,6 +2754,30 @@ elif event['type'] == 'model_select':
         assert!(!text.contains("timed out"), "{text}");
         text.contains("Model callback finished with dark theme")
     });
+}
+
+#[test]
+fn mounted_header_redraws_after_extension_theme_selection_in_both_modes() {
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let (mut master, _process) = start_theme_extension(
+            root.path(),
+            &["--tui-mode", mode],
+            r#"
+if event['type'] == 'session_start':
+    assert active() == 'dark'
+    assert ui('setHeaderRenderer', enabled=True) is None
+elif event['type'] == 'thinking_level_select' and event['level'] == 'low':
+    assert ui('setTheme', theme='light') == {'success':True}
+    assert active() == 'light'
+"#,
+        );
+        output_until(&mut master, |text| text.contains("Mounted header 110 dark"));
+        master.write_all(b"/thinking low\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Mounted header 110 light")
+        });
+    }
 }
 
 #[test]
@@ -2589,6 +3455,10 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         let home = root.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"models":[{"id":"test-fixture","reasoning":true,"thinkingLevelMap":{"xhigh":"xhigh"}}]}}}"#).unwrap();
+        let project_settings = root.path().join(".pi/settings.json");
+        let project = br#"{"externalEditor":"project-editor"}"#;
+        std::fs::create_dir(project_settings.parent().unwrap()).unwrap();
+        std::fs::write(&project_settings, project).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (finish, finished) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
@@ -2687,7 +3557,7 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
                     root.path().to_str().unwrap(),
                     "--session",
                     session_path.to_str().unwrap(),
-                    "--no-trust",
+                    "--trust",
                     "--no-mcp",
                     "--offline",
                     "--model",
@@ -2799,6 +3669,15 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         output_until(&mut master, |text| {
             text.contains("Edit shellPath") && text.contains("to change")
         });
+        master.write_all(b"\x15Edit externalEditor\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Edit externalEditor as JSON")
+                && text.contains("overridden by the project")
+        });
+        master.write_all(b"\x13").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Edit externalEditor") && text.contains("to change")
+        });
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
                 .unwrap();
@@ -2811,6 +3690,8 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             "high"
         );
         assert_eq!(settings["shellPath"], "");
+        assert_eq!(settings["externalEditor"], "");
+        assert_eq!(std::fs::read(project_settings).unwrap(), project);
         finish.send(()).unwrap();
         server.join().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);

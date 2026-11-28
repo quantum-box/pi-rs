@@ -42,7 +42,7 @@ pub fn qualified_model<'a>(
 // The order is Pi's startup preference across authenticated providers.
 const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
     ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
-    ("ant-ling", "Ring-2.6-1T"),
+    ("ant-ling", "Ling-3.1-flash"),
     ("anthropic", "claude-opus-5-5"),
     ("openai", "gpt-6.2-sol"),
     ("azure", "gpt-6.2-sol"),
@@ -60,7 +60,7 @@ const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
     ("cerebras", "gpt-oss-120b"),
     ("zai", "glm-5.3"),
     ("zai-coding-cn", "glm-5.3"),
-    ("mistral", "devstral-medium-latest"),
+    ("mistral", "mistral-medium-latest"),
     ("minimax", "MiniMax-M3"),
     ("minimax-cn", "MiniMax-M3"),
     ("moonshotai", "kimi-k2.7-code"),
@@ -73,11 +73,8 @@ const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
     ("opencode-go", "kimi-k3.1-pro"),
     ("kimi-coding", "kimi-for-coding"),
     ("meta", "muse-spark-1.3"),
-    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.7-code"),
-    (
-        "cloudflare-ai-gateway",
-        "workers-ai/@cf/moonshotai/kimi-k2.7-code",
-    ),
+    ("cloudflare-workers-ai", "@cf/zai-org/glm-5.3"),
+    ("cloudflare-ai-gateway", "workers-ai/@cf/zai-org/glm-5.3"),
     ("qwen-token-plan", "qwen3.8-max"),
     ("qwen-token-plan-cn", "qwen3.8-max"),
     ("qwen-token-plan-individual", "qwen3.8-max"),
@@ -98,6 +95,16 @@ pub(super) fn default_for_provider<'a>(
         .find(|(id, _)| *id == provider.id())
         .and_then(|(_, preferred)| models.iter().find(|model| model == preferred))
         .or_else(|| models.first())
+}
+
+pub(super) fn is_unconfigured_retired_ant_ling_model(
+    profiles: &super::model_profiles::Profiles,
+    provider: &Provider,
+    id: &str,
+) -> bool {
+    provider.id() == "ant-ling"
+        && matches!(id, "Ling-2.6-flash" | "Ling-2.6-1T" | "Ring-2.6-1T")
+        && profiles.model(provider, id).is_none()
 }
 
 /// Choose from known catalog entries without resolving credential commands
@@ -187,7 +194,7 @@ pub(super) async fn automatic_startup_model(args: &Cli) -> Option<ScopedChoice> 
 
 pub struct Catalog {
     pub provider: Provider,
-    pub client: super::providers::Client,
+    client: Option<super::providers::Client>,
     pub models: Vec<String>,
     aliases: Vec<(String, String)>,
     probe_details: bool,
@@ -195,6 +202,12 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    pub(super) async fn discovered_radius_catalog(
+        &self,
+    ) -> Option<std::sync::Arc<super::radius_catalog::Catalog>> {
+        self.client.as_ref()?.discovered_radius_catalog().await
+    }
+
     pub fn display_name<'a>(&'a self, model: &'a str) -> &'a str {
         self.aliases
             .iter()
@@ -207,8 +220,10 @@ impl Catalog {
         models: &[String],
         profiles: &super::model_profiles::Profiles,
     ) -> std::collections::BTreeMap<String, pi_rs::ollama::ModelDetails> {
-        let mut details = if self.probe_details {
-            self.client.model_details(models).await
+        let mut details = if self.probe_details
+            && let Some(client) = &self.client
+        {
+            client.model_details(models).await
         } else {
             Default::default()
         };
@@ -224,14 +239,35 @@ impl Catalog {
     }
 }
 
+fn catalog_client(
+    args: &Cli,
+    provider: &Provider,
+    models: &mut Vec<String>,
+) -> Result<Option<super::providers::Client>> {
+    if args.endpoint_for(provider).is_empty() {
+        let has_model_endpoint = |model: &String| {
+            args.model_profiles
+                .model_endpoint(provider, model)
+                .is_some_and(|endpoint| !endpoint.is_empty())
+        };
+        if models.iter().any(has_model_endpoint) {
+            // Bundled and cached model IDs may have no route in this profile.
+            models.retain(has_model_endpoint);
+            return Ok(None);
+        }
+    }
+    args.connect_provider(provider, None).map(Some)
+}
+
 pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
-    let client = args.connect_provider(&provider, None)?;
-    let client = if provider == Provider::Radius {
-        client.with_context_probes(probe)
-    } else {
-        client
-    };
     let mut models = args.model_profiles.model_ids(&provider);
+    let client = catalog_client(args, &provider, &mut models)?.map(|client| {
+        if provider == Provider::Radius {
+            client.with_context_probes(probe)
+        } else {
+            client
+        }
+    });
     let mut probe_details = false;
     let bundled = provider.id() == "azure"
         || (provider.id() == "cloudflare-ai-gateway"
@@ -244,7 +280,9 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
         || super::builtin_chat::find(provider.id())
             .is_some_and(|builtin| builtin.is_default_endpoint(args.endpoint_for(&provider)));
     let mut complete = false;
-    if (probe && !bundled) || provider == Provider::Radius {
+    if let Some(client) = &client
+        && ((probe && !bundled) || provider == Provider::Radius)
+    {
         match client.models(args.model_profiles.azure_api_version()).await {
             Ok(discovered) => {
                 complete = true;
@@ -272,8 +310,8 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
         aliases.iter().map(|(id, _)| id.clone()).collect();
     aliases.extend(
         client
-            .aliases()
-            .into_iter()
+            .iter()
+            .flat_map(super::providers::Client::aliases)
             .filter(|(id, _)| !configured.contains(id)),
     );
     Ok(Catalog {
@@ -328,7 +366,6 @@ pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
     );
     providers
         .filter_map(|provider| {
-            let client = args.connect_provider(&provider, None).ok()?;
             let mut models = args.model_profiles.model_ids(&provider);
             for model in args
                 .discovered_models
@@ -346,6 +383,7 @@ pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
                     models.push(model.clone());
                 }
             }
+            let client = catalog_client(args, &provider, &mut models).ok()?;
             let endpoint = args.endpoint_for(&provider);
             if matches!(
                 args.model_credential_for(&provider, endpoint),
@@ -1072,6 +1110,23 @@ pub fn fuzzy(query: &str, value: &str) -> bool {
 mod tests {
     use super::{Choice, Scope};
 
+    #[test]
+    fn updated_provider_defaults_exist_in_the_builtin_catalog() {
+        for (id, expected) in [
+            ("ant-ling", "Ling-3.1-flash"),
+            ("cloudflare-workers-ai", "@cf/zai-org/glm-5.3"),
+            ("cloudflare-ai-gateway", "workers-ai/@cf/zai-org/glm-5.3"),
+        ] {
+            let profiles = crate::model_profiles::Profiles::default();
+            let provider = profiles.provider(id).unwrap();
+            let models = profiles.model_ids(&provider);
+            assert_eq!(
+                super::default_for_provider(&provider, &models).map(String::as_str),
+                Some(expected),
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unqueried_dynamic_catalog_is_not_complete() {
         use clap::Parser;
@@ -1080,6 +1135,28 @@ mod tests {
             .await
             .unwrap();
         assert!(!catalog.complete);
+    }
+
+    #[test]
+    fn cached_azure_catalog_omits_unrouted_bundled_and_cached_models() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.model_profiles = crate::model_profiles::Profiles::parse_with_azure_env(
+            &json!({"providers":{"azure":{
+                "models":[{"id":"routed","api":"azure-openai-responses","baseUrl":"http://127.0.0.1:2"}]
+            }}}),
+            |_| None,
+        ).unwrap();
+        args.discovered_models
+            .push(("azure".into(), "old-deployment".into()));
+        let catalog = super::cached_catalogs(&args)
+            .into_iter()
+            .find(|catalog| catalog.provider.id() == "azure")
+            .unwrap();
+        assert_eq!(catalog.models, ["routed"]);
+        assert!(catalog.client.is_none());
     }
 
     #[test]
@@ -1111,14 +1188,7 @@ mod tests {
         let catalogs = [
             Catalog {
                 provider: Provider::Ollama,
-                client: Provider::Ollama
-                    .connect(
-                        Provider::Ollama.adapter(),
-                        Provider::Ollama.default_endpoint(),
-                        None,
-                        false,
-                    )
-                    .unwrap(),
+                client: None,
                 models: [
                     "same",
                     "exact-extra",
@@ -1140,14 +1210,7 @@ mod tests {
             },
             Catalog {
                 provider: Provider::Anthropic,
-                client: Provider::Anthropic
-                    .connect(
-                        Provider::Anthropic.adapter(),
-                        Provider::Anthropic.default_endpoint(),
-                        Some("fixture".into()),
-                        false,
-                    )
-                    .unwrap(),
+                client: None,
                 models: [
                     "same",
                     "exact",

@@ -2084,6 +2084,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hmac",
  "http",
+ "indexmap 2.14.2",
  "js-sys",
  "jsonschema",
  "libc",
