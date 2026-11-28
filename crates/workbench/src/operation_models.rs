@@ -3372,6 +3372,48 @@ mod tests {
         assert_eq!(output, vec![json!({"type":"text","text":"description"})]);
     }
     #[test]
+    fn openrouter_image_usage_exposes_output_breakdown_and_complete_billing() {
+        let config = json!({"relay":{"baseUrl":"https://relay.example/v1", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images"
+        }]}});
+        let catalog = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalog
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let mut raw = json!({
+            "prompt_tokens": 5, "completion_tokens": 20,
+            "completion_tokens_details": {"reasoning_tokens": 3, "image_tokens": 0},
+            "cost": 0.25, "is_byok": false
+        });
+        let billed = usage(entry, &raw).unwrap();
+        assert_eq!(billed["imageOutput"], 0);
+        assert_eq!(billed["reasoning"], 3);
+        assert_eq!(billed["totalTokens"], 25);
+        assert_eq!(billed["cost"]["total"], 0.25);
+        assert_eq!(billed["cost"]["totalFromProvider"], true);
+
+        raw["is_byok"] = json!(true);
+        raw["cost_details"] = json!({"upstream_inference_cost": 0.5});
+        raw["completion_tokens_details"]["image_tokens"] = json!(14);
+        let byok = usage(entry, &raw).unwrap();
+        assert_eq!(byok["imageOutput"], 14);
+        assert_eq!(byok["totalTokens"], 25);
+        assert_eq!(byok["cost"]["total"], 0.75);
+        assert_eq!(byok["cost"]["totalFromProvider"], true);
+
+        raw.as_object_mut()
+            .unwrap()
+            .remove("completion_tokens_details");
+        raw.as_object_mut().unwrap().remove("cost_details");
+        let estimated = usage(entry, &raw).unwrap();
+        assert!(estimated.get("imageOutput").is_none());
+        assert_eq!(estimated["reasoning"], 0);
+        assert_eq!(estimated["cost"]["totalFromProvider"], false);
+    }
+
+    #[test]
     fn openrouter_image_usage_keeps_reported_cache_counts() {
         let config = json!({"relay":{"baseUrl":"https://relay.example/v1", "models":[{
             "type":"image", "id":"fixture", "api":"openrouter-images"

@@ -1,6 +1,7 @@
 //! System One classification and OpenRouter image request/response conversion.
 use base64::Engine;
 use pi_rs::{Error, Result};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::{Api, Entry, ImageInput};
@@ -348,11 +349,26 @@ pub(super) fn usage(entry: &Entry, raw: &Value) -> Option<Value> {
             )
         }
     };
-    Some(json!({
+    let mut usage = json!({
         "input":input,"output":output,"cacheRead":cache_read,"cacheWrite":cache_write,
         "totalTokens":input+output+cache_read+cache_write,
         "cost": token_cost(&entry.model.cost, [input, output, cache_read, cache_write].map(|count| count as f64)),
-    }))
+    });
+    if matches!(entry.api, Api::OpenRouterImages) {
+        let details = &raw["completion_tokens_details"];
+        usage["reasoning"] = json!(details["reasoning_tokens"].as_u64().unwrap_or_default());
+        if let Some(tokens) = details["image_tokens"].as_u64() {
+            usage["imageOutput"] = json!(tokens);
+        }
+        if raw["is_byok"].is_boolean()
+            && let Ok(reported) = pi_rs::ReportedUsageCost::deserialize(raw)
+            && let Some(total) = reported.total()
+        {
+            usage["cost"]["total"] = json!(total);
+            usage["cost"]["totalFromProvider"] = json!(true);
+        }
+    }
+    Some(usage)
 }
 
 pub(super) fn token_cost(cost: &super::Cost, counts: [f64; 4]) -> Value {
