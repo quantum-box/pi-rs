@@ -65,6 +65,15 @@ impl Dialog {
             masked: false,
         }
     }
+    pub(crate) fn refresh_custom_lines(&mut self, replacement: Vec<Vec<pi_rs::UiComponentSpan>>) {
+        if let UiRequest::Custom { lines, .. } = &mut self.request {
+            if self.selected >= self.scroll_max.get() {
+                self.selected = usize::MAX;
+            }
+            *lines = replacement;
+        }
+    }
+
     pub fn secret(title: String) -> Self {
         let mut dialog = Self::new(
             Uuid::new_v4(),

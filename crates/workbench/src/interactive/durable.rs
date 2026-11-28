@@ -105,6 +105,16 @@ impl Drop for Companion {
     }
 }
 
+const FOREGROUND_REFRESH: Duration = Duration::from_millis(250);
+
+struct ForegroundViewer {
+    child: Uuid,
+    dialog: Uuid,
+    request: Option<(Uuid, bool)>,
+    last_refresh: Option<Instant>,
+    stopped: bool,
+}
+
 #[derive(Default)]
 struct Conversation {
     active: bool,
@@ -112,6 +122,9 @@ struct Conversation {
     tree: Option<TerminalTree>,
     tree_request: Option<Uuid>,
     fork_pending: bool,
+    foreground_children: Vec<Uuid>,
+    foreground_choices: Option<Vec<Uuid>>,
+    foreground_viewer: Option<ForegroundViewer>,
 }
 
 impl Conversation {
@@ -124,6 +137,10 @@ impl Conversation {
             Some("response") => {
                 let id = entry_id(&event["id"]);
                 let command = event["command"].as_str();
+                if command == Some("get_foreground_subagent") {
+                    self.receive_foreground_view(view, id, &event);
+                    return;
+                }
                 if command == Some("get_entries") {
                     if id.is_some() && id == self.tree_request {
                         self.tree_request = None;
@@ -193,7 +210,19 @@ impl Conversation {
                 }
             }
             Some("agent_start") => self.active = true,
-            Some("agent_end") => self.active = false,
+            Some("agent_end") => {
+                self.active = false;
+                self.foreground_children.clear();
+            }
+            Some("durable_foreground_subagents") => {
+                self.foreground_children = event["conversationIds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(entry_id)
+                    .take(16)
+                    .collect();
+            }
             Some("tool_execution_start") => {
                 show_tool(view, &event["durableInvocation"], &Value::Null);
             }
@@ -216,6 +245,143 @@ impl Conversation {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn choose_foreground(&mut self, view: &mut View) {
+        self.tree = None;
+        self.tree_request = None;
+        let children = self.foreground_children.clone();
+        let mut items = vec![Item {
+            label: "main".into(),
+            selection: Selection::Checkout(0),
+        }];
+        items.extend(children.iter().enumerate().map(|(index, child)| Item {
+            label: format!("Subagent {child}"),
+            selection: Selection::Checkout(index as u64 + 1),
+        }));
+        view.picker = Some(Picker::new("Conversations", items));
+        self.foreground_choices = Some(children);
+    }
+
+    fn pick_foreground(&mut self, view: &mut View, key: Option<KeyEvent>, keys: &Keys) -> bool {
+        let Some(choices) = self.foreground_choices.as_ref() else {
+            return false;
+        };
+        let Some(picker) = view.picker.as_mut() else {
+            return false;
+        };
+        let input = match key {
+            Some(key) => picker.input(key, keys),
+            None => picker.activate_mouse_selection(keys),
+        };
+        match input {
+            Input::Cancel | Input::Select(Selection::Checkout(0)) => {
+                view.picker = None;
+                self.foreground_choices = None;
+            }
+            Input::Select(Selection::Checkout(row)) => {
+                let child = choices.get((row - 1) as usize).copied();
+                if let Some(child) = child.filter(|child| self.foreground_children.contains(child))
+                {
+                    view.picker = None;
+                    self.foreground_choices = None;
+                    self.open_foreground_view(view, child);
+                } else {
+                    picker.show_feedback(Err("Subagent is no longer running".into()));
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn open_foreground_view(&mut self, view: &mut View, child: Uuid) {
+        let dialog = Uuid::new_v4();
+        view.dialogs.push_front(crate::ui::dialog::Dialog::new(
+            dialog,
+            pi_rs::UiRequest::Custom {
+                title: format!("Subagent {child}"),
+                lines: vec![foreground_line("Loading conversation", "muted")],
+                actions: vec![],
+                timeout: None,
+            },
+        ));
+        self.foreground_viewer = Some(ForegroundViewer {
+            child,
+            dialog,
+            request: None,
+            last_refresh: None,
+            stopped: false,
+        });
+    }
+
+    fn foreground_input(&mut self, view: &mut View, key: KeyEvent, keys: &Keys) -> bool {
+        let Some(viewer) = &self.foreground_viewer else {
+            return false;
+        };
+        if let Some(dialog) = view
+            .dialog_mut()
+            .filter(|dialog| dialog.id == viewer.dialog)
+            && dialog.input(key, keys).is_some()
+        {
+            view.dialogs.pop_front();
+            self.foreground_viewer = None;
+        }
+        true
+    }
+
+    fn refresh_foreground_view(&mut self, send: impl FnOnce(Value) -> Result<()>) -> Result<()> {
+        let Some(viewer) = self.foreground_viewer.as_mut() else {
+            return Ok(());
+        };
+        let final_refresh = !self.foreground_children.contains(&viewer.child);
+        if viewer.stopped
+            || viewer.request.is_some()
+            || (!final_refresh
+                && viewer
+                    .last_refresh
+                    .is_some_and(|at| at.elapsed() < FOREGROUND_REFRESH))
+        {
+            return Ok(());
+        }
+        let id = Uuid::new_v4();
+        send(json!({"type": "get_foreground_subagent", "conversationId": viewer.child, "id": id}))?;
+        viewer.request = Some((id, final_refresh));
+        viewer.last_refresh = Some(Instant::now());
+        Ok(())
+    }
+
+    fn receive_foreground_view(&mut self, view: &mut View, id: Option<Uuid>, event: &Value) {
+        let Some(viewer) = self.foreground_viewer.as_mut() else {
+            return;
+        };
+        let Some((request, final_refresh)) = viewer.request else {
+            return;
+        };
+        if id != Some(request) {
+            return;
+        }
+        viewer.request = None;
+        viewer.stopped = final_refresh;
+        let Some(dialog) = view
+            .dialog_mut()
+            .filter(|dialog| dialog.id == viewer.dialog)
+        else {
+            return;
+        };
+        if event["success"] == true
+            && entry_id(&event["data"]["conversationId"]) == Some(viewer.child)
+        {
+            dialog.refresh_custom_lines(foreground_transcript(&event["data"]));
+        } else {
+            viewer.stopped = true;
+            dialog.set_error(
+                event["error"]
+                    .as_str()
+                    .unwrap_or("Subagent view unavailable")
+                    .into(),
+            );
         }
     }
 
@@ -362,6 +528,48 @@ impl Conversation {
         view.picker = Some(picker);
         Ok(true)
     }
+}
+
+fn foreground_line(text: &str, color: &str) -> Vec<pi_rs::UiComponentSpan> {
+    vec![pi_rs::UiComponentSpan {
+        text: text.into(),
+        color: Some(color.into()),
+        ..Default::default()
+    }]
+}
+
+fn foreground_transcript(data: &Value) -> Vec<Vec<pi_rs::UiComponentSpan>> {
+    let mut lines = Vec::new();
+    for message in data["messages"].as_array().into_iter().flatten() {
+        let (label, color) = match message["role"].as_str() {
+            Some("user" | "user_with_images") => ("User", "userMessageText"),
+            Some("assistant") => ("Assistant", "text"),
+            Some("tool") => ("Tool", "toolOutput"),
+            _ => continue,
+        };
+        let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) else {
+            continue;
+        };
+        lines.push(foreground_line(label, "muted"));
+        lines.extend(text.lines().map(|line| foreground_line(line, color)));
+    }
+    for (pointer, label, color) in [
+        ("/live/partial/text", "Assistant", "text"),
+        ("/toolProgress/partial/text", "Tool", "toolOutput"),
+    ] {
+        if let Some(text) = data
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            lines.push(foreground_line(label, "muted"));
+            lines.extend(text.lines().map(|line| foreground_line(line, color)));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(foreground_line("Waiting for output", "muted"));
+    }
+    lines
 }
 
 fn entry_id(value: &Value) -> Option<Uuid> {
@@ -730,6 +938,7 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
             }
             dirty = true;
         }
+        conversation.refresh_foreground_view(|request| worker.send(request))?;
         dirty |= view.poll_clipboard();
         if last_theme_check.elapsed() >= Duration::from_millis(500) {
             dirty |= watcher.poll(&mut theme)?;
@@ -753,6 +962,11 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
         dirty = true;
         match input.next(Duration::from_millis(32))? {
             Some(InputEvent::Event(Event::Key(key))) if key.kind != KeyEventKind::Release => {
+                if conversation.foreground_input(&mut view, key, &keys)
+                    || conversation.pick_foreground(&mut view, Some(key), &keys)
+                {
+                    continue;
+                }
                 if key.code == KeyCode::Esc && conversation.tree_request.take().is_some() {
                     continue;
                 }
@@ -799,6 +1013,12 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                         view.editor.take();
                         conversation.request_tree(&mut worker)?;
                     }
+                    "tui.input.submit"
+                        if view.editor.text.trim() == "/agents" && view.draft_images.is_empty() =>
+                    {
+                        view.editor.take();
+                        conversation.choose_foreground(&mut view);
+                    }
                     "tui.input.submit" | "app.message.followUp" => {
                         conversation.submit(
                             &mut view,
@@ -825,7 +1045,9 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                     && let Some(row) =
                         usize::from(mouse.row).checked_sub(view.fullscreen_header_rows)
                 {
-                    if matches!(picker.mouse(mouse.kind, row), MouseInput::Activate) {
+                    if matches!(picker.mouse(mouse.kind, row), MouseInput::Activate)
+                        && !conversation.pick_foreground(&mut view, None, &keys)
+                    {
                         conversation.pick_tree(&mut view, &mut worker, None, &keys)?;
                     }
                 } else {
@@ -838,6 +1060,9 @@ pub(crate) fn run(executable: &Path, options: &[OsString]) -> Result<()> {
                 dirty = view.fullscreen_mouse(mouse, &args);
             }
             Some(InputEvent::Event(Event::Paste(text))) => {
+                if conversation.foreground_viewer.is_some() {
+                    continue;
+                }
                 if let Some(picker) = &mut view.picker {
                     picker.paste(&text);
                 } else {
@@ -975,6 +1200,96 @@ mod tests {
         )
         .unwrap();
         assert!(colors.color_queries.is_empty());
+    }
+
+    #[test]
+    fn foreground_overlay_follows_the_child_and_preserves_the_parent_draft() {
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        let keys = Keys::default();
+        let mut view = View::default();
+        let mut conversation = Conversation::default();
+        let child = Uuid::from_u128(1);
+        view.editor.replace("keep this draft".into());
+        conversation.event(
+            &mut view,
+            &mut args,
+            json!({"type":"durable_foreground_subagents", "conversationIds":[child]}),
+        );
+        conversation.choose_foreground(&mut view);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(conversation.pick_foreground(&mut view, Some(key(KeyCode::Down)), &keys));
+        assert!(conversation.pick_foreground(&mut view, Some(key(KeyCode::Enter)), &keys));
+        let mut request = None;
+        conversation
+            .refresh_foreground_view(|frame| {
+                request = Some(frame);
+                Ok(())
+            })
+            .unwrap();
+        let request = request.unwrap();
+        assert_eq!(request["conversationId"], json!(child));
+        assert_eq!(request["type"], "get_foreground_subagent");
+        conversation
+            .refresh_foreground_view(|_| panic!("request is still pending"))
+            .unwrap();
+        let response = |id, text| {
+            json!({
+                "type":"response","command":"get_foreground_subagent","success":true,"id":id,
+                "data":{"conversationId":child,"messages":[{"role":"user","content":"child prompt"}],
+                "live":{"state":"running","partial":{"text":text}}}
+            })
+        };
+        conversation.event(&mut view, &mut args, response(json!(Uuid::nil()), "stale"));
+        conversation.event(
+            &mut view,
+            &mut args,
+            response(request["id"].clone(), "live output"),
+        );
+        let drawn = view
+            .dialog()
+            .unwrap()
+            .render(&Theme::system(), 100, 16, &keys)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| span.text)
+            .collect::<String>();
+        assert!(drawn.contains("child prompt"));
+        assert!(drawn.contains("live output"));
+        assert!(!drawn.contains("stale"));
+
+        conversation.event(&mut view, &mut args, json!({
+            "type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"parent answer"}]}
+        }));
+        conversation.event(&mut view, &mut args, json!({"type":"agent_end"}));
+        let mut last = None;
+        conversation
+            .refresh_foreground_view(|frame| {
+                last = Some(frame);
+                Ok(())
+            })
+            .unwrap();
+        let last = last.unwrap();
+        conversation.event(
+            &mut view,
+            &mut args,
+            response(last["id"].clone(), "final answer"),
+        );
+        let drawn = view
+            .dialog()
+            .unwrap()
+            .render(&Theme::system(), 100, 16, &keys)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| span.text)
+            .collect::<String>();
+        assert!(drawn.contains("final answer"));
+        conversation
+            .refresh_foreground_view(|_| panic!("final snapshot was already received"))
+            .unwrap();
+        assert!(conversation.foreground_input(&mut view, key(KeyCode::Esc), &keys));
+        assert!(view.dialog().is_none());
+        assert_eq!(view.editor.text, "keep this draft");
+        assert!(matches!(view.lines.last(), Some(Entry::Assistant(_))));
     }
 
     #[test]
