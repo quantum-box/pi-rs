@@ -156,6 +156,31 @@ impl ForkMembershipProof {
     }
 }
 
+pub(crate) fn document_scope(
+    store: &Store,
+    conversation: Uuid,
+) -> Result<(Uuid, [Check; 2]), crate::document::Error> {
+    let unavailable = || {
+        crate::document::Error::InvalidSessionAdmission(
+            "session documents require active conversation membership".into(),
+        )
+    };
+    let key = member_key(conversation);
+    let entry = store.get_bounded(&key, 4096)?.ok_or_else(unavailable)?;
+    let member: Membership = serde_json::from_slice(&entry.value)?;
+    if member.version != 1 || member.conversation != conversation || member.session.is_nil() {
+        return Err(unavailable());
+    }
+    let session = SessionMembership::new(store)
+        .session(member.session)
+        .map_err(|error| match error {
+            Error::Store(error) => crate::document::Error::Store(error),
+            Error::Json(error) => crate::document::Error::Json(error),
+            _ => unavailable(),
+        })?;
+    Ok((member.session, [checked(key, entry.version), session]))
+}
+
 /// Resolve authority from the owner's membership, never from a caller-supplied
 /// session identifier. Every record used here is retained as a commit check.
 pub(crate) fn task_pair(

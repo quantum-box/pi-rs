@@ -9,6 +9,9 @@ use durable_store::{Check, Expected, Mutation, Store};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
+pub(crate) mod session_current;
+pub use session_current::SessionDocument;
+
 const PREFIX: &[u8] = b"durable/document/";
 const OPS_PREFIX: &[u8] = b"durable/document-operations/v1/";
 const POLICY_PREFIX: &[u8] = b"durable/document-policy/";

@@ -5,7 +5,7 @@
 use crate::{
     document::{
         Address, ConversationDocument, DefinedDocumentValue, Documents, Error, ForkPolicy,
-        StoredDocumentPolicy,
+        SessionDocument, StoredDocumentPolicy, session_current::SessionDocuments,
     },
     runtime::{ApplicationWrite, Conversation, Submission},
     task_store::OwnedBatch,
@@ -57,6 +57,7 @@ type SessionParts = (
 /// The candidate state of one host-initiated session transaction.
 pub struct SessionTransaction<'a> {
     store: &'a Store,
+    session_documents: SessionDocuments<'a>,
     revision: u64,
     pub(crate) state: Conversation,
     pub(crate) table_written: bool,
@@ -95,6 +96,7 @@ impl<'a> SessionTransaction<'a> {
     ) -> Result<Self, Error> {
         Ok(Self {
             store,
+            session_documents: SessionDocuments::new(store, state.id),
             revision: store.document_snapshot()?,
             state,
             table_written: false,
@@ -330,6 +332,55 @@ impl<'a> SessionTransaction<'a> {
         self.drafts.remove(address);
         self.writes.insert(address.clone(), None);
         Ok(())
+    }
+
+    /// Read a current-only document shared by this conversation's session.
+    pub fn read_session_document<T>(
+        &mut self,
+        definition: &SessionDocument<T>,
+        key: &str,
+    ) -> Result<Option<DefinedDocumentValue<T>>, Error>
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize,
+    {
+        self.session_documents.read(definition, key)
+    }
+
+    /// Create or edit a shared session document in this checked transaction.
+    pub fn edit_session_document<T, R>(
+        &mut self,
+        definition: &SessionDocument<T>,
+        key: &str,
+        edit: impl FnOnce(&mut T) -> Result<R, Error>,
+    ) -> Result<R, Error>
+    where
+        T: Clone + serde::de::DeserializeOwned + serde::Serialize,
+    {
+        self.session_documents.edit(definition, key, edit)
+    }
+
+    /// Retire a shared session document. Recreating it gives it a new identity.
+    pub fn retire_session_document<T: serde::Serialize>(
+        &mut self,
+        definition: &SessionDocument<T>,
+        key: &str,
+    ) -> Result<bool, Error> {
+        self.session_documents.retire(definition, key)
+    }
+
+    /// Upgrade a shared session document in place, preserving its incarnation.
+    pub fn migrate_session_document<From, To>(
+        &mut self,
+        old: &SessionDocument<From>,
+        new: &SessionDocument<To>,
+        key: &str,
+        migrate: impl FnOnce(From) -> Result<To, Error>,
+    ) -> Result<(), Error>
+    where
+        From: serde::de::DeserializeOwned + serde::Serialize,
+        To: serde::Serialize,
+    {
+        self.session_documents.migrate(old, new, key, migrate)
     }
 
     /// Read a document by its definition in this conversation.
@@ -912,11 +963,15 @@ impl<'a> SessionTransaction<'a> {
                 ));
             }
         }
-        let changed = self.table_written || !self.writes.is_empty() || !self.policies.is_empty();
         let mut batch = OwnedBatch {
             checks: Vec::new(),
             mutations: Vec::new(),
         };
+        let session_documents_changed = self.session_documents.append_to(&mut batch)?;
+        let changed = self.table_written
+            || !self.writes.is_empty()
+            || !self.policies.is_empty()
+            || session_documents_changed;
         for (id, (expected, _)) in &self.task_reads {
             batch.checks.push(Check {
                 key: crate::task_store::key(*id),

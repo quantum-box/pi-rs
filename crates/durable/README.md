@@ -473,6 +473,16 @@ not upstream's fine-grained operations or windowed view. There is no background
 queue or automatic termination on harness close. Individual frames and retained
 history are not byte-bounded.
 
+A `document::SessionDocument<T>` describes a current-only document family
+shared by conversations enrolled in the same `SessionMembership`. Read, edit,
+retire and migrate it through `SessionTransaction`. Conflicting edits or
+membership changes reject the enclosing commit. Forks share the current value
+with the parent through the inherited membership. A migration keeps the
+incarnation ID, and recreating after retirement assigns a new ID. The store
+replaces the current payload and retains no historical document snapshots for
+these addresses.
+
+
 Nested tool calls are journaled by parent operation and call order. The standalone
 `NestedHost::call_keyed` API also accepts explicit caller-scoped keys and reuses
 completed results across reordered replay, rejecting a changed tool or arguments.
