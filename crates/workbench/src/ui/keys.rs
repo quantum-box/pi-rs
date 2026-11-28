@@ -166,8 +166,10 @@ impl Keys {
             ("app.message.copy", &["ctrl+x"]),
             (
                 "app.clipboard.pasteImage",
-                if windows_keys {
+                if windows {
                     &["alt+v"]
+                } else if windows_keys {
+                    &["alt+v", "ctrl+v"]
                 } else {
                     &["ctrl+v"]
                 },
@@ -558,6 +560,13 @@ mod tests {
             let keys = Keys {
                 bindings: Keys::defaults_for(windows, windows_keys).unwrap(),
             };
+            let paste_keys: &[&str] = match (windows, windows_keys) {
+                (true, _) => &["alt+v"],
+                (false, true) => &["alt+v", "ctrl+v"],
+                (false, false) => &["ctrl+v"],
+            };
+            let expected: Vec<_> = paste_keys.iter().map(|key| parse(key).unwrap()).collect();
+            assert_eq!(keys.bindings["app.clipboard.pasteImage"], expected);
             assert!(keys.matches("tui.editor.undo", parse(undo).unwrap()));
             assert!(keys.matches("tui.altScreen.search", parse(search).unwrap()));
             assert_eq!(

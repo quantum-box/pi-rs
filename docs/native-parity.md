@@ -3411,7 +3411,7 @@ preparation resumes with the foreground job.
 Windows and WSL use Pi's Ctrl+Q follow-up, Alt+P reverse-model and Alt+V paste
 bindings. On Linux, WSL detection uses nonempty WSL environment markers and
 falls back to the kernel signature in `/proc/version` for service-launched
-terminals. Unix suspension remains available on WSL.
+terminals. WSL also keeps Ctrl+V for image paste and supports Unix suspension.
 Windows uses Ctrl+Z for undo; WSL uses Alt+Z so Ctrl+Z remains suspend.
 Both use Ctrl+F for fullscreen transcript search and their prompt-jump
 defaults omit the redundant Ctrl+Shift variants, matching Pi.
