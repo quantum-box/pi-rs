@@ -632,6 +632,113 @@ async fn required_thinking_models_keep_default_and_use_low_effort_for_summaries(
 }
 
 #[tokio::test]
+async fn mapped_bedrock_effort_and_reasoning_replay_follow_the_selected_model() {
+    use pi_rs_core::{ProviderReplay, ResolvedModelIdentity};
+
+    for (model, level, mapped, override_replay, expect_replay) in [
+        (
+            "global.moonshotai.kimi-k3",
+            Some("off"),
+            Some("none"),
+            None,
+            false,
+        ),
+        (
+            "us.moonshotai.kimi-k3.1",
+            Some("xhigh"),
+            Some("xhigh"),
+            None,
+            false,
+        ),
+        ("global.zai.glm-5.3", Some("high"), Some("high"), None, true),
+        ("us.zai.glm-5.3", None, None, Some(false), false),
+        ("amazon.nova-2-lite-v1:0", Some("high"), None, None, true),
+    ] {
+        let mut request = request(model, 1024);
+        request.messages.push(Message::Assistant {
+            content: "visible answer".into(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "call.with/slash".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            }],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "amazon-bedrock".into(),
+                    model: model.into(),
+                },
+                blocks: vec![
+                    json!({"type":"reasoning","text":"prior reasoning ".repeat(200)}),
+                    json!({"type":"text","text":"visible answer"}),
+                    json!({"type":"tool_use","id":"call.with/slash","name":"lookup","input":{}}),
+                ],
+            })),
+        });
+        request.messages.push(Message::Tool {
+            call_id: "call.with/slash".into(),
+            content: "tool result".into(),
+            is_error: false,
+            is_structured: Some(false),
+        });
+        request.messages.push(Message::User {
+            content: "follow-up".into(),
+        });
+        let estimator = Bedrock::from_env().with_reasoning_replay_support(override_replay);
+        let mut without_reasoning = request.clone();
+        let Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = &mut without_reasoning.messages[2]
+        else {
+            unreachable!()
+        };
+        replay.blocks.remove(0);
+        let estimate = estimator.estimate_request_tokens(&request);
+        let visible_estimate = estimator.estimate_request_tokens(&without_reasoning);
+        if expect_replay {
+            assert!(estimate > visible_estimate, "{model}");
+        } else {
+            assert_eq!(estimate, visible_estimate, "{model}");
+            assert!(!estimator.can_reuse_measured_context(&request), "{model}");
+        }
+        let (body, _) = capture(
+            "us-east-1",
+            |client| {
+                client
+                    .with_reasoning(level, mapped)
+                    .unwrap()
+                    .with_reasoning_replay_support(override_replay)
+            },
+            request,
+            false,
+        )
+        .await;
+        assert_eq!(
+            body["additionalModelRequestFields"]["reasoning_effort"].as_str(),
+            mapped,
+            "{model}"
+        );
+        let blocks = body["messages"][1]["content"].as_array().unwrap();
+        assert!(blocks.iter().any(|block| block["text"] == "visible answer"));
+        let tool_id = blocks
+            .iter()
+            .find_map(|block| block["toolUse"]["toolUseId"].as_str())
+            .unwrap();
+        assert_eq!(
+            body["messages"][2]["content"][0]["toolResult"]["toolUseId"],
+            tool_id
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .any(|block| block.get("reasoningContent").is_some()),
+            expect_replay,
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn gpt_mapping_summary_and_unsupported_cache_models() {
     let (oss, _) = capture(
         "us-east-1",
@@ -713,6 +820,50 @@ async fn gpt_mapping_summary_and_unsupported_cache_models() {
         1
     );
     assert!(summary.get("additionalModelRequestFields").is_none());
+}
+
+#[tokio::test]
+async fn explicit_binding_preserves_resolved_replay_and_summary_policy() {
+    let request = request("fixture-profile", 1024);
+    for summary in [false, true] {
+        let (body, _) = capture(
+            "us-east-1",
+            |client| {
+                let client = client
+                    .with_force_cache(true)
+                    .with_cache_retention(CacheRetention::Short)
+                    .with_reasoning_resolver(|model| {
+                        assert_eq!(model, "fixture-profile");
+                        pi_rs_bedrock::ModelReasoning {
+                            level: Some(pi_rs_bedrock::ReasoningLevel::Low),
+                            mapped_effort: Some("resolver-low".into()),
+                            off_effort: Some("none".into()),
+                            supports_replay: Some(false),
+                            ..Default::default()
+                        }
+                    })
+                    .with_model_reasoning(&request.model, None, "high", Some("exact"))
+                    .unwrap();
+                assert!(!client.can_reuse_measured_context(&request));
+                client
+            },
+            request.clone(),
+            summary,
+        )
+        .await;
+        let expected = if summary { "none" } else { "exact" };
+        assert_eq!(
+            body["additionalModelRequestFields"]["reasoning_effort"],
+            expected
+        );
+        let checkpoints = body["system"].as_array().unwrap();
+        assert_eq!(
+            checkpoints
+                .iter()
+                .any(|block| block.get("cachePoint").is_some()),
+            !summary,
+        );
+    }
 }
 
 #[tokio::test]
