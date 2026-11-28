@@ -324,7 +324,7 @@ mod tests {
             cache_read: 10.0,
             ..Cost::default()
         };
-        let priced = usage(&cost, &json!({"input":1e308,"cacheRead":1e307})).unwrap();
+        let priced = usage(&cost, &json!({"input":8e307,"cacheRead":8e307})).unwrap();
         assert!(priced["cost"]["input"].as_f64().unwrap().is_finite());
         assert!(priced["cost"]["cacheRead"].as_f64().unwrap().is_finite());
     }
