@@ -2256,6 +2256,21 @@ mod tests {
                         "{data}"
                     );
                 }
+                let cancelled = context();
+                let token = cancelled.cancellation.clone();
+                let pending = super::super::config::agent_dir().join("image-response-started");
+                let (reply, ()) = tokio::time::timeout(Duration::from_secs(8), async {
+                    tokio::join!(operation.invoke(image_request, cancelled), async {
+                        while !pending.is_file() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        token.cancel();
+                    })
+                })
+                .await
+                .expect("in-flight image request should cancel");
+                assert!(matches!(reply, Outcome::Structured { data, .. }
+                    if data["stopReason"] == "aborted" && data["output"] == json!([])));
                 for status in [503, 404, 307] {
                     let Outcome::Structured { data, .. } =
                         operation.invoke(classify.clone(), context()).await
@@ -2357,6 +2372,7 @@ mod tests {
             json!({"providers":{"radius":{"headers":{"x-fixture-tenant":"test"}}}}).to_string(),
         )
         .unwrap();
+        let pending = home.path().join("image-response-started");
         let server = tokio::spawn(async move {
             const CONFIG: &str = "GET /v1/config HTTP/1.1";
             const DECIDE: &str = "POST /relay/v1/decision HTTP/1.1";
@@ -2374,6 +2390,7 @@ mod tests {
                 (IMAGE, KEY, 200, &base),
                 (IMAGE, KEY, 201, &base),
                 (IMAGE, KEY, 503, &base),
+                (IMAGE, KEY, 206, &base),
                 (DECIDE, KEY, 503, &base),
                 (DECIDE, KEY, 404, &base),
                 (DECIDE, KEY, 307, &base),
@@ -2435,6 +2452,22 @@ mod tests {
                             "options":{"size":"1K"}
                         })
                     );
+                    if status == 206 {
+                        request.get_mut().write_all(b"HTTP/1.1 200 Fixture\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{").await.unwrap();
+                        std::fs::write(&pending, []).unwrap();
+                        let mut remaining = [0; 1];
+                        assert_eq!(
+                            tokio::time::timeout(
+                                Duration::from_secs(8),
+                                request.read(&mut remaining)
+                            )
+                            .await
+                            .expect("cancelled image request should close the socket")
+                            .unwrap(),
+                            0
+                        );
+                        continue;
+                    }
                     let body = match status {
                         200 => json!({"responseId":"fixture-image",
                             "usage":{"cost":{"total":0.25,"totalFromProvider":true}},
