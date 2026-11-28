@@ -805,10 +805,10 @@ impl Entry {
                     }
                     None => wrap(&[title], inner),
                 };
-                if let Some(result) = rendered
+                let custom_result = rendered
                     .as_ref()
-                    .and_then(|rendered| rendered.result.as_ref())
-                {
+                    .and_then(|rendered| rendered.result.as_ref());
+                if let Some(result) = custom_result {
                     lines.extend(extension_rows(result, theme, inner));
                     if let Some((protocol, limit)) = options.inline_images {
                         for part in parts {
@@ -889,9 +889,16 @@ impl Entry {
                     }
                 }
                 for part in parts {
-                    if let ToolPart::Warning(warning) | ToolPart::TruncationNotice(warning) = part {
-                        lines.extend(wrap(&[Span::themed(warning, theme, "warning")], inner));
-                    }
+                    let warning = match part {
+                        ToolPart::Warning(warning) => warning,
+                        ToolPart::TruncationNotice(warning)
+                            if *finished || custom_result.is_none() =>
+                        {
+                            warning
+                        }
+                        _ => continue,
+                    };
+                    lines.extend(wrap(&[Span::themed(warning, theme, "warning")], inner));
                 }
                 if self_framed {
                     if lines.is_empty() {

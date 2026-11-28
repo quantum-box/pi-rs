@@ -2794,6 +2794,18 @@ impl View {
             .unwrap_or_else(|| text.clone().into())
     }
 
+    fn set_shell_progress_notice(tool_name: &str, update: &Value, parts: &mut Vec<ToolPart>) {
+        if !matches!(tool_name, "bash" | "powershell") {
+            return;
+        }
+        parts.retain(|part| !matches!(part, ToolPart::TruncationNotice(_)));
+        if let Some(notice) = pi_rs_workbench::shell_progress_notice(&update["details"]) {
+            parts.push(ToolPart::TruncationNotice(
+                crate::ui::render::strip_shell_ansi(&notice),
+            ));
+        }
+    }
+
     fn render_tool_progress(&mut self, event: &Value) -> bool {
         let (Some(call_id), Some(name)) =
             (event["toolCallId"].as_str(), event["toolName"].as_str())
@@ -2824,6 +2836,7 @@ impl View {
         };
         *output = crate::ui::render::strip_shell_ansi(&display_tool_blocks(blocks));
         *parts = tool_result_parts(&update["content"]);
+        Self::set_shell_progress_notice(name, update, parts);
         if name == "codemode"
             && let Some(text) = codemode_progress_text(&update["details"])
         {
@@ -3856,7 +3869,7 @@ impl View {
         ) else {
             return;
         };
-        if let Some(Entry::Tool { output, .. }) = self.lines.iter_mut().rev().find(|entry| {
+        if let Some(Entry::Tool { output, parts, .. }) = self.lines.iter_mut().rev().find(|entry| {
             matches!(entry,
                 Entry::Tool { call_id: Some(id), name, finished: false, .. }
                 if id == call_id && name == tool_name
@@ -3869,6 +3882,7 @@ impl View {
                 .collect::<Vec<_>>()
                 .join("\n");
             *output = crate::ui::render::strip_shell_ansi(&text);
+            Self::set_shell_progress_notice(tool_name, &event["partialResult"], parts);
         }
     }
 
@@ -15013,6 +15027,91 @@ exit {exit}
         assert!(
             matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/skill:review")
         );
+    }
+
+    #[test]
+    fn shell_progress_warns_without_hiding_output_and_replaces_stale_paths() {
+        use super::*;
+
+        for (tool_name, tracked) in [("bash", true), ("powershell", false)] {
+            let mut view = View::default();
+            let operation_id = uuid::Uuid::new_v4();
+            let operation = operation_id.to_string();
+            view.add_tool(
+                &pi_rs::Invocation {
+                    operation_id,
+                    call: pi_rs::ToolCall {
+                        id: "shell-call".into(),
+                        name: tool_name.into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                tracked.then_some(1),
+            );
+            if tracked {
+                view.track_tool_render(&operation, 2, true);
+            }
+            let update = |details| {
+                json!({
+                    "type":"tool_execution_update",
+                    "toolCallId":"shell-call",
+                    "toolName":tool_name,
+                    "partialResult":{"content":[{"type":"text","text":"working"}],"details":details}
+                })
+            };
+            let text = |view: &View, expanded| {
+                view.lines[0]
+                    .render(&Theme::system(), 120, expanded, true, Default::default())
+                    .into_iter()
+                    .flat_map(|line| line.spans)
+                    .map(|span| span.text)
+                    .collect::<String>()
+            };
+            view.receive(&update(json!({
+                "fullOutputPath":"/tmp/spill",
+                "truncation":{"truncated":true,"truncatedBy":"lines","outputLines":10,"totalLines":14}
+            })));
+            for expanded in [false, true] {
+                let rendered = text(&view, expanded);
+                assert!(rendered.contains("working"), "{rendered}");
+                assert!(
+                    rendered
+                        .contains("[Full output: /tmp/spill. Truncated: showing 10 of 14 lines]"),
+                    "{rendered}"
+                );
+            }
+            view.receive(&update(json!({
+                "fullOutputError":"missing file",
+                "truncation":{"truncated":true,"truncatedBy":"bytes","outputLines":10,"maxBytes":51200}
+            })));
+            let rendered = text(&view, false);
+            assert!(rendered.contains("[Could not save the full output: missing file. Truncated: 10 lines shown (50.0KB limit)]"), "{rendered}");
+            assert!(!rendered.contains("/tmp/spill"), "{rendered}");
+
+            let Entry::Tool { rendered, .. } = &mut view.lines[0] else {
+                unreachable!("the progress update belongs to the shell row");
+            };
+            *rendered = Some(std::sync::Arc::new(pi_rs::RenderedTool {
+                result: Some(pi_rs::RenderedExtensionRows {
+                    lines: vec![vec![pi_rs::UiComponentSpan {
+                        text: "missing file (custom renderer)".into(),
+                        ..Default::default()
+                    }]],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+            assert_eq!(text(&view, false).matches("missing file").count(), 1);
+
+            let Entry::Tool { rendered, .. } = &mut view.lines[0] else {
+                unreachable!("the custom result belongs to the shell row");
+            };
+            *rendered = None;
+            view.finish_tool(&operation, &pi_rs::Outcome::Succeeded("done".into()), None);
+            let finished = text(&view, false);
+            assert!(finished.contains("done"), "{finished}");
+            assert!(!finished.contains("missing file"), "{finished}");
+        }
     }
 
     #[test]

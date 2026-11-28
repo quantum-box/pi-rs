@@ -7622,6 +7622,14 @@ Tree search also matches the first 200 UTF-16 units of tool-result text.
 Focused selector tests cover linear chains, branches, hidden records, search,
 and fold/unfold behavior. Other tree layout and navigation differences remain.
 
+### Live shell output notices
+
+Bash and PowerShell tool progress renders the current truncation warning
+alongside the bounded output in both native terminal modes. A later
+snapshot replaces the previous warning. The final result clears the live
+warning and renders its own output. The terminal displays a retained path
+or save error when the progress event supplies one.
+
 ### Shell output without a retained file
 
 A truncated user shell result shows `Output truncated` in terminal history and
