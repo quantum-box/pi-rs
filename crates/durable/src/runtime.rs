@@ -3328,7 +3328,7 @@ pub struct MergedProgressCursor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     document_position: Option<u64>,
 }
-/// One conversation-scoped document's final state in a transaction.
+/// The final state of a conversation or owned task document in a transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MergedDocumentChange {
     pub address: crate::document::Address,
@@ -3752,6 +3752,8 @@ pub struct UnifiedHistoryCursor {
     conversation: Uuid,
     after: u64,
     through: u64,
+    #[serde(default)]
+    include_task_documents: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3762,7 +3764,7 @@ pub struct UnifiedHistoryCommit {
     pub applications: Option<Vec<crate::application_entry::ApplicationEntry>>,
     /// Generation and tool progress committed alongside any other records.
     pub progress: Vec<ProgressHistoryFrame>,
-    /// Document changes in the conversation's explicit address scope.
+    /// Changes to documents in the conversation's scope and its owned task documents.
     pub documents: Vec<(
         crate::document::Address,
         crate::document::DocumentOperationFrame,
@@ -13628,6 +13630,7 @@ impl Harness {
             conversation: id,
             after: 0,
             through: store.commit_sequence()?,
+            include_task_documents: true,
         })
     }
 
@@ -13640,6 +13643,7 @@ impl Harness {
             conversation: id,
             after: sequence,
             through: sequence,
+            include_task_documents: true,
         })
     }
 
@@ -13669,8 +13673,10 @@ impl Harness {
             limit.get() + 1,
         )?;
         let scope = crate::document::Address::conversation_scope_prefix(cursor.conversation);
-        let document_commits = store.scoped_document_commit_positions(
+        let task_documents = cursor.include_task_documents.then_some(cursor.conversation);
+        let document_commits = store.conversation_document_commit_positions(
             &scope,
+            task_documents,
             cursor.after,
             cursor.through,
             limit.get() + 1,
@@ -13732,14 +13738,13 @@ impl Harness {
                 }
             }
             let documents = if let Some(revision) = document_commit {
-                let changes =
-                    store.scoped_document_changes_at_commit(&scope, revision, sequence)?;
-                crate::document::scoped_document_operations(
-                    store,
-                    cursor.conversation,
+                let changes = store.conversation_document_changes_at_commit(
+                    &scope,
+                    task_documents,
                     revision,
-                    changes,
-                )?
+                    sequence,
+                )?;
+                crate::document::committed_document_operations(store, revision, changes)?
             } else {
                 Vec::new()
             };
@@ -13839,12 +13844,15 @@ impl Harness {
         &self,
         conversation: Uuid,
         after: u64,
+        include_task_documents: bool,
     ) -> Result<Option<(u64, u64, Vec<MergedDocumentChange>)>, Error> {
         let prefix = crate::document::Address::conversation_scope_prefix(conversation);
-        let Some((revision, sequence, changes)) = self
-            .owner
-            .store()
-            .next_scoped_document_commit(&prefix, after)?
+        let Some((revision, sequence, changes)) =
+            self.owner.store().next_conversation_document_commit(
+                &prefix,
+                include_task_documents.then_some(conversation),
+                after,
+            )?
         else {
             return Ok(None);
         };
@@ -13852,9 +13860,6 @@ impl Harness {
             .into_iter()
             .map(|(key, entry)| -> Result<_, Error> {
                 let address = crate::document::Address::from_storage_key(&key)?;
-                if address.scope != conversation.to_string() {
-                    return Err(Error::Invalid("document scope mismatch".into()));
-                }
                 Ok(MergedDocumentChange {
                     address,
                     document: crate::document::Documents::decode(entry)?,
@@ -13920,7 +13925,7 @@ impl Harness {
     }
 
     /// Attach a lifecycle-aware merged watch from now or after a consumed cursor.
-    /// Both v1 and v2 cursor semantics are preserved on resume.
+    /// Older cursors keep their original document selection on resume.
     pub fn watch_merged_progress_handle(
         &self,
         conversation: Uuid,
@@ -13982,7 +13987,7 @@ impl Harness {
                 continue;
             }
             let cursor = MergedProgressCursor {
-                version: 2,
+                version: 3,
                 conversation,
                 after_sequence: before,
                 observation_position: observation,
@@ -13997,9 +14002,9 @@ impl Harness {
         ))
     }
     fn validate_merged_progress_cursor(&self, cursor: &MergedProgressCursor) -> Result<(), Error> {
-        if !matches!(cursor.version, 1 | 2)
+        if !matches!(cursor.version, 1..=3)
             || (cursor.version == 1 && cursor.document_position.is_some())
-            || (cursor.version == 2 && cursor.document_position.is_none())
+            || (cursor.version >= 2 && cursor.document_position.is_none())
             || cursor.after_sequence > self.owner.store().commit_sequence()?
         {
             return Err(Error::Invalid("invalid merged progress cursor".into()));
@@ -14058,7 +14063,9 @@ impl Harness {
             self.merged_progress_record(cursor.conversation, cursor.progress_position)?;
         let documents = cursor
             .document_position
-            .map(|position| self.merged_document_record(cursor.conversation, position))
+            .map(|position| {
+                self.merged_document_record(cursor.conversation, position, cursor.version >= 3)
+            })
             .transpose()?
             .flatten();
         if observation

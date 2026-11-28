@@ -433,39 +433,43 @@ impl Resources {
         }
         Ok(resources)
     }
-    pub fn system_prompt(&self, base: &str, tools: &[pi_rs::ToolSpec], workspace: &Path) -> String {
-        let mut text = self.system.as_deref().unwrap_or(base).to_owned();
+    pub fn system_prompt_sections(
+        &self,
+        base: &str,
+        tools: &[pi_rs::ToolSpec],
+        workspace: &Path,
+    ) -> (String, Vec<(String, String)>) {
+        let preamble = self.system.as_deref().unwrap_or(base).to_owned();
+        let mut sections = Vec::new();
         if self.system.is_none() {
-            text.push_str("\n\n<tools>\n");
+            let mut listing = String::new();
             if tools.is_empty() {
-                text.push_str("(none)\n");
+                listing.push_str("(none)\n");
             }
             for tool in tools {
-                text.push_str(&format!("- {}: {}\n", tool.name, tool.description));
+                listing.push_str(&format!("- {}: {}\n", tool.name, tool.description));
             }
-            text.push_str("Additional tools may be available.\n</tools>\n\n<rules>\n");
+            listing.push_str("Additional tools may be available.");
+            sections.push(("tools".into(), listing));
+
+            let mut rules = String::new();
             if tools.iter().any(|tool| tool.name == "read") {
-                text.push_str("- Use read to inspect files before editing them.\n");
+                rules.push_str("- Use read to inspect files before editing them.\n");
             }
             if tools.iter().any(|tool| tool.name == "edit") {
-                text.push_str("- Use edit for targeted changes. Batch changes to one file in a single call.\n- Each edits[].oldText must exactly and uniquely match the original file. Keep matches short and non-overlapping; merge nearby changes without including large unchanged regions.\n");
+                rules.push_str("- Use edit for targeted changes. Batch changes to one file in a single call.\n- Each edits[].oldText must exactly and uniquely match the original file. Keep matches short and non-overlapping; merge nearby changes without including large unchanged regions.\n");
             }
             if tools.iter().any(|tool| tool.name == "write") {
-                text.push_str("- Use write only for new files or complete rewrites.\n");
+                rules.push_str("- Use write only for new files or complete rewrites.\n");
             }
-            text.push_str("- Be concise in your responses.\n- Show file paths clearly when working with files.\n</rules>");
+            rules.push_str("- Be concise in your responses.\n- Show file paths clearly when working with files.");
+            sections.push(("rules".into(), rules));
         }
         if !self.append_system.is_empty() {
-            text.push_str(&format!(
-                "\n\n<addendum>\n{}\n</addendum>",
-                self.append_system
-            ));
+            sections.push(("addendum".into(), self.append_system.clone()));
         }
         if !self.instructions.is_empty() {
-            text.push_str(&format!(
-                "\n\n<project_context>\n{}\n</project_context>",
-                self.instructions
-            ));
+            sections.push(("project_context".into(), self.instructions.clone()));
         }
         let reader = ["read", "bash", "powershell"]
             .into_iter()
@@ -478,14 +482,17 @@ impl Resources {
         if let Some(reader) = reader
             && !automatic.is_empty()
         {
-            text.push_str(&format!("\n\n<skills>\nThe following skills provide specialized instructions for specific tasks.\nUse {reader} to load a skill's file when the task matches its description.\nResolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.\n\n<available_skills>\n"));
+            let mut skills = format!(
+                "The following skills provide specialized instructions for specific tasks.\nUse {reader} to load a skill's file when the task matches its description.\nResolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.\n\n<available_skills>\n"
+            );
             for (name, skill) in automatic {
-                text.push_str(&format!("  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n", xml(name), xml(&skill.description), xml(&skill.path.to_string_lossy())));
+                skills.push_str(&format!("  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n", xml(name), xml(&skill.description), xml(&skill.path.to_string_lossy())));
             }
-            text.push_str("</available_skills>\n</skills>");
+            skills.push_str("</available_skills>");
+            sections.push(("skills".into(), skills));
         }
-        text.push_str(&format!("\n\n<cwd>\n{}\n</cwd>", workspace.display()));
-        text
+        sections.push(("cwd".into(), workspace.display().to_string()));
+        (preamble, sections)
     }
     pub fn expand(&self, input: &str) -> Option<String> {
         if let Some(command) = input.strip_prefix("/skill:") {
@@ -767,26 +774,7 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-pub(super) fn skill_invocation(text: &str) -> Option<(&str, &str, Option<&str>)> {
-    static BLOCK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let captures = BLOCK
-        .get_or_init(|| {
-            regex::Regex::new(
-                r#"(?s)\A<skill name="([^"]+)" location="[^"]+">\n(.*?)\n</skill>(?:\n\n(.+))?\z"#,
-            )
-            .expect("Pi skill invocation block")
-        })
-        .captures(text)?;
-    let message = captures
-        .get(3)
-        .map(|text| text.as_str().trim_matches(is_prompt_space))
-        .filter(|text| !text.is_empty());
-    Some((
-        captures.get(1)?.as_str(),
-        captures.get(2)?.as_str(),
-        message,
-    ))
-}
+pub(super) use pi_rs_workbench::skill_resources::skill_invocation;
 
 pub(super) fn is_prompt_space(character: char) -> bool {
     (character.is_whitespace() && character != '\u{0085}') || character == '\u{feff}'
@@ -1773,19 +1761,24 @@ mod tests {
                 automatic: true,
             },
         );
-        let no_reader = resources.system_prompt("default", &[], Path::new("/workspace"));
+        let render = |resources: &Resources, tools: &[pi_rs::ToolSpec]| {
+            let (preamble, sections) =
+                resources.system_prompt_sections("default", tools, Path::new("/workspace"));
+            pi_rs::Registry::default().compose_system_prompt(preamble, sections)
+        };
+        let no_reader = render(&resources, &[]);
         assert!(!no_reader.contains("available_skills"));
         let tools = [pi_rs::ToolSpec {
             name: "read".into(),
             description: "Read a file".into(),
             parameters: serde_json::json!({}),
         }];
-        let prompt = resources.system_prompt("default", &tools, Path::new("/workspace"));
+        let prompt = render(&resources, &tools);
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains("demo&amp;skill"));
         assert!(prompt.contains("specific &lt;task&gt;"));
         resources.system = Some("explicit system".into());
-        let custom = resources.system_prompt("default", &tools, Path::new("/workspace"));
+        let custom = render(&resources, &tools);
         assert!(custom.starts_with("explicit system"));
         assert!(!custom.contains("project system"));
         assert!(!custom.contains("<rules>"));
@@ -1971,7 +1964,7 @@ mod tests {
                 "$1|$2|$3|$4|$5",
                 r#"C:\work\file "" "two words" 'unfinished quote"#,
             ),
-            r"C:\work\file||two words|unfinished quote|"
+            r"C:\work\file||two words|'unfinished|quote"
         );
         assert_eq!(
             expand_arguments(

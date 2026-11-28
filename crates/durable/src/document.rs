@@ -660,21 +660,16 @@ fn document_operation_frame(
     })
 }
 
-pub(crate) fn scoped_document_operations(
+pub(crate) fn committed_document_operations(
     store: &Store,
-    conversation: uuid::Uuid,
     revision: u64,
     changes: Vec<durable_store::DocumentChange>,
 ) -> Result<Vec<(Address, DocumentOperationFrame)>, Error> {
-    let scope = conversation.to_string();
     let before = revision.checked_sub(1).ok_or(Error::InvalidDocument)?;
     changes
         .into_iter()
         .map(|(key, entry)| {
             let address = Address::from_storage_key(&key)?;
-            if address.scope != scope {
-                return Err(Error::InvalidDocument);
-            }
             let previous = Documents::decode(store.document_at_bounded(
                 &key,
                 before,

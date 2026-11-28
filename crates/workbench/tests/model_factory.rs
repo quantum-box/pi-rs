@@ -1151,6 +1151,112 @@ async fn granted_model_file_composes_saved_auth_with_exact_api_and_base_routes()
     assert_eq!(grants.load(&factory).unwrap().identities().len(), 0);
 }
 
+fn load_file_thinking_catalog(declaration: serde_json::Value) -> pi_rs::ModelCatalog {
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use serde_json::json;
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("models.json");
+    let base_url = "http://127.0.0.1:1/v1";
+    let endpoint = format!("{base_url}/chat/completions");
+    let mut provider = json!({"api":"openai-completions","baseUrl":base_url});
+    provider
+        .as_object_mut()
+        .unwrap()
+        .extend(declaration.as_object().unwrap().clone());
+    std::fs::write(
+        &file,
+        json!({"providers":{"relay":provider,"ungranted":{"models":true}}}).to_string(),
+    )
+    .unwrap();
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "relay",
+        &endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    ModelFileReadGrants {
+        file,
+        routes: vec![ModelFileRoute {
+            provider: "relay".into(),
+            api: NativeModelApi::OpenAiChat,
+            base_url: base_url.into(),
+            endpoint,
+        }],
+    }
+    .load(&ModelClientFactory::new(auth.build()))
+    .unwrap()
+}
+
+#[test]
+fn file_thinking_levels() {
+    let catalog = load_file_thinking_catalog(serde_json::json!({"models":[
+        {"id":"mapped","reasoning":true,
+         "thinkingLevelMap":{"off":null,"medium":null,"xhigh":"strong","max":null}},
+        {"id":"legacy","reasoning":true},
+        {"id":"legacy-nonreasoning","reasoning":false},
+        {"id":"empty-map","reasoning":true,"thinkingLevelMap":{}},
+        {"id":"nonreasoning","reasoning":false,"thinkingLevelMap":{"off":null,"max":"very-strong"}},
+        {"id":"all-disabled","reasoning":true,
+         "thinkingLevelMap":{"off":null,"minimal":null,"low":null,"medium":null,"high":null}}
+    ]}));
+    assert_eq!(
+        catalog.thinking_levels("relay", "mapped").unwrap(),
+        ["minimal", "low", "high", "xhigh"]
+    );
+    assert_eq!(catalog.thinking_levels("relay", "legacy"), None);
+    assert_eq!(
+        catalog.thinking_levels("relay", "legacy-nonreasoning"),
+        None
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "empty-map").unwrap(),
+        ["off", "minimal", "low", "medium", "high"]
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "nonreasoning").unwrap(),
+        ["off"]
+    );
+    assert!(
+        catalog
+            .thinking_levels("relay", "all-disabled")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn file_thinking_overrides() {
+    let catalog = load_file_thinking_catalog(serde_json::json!({
+        "models":[
+            {"id":"mapped","reasoning":true,
+             "thinkingLevelMap":{"off":null,"medium":null,"xhigh":"strong","max":null}},
+            {"id":"override-only","reasoning":false},
+            {"id":"outside","baseUrl":"http://127.0.0.1:2/v1","thinkingLevelMap":true},
+            {"id":"classifier","type":"classifier","thinkingLevelMap":true}
+        ],
+        "modelOverrides":{
+            "mapped":{"thinkingLevelMap":{"medium":"normal","high":null,"xhigh":null,"max":"ultra"}},
+            "override-only":{"reasoning":true,"thinkingLevelMap":{"low":null}},
+            "outside":{"thinkingLevelMap":true},
+            "classifier":{"thinkingLevelMap":true}
+        }
+    }));
+    assert_eq!(
+        catalog.identities().collect::<Vec<_>>(),
+        [("relay", "mapped"), ("relay", "override-only")]
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "mapped").unwrap(),
+        ["minimal", "low", "medium", "max"]
+    );
+    assert_eq!(
+        catalog.thinking_levels("relay", "override-only").unwrap(),
+        ["off", "minimal", "medium", "high"]
+    );
+}
+
 #[test]
 fn configured_model_key_grants_reject_codex_oauth_routes() {
     use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
@@ -1519,6 +1625,447 @@ async fn pi_messages_streams_on_explicit_sdk_routes() {
     }
 }
 
+async fn capture_thinking_request(
+    listener: &tokio::net::TcpListener,
+    client: std::sync::Arc<dyn pi_rs::Model>,
+    model: &str,
+) -> (String, serde_json::Value) {
+    use tokio::io::AsyncWriteExt;
+
+    let serve = async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let captured = read_model_json_request(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        captured
+    };
+    let request = pi_rs::ModelRequest {
+        model: model.into(),
+        messages: vec![pi_rs::Message::User {
+            content: "hello".into(),
+        }],
+        tools: vec![],
+        max_output_tokens: 2_048,
+    };
+    let (captured, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(serve, client.stream(request))
+    })
+    .await
+    .unwrap();
+    captured
+}
+
+#[tokio::test]
+async fn file_thinking_snapshot_binds_models_and_keys_once() {
+    use pi_rs_workbench::model_file::{
+        ModelFileBindingError as Rejection, ModelFileReadGrants, ModelFileRoute,
+    };
+    use serde_json::json;
+
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("models.json");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let base = "https://relay.example.test/v1";
+    let route = ModelFileRoute {
+        provider: "relay".into(),
+        api: NativeModelApi::OpenAiChat,
+        base_url: base.into(),
+        endpoint: endpoint.clone(),
+    };
+    let grants = ModelFileReadGrants {
+        file: file.clone(),
+        routes: vec![route.clone()],
+    };
+    let keys = std::slice::from_ref(&route);
+    std::fs::write(&file, json!({"providers":{"relay":{
+        "api":"openai-completions", "baseUrl":base, "apiKey":"${KEY}",
+        "models":[
+            {"id":"alpha","reasoning":true,"thinkingLevelMap":{"high":"old-a","low":null,"off":"off"}},
+            {"id":"beta","reasoning":true,"thinkingLevelMap":{"high":"b-high","off":null}},
+            {"id":"legacy","reasoning":true},
+            {"id":"outside","reasoning":true,"baseUrl":"https://outside.example.test","thinkingLevelMap":false}
+        ],
+        "modelOverrides":{"alpha":{"thinkingLevelMap":{"high":"a-high"}}}
+    }}}).to_string()).unwrap();
+
+    let factory = ModelClientFactory::default();
+    assert!(grants.snapshot(&factory).is_err());
+    let wrong_key_route = ModelFileRoute {
+        endpoint: format!("{endpoint}/other"),
+        ..route.clone()
+    };
+    assert!(
+        grants
+            .snapshot_with_api_keys(&factory, &[wrong_key_route], |_, _| {
+                panic!("ungranted key route must fail before lookup")
+            })
+            .is_err()
+    );
+    assert!(
+        grants
+            .snapshot_with_api_keys(&factory, keys, |_, _| Some("bad\nkey".into()))
+            .is_err()
+    );
+    let mut lookups = 0;
+    let from_file = grants
+        .snapshot_with_api_keys(&factory, keys, |requested, name| {
+            assert_eq!(requested, &route);
+            assert_eq!(name, "KEY");
+            lookups += 1;
+            Some("file-key".into())
+        })
+        .unwrap();
+    assert_eq!(lookups, 1);
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "relay",
+        &endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "host-key").unwrap(),
+    )
+    .unwrap();
+    let from_host = grants
+        .snapshot_with_api_keys(&ModelClientFactory::new(auth.build()), keys, |_, _| {
+            panic!("the exact host key takes precedence over the granted file key")
+        })
+        .unwrap();
+    std::fs::remove_file(file).unwrap();
+
+    for (model, level, rejection) in [
+        ("outside", "high", Rejection::UnknownModel),
+        ("alpha", "HIGH", Rejection::UnknownLevel),
+        ("alpha", "low", Rejection::DisabledLevel),
+        ("beta", "off", Rejection::DisabledLevel),
+        ("beta", "xhigh", Rejection::MissingMapping),
+        ("legacy", "high", Rejection::MissingMapping),
+    ] {
+        assert_eq!(
+            from_file.bind_thinking("relay", model, level).err(),
+            Some(rejection)
+        );
+    }
+    assert_eq!(
+        from_file.bind_thinking("Relay", "alpha", "high").err(),
+        Some(Rejection::UnknownModel)
+    );
+    let alpha = from_file.bind_thinking("relay", "alpha", "high").unwrap();
+    let wrong_model = pi_rs::ModelRequest {
+        model: "beta".into(),
+        messages: vec![],
+        tools: vec![],
+        max_output_tokens: 2_048,
+    };
+    assert!(matches!(
+        alpha.prepare_context(&wrong_model).await,
+        Err(pi_rs::Error::Config(_))
+    ));
+    assert!(matches!(
+        alpha.stream(wrong_model).await,
+        Err(pi_rs::Error::Config(_))
+    ));
+
+    for (snapshot, model, level, expected, key) in [
+        (&from_file, "alpha", "high", "a-high", "file-key"),
+        (&from_file, "beta", "high", "b-high", "file-key"),
+        (&from_host, "alpha", "off", "off", "host-key"),
+        (&from_host, "beta", "medium", "medium", "host-key"),
+    ] {
+        let client = snapshot.bind_thinking("relay", model, level).unwrap();
+        let (head, body) = capture_thinking_request(&listener, client, model).await;
+        assert!(head.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(
+            head.lines()
+                .any(|line| line.eq_ignore_ascii_case(&format!("authorization: Bearer {key}")))
+        );
+        assert_eq!(body["model"], model);
+        assert_eq!(body["reasoning_effort"], expected);
+    }
+    let ordinary = from_file.catalog().get("relay", "alpha").unwrap();
+    let (_, body) = capture_thinking_request(&listener, ordinary, "alpha").await;
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+#[tokio::test]
+async fn file_thinking_responses_off_is_literal_and_has_no_summary() {
+    use pi_rs_workbench::model_file::{
+        ModelFileBindingError as Rejection, ModelFileReadGrants, ModelFileRoute,
+    };
+    use serde_json::json;
+
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("models.json");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let base = "https://relay.example.test/v1";
+    std::fs::write(
+        &file,
+        json!({"providers":{"relay":{
+            "api":"openai-responses","baseUrl":base,"models":[
+                {"id":"one","reasoning":true,"thinkingLevelMap":{"off":"off","xhigh":"ultra"}},
+                {"id":"two","reasoning":true,"thinkingLevelMap":{}},
+                {"id":"three","reasoning":true,"thinkingLevelMap":{"off":null}}
+            ]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "relay",
+        &endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    let snapshot = ModelFileReadGrants {
+        file,
+        routes: vec![ModelFileRoute {
+            provider: "relay".into(),
+            api: NativeModelApi::OpenAiResponses,
+            base_url: base.into(),
+            endpoint,
+        }],
+    }
+    .snapshot(&ModelClientFactory::new(auth.build()))
+    .unwrap();
+    for (model, level, reasoning) in [
+        ("one", "off", json!({"effort":"off"})),
+        ("one", "xhigh", json!({"effort":"ultra","summary":"auto"})),
+        ("two", "off", json!({"effort":"none"})),
+    ] {
+        let client = snapshot.bind_thinking("relay", model, level).unwrap();
+        let (_, body) = capture_thinking_request(&listener, client, model).await;
+        assert_eq!(body["reasoning"], reasoning);
+    }
+    assert_eq!(
+        snapshot.bind_thinking("relay", "three", "off").err(),
+        Some(Rejection::DisabledLevel)
+    );
+}
+
+#[tokio::test]
+async fn file_thinking_uses_native_adapter_shapes() {
+    use pi_rs_workbench::model_file::{
+        ModelFileBindingError as Rejection, ModelFileReadGrants, ModelFileRoute,
+    };
+    use serde_json::json;
+
+    for (provider, api, protocol, model, effort, pointer, expected) in [
+        (
+            "openrouter",
+            NativeModelApi::OpenAiChat,
+            "openai-completions",
+            "fixture",
+            "strong",
+            "/reasoning/effort",
+            "strong",
+        ),
+        (
+            "relay",
+            NativeModelApi::AnthropicMessages,
+            "anthropic-messages",
+            "fixture",
+            "max",
+            "/output_config/effort",
+            "max",
+        ),
+        (
+            "relay",
+            NativeModelApi::GoogleGemini,
+            "google-generative-ai",
+            "gemini-3-flash",
+            "LOW",
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "LOW",
+        ),
+        (
+            "relay",
+            NativeModelApi::PiMessages,
+            "pi-messages",
+            "fixture",
+            "high",
+            "/options/reasoning",
+            "high",
+        ),
+        (
+            "openai-codex",
+            NativeModelApi::OpenAiCodexResponses,
+            "openai-codex-responses",
+            "fixture",
+            "strong",
+            "/reasoning/effort",
+            "strong",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("models.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let path = match api {
+            NativeModelApi::AnthropicMessages => "/v1/messages",
+            NativeModelApi::GoogleGemini => "/v1beta",
+            NativeModelApi::PiMessages => "/messages",
+            NativeModelApi::OpenAiCodexResponses => "/backend-api/codex/responses",
+            _ => "/v1/chat/completions",
+        };
+        let endpoint = format!("http://{}{path}", listener.local_addr().unwrap());
+        let base = "https://relay.example.test/v1";
+        std::fs::write(
+            &file,
+            json!({"providers":{(provider):{
+                "api":protocol,"baseUrl":base,"compat":{"forceAdaptiveThinking":true},
+                "models":[{"id":model,"reasoning":true,
+                "thinkingLevelMap":{"high":effort,"xhigh":"opaque-effort"}}]
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let mut auth = HostAuthBuilder::new();
+        let credential = if api == NativeModelApi::OpenAiCodexResponses {
+            use base64::Engine;
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture"}}"#);
+            HostCredential::new(
+                HostCredentialKind::Bearer,
+                format!("fixture.{payload}.signature"),
+            )
+        } else {
+            HostCredential::new(HostCredentialKind::ApiKey, "fixture-key")
+        }
+        .unwrap();
+        auth.register(provider, &endpoint, credential).unwrap();
+        let snapshot = ModelFileReadGrants {
+            file,
+            routes: vec![ModelFileRoute {
+                provider: provider.into(),
+                api,
+                base_url: base.into(),
+                endpoint,
+            }],
+        }
+        .snapshot(&ModelClientFactory::new(auth.build()))
+        .unwrap();
+        let client = snapshot.bind_thinking(provider, model, "high").unwrap();
+        let (_, body) = capture_thinking_request(&listener, client, model).await;
+        assert_eq!(
+            body.pointer(pointer),
+            Some(&json!(expected)),
+            "{api:?}: {body}"
+        );
+        if matches!(
+            api,
+            NativeModelApi::AnthropicMessages
+                | NativeModelApi::GoogleGemini
+                | NativeModelApi::PiMessages
+        ) {
+            assert_eq!(
+                snapshot.bind_thinking(provider, model, "xhigh").err(),
+                Some(Rejection::UnsupportedMapping { api })
+            );
+        }
+    }
+}
+
+#[test]
+fn file_thinking_bedrock_keeps_the_adapter_context_reuse_policy() {
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use serde_json::json;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("models.json");
+    let endpoint = "https://bedrock-runtime.us-east-1.amazonaws.com";
+    let provider = "amazon-bedrock";
+    let model = "moonshotai.kimi-k3";
+    std::fs::write(
+        &file,
+        json!({"providers":{(provider):{
+            "api":"bedrock-converse-stream", "baseUrl":endpoint,
+            "models":[{"id":model,"reasoning":true,"thinkingLevelMap":{"high":"high"}}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        provider,
+        endpoint,
+        HostCredential::new(HostCredentialKind::Bearer, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    let snapshot = ModelFileReadGrants {
+        file,
+        routes: vec![ModelFileRoute {
+            provider: provider.into(),
+            api: NativeModelApi::BedrockConverse,
+            base_url: endpoint.into(),
+            endpoint: endpoint.into(),
+        }],
+    }
+    .snapshot(&ModelClientFactory::new(auth.build()))
+    .unwrap();
+    let bound = snapshot.bind_thinking(provider, model, "high").unwrap();
+    let request = pi_rs::ModelRequest {
+        model: model.into(),
+        messages: vec![],
+        tools: vec![],
+        max_output_tokens: 2048,
+    };
+    assert!(!bound.can_reuse_measured_context(&request));
+}
+
+#[tokio::test]
+async fn bedrock_snapshot_effort_reaches_converse_fields() {
+    use serde_json::json;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/gateway", listener.local_addr().unwrap());
+    let client =
+        pi_rs::bedrock::Bedrock::from_bearer_endpoint(&endpoint, "us-east-1", "fixture-key".into())
+            .unwrap();
+    for (model, level, effort, fields) in [
+        ("kimi.k3", "off", "none", json!({"reasoning_effort":"none"})),
+        (
+            "openai.gpt-5",
+            "high",
+            "xhigh",
+            json!({"reasoning":{"effort":"xhigh"}}),
+        ),
+        (
+            "openai.gpt-5",
+            "off",
+            "none",
+            json!({"reasoning":{"effort":"none"}}),
+        ),
+        (
+            "openai.gpt-oss-120b",
+            "high",
+            "low",
+            json!({"reasoning_effort":"low"}),
+        ),
+    ] {
+        let bound = client
+            .clone()
+            .with_model_reasoning(model, None, level, Some(effort))
+            .unwrap();
+        let (_, body) =
+            capture_thinking_request(&listener, std::sync::Arc::new(bound), model).await;
+        assert_eq!(body["additionalModelRequestFields"], fields);
+    }
+    let model = "anthropic.claude-fable-5";
+    let plain = client.clone().without_reasoning_fields();
+    let (_, body) = capture_thinking_request(&listener, std::sync::Arc::new(plain), model).await;
+    assert!(body.get("additionalModelRequestFields").is_none(), "{body}");
+    assert!(
+        client
+            .with_model_reasoning("anthropic.claude-3-7-sonnet", None, "high", Some("high"))
+            .is_err()
+    );
+}
+
 async fn read_model_json_request(
     socket: &mut tokio::net::TcpStream,
 ) -> (String, serde_json::Value) {
@@ -1551,8 +2098,15 @@ async fn read_model_json_request(
     let head = std::str::from_utf8(&bytes[..header_end])
         .unwrap()
         .to_owned();
-    let body: serde_json::Value =
-        serde_json::from_slice(&bytes[header_end..header_end + body_size]).unwrap();
+    let bytes = &bytes[header_end..header_end + body_size];
+    let body = if head
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("content-encoding: zstd"))
+    {
+        serde_json::from_slice(&zstd::bulk::decompress(bytes, 65_536).unwrap()).unwrap()
+    } else {
+        serde_json::from_slice(bytes).unwrap()
+    };
     (head, body)
 }
 
@@ -1598,4 +2152,234 @@ async fn pi_messages_does_not_follow_redirects_from_the_granted_endpoint() {
             }
         }
     }).await.unwrap();
+}
+
+#[tokio::test]
+async fn file_thinking_rejects_unrepresentable_off_and_gemini_family_levels() {
+    use pi_rs_workbench::model_file::{
+        ModelFileBindingError as Rejection, ModelFileReadGrants, ModelFileRoute,
+    };
+    use serde_json::json;
+
+    for (provider, api, protocol, model, path) in [
+        (
+            "relay",
+            NativeModelApi::GoogleGemini,
+            "google-generative-ai",
+            "gemini-3.1-pro",
+            "/v1beta",
+        ),
+        (
+            "relay",
+            NativeModelApi::AnthropicMessages,
+            "anthropic-messages",
+            "fixture",
+            "/v1/messages",
+        ),
+        (
+            "relay",
+            NativeModelApi::PiMessages,
+            "pi-messages",
+            "fixture",
+            "/messages",
+        ),
+        (
+            "github-copilot",
+            NativeModelApi::OpenAiResponses,
+            "openai-responses",
+            "fixture",
+            "/v1/responses",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("models.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}{path}", listener.local_addr().unwrap());
+        let base = "https://relay.example.test/v1";
+        std::fs::write(&file, json!({"providers":{(provider):{
+            "api":protocol,"baseUrl":base,"models":[
+                {"id":model,"reasoning":true,"thinkingLevelMap":{"off":"opaque", "minimal":"MINIMAL", "medium":"MEDIUM", "high":"HIGH"}},
+                {"id":"plain","reasoning":false,"thinkingLevelMap":{"off":"opaque"}},
+                {"id":"gemini-2.5-flash","reasoning":true,"thinkingLevelMap":{"high":"OFF"}}
+            ]
+        }}}).to_string()).unwrap();
+        let mut auth = HostAuthBuilder::new();
+        auth.register(
+            provider,
+            &endpoint,
+            HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+        )
+        .unwrap();
+        let snapshot = ModelFileReadGrants {
+            file,
+            routes: vec![ModelFileRoute {
+                provider: provider.into(),
+                api,
+                base_url: base.into(),
+                endpoint,
+            }],
+        }
+        .snapshot(&ModelClientFactory::new(auth.build()))
+        .unwrap();
+        for id in [model, "plain"] {
+            assert_eq!(
+                snapshot.bind_thinking(provider, id, "off").err(),
+                Some(Rejection::UnsupportedMapping { api })
+            );
+        }
+        if api == NativeModelApi::GoogleGemini {
+            assert_eq!(
+                snapshot
+                    .bind_thinking(provider, "gemini-2.5-flash", "high")
+                    .err(),
+                Some(Rejection::UnsupportedMapping { api })
+            );
+            for level in ["minimal", "medium"] {
+                assert_eq!(
+                    snapshot.bind_thinking(provider, model, level).err(),
+                    Some(Rejection::UnsupportedMapping { api })
+                );
+            }
+            let high = snapshot.bind_thinking(provider, model, "high").unwrap();
+            let (_, body) = capture_thinking_request(&listener, high, model).await;
+            assert_eq!(
+                body.pointer("/generationConfig/thinkingConfig/thinkingLevel"),
+                Some(&json!("HIGH"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn file_thinking_gemini_bindings_are_isolated_concurrently() {
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use serde_json::json;
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("models.json");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1beta", listener.local_addr().unwrap());
+    let base = "https://relay.example.test/v1";
+    std::fs::write(
+        &file,
+        json!({"providers":{"relay":{"api":"google-generative-ai","baseUrl":base,"models":[
+            {"id":"gemini-3-flash","reasoning":true,"thinkingLevelMap":{"low":"LOW","high":"HIGH"}}
+        ]}}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "relay",
+        &endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    let snapshot = ModelFileReadGrants {
+        file,
+        routes: vec![ModelFileRoute {
+            provider: "relay".into(),
+            api: NativeModelApi::GoogleGemini,
+            base_url: base.into(),
+            endpoint,
+        }],
+    }
+    .snapshot(&ModelClientFactory::new(auth.build()))
+    .unwrap();
+    let low = snapshot
+        .bind_thinking("relay", "gemini-3-flash", "low")
+        .unwrap();
+    let high = snapshot
+        .bind_thinking("relay", "gemini-3-flash", "high")
+        .unwrap();
+    let (a, b) = tokio::join!(
+        capture_thinking_request(&listener, low, "gemini-3-flash"),
+        capture_thinking_request(&listener, high, "gemini-3-flash")
+    );
+    let mut values = [
+        a.1["generationConfig"]["thinkingConfig"]["thinkingLevel"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+        b.1["generationConfig"]["thinkingConfig"]["thinkingLevel"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    ];
+    values.sort();
+    assert_eq!(values, ["HIGH", "LOW"]);
+}
+
+#[tokio::test]
+async fn file_thinking_unmapped_off_keeps_native_request_shapes() {
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use serde_json::json;
+    for (provider, api, protocol, model, path) in [
+        (
+            "relay",
+            NativeModelApi::GoogleGemini,
+            "google-generative-ai",
+            "gemini-2.5-flash",
+            "/v1beta",
+        ),
+        (
+            "relay",
+            NativeModelApi::AnthropicMessages,
+            "anthropic-messages",
+            "fixture",
+            "/v1/messages",
+        ),
+        (
+            "relay",
+            NativeModelApi::PiMessages,
+            "pi-messages",
+            "fixture",
+            "/messages",
+        ),
+        (
+            "github-copilot",
+            NativeModelApi::OpenAiResponses,
+            "openai-responses",
+            "fixture",
+            "/v1/responses",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("models.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}{path}", listener.local_addr().unwrap());
+        let base = "https://relay.example.test/v1";
+        std::fs::write(&file, json!({"providers":{(provider):{"api":protocol,"baseUrl":base,"models":[{"id":model,"reasoning":true,"thinkingLevelMap":{}}]}}}).to_string()).unwrap();
+        let mut auth = HostAuthBuilder::new();
+        auth.register(
+            provider,
+            &endpoint,
+            HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+        )
+        .unwrap();
+        let snapshot = ModelFileReadGrants {
+            file,
+            routes: vec![ModelFileRoute {
+                provider: provider.into(),
+                api,
+                base_url: base.into(),
+                endpoint,
+            }],
+        }
+        .snapshot(&ModelClientFactory::new(auth.build()))
+        .unwrap();
+        let client = snapshot.bind_thinking(provider, model, "off").unwrap();
+        let (_, body) = capture_thinking_request(&listener, client, model).await;
+        match api {
+            NativeModelApi::GoogleGemini => assert_eq!(
+                body.pointer("/generationConfig/thinkingConfig/thinkingBudget"),
+                Some(&json!(0))
+            ),
+            NativeModelApi::AnthropicMessages => {
+                assert_eq!(body.pointer("/thinking/type"), Some(&json!("disabled")))
+            }
+            NativeModelApi::PiMessages => assert!(body.pointer("/options/reasoning").is_none()),
+            NativeModelApi::OpenAiResponses => assert!(body.get("reasoning").is_none()),
+            _ => unreachable!(),
+        }
+    }
 }
