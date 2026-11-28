@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicUsize},
 };
 
 use fluent_uri::Iri;
@@ -335,7 +335,22 @@ pub(crate) struct McpRuntime {
 struct McpRuntimeState {
     registrations: McpServerRegistrations,
     pending: VecDeque<Vec<Arc<RegisteredMcpServer>>>,
+    in_flight: Option<Arc<McpChange>>,
     delivering: bool,
+}
+
+pub(crate) struct McpChange {
+    servers: Vec<Arc<RegisteredMcpServer>>,
+    pub(crate) completed_hooks: AtomicUsize,
+}
+
+impl McpChange {
+    pub(crate) fn servers(&self) -> Vec<RegisteredMcpServer> {
+        self.servers
+            .iter()
+            .map(|entry| entry.as_ref().clone())
+            .collect()
+    }
 }
 
 impl McpRuntime {
@@ -408,7 +423,7 @@ impl McpRuntime {
 
     pub(crate) fn begin_delivery(&self) -> Option<McpChangeDelivery<'_>> {
         let mut state = self.state.lock().expect("MCP registrations");
-        if state.delivering || state.pending.is_empty() {
+        if state.delivering || (state.in_flight.is_none() && state.pending.is_empty()) {
             return None;
         }
         state.delivering = true;
@@ -425,14 +440,31 @@ pub(crate) struct McpChangeDelivery<'a> {
 }
 
 impl McpChangeDelivery<'_> {
-    pub(crate) fn pop_change(&mut self) -> Option<Vec<RegisteredMcpServer>> {
+    pub(crate) fn next_change(&mut self) -> Option<Arc<McpChange>> {
         let mut state = self.runtime.state.lock().expect("MCP registrations");
-        let change = state.pending.pop_front();
+        // Keep the snapshot and callback cursor if this delivery future is dropped.
+        if state.in_flight.is_none() {
+            state.in_flight = state.pending.pop_front().map(|servers| {
+                Arc::new(McpChange {
+                    servers,
+                    completed_hooks: AtomicUsize::new(0),
+                })
+            });
+        }
+        let change = state.in_flight.clone();
         if change.is_none() {
             state.delivering = false;
             self.claimed = false;
         }
-        change.map(|servers| servers.iter().map(|entry| entry.as_ref().clone()).collect())
+        change
+    }
+
+    pub(crate) fn complete_change(&mut self) {
+        self.runtime
+            .state
+            .lock()
+            .expect("MCP registrations")
+            .in_flight = None;
     }
 }
 

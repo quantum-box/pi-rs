@@ -857,19 +857,22 @@ async fn deliver_mcp_changes(
         if remaining.is_zero() {
             return;
         }
-        let Some(servers) = delivery.pop_change() else {
+        let Some(change) = delivery.next_change() else {
             return;
         };
         notify_inner_once(
             registry,
-            LifecycleEvent::McpServersChange { servers },
+            LifecycleEvent::McpServersChange {
+                servers: change.servers(),
+            },
             states,
             remaining,
-            (observer, &mut |_| true, None, None),
+            (observer, &mut |_| true, None, Some(&change.completed_hooks)),
             host.clone().map(ActiveHost::Shared),
             None,
         )
         .await;
+        delivery.complete_change();
         tokio::task::yield_now().await;
     }
 }

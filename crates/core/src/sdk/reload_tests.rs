@@ -745,6 +745,131 @@ async fn sdk_reload_startup_retries_only_unfinished_hooks() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn sdk_reload_retries_only_unfinished_mcp_change_callbacks() {
+    struct McpObserver {
+        id: &'static str,
+        log: LifecycleLog,
+        pause: Option<Arc<Pause>>,
+        queue_second: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Extension for McpObserver {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+
+        fn handles_mcp_registry(&self) -> bool {
+            true
+        }
+
+        fn handles_mcp_servers_change(&self) -> bool {
+            true
+        }
+
+        async fn lifecycle_with_mcp_registry(
+            &self,
+            event: &LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+            mcp: Arc<dyn crate::McpRegistryHost>,
+        ) -> crate::ExtensionResult<()> {
+            match event {
+                LifecycleEvent::SessionStart {
+                    reason: crate::SessionStartReason::Reload,
+                    ..
+                } => {
+                    self.log.lock().unwrap().push(format!("{}:start", self.id));
+                    if self.id == "first" {
+                        for name in ["one"]
+                            .into_iter()
+                            .chain(self.queue_second.then_some("two"))
+                        {
+                            mcp.register_mcp_server(crate::McpServerDeclaration {
+                                name: name.into(),
+                                config: serde_json::json!({"command":"fixture"}),
+                            })
+                            .await?;
+                        }
+                    }
+                }
+                LifecycleEvent::McpServersChange { servers } => {
+                    let names = servers
+                        .iter()
+                        .map(|registration| registration.server.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    self.log
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}:{names}", self.id));
+                    if let Some(pause) = &self.pause {
+                        pause.once().await;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    for queue_second in [false, true] {
+        let log = LifecycleLog::default();
+        let pause = Arc::new(Pause::default());
+        let update = RegistryUpdate {
+            registry: registry(
+                ["first", "paused", "last"]
+                    .into_iter()
+                    .map(|id| {
+                        Arc::new(McpObserver {
+                            id,
+                            log: log.clone(),
+                            pause: (id == "paused").then(|| pause.clone()),
+                            queue_second,
+                        }) as Arc<dyn Extension>
+                    })
+                    .collect(),
+            ),
+            system_prompt: None,
+        };
+        let mut session = SessionBuilder::new(Arc::new(ReloadModel("fixture")), "model")
+            .in_memory()
+            .unwrap();
+        session.start().await.unwrap();
+        let control = session.controls();
+        let mut reload = Box::pin(session.reload(&update));
+        tokio::select! {
+            _ = pause.entered.notified() => {}
+            result = &mut reload => panic!("reload finished before the MCP callback paused: {result:?}"),
+        }
+        control.abort();
+        assert!(matches!(reload.await, Err(Error::Cancelled)));
+        session.start().await.unwrap();
+        let mut expected = vec![
+            "first:start",
+            "paused:start",
+            "last:start",
+            "first:one",
+            "paused:one",
+            "paused:one",
+            "last:one",
+        ];
+        if queue_second {
+            expected.extend(["first:one,two", "paused:one,two", "last:one,two"]);
+        }
+        assert_eq!(*log.lock().unwrap(), expected);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn sdk_reload_close_rejoins_teardown_after_waiter_is_dropped() {
     for (pause_quit, reenter_pending) in [(true, false), (false, false), (false, true)] {
         let log = LifecycleLog::default();
