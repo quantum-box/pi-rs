@@ -1,18 +1,22 @@
 //! Read explicit Pi model declarations into a host-authorized native catalog.
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::path::{Component, PathBuf};
-use std::sync::Arc;
 
 use pi_rs::{
     CatalogModelCost, CatalogModelInfo, Error, HostAuthBuilder, HostCredential, HostCredentialKind,
-    Model, ModelCatalog, ModelCatalogBuilder, Result,
+    ModelCatalog, ModelCatalogBuilder, Result,
 };
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth_factory::{MAX_API_KEY_BYTES, expand_config_value, valid_api_key};
-use crate::model_factory::{ModelClientFactory, NativeModelApi};
+use crate::model_factory::{ModelClientFactory, NativeModelApi, NativeRouteClient};
 use crate::model_thinking_levels::mapped_levels;
+
+mod bound_model;
+mod thinking;
+use thinking::{BindingEntries, BindingEntry};
+pub use thinking::{ModelFileBindingError, ModelFileSnapshot};
 
 /// Authorize one model-file route. Route fields use exact, case-sensitive
 /// matches. The declared base URL identifies a file entry; only the host's
@@ -53,7 +57,37 @@ impl ModelFileReadGrants {
         &self,
         factory: &ModelClientFactory,
         key_routes: &[ModelFileRoute],
+        lookup: impl FnMut(&ModelFileRoute, &str) -> Option<String>,
+    ) -> Result<ModelCatalog> {
+        self.read(factory, key_routes, lookup, None)
+    }
+
+    /// Read a catalog and its opt-in thinking bindings using host credentials.
+    /// The returned snapshot is independent of later file and credential changes.
+    pub fn snapshot(&self, factory: &ModelClientFactory) -> Result<ModelFileSnapshot> {
+        self.snapshot_with_api_keys(factory, &[], |_, _| None)
+    }
+
+    /// Read a snapshot with the same exact file-key opt-in and precedence as
+    /// [Self::load_with_api_keys]. Resolve credentials during this synchronous
+    /// read so bindings never run the lookup callback again.
+    pub fn snapshot_with_api_keys(
+        &self,
+        factory: &ModelClientFactory,
+        key_routes: &[ModelFileRoute],
+        lookup: impl FnMut(&ModelFileRoute, &str) -> Option<String>,
+    ) -> Result<ModelFileSnapshot> {
+        let mut entries = BindingEntries::new();
+        let catalog = self.read(factory, key_routes, lookup, Some(&mut entries))?;
+        Ok(ModelFileSnapshot::new(catalog, entries))
+    }
+
+    fn read(
+        &self,
+        factory: &ModelClientFactory,
+        key_routes: &[ModelFileRoute],
         mut lookup: impl FnMut(&ModelFileRoute, &str) -> Option<String>,
+        mut entries: Option<&mut BindingEntries>,
     ) -> Result<ModelCatalog> {
         if !self.file.is_absolute()
             || self
@@ -120,7 +154,7 @@ impl ModelFileReadGrants {
         let config: ModelFile = serde_json::from_slice(&normalize_model_json(text))
             .map_err(|_| Error::Config("invalid models file JSON".into()))?;
         for (provider, routes) in authorized {
-            let mut clients = BTreeMap::<_, Arc<dyn Model>>::new();
+            let mut clients = BTreeMap::new();
             let Some(value) = config.providers.get(provider) else {
                 continue;
             };
@@ -136,9 +170,9 @@ impl ModelFileReadGrants {
                 .get("modelOverrides")
                 .map(|value| value.as_object().ok_or_else(|| invalid_provider(provider)))
                 .transpose()?;
-            for model in models {
-                let route =
-                    RouteDeclaration::deserialize(model).map_err(|_| invalid_provider(provider))?;
+            for model_value in models {
+                let route = RouteDeclaration::deserialize(model_value)
+                    .map_err(|_| invalid_provider(provider))?;
                 if route.kind.is_some_and(|kind| kind != "chat") {
                     continue;
                 }
@@ -150,18 +184,18 @@ impl ModelFileReadGrants {
                 let Some(grant) = routes.get(&key) else {
                     continue;
                 };
-                let model =
-                    ModelMetadata::deserialize(model).map_err(|_| invalid_provider(provider))?;
+                let model = ModelMetadata::deserialize(model_value)
+                    .map_err(|_| invalid_provider(provider))?;
                 let id = model.id;
                 let mut metadata = model.metadata;
-                if let Some(value) = overrides.and_then(|overrides| overrides.get(id)) {
+                let model_override = overrides.and_then(|overrides| overrides.get(id));
+                if let Some(value) = model_override {
                     let overrides = DisplayMetadata::deserialize(value)
                         .map_err(|_| invalid_provider(provider))?;
                     metadata.apply_overrides(overrides);
                 }
                 let levels = metadata.thinking_levels();
-                let info = metadata.into_catalog_info(id, api_name(grant.api));
-                if info.context_window == Some(0) || info.max_output_tokens == Some(0) {
+                if metadata.context_window == Some(0) || metadata.max_tokens == Some(0) {
                     return Err(invalid_provider(provider));
                 }
                 let client = match clients.entry(key) {
@@ -174,7 +208,21 @@ impl ModelFileReadGrants {
                         &mut lookup,
                     )?),
                 };
-                catalog.register_with_info(provider, id, client.clone(), info)?;
+                if let Some(entries) = entries.as_deref_mut() {
+                    entries.entry(provider.into()).or_default().insert(
+                        id.into(),
+                        BindingEntry::new(
+                            grant,
+                            client.clone(),
+                            &metadata,
+                            value,
+                            model_value,
+                            model_override,
+                        ),
+                    );
+                }
+                let info = metadata.into_catalog_info(id, api_name(grant.api));
+                catalog.register_with_info(provider, id, client.model(), info)?;
                 if let Some(levels) = levels {
                     catalog.set_thinking_levels(provider, id, levels)?;
                 }
@@ -190,21 +238,21 @@ fn client_for_route(
     allow_file_key: bool,
     declaration: &Value,
     lookup: &mut impl FnMut(&ModelFileRoute, &str) -> Option<String>,
-) -> Result<Arc<dyn Model>> {
+) -> Result<NativeRouteClient> {
     let provider = &route.provider;
     let endpoint = &route.endpoint;
     if factory.has_credential(provider, endpoint) || !allow_file_key {
-        return factory.client(route.api, provider, endpoint);
+        return factory.route_client(route.api, provider, endpoint);
     }
     let Some(value) = declaration.get("apiKey") else {
-        return factory.client(route.api, provider, endpoint);
+        return factory.route_client(route.api, provider, endpoint);
     };
     let value = value
         .as_str()
         .ok_or_else(|| Error::Config("configured model API key must be a string".into()))?;
     let Some(key) = expand_config_value(value, MAX_API_KEY_BYTES, |name| lookup(route, name))?
     else {
-        return factory.client(route.api, provider, endpoint);
+        return factory.route_client(route.api, provider, endpoint);
     };
     if !valid_api_key(&key) {
         return Err(Error::Config("invalid configured model API key".into()));
@@ -215,7 +263,7 @@ fn client_for_route(
         endpoint,
         HostCredential::new(HostCredentialKind::ApiKey, key)?,
     )?;
-    ModelClientFactory::new(auth.build()).client(route.api, provider, endpoint)
+    ModelClientFactory::new(auth.build()).route_client(route.api, provider, endpoint)
 }
 
 // Pi accepts line comments and trailing commas. Mask them without changing

@@ -20,6 +20,31 @@ pub enum NativeModelApi {
     BedrockConverse,
 }
 
+/// Typed clients kept by the native file snapshot so rebinding does not
+/// reconstruct a client or repeat credential and environment resolution.
+#[derive(Clone)]
+pub(crate) enum NativeRouteClient {
+    Chat(Arc<pi_rs::ollama::Ollama>),
+    Responses(Arc<pi_rs::openai::OpenAiResponses>),
+    Anthropic(Arc<pi_rs::anthropic::Anthropic>),
+    Gemini(Arc<pi_rs::google::Google>),
+    Bedrock(Arc<pi_rs::bedrock::Bedrock>),
+    PiMessages(Arc<crate::native_pi_messages::HostModel>),
+}
+
+impl NativeRouteClient {
+    pub(crate) fn model(&self) -> Arc<dyn Model> {
+        match self {
+            Self::Chat(client) => client.clone(),
+            Self::Responses(client) => client.clone(),
+            Self::Anthropic(client) => client.clone(),
+            Self::Gemini(client) => client.clone(),
+            Self::Bedrock(client) => client.clone(),
+            Self::PiMessages(client) => client.clone(),
+        }
+    }
+}
+
 /// A catalog entry with an explicitly authorized provider protocol and route.
 /// Optional metadata is descriptive and cannot change the route.
 #[derive(Clone, Debug)]
@@ -78,34 +103,50 @@ impl ModelClientFactory {
         provider: &str,
         endpoint: &str,
     ) -> Result<Arc<dyn Model>> {
+        Ok(self.route_client(api, provider, endpoint)?.model())
+    }
+
+    pub(crate) fn route_client(
+        &self,
+        api: NativeModelApi,
+        provider: &str,
+        endpoint: &str,
+    ) -> Result<NativeRouteClient> {
+        use NativeRouteClient as Client;
         match api {
-            NativeModelApi::OpenAiChat => Ok(Arc::new(self.chat_client(provider, endpoint)?)),
-            NativeModelApi::OpenAiResponses => {
-                Ok(Arc::new(self.responses_client(provider, endpoint)?))
-            }
-            NativeModelApi::OpenAiCodexResponses => {
-                Ok(Arc::new(self.codex_client(provider, endpoint)?))
-            }
-            NativeModelApi::ChatGptResponses => {
-                Ok(Arc::new(self.chatgpt_client(provider, endpoint)?))
-            }
-            NativeModelApi::AnthropicMessages => {
-                Ok(Arc::new(self.anthropic_client(provider, endpoint)?))
-            }
+            NativeModelApi::OpenAiChat => Ok(Client::Chat(Arc::new(
+                self.chat_client(provider, endpoint)?,
+            ))),
+            NativeModelApi::OpenAiResponses => Ok(Client::Responses(Arc::new(
+                self.responses_client(provider, endpoint)?,
+            ))),
+            NativeModelApi::OpenAiCodexResponses => Ok(Client::Responses(Arc::new(
+                self.codex_client(provider, endpoint)?,
+            ))),
+            NativeModelApi::ChatGptResponses => Ok(Client::Responses(Arc::new(
+                self.chatgpt_client(provider, endpoint)?,
+            ))),
+            NativeModelApi::AnthropicMessages => Ok(Client::Anthropic(Arc::new(
+                self.anthropic_client(provider, endpoint)?,
+            ))),
             NativeModelApi::PiMessages => {
                 let credential = self.credential(provider, endpoint)?;
-                Ok(Arc::new(crate::native_pi_messages::HostModel::new(
-                    provider,
-                    endpoint,
-                    credential.secret().to_owned(),
-                )?))
+                Ok(Client::PiMessages(Arc::new(
+                    crate::native_pi_messages::HostModel::new(
+                        provider,
+                        endpoint,
+                        credential.secret().to_owned(),
+                    )?,
+                )))
             }
-            NativeModelApi::GoogleGemini => Ok(Arc::new(self.gemini_client(provider, endpoint)?)),
-            NativeModelApi::BedrockConverse => Ok(Arc::new(self.bedrock_client(
+            NativeModelApi::GoogleGemini => Ok(Client::Gemini(Arc::new(
+                self.gemini_client(provider, endpoint)?,
+            ))),
+            NativeModelApi::BedrockConverse => Ok(Client::Bedrock(Arc::new(self.bedrock_client(
                 provider,
                 endpoint,
                 &bedrock_endpoint_region(endpoint)?,
-            )?)),
+            )?))),
         }
     }
 

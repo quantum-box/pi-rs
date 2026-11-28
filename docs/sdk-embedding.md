@@ -40,19 +40,34 @@ levels stay available, and `xhigh` and `max` require a non-null mapping. An
 explicit map on a non-reasoning model yields only `off`. A declaration with
 no map retains `None`.
 
-The granted file loader binds the default `ModelClientFactory::client` for
-each route and shares that client across its model declarations. It publishes
-the selectable levels without passing the provider effort strings to the
-client. A host that owns the effort mapping and credentials can obtain a
-typed `chat_client` and call `with_mapped_reasoning_effort`, or obtain a
-typed Responses client and call `with_mapped_thinking`. The binding callbacks
-for [model cycling](https://github.com/quantum-box/pi-rs/pull/833) and
-[thinking selection](https://github.com/quantum-box/pi-rs/pull/846) take the
-configured client from the host. For historical branches the host supplies
-it through `cycled_model_resolver`. Automatic dispatch from a granted file
-would need to retain the merged effort map per exact model and build those
-level-specific clients through the same authorized route and credential
-resolution. The browser WASM SDK does not read native model files.
+Use `ModelFileReadGrants::snapshot` to opt into native wire bindings.
+`snapshot_with_api_keys` also accepts the exact file-key grants and variable
+resolver documented for `load_with_api_keys`. The snapshot resolves
+credentials once, keeps each model's merged map, and exposes the ordinary
+catalog through `snapshot.catalog()`. Build a fresh snapshot to adopt edits
+to the file or credentials. In a Tauri app, take the snapshot on a blocking
+worker and keep it in managed Rust state. Binding is synchronous and
+requires neither filesystem access nor credential resolution.
+
+```rust,ignore
+let snapshot = grants.snapshot(&factory)?;
+let client = snapshot.bind_thinking("relay", "chat", "high")?;
+```
+
+The configured client rejects requests for a different model ID. A reasoning
+model needs a declared map to bind. Inside that map, omitted ordinary levels
+use the adapter's default where it can represent the selection. A null entry
+returns `DisabledLevel`, including `off: null` on a reasoning model. An
+unmapped extended level returns `MissingMapping`. The exact model and level
+lookup returns `UnknownModel` or `UnknownLevel`, and a wire format that cannot
+represent the mapping returns `UnsupportedMapping`.
+
+The host can provide this client in the binding callbacks for
+[model cycling](https://github.com/quantum-box/pi-rs/pull/833) and
+[thinking selection](https://github.com/quantum-box/pi-rs/pull/846). Pass the
+selected Pi level alongside the client. For historical branches, resolve the
+recorded level through the snapshot authorized for that binding in
+`cycled_model_resolver`. The browser WASM SDK does not read native model files.
 
 For older journals that recorded a model name without its provider, the host
 may explicitly authorize that name with `session_builder_with_legacy_model`.

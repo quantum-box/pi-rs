@@ -77,6 +77,7 @@ pub struct Bedrock {
     credentials_http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     reasoning: ModelReasoning,
     reasoning_resolver: Option<Arc<ReasoningResolver>>,
+    omit_reasoning_fields: bool,
     thinking_budgets: ThinkingBudgets,
     configured_thinking_budgets: Option<Value>,
     thinking_display: ThinkingDisplay,
@@ -110,6 +111,7 @@ impl Bedrock {
             credentials_http_client: None,
             reasoning: ModelReasoning::default(),
             reasoning_resolver: None,
+            omit_reasoning_fields: false,
             thinking_budgets: ThinkingBudgets::default(),
             configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
@@ -227,6 +229,7 @@ impl Bedrock {
             credentials_http_client: None,
             reasoning: ModelReasoning::default(),
             reasoning_resolver: None,
+            omit_reasoning_fields: false,
             thinking_budgets: ThinkingBudgets::default(),
             configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
@@ -550,6 +553,13 @@ impl Bedrock {
             self.force_cache,
             self.summary,
         ));
+        let identity = if self.omit_reasoning_fields {
+            identity.and_then(|identity| {
+                pi_rs_core::protected_model_fingerprint(&("bedrock-omit-reasoning-v1", identity))
+            })
+        } else {
+            identity
+        };
         let identity = if let Some(choice) = &self.tool_choice {
             identity.and_then(|identity| {
                 pi_rs_core::protected_model_fingerprint(&(
@@ -613,6 +623,7 @@ impl Bedrock {
         mapped_effort: Option<&str>,
     ) -> Result<Self> {
         self.reasoning.level = level.map(ReasoningLevel::parse).transpose()?;
+        self.omit_reasoning_fields = false;
         self.reasoning.mapped_effort = mapped_effort.map(str::to_owned);
         self.reasoning.off_effort = mapped_effort
             .filter(|_| self.reasoning.level == Some(ReasoningLevel::Off))
@@ -623,6 +634,50 @@ impl Bedrock {
     /// Override whether this route accepts reasoning from earlier assistant messages.
     pub fn with_reasoning_replay_support(mut self, supported: Option<bool>) -> Self {
         self.reasoning.supports_replay = supported;
+        self.prepared_identity = None;
+        self
+    }
+
+    /// Omit Converse reasoning controls for a model declared non-reasoning.
+    pub fn without_reasoning_fields(mut self) -> Self {
+        self.omit_reasoning_fields = true;
+        self.prepared_identity = None;
+        self
+    }
+
+    /// Bind one model's explicit effort, retaining the selected host catalog
+    /// entry's name, summary effort and replay policy unless overridden.
+    pub fn with_model_reasoning(
+        self,
+        model: &str,
+        name: Option<&str>,
+        level: &str,
+        effort: Option<&str>,
+    ) -> Result<Self> {
+        let mut client = self.bind_reasoning_model(model);
+        if let Some(name) = name {
+            client.reasoning.model_name = Some(name.to_owned());
+        }
+        let level = ReasoningLevel::parse(level)?;
+        options::validate_explicit_reasoning(
+            model,
+            client.model_name_for(model, &client.reasoning),
+            level,
+            effort,
+        )?;
+        client.reasoning.level = Some(level);
+        client.reasoning.mapped_effort = effort.map(str::to_owned);
+        if level == ReasoningLevel::Off {
+            client.reasoning.off_effort = effort.map(str::to_owned);
+        }
+        client.omit_reasoning_fields = false;
+        client.prepared_identity = None;
+        Ok(client)
+    }
+
+    /// Set the declared off effort for summaries on models with a flat effort field.
+    pub fn with_reasoning_off_effort(mut self, effort: &str) -> Self {
+        self.reasoning.off_effort = Some(effort.to_owned());
         self.prepared_identity = None;
         self
     }
@@ -1785,21 +1840,25 @@ impl Bedrock {
                 reasoning_options.mapped_effort.as_deref(),
             )
         };
-        let fields = options::reasoning_fields(
-            &request.model,
-            model_name,
-            reasoning,
-            mapped_effort,
-            request.max_output_tokens,
-            options::ReasoningContext {
-                region: client.config().region().map(|region| region.as_ref()),
-                tool_free,
-                budgets: &self.thinking_budgets,
-                configured_budgets: self.configured_thinking_budgets.as_ref(),
-                display: self.thinking_display,
-                interleaved: self.interleaved_thinking,
-            },
-        )?;
+        let fields = if self.omit_reasoning_fields {
+            None
+        } else {
+            options::reasoning_fields(
+                &request.model,
+                model_name,
+                reasoning,
+                mapped_effort,
+                request.max_output_tokens,
+                options::ReasoningContext {
+                    region: client.config().region().map(|region| region.as_ref()),
+                    tool_free,
+                    budgets: &self.thinking_budgets,
+                    configured_budgets: self.configured_thinking_budgets.as_ref(),
+                    display: self.thinking_display,
+                    interleaved: self.interleaved_thinking,
+                },
+            )?
+        };
         if !tool_free
             && matches!(
                 self.tool_choice,
